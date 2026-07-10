@@ -2,14 +2,25 @@
 //!
 //! There is one concrete completion type per operation kind:
 //! [`AcceptCompletion`], [`ConnectCompletion`], [`RecvCompletion`], [`RecvBufCompletion`],
-//! [`SendCompletion`], [`SendOwnedCompletion`], [`PReadCompletion`], [`PWriteCompletion`], [`FsyncCompletion`],
-//! [`SizeCompletion`], [`MkdirCompletion`]. Each is a thin wrapper around
+//! [`SendCompletion`], [`SendOwnedCompletion`], [`PReadCompletion`], [`PWriteCompletion`],
+//! [`PWriteOwnedCompletion`], [`FsyncCompletion`], [`SizeCompletion`], [`MkdirCompletion`].
+//! Each is a thin wrapper around
 //! [`CompletionInner`] (the shared state machine and operation slot) and
 //! carries its own typed result.
 //!
 //! The caller passes `&mut RecvCompletion` to [`IOSocket::recv`] (and so on),
 //! the backend records an [`Operation`] in the underlying slot, submits the
 //! work, and later finishes the same object with a typed result.
+//!
+//! ## Address and lifetime
+//!
+//! Backends retain a pointer to an armed completion after the submission call
+//! returns. Callers must therefore place every completion in stable storage
+//! before submission and keep it alive until it has a terminal result or the
+//! backend confirms cancellation. A `Box<...Completion>` satisfies the address
+//! requirement: moving the box handle does not move its allocation. Cancelling
+//! the higher-level request does not by itself permit dropping the box while
+//! the backend still owns its pointer.
 //!
 //! ## Backend dispatch
 //!
@@ -156,6 +167,15 @@ define_completion!(
 );
 
 define_completion!(
+    /// Completion slot for a positional file write that returns the buffer.
+    ///
+    /// The complete allocation is returned on success and failure. Success
+    /// reports only the bytes accepted by that one positional write, so callers
+    /// must advance both their buffer cursor and file offset after a short write.
+    pub struct PWriteOwnedCompletion => Result<(Vec<u8>, usize), (io::Error, Vec<u8>)>
+);
+
+define_completion!(
     /// Completion slot for an `fsync(2)` operation.
     pub struct FsyncCompletion => io::Result<()>
 );
@@ -291,6 +311,8 @@ pub enum Operation {
     PRead(PReadOp),
     /// Write bytes to a file at a fixed offset.
     PWrite(PWriteOp),
+    /// Write bytes to a file at a fixed offset and return the buffer.
+    PWriteOwned(PWriteOp),
     /// Flush file data to stable storage.
     Fsync(FsyncOp),
     /// Read file size metadata.
@@ -323,6 +345,7 @@ pub struct RecvOp {
 pub struct SendOp {
     pub fd: RawFd,
     pub buf: Vec<u8>,
+    pub start: usize,
     pub flags: i32,
 }
 
@@ -337,6 +360,7 @@ pub struct PReadOp {
 pub struct PWriteOp {
     pub fd: RawFd,
     pub buf: Vec<u8>,
+    pub start: usize,
     pub offset: u64,
 }
 

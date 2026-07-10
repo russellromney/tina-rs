@@ -35,8 +35,8 @@ pub mod task;
 pub use completion::{
     AcceptCompletion, AcceptOp, ConnectCompletion, ConnectOp, FsyncCompletion, FsyncOp,
     MkdirCompletion, MkdirOp, PReadCompletion, PReadOp, PWriteCompletion, PWriteOp,
-    RecvBufCompletion, RecvCompletion, RecvOp, SendCompletion, SendOp, SendOwnedCompletion,
-    SizeCompletion, SizeOp,
+    PWriteOwnedCompletion, RecvBufCompletion, RecvCompletion, RecvOp, SendCompletion, SendOp,
+    SendOwnedCompletion, SizeCompletion, SizeOp,
 };
 
 pub use completion::{CompletionInner, Operation};
@@ -126,6 +126,23 @@ pub trait IOFile {
     /// Writes `buf` starting at `offset`.
     fn pwrite(&self, c: &mut PWriteCompletion, buf: Vec<u8>, offset: u64) -> stdio::Result<()>;
 
+    /// Writes `buf` at `offset` and returns it through the completion.
+    fn pwrite_owned(
+        &self,
+        c: &mut PWriteOwnedCompletion,
+        buf: Vec<u8>,
+        offset: u64,
+    ) -> Result<(), (stdio::Error, Vec<u8>)>;
+
+    /// Writes `buf[start..]` at `offset` and returns the complete buffer.
+    fn pwrite_owned_from(
+        &self,
+        c: &mut PWriteOwnedCompletion,
+        buf: Vec<u8>,
+        start: usize,
+        offset: u64,
+    ) -> Result<(), (stdio::Error, Vec<u8>)>;
+
     /// Flushes file data to stable storage.
     fn fsync(&self, c: &mut FsyncCompletion) -> stdio::Result<()>;
 
@@ -194,6 +211,14 @@ pub trait IOSocket {
         &self,
         c: &mut SendOwnedCompletion,
         buf: Vec<u8>,
+    ) -> Result<(), (stdio::Error, Vec<u8>)>;
+
+    /// Sends `buf[start..]` and returns the complete buffer.
+    fn send_owned_from(
+        &self,
+        c: &mut SendOwnedCompletion,
+        buf: Vec<u8>,
+        start: usize,
     ) -> Result<(), (stdio::Error, Vec<u8>)>;
 
     /// Enables or disables the `TCP_NODELAY` socket option.

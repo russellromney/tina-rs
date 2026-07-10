@@ -938,7 +938,10 @@ fn encode_process_config(out: &mut String, config: &crate::ScriptedProcessConfig
 }
 
 fn encode_storage_config(out: &mut String, config: crate::ScriptedStorageFaultConfig) {
-    out.push_str("{fail_journal=");
+    out.push_str("{file_write_cap=");
+    encode_option_usize(out, config.file_write_cap);
+    let _ = write!(out, ";max_file_bytes={}", config.max_file_bytes);
+    out.push_str(";fail_journal=");
     encode_option_u64(out, config.fail_journal_append_at);
     out.push_str(";fail_snapshot=");
     encode_option_u64(out, config.fail_snapshot_commit_at);

@@ -293,6 +293,8 @@ fn child_has_exited(child: &mut std::process::Child) -> std::io::Result<bool> {
     }
     // With `WNOHANG`, waitid returns 0 even when no child is ready. A zero
     // si_pid means "not exited yet"; nonzero means the child is waitable.
+    // SAFETY: `info` was initialized and passed to a successful `waitid` call;
+    // libc's accessor reads the active `si_pid` field without outliving it.
     let si_pid = unsafe { info.si_pid() };
     Ok(si_pid != 0)
 }
@@ -447,6 +449,8 @@ fn spawn_process(command: &ProcessCommand) -> std::io::Result<std::process::Chil
 fn kill_process_group(pid: u32) -> std::io::Result<()> {
     let pgid = libc::pid_t::try_from(pid)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "pid overflow"))?;
+    // SAFETY: `pgid` is a positive process-group identifier derived from the
+    // live child created by this lane; `killpg` borrows no Rust memory.
     let result = unsafe { libc::killpg(pgid, libc::SIGKILL) };
     if result == 0 {
         Ok(())
@@ -580,7 +584,7 @@ fn join_drain_bounded(handle: Option<DrainHandle>, timeout: Duration) -> (Vec<u8
     let Some(handle) = handle else {
         return (Vec::new(), false);
     };
-    let deadline = Instant::now() + timeout;
+    let deadline = deadline_after(Instant::now(), timeout);
     let mut handle = Some(handle);
     while Instant::now() < deadline {
         if handle

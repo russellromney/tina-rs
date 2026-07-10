@@ -154,11 +154,9 @@ impl StorageLane {
     }
 }
 
-impl Drop for StorageLane {
-    fn drop(&mut self) {
-        self.cancel_pending(Instant::now());
-    }
-}
+// No `Drop` impl on purpose. Reactor storage shares its Betelgeuse loop with
+// TCP, TLS, and Unix; `SharedIoLanes` is the sole owner allowed to cancel, step,
+// and either reclaim or quarantine that lifetime unit during destruction.
 
 // -----------------------------------------------------------------------------
 // Reactor storage lane
@@ -2513,7 +2511,7 @@ mod reactor_proofs {
 
         let budget = Duration::from_millis(50);
         let start = Instant::now();
-        lane.cancel_pending(Instant::now() + budget);
+        lane.cancel_pending(deadline_after(Instant::now(), budget));
         assert!(
             start.elapsed() < budget * 20,
             "bounded shutdown must return near the budget even when stuck"
@@ -2948,6 +2946,7 @@ mod reactor_proofs {
             c.inner_mut().prepare(Operation::PWrite(PWriteOp {
                 fd: self.fd,
                 buf: Vec::new(),
+                start: 0,
                 offset,
             }));
             let mut st = self.state.borrow_mut();
@@ -2960,6 +2959,25 @@ mod reactor_proofs {
                 delay,
             });
             Ok(())
+        }
+
+        fn pwrite_owned(
+            &self,
+            _c: &mut PWriteOwnedCompletion,
+            buf: Vec<u8>,
+            _offset: u64,
+        ) -> Result<(), (io::Error, Vec<u8>)> {
+            Err((io::Error::from(io::ErrorKind::Unsupported), buf))
+        }
+
+        fn pwrite_owned_from(
+            &self,
+            _c: &mut PWriteOwnedCompletion,
+            buf: Vec<u8>,
+            _start: usize,
+            _offset: u64,
+        ) -> Result<(), (io::Error, Vec<u8>)> {
+            Err((io::Error::from(io::ErrorKind::Unsupported), buf))
         }
 
         fn fsync(&self, c: &mut FsyncCompletion) -> io::Result<()> {
@@ -3077,6 +3095,9 @@ mod reactor_proofs {
                         Err(error) => Err(error),
                     }
                 };
+                // SAFETY: submission stored the unique live `PReadCompletion`
+                // pointer in this operation; the queue removes and completes
+                // each operation exactly once before the completion is dropped.
                 unsafe { &mut *(op.completion as *mut PReadCompletion) }.complete(result);
             }
             FileOpKind::PWrite { buf, offset } => {
@@ -3095,6 +3116,8 @@ mod reactor_proofs {
                 };
                 st.outstanding_pwrite.remove(&op.fd);
                 st.saw_pwrite_complete = true;
+                // SAFETY: submission stored the unique live `PWriteCompletion`
+                // pointer, and this operation is completed exactly once here.
                 unsafe { &mut *(op.completion as *mut PWriteCompletion) }.complete(result);
             }
             FileOpKind::Fsync => {
@@ -3106,6 +3129,8 @@ mod reactor_proofs {
                     file.sync_all()
                 };
                 st.saw_fsync_complete = true;
+                // SAFETY: submission stored the unique live `FsyncCompletion`
+                // pointer, and this operation is completed exactly once here.
                 unsafe { &mut *(op.completion as *mut FsyncCompletion) }.complete(result);
             }
             FileOpKind::Size => {
@@ -3113,6 +3138,8 @@ mod reactor_proofs {
                     let file = st.files.get(&op.fd).expect("fd open");
                     file.metadata().map(|m| m.len())
                 };
+                // SAFETY: submission stored the unique live `SizeCompletion`
+                // pointer, and this operation is completed exactly once here.
                 unsafe { &mut *(op.completion as *mut SizeCompletion) }.complete(result);
             }
         }

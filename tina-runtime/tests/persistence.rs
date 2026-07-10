@@ -464,6 +464,30 @@ fn journal_replay_reports_truncated_tail_but_rejects_bad_checksum() {
 }
 
 #[test]
+fn persistence_decoders_reject_unrepresentable_or_overflowing_payload_lengths() {
+    let mut snapshot = tina_runtime::persistence::encode_snapshot(&tina_runtime::SnapshotImage {
+        bytes: Vec::new(),
+        last_journal_index: 0,
+    });
+    snapshot[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert_eq!(
+        tina_runtime::persistence::decode_snapshot(&snapshot),
+        Err(CallError::CorruptRecord)
+    );
+
+    let mut journal =
+        tina_runtime::persistence::encode_journal_record(&tina_runtime::JournalRecord {
+            index: 1,
+            bytes: Vec::new(),
+        });
+    journal[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert_eq!(
+        tina_runtime::persistence::replay_journal_bytes(&journal),
+        Err(CallError::CorruptRecord)
+    );
+}
+
+#[test]
 fn journal_append_rejects_unreplayable_index_order_before_appending() {
     let dir = unique_dir("append-order-visible");
     let journal = dir.join("state.journal");

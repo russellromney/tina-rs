@@ -241,15 +241,21 @@ impl<S: Shard + 'static> SqliteWorker<S> {
     pub fn new(config: SqliteConfig) -> Result<(Self, SqliteMetricsHandle), InstallError> {
         config.validate()?;
 
-        let conn = open_connection(&config.path).map_err(|e| InstallError::Open(format!("{e}")))?;
+        let conn = open_connection(&config.path).map_err(InstallError::Open)?;
         if !config.busy_timeout.is_zero() {
             conn.busy_timeout(config.busy_timeout)
-                .map_err(|e| InstallError::Setup(format!("busy_timeout: {e}")))?;
+                .map_err(|source| InstallError::Setup {
+                    operation: "busy_timeout",
+                    source,
+                })?;
         }
         for pragma in &config.pragmas {
             let stmt = format!("PRAGMA {pragma}");
             conn.execute_batch(&stmt)
-                .map_err(|e| InstallError::Pragma(format!("'{pragma}': {e}")))?;
+                .map_err(|source| InstallError::Pragma {
+                    pragma: pragma.clone(),
+                    source,
+                })?;
         }
 
         let metrics_inner = Arc::new(MetricsInner::default());
@@ -261,7 +267,7 @@ impl<S: Shard + 'static> SqliteWorker<S> {
         let join = thread::Builder::new()
             .name("tina-sqlite-bridge".into())
             .spawn(move || worker_loop(conn, cmd_rx, metrics_for_thread))
-            .map_err(|e| InstallError::Spawn(format!("{e}")))?;
+            .map_err(InstallError::Spawn)?;
 
         let metrics_handle = SqliteMetricsHandle {
             inner: Arc::clone(&metrics_inner),
@@ -486,7 +492,7 @@ impl<S: Shard + Send + 'static> SqliteWorker<S> {
         let closer = worker.closer();
         let address = runtime
             .register_with_capacity::<_, Infallible>(worker, cap)
-            .map_err(|e| InstallError::Register(format!("{e:?}")))?;
+            .map_err(InstallError::Register)?;
         Ok(InstalledSqliteBridge {
             address: address.callable(),
             closer,

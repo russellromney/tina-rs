@@ -4095,7 +4095,7 @@ where
     F: MailboxFactory,
 {
     fn mailbox_capacity(&self) -> usize {
-        match *self {}
+        unreachable!("an Infallible spawn request cannot be borrowed")
     }
 
     fn into_send_erased_spawn(self) -> Box<dyn SendErasedSpawn<S, F>> {

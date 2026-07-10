@@ -1537,6 +1537,7 @@ fn call_error_tag(error: CallError) -> u8 {
         // Appended after the existing tags; never renumber.
         CallError::TlsAlpnMismatch => 28,
         CallError::TimerFull => 29,
+        CallError::InvariantViolation => 30,
     }
 }
 
@@ -2279,6 +2280,23 @@ mod stable_hash_tests {
         // intentionally rebased the trace contract (in which case the
         // user-facing replay docs must call it out).
         assert_eq!(event.stable_hash(), 0x7ebc64a1613463c7);
+    }
+
+    #[test]
+    fn invariant_violation_call_error_tag_and_event_hash_are_stable() {
+        assert_eq!(call_error_tag(CallError::InvariantViolation), 30);
+        let event = RuntimeEvent::new(
+            EventId::new(11),
+            Some(CauseId::new(EventId::new(7))),
+            ShardId::new(2),
+            IsolateId::new(5),
+            RuntimeEventKind::CallFailed {
+                call_id: CallId::new(13),
+                call_kind: CallKind::UnixWrite,
+                reason: CallError::InvariantViolation,
+            },
+        );
+        assert_eq!(event.stable_hash(), 0xc45645ee45d71e4f);
     }
 
     #[test]

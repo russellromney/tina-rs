@@ -3,6 +3,7 @@
 mod common;
 
 use std::convert::Infallible;
+use std::error::Error as _;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,8 +13,9 @@ use http::header::HeaderName;
 use http::status::StatusCode;
 use tina::prelude::*;
 use tina_reqwest_bridge::{
-    InstalledReqwestBridge, ReqwestAddress, ReqwestConfig, ReqwestConfigError, ReqwestError,
-    ReqwestMsg, ReqwestRequest, ReqwestResponse, ReqwestWorker, RetryPolicy, send_request,
+    InstallError, InstalledReqwestBridge, ReqwestAddress, ReqwestConfig, ReqwestConfigError,
+    ReqwestError, ReqwestMsg, ReqwestRequest, ReqwestResponse, ReqwestWorker, RetryPolicy,
+    send_request,
 };
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
@@ -181,6 +183,29 @@ fn happy_path_returns_full_body() {
     assert_eq!(snap.timeout, 0);
     assert_eq!(snap.full, 0);
     assert_eq!(snap.current_in_flight, 0, "no leftover in-flight");
+    server.stop();
+}
+
+#[test]
+fn maximum_timeouts_complete_a_real_http_request() {
+    let server = FakeServer::spawn(delayed_ok(b"max timeout", Duration::from_millis(1)));
+    let mut request = ReqwestRequest::get(server.url("/max-timeout"));
+    request.timeout = Some(Duration::MAX);
+    let (outcome, metrics) = run_one_call(
+        ReqwestConfig::default().with_default_timeout(Duration::MAX),
+        request,
+        Duration::MAX,
+        Duration::from_secs(5),
+    );
+
+    match outcome {
+        CallOutcome::Replied(Ok(response)) => {
+            assert_eq!(response.status.as_u16(), 200);
+            assert_eq!(response.body.as_slice(), b"max timeout");
+        }
+        other => panic!("maximum timeout request failed: {other:?}"),
+    }
+    assert_eq!(metrics.snapshot().responses, 1);
     server.stop();
 }
 
@@ -1144,6 +1169,27 @@ fn config_validation_rejects_zero_capacity() {
         cfg.validate(),
         Err(ReqwestConfigError::ZeroMailboxCapacity)
     ));
+}
+
+#[test]
+fn install_errors_keep_typed_build_and_registration_sources() {
+    let build = InstallError::Build(ReqwestError::Internal("client build failed".into()));
+    assert!(
+        build
+            .source()
+            .and_then(|source| source.downcast_ref::<ReqwestError>())
+            .is_some(),
+        "reqwest worker build classification must remain inspectable"
+    );
+
+    let register = InstallError::Register(tina_runtime::ThreadedRuntimeError::WorkerStopped);
+    assert!(
+        register
+            .source()
+            .and_then(|source| source.downcast_ref::<tina_runtime::ThreadedRuntimeError>())
+            .is_some(),
+        "runtime registration failure must remain inspectable"
+    );
 }
 
 #[test]

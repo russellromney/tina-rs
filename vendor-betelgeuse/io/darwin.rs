@@ -16,13 +16,26 @@ use log::trace;
 use crate::{
     AcceptCompletion, AcceptOp, CompletionInner, ConnectCompletion, ConnectOp, FsyncCompletion,
     FsyncOp, IO, IOFile, IOLoop, IOSocket, MkdirCompletion, MkdirOp, OpenOptions, Operation,
-    PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, RecvBufCompletion, RecvCompletion,
-    RecvOp, SendCompletion, SendOp, SendOwnedCompletion, SizeCompletion, SizeOp,
+    PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, PWriteOwnedCompletion, RecvBufCompletion,
+    RecvCompletion, RecvOp, SendCompletion, SendOp, SendOwnedCompletion, SizeCompletion, SizeOp,
 };
 
 enum SocketKind {
     Listener,
     Stream,
+}
+
+fn validate_file_range(offset: u64, len: usize) -> io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let len = u64::try_from(len).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    i64::try_from(end)
+        .map(|_| ())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
 }
 
 struct OwnedFd {
@@ -242,10 +255,36 @@ impl DarwinIO {
         }
         Ok(())
     }
+
+    fn cancel_watched_with(
+        &self,
+        mut delete: impl FnMut(WatchedCompletion) -> io::Result<()>,
+    ) -> io::Result<()> {
+        loop {
+            let watched = {
+                let state = self.state.borrow();
+                state.watched.last().copied()
+            };
+            let Some(watched) = watched else {
+                return Ok(());
+            };
+            delete(watched)?;
+            let removed = self
+                .state
+                .borrow_mut()
+                .watched
+                .pop()
+                .expect("watched completion inspected above");
+            debug_assert_eq!(removed.completion, watched.completion);
+            let completion = unsafe { watched.completion.as_ptr().as_mut().expect("non-null") };
+            fail_completion(completion, cancelled_error());
+        }
+    }
 }
 
 impl IOFile for DarwinFile {
     fn pread(&self, c: &mut PReadCompletion, len: usize, offset: u64) -> io::Result<()> {
+        validate_file_range(offset, len)?;
         let inner = c.inner_mut();
         inner.prepare(Operation::PRead(PReadOp {
             fd: self.fd.raw(),
@@ -257,10 +296,86 @@ impl IOFile for DarwinFile {
     }
 
     fn pwrite(&self, c: &mut PWriteCompletion, buf: Vec<u8>, offset: u64) -> io::Result<()> {
+        validate_file_range(offset, buf.len())?;
+        if buf.is_empty() {
+            c.inner_mut().prepare(Operation::PWrite(PWriteOp {
+                fd: self.fd.raw(),
+                buf,
+                start: 0,
+                offset,
+            }));
+            c.complete(Ok(0));
+            return Ok(());
+        }
         let inner = c.inner_mut();
         inner.prepare(Operation::PWrite(PWriteOp {
             fd: self.fd.raw(),
             buf,
+            start: 0,
+            offset,
+        }));
+        queue(&self.state, inner);
+        Ok(())
+    }
+
+    fn pwrite_owned(
+        &self,
+        c: &mut PWriteOwnedCompletion,
+        buf: Vec<u8>,
+        offset: u64,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
+        if let Err(error) = validate_file_range(offset, buf.len()) {
+            return Err((error, buf));
+        }
+        if buf.is_empty() {
+            c.inner_mut().prepare(Operation::PWriteOwned(PWriteOp {
+                fd: self.fd.raw(),
+                buf: Vec::new(),
+                start: 0,
+                offset,
+            }));
+            c.complete(Ok((buf, 0)));
+            return Ok(());
+        }
+        let inner = c.inner_mut();
+        inner.prepare(Operation::PWriteOwned(PWriteOp {
+            fd: self.fd.raw(),
+            buf,
+            start: 0,
+            offset,
+        }));
+        queue(&self.state, inner);
+        Ok(())
+    }
+
+    fn pwrite_owned_from(
+        &self,
+        c: &mut PWriteOwnedCompletion,
+        buf: Vec<u8>,
+        start: usize,
+        offset: u64,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
+        if start > buf.len() {
+            return Err((io::Error::from(io::ErrorKind::InvalidInput), buf));
+        }
+        if let Err(error) = validate_file_range(offset, buf.len() - start) {
+            return Err((error, buf));
+        }
+        if start == buf.len() {
+            c.inner_mut().prepare(Operation::PWriteOwned(PWriteOp {
+                fd: self.fd.raw(),
+                buf: Vec::new(),
+                start: 0,
+                offset,
+            }));
+            c.complete(Ok((buf, 0)));
+            return Ok(());
+        }
+        let inner = c.inner_mut();
+        inner.prepare(Operation::PWriteOwned(PWriteOp {
+            fd: self.fd.raw(),
+            buf,
+            start,
             offset,
         }));
         queue(&self.state, inner);
@@ -532,6 +647,7 @@ impl IOSocket for DarwinSocket {
         inner.prepare(Operation::Send(SendOp {
             fd,
             buf,
+            start: 0,
             flags: libc::MSG_DONTWAIT,
         }));
         queue(&self.state, inner);
@@ -572,6 +688,39 @@ impl IOSocket for DarwinSocket {
         inner.prepare(Operation::SendOwned(SendOp {
             fd,
             buf,
+            start: 0,
+            flags: libc::MSG_DONTWAIT,
+        }));
+        queue(&self.state, inner);
+        Ok(())
+    }
+
+    fn send_owned_from(
+        &self,
+        c: &mut SendOwnedCompletion,
+        buf: Vec<u8>,
+        start: usize,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
+        if start > buf.len() {
+            return Err((io::Error::from(io::ErrorKind::InvalidInput), buf));
+        }
+        let fd = match self.fd.borrow().as_ref() {
+            Some(fd) => fd.raw(),
+            None => {
+                return Err((
+                    io::Error::new(io::ErrorKind::NotConnected, "send called on closed socket"),
+                    buf,
+                ));
+            }
+        };
+        if !matches!(&*self.kind.borrow(), Some(SocketKind::Stream)) {
+            return Err((io::Error::from(io::ErrorKind::InvalidInput), buf));
+        }
+        let inner = c.inner_mut();
+        inner.prepare(Operation::SendOwned(SendOp {
+            fd,
+            buf,
+            start,
             flags: libc::MSG_DONTWAIT,
         }));
         queue(&self.state, inner);
@@ -784,13 +933,9 @@ impl IOLoop for DarwinIO {
     }
 
     fn cancel_pending_completions(&self) -> io::Result<()> {
-        let (queued, watched, kq) = {
+        let (queued, kq) = {
             let mut state = self.state.borrow_mut();
-            (
-                std::mem::take(&mut state.queued),
-                std::mem::take(&mut state.watched),
-                state.kq,
-            )
+            (std::mem::take(&mut state.queued), state.kq)
         };
 
         for completion_ptr in queued {
@@ -798,19 +943,22 @@ impl IOLoop for DarwinIO {
             fail_completion(completion, cancelled_error());
         }
 
-        for watched in watched {
-            Self::delete_watch(kq, watched)?;
-            let completion = unsafe { watched.completion.as_ptr().as_mut().expect("non-null") };
-            fail_completion(completion, cancelled_error());
-        }
-
-        Ok(())
+        // Keep each watch recorded until EV_DELETE succeeds. Taking the whole
+        // vector up front made one fallible delete lose ownership bookkeeping
+        // for that watch and every unprocessed watch after it.
+        self.cancel_watched_with(|watched| Self::delete_watch(kq, watched))
     }
 }
 
 /// Stores the same `io::Error` into whichever typed completion the inner is
 /// the prefix of. Used for the kqueue `EV_ERROR` path, which delivers a
 /// kernel-side errno before the syscall has even run.
+///
+/// SAFETY in each arm follows the completion layout invariant: the IO method
+/// arms only the `Operation` matching its concrete `#[repr(C)]` completion,
+/// whose `CompletionInner` is the first field. Owned arms extract the buffer
+/// before casting and complete exactly once, so no reference into the
+/// operation survives the result write.
 fn fail_completion(c: &mut CompletionInner, err: io::Error) {
     match c.operation() {
         Operation::Accept(_) => unsafe { AcceptCompletion::from_inner_mut(c) }.complete(Err(err)),
@@ -828,6 +976,8 @@ fn fail_completion(c: &mut CompletionInner, err: io::Error) {
             RecvBufCompletion::from_inner_mut(c).complete(Err((err, buffer)));
         },
         Operation::Send(_) => unsafe { SendCompletion::from_inner_mut(c) }.complete(Err(err)),
+        // SAFETY: this operation is armed only by `SendOwnedCompletion`; the
+        // buffer is extracted before the typed result is written.
         Operation::SendOwned(_) => unsafe {
             let buffer = {
                 let Operation::SendOwned(op) = c.operation_mut() else {
@@ -839,6 +989,17 @@ fn fail_completion(c: &mut CompletionInner, err: io::Error) {
         },
         Operation::PRead(_) => unsafe { PReadCompletion::from_inner_mut(c) }.complete(Err(err)),
         Operation::PWrite(_) => unsafe { PWriteCompletion::from_inner_mut(c) }.complete(Err(err)),
+        // SAFETY: this operation is armed only by `PWriteOwnedCompletion`; the
+        // buffer is extracted before the typed result is written.
+        Operation::PWriteOwned(_) => unsafe {
+            let buffer = {
+                let Operation::PWriteOwned(op) = c.operation_mut() else {
+                    unreachable!()
+                };
+                mem::take(&mut op.buf)
+            };
+            PWriteOwnedCompletion::from_inner_mut(c).complete(Err((err, buffer)));
+        },
         Operation::Fsync(_) => unsafe { FsyncCompletion::from_inner_mut(c) }.complete(Err(err)),
         Operation::Size(_) => unsafe { SizeCompletion::from_inner_mut(c) }.complete(Err(err)),
         Operation::Mkdir(_) => unsafe { MkdirCompletion::from_inner_mut(c) }.complete(Err(err)),
@@ -1000,8 +1161,10 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
         }
         Operation::Send(op) => {
             let result = {
-                let rc =
-                    unsafe { libc::send(op.fd, op.buf.as_ptr().cast(), op.buf.len(), op.flags) };
+                let bytes = &op.buf[op.start..];
+                // SAFETY: `bytes` is a live immutable slice for the duration
+                // of `send`, and the socket retains ownership of `op.fd`.
+                let rc = unsafe { libc::send(op.fd, bytes.as_ptr().cast(), bytes.len(), op.flags) };
                 if rc < 0 {
                     let err = io::Error::last_os_error();
                     if err.kind() == io::ErrorKind::WouldBlock {
@@ -1020,8 +1183,10 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
         }
         Operation::SendOwned(op) => {
             let result = {
-                let rc =
-                    unsafe { libc::send(op.fd, op.buf.as_ptr().cast(), op.buf.len(), op.flags) };
+                let bytes = &op.buf[op.start..];
+                // SAFETY: `bytes` is a live immutable slice for the duration
+                // of `send`, and the socket retains ownership of `op.fd`.
+                let rc = unsafe { libc::send(op.fd, bytes.as_ptr().cast(), bytes.len(), op.flags) };
                 if rc < 0 {
                     let err = io::Error::last_os_error();
                     if err.kind() == io::ErrorKind::WouldBlock {
@@ -1035,6 +1200,8 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
                     Ok((mem::take(&mut op.buf), rc as usize))
                 }
             };
+            // SAFETY: the matching IO method armed `SendOwned` only in a
+            // `SendOwnedCompletion`, and no buffer borrow survives this cast.
             unsafe { SendOwnedCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
@@ -1064,11 +1231,14 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
         }
         Operation::PWrite(op) => {
             let result = {
+                // SAFETY: the remaining buffer slice is live for the syscall,
+                // `op.fd` remains owned by the file, and the non-empty range's
+                // offset was validated as representable by `off_t` when armed.
                 let rc = unsafe {
                     libc::pwrite(
                         op.fd,
-                        op.buf.as_ptr().cast(),
-                        op.buf.len(),
+                        op.buf[op.start..].as_ptr().cast(),
+                        op.buf.len() - op.start,
                         op.offset as libc::off_t,
                     )
                 };
@@ -1083,6 +1253,39 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
                 }
             };
             unsafe { PWriteCompletion::from_inner_mut(c) }.complete(result);
+            PollResult::Done
+        }
+        Operation::PWriteOwned(op) => {
+            let result = {
+                // SAFETY: the remaining buffer slice is live for the syscall,
+                // `op.fd` remains owned by the file, and the non-empty range's
+                // offset was validated as representable by `off_t` when armed.
+                let rc = unsafe {
+                    libc::pwrite(
+                        op.fd,
+                        op.buf[op.start..].as_ptr().cast(),
+                        op.buf.len() - op.start,
+                        op.offset as libc::off_t,
+                    )
+                };
+                if rc < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        return PollResult::Retry;
+                    }
+                    Err(err)
+                } else {
+                    Ok(rc as usize)
+                }
+            };
+            let buffer = mem::take(&mut op.buf);
+            let result = match result {
+                Ok(count) => Ok((buffer, count)),
+                Err(error) => Err((error, buffer)),
+            };
+            // SAFETY: the matching IO method armed `PWriteOwned` only in a
+            // `PWriteOwnedCompletion`; the buffer has been moved out.
+            unsafe { PWriteOwnedCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
         Operation::Fsync(op) => {
@@ -1356,6 +1559,7 @@ fn set_no_sigpipe(fd: RawFd) -> io::Result<()> {
 mod tests {
     use std::io::Write;
     use std::os::fd::AsRawFd;
+    use std::ptr::NonNull;
 
     use super::*;
 
@@ -1378,5 +1582,40 @@ mod tests {
         full_fsync(file.as_raw_fd()).expect("full fsync regular file");
         drop(file);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_watch_delete_preserves_all_backend_ownership_tracking() {
+        let io = DarwinIO::new().expect("create test kqueue");
+        let mut first = Box::new(RecvCompletion::new());
+        let mut second = Box::new(RecvCompletion::new());
+        let first_ptr = NonNull::from(first.inner_mut());
+        let second_ptr = NonNull::from(second.inner_mut());
+        io.state.borrow_mut().watched.extend([
+            WatchedCompletion {
+                completion: first_ptr,
+                fd: -1,
+                filter: libc::EVFILT_READ,
+            },
+            WatchedCompletion {
+                completion: second_ptr,
+                fd: -1,
+                filter: libc::EVFILT_READ,
+            },
+        ]);
+
+        let error = io
+            .cancel_watched_with(|_| Err(io::Error::other("injected EV_DELETE failure")))
+            .expect_err("delete failure must remain visible");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(io.pending_completion_count(), 2);
+        let watched: Vec<_> = io
+            .state
+            .borrow()
+            .watched
+            .iter()
+            .map(|watched| watched.completion)
+            .collect();
+        assert_eq!(watched, [first_ptr, second_ptr]);
     }
 }

@@ -12,18 +12,20 @@ use tina::{
 };
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutput, FileId,
-    FileOpenOptions, ListenerId, PathKind, ProcessRunResult, RuntimeCall, RuntimeEvent,
-    RuntimeEventKind, StreamId, TlsListenerId, TlsStreamId, UdpSocketId, dns_lookup, file_close,
-    file_create, file_write, mkdir, path_metadata, process_run, read_dir, remove_file,
-    rename_replace, signal_wait, sync_parent, tls_accept, tls_bind, tls_close, tls_close_listener,
-    tls_connect, tls_read, tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
+    FileOpenOptions, FileWriteOwnedReply, ListenerId, LoopStep, PathKind, ProcessRunResult,
+    RuntimeCall, RuntimeEvent, RuntimeEventKind, StreamId, TcpWriteAll, TcpWriteOwnedReply,
+    TlsListenerId, TlsStreamId, UdpSocketId, WriteOwnedError, dns_lookup, file_close, file_create,
+    file_size, file_write, file_write_at, file_write_at_owned, mkdir, path_metadata, process_run,
+    read_dir, remove_file, rename_replace, signal_wait, sync_parent, tls_accept, tls_bind,
+    tls_close, tls_close_listener, tls_connect, tls_read, tls_write, udp_bind, udp_close_socket,
+    udp_recv_from, udp_send_to,
 };
 use tina_sim::{
     Checker, CheckerDecision, FaultConfig, ObservedPeerOutput, ReplayArtifact, ScriptedDnsConfig,
     ScriptedDnsLookupConfig, ScriptedDnsResult, ScriptedListenerConfig, ScriptedPeerConfig,
     ScriptedProcessConfig, ScriptedProcessResult, ScriptedProcessRunConfig, ScriptedSignalConfig,
-    ScriptedSignalEventConfig, ScriptedSignalResult, ScriptedTcpConfig, ScriptedTlsConfig,
-    ScriptedTlsConnectConfig, ScriptedTlsConnectResult, ScriptedTlsReadResult,
+    ScriptedSignalEventConfig, ScriptedSignalResult, ScriptedStorageFaultConfig, ScriptedTcpConfig,
+    ScriptedTlsConfig, ScriptedTlsConnectConfig, ScriptedTlsConnectResult, ScriptedTlsReadResult,
     ScriptedTlsWriteResult, ScriptedUdpConfig, ScriptedUdpDatagramConfig, ScriptedUdpSocketConfig,
     Simulator, SimulatorConfig, TcpCompletionFaultMode,
     dst::{DstRun, History, InvariantSuite, ShrinkConfig, assert_replays, delete_shrink},
@@ -100,7 +102,7 @@ impl Isolate for Connection {
 enum ClientMsg {
     Start(SocketAddr),
     Connected(Result<(StreamId, SocketAddr, SocketAddr), CallError>),
-    Wrote(Result<(Vec<u8>, usize), CallError>),
+    Wrote(Result<TcpWriteOwnedReply, WriteOwnedError>),
     Read(Result<(Vec<u8>, usize), CallError>),
     Closed(Result<(), CallError>),
 }
@@ -108,7 +110,7 @@ enum ClientMsg {
 #[derive(Debug)]
 struct Client {
     payload: Vec<u8>,
-    pending_write: Vec<u8>,
+    write_all: Option<TcpWriteAll>,
     stream: Option<StreamId>,
     observed: Arc<Mutex<Option<Vec<u8>>>>,
 }
@@ -143,50 +145,36 @@ impl Isolate for Client {
             )),
             ClientMsg::Connected(Ok((stream, _local_addr, _peer_addr))) => {
                 self.stream = Some(stream);
-                self.pending_write = std::mem::take(&mut self.payload);
-                Effect::Io(RuntimeCall::new(
-                    CallInput::TcpWriteOwned {
-                        stream,
-                        bytes: std::mem::take(&mut self.pending_write),
-                    },
-                    |result| match result {
-                        CallOutput::TcpWroteOwned { bytes, count } => {
-                            ClientMsg::Wrote(Ok((bytes, count)))
-                        }
-                        CallOutput::Failed(error) => ClientMsg::Wrote(Err(error)),
-                        other => panic!("unexpected write result {other:?}"),
-                    },
-                ))
+                let mut write_all = TcpWriteAll::new(stream, std::mem::take(&mut self.payload));
+                let effect = write_all
+                    .next_effect(ClientMsg::Wrote)
+                    .expect("client payload is non-empty");
+                self.write_all = Some(write_all);
+                effect
             }
-            ClientMsg::Wrote(Ok((mut bytes, count))) => {
+            ClientMsg::Wrote(reply) => {
                 let stream = self.stream.expect("stream set after connect");
-                if count >= bytes.len() {
-                    Effect::Io(RuntimeCall::new(
-                        CallInput::TcpReadBuf {
-                            stream,
-                            buffer: Vec::with_capacity(16),
-                            max_len: 4,
-                        },
-                        |result| match result {
-                            CallOutput::TcpReadBuf { buffer, len } => {
-                                ClientMsg::Read(Ok((buffer, len)))
-                            }
-                            CallOutput::Failed(error) => ClientMsg::Read(Err(error)),
-                            other => panic!("unexpected read result {other:?}"),
-                        },
-                    ))
-                } else {
-                    bytes.drain(..count);
-                    Effect::Io(RuntimeCall::new(
-                        CallInput::TcpWriteOwned { stream, bytes },
-                        |result| match result {
-                            CallOutput::TcpWroteOwned { bytes, count } => {
-                                ClientMsg::Wrote(Ok((bytes, count)))
-                            }
-                            CallOutput::Failed(error) => ClientMsg::Wrote(Err(error)),
-                            other => panic!("unexpected write result {other:?}"),
-                        },
-                    ))
+                let write_all = self.write_all.as_mut().expect("write helper armed");
+                match write_all.advance::<Self, _, _>(reply, ClientMsg::Wrote) {
+                    LoopStep::Pending(effect) => effect,
+                    LoopStep::Done(_) => {
+                        self.write_all = None;
+                        Effect::Io(RuntimeCall::new(
+                            CallInput::TcpReadBuf {
+                                stream,
+                                buffer: Vec::with_capacity(16),
+                                max_len: 4,
+                            },
+                            |result| match result {
+                                CallOutput::TcpReadBuf { buffer, len } => {
+                                    ClientMsg::Read(Ok((buffer, len)))
+                                }
+                                CallOutput::Failed(error) => ClientMsg::Read(Err(error)),
+                                other => panic!("unexpected read result {other:?}"),
+                            },
+                        ))
+                    }
+                    LoopStep::Failed(_) => Effect::Stop,
                 }
             }
             ClientMsg::Read(Ok((buffer, len))) => {
@@ -202,10 +190,9 @@ impl Isolate for Client {
                 ))
             }
             ClientMsg::Closed(Ok(())) => Effect::Stop,
-            ClientMsg::Connected(Err(_))
-            | ClientMsg::Wrote(Err(_))
-            | ClientMsg::Read(Err(_))
-            | ClientMsg::Closed(Err(_)) => Effect::Stop,
+            ClientMsg::Connected(Err(_)) | ClientMsg::Read(Err(_)) | ClientMsg::Closed(Err(_)) => {
+                Effect::Stop
+            }
         }
     }
 }
@@ -228,6 +215,151 @@ struct FileClient {
     file: Option<FileId>,
     size: Option<u64>,
     observed: FileObserved,
+}
+
+#[derive(Debug, Clone)]
+enum FileBoundaryMsg {
+    Start { dir: PathBuf, path: PathBuf },
+    DirectoryMade(Result<(), CallError>, PathBuf),
+    Opened(Result<FileId, CallError>),
+    Seeded(Result<usize, CallError>),
+    RawEmpty(Result<usize, CallError>),
+    OwnedEmpty(FileWriteOwnedReply),
+    SizeAfterEmpty(Result<u64, CallError>),
+    WroteBoundary(Result<usize, CallError>),
+    RawPastCap(Result<usize, CallError>),
+    RawHostileOffset(Result<usize, CallError>),
+    OwnedHostileOffset(FileWriteOwnedReply),
+    FinalSize(Result<u64, CallError>),
+    Closed(Result<(), CallError>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileBoundaryObservation {
+    Seeded(Result<usize, CallError>),
+    RawEmpty(Result<usize, CallError>),
+    OwnedEmpty(Result<(Vec<u8>, usize), (CallError, Vec<u8>)>),
+    SizeAfterEmpty(Result<u64, CallError>),
+    WroteBoundary(Result<usize, CallError>),
+    RawPastCap(Result<usize, CallError>),
+    RawHostileOffset(Result<usize, CallError>),
+    OwnedHostileOffset(Result<(Vec<u8>, usize), (CallError, Vec<u8>)>),
+    FinalSize(Result<u64, CallError>),
+}
+
+#[derive(Debug)]
+struct FileBoundaryClient {
+    file: Option<FileId>,
+    observed: Arc<Mutex<Vec<FileBoundaryObservation>>>,
+}
+
+fn observe_owned(reply: FileWriteOwnedReply) -> Result<(Vec<u8>, usize), (CallError, Vec<u8>)> {
+    match reply {
+        Ok(reply) => Ok((reply.bytes, reply.written)),
+        Err(error) => Err((error.error, error.bytes)),
+    }
+}
+
+impl Isolate for FileBoundaryClient {
+    type Message = FileBoundaryMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type SpawnObserved = Infallible;
+    type Io = RuntimeCall<FileBoundaryMsg>;
+    type Fact = Infallible;
+    type Shard = TestShard;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            FileBoundaryMsg::Start { dir, path } => {
+                mkdir(dir, 0o755).then(move |result| FileBoundaryMsg::DirectoryMade(result, path))
+            }
+            FileBoundaryMsg::DirectoryMade(Ok(()), path) => {
+                file_create(path).then(FileBoundaryMsg::Opened)
+            }
+            FileBoundaryMsg::Opened(Ok(file)) => {
+                self.file = Some(file);
+                file_write_at(file, b"seed".to_vec(), 0).then(FileBoundaryMsg::Seeded)
+            }
+            FileBoundaryMsg::Seeded(result) => {
+                self.observed
+                    .lock()
+                    .expect("boundary observations")
+                    .push(FileBoundaryObservation::Seeded(result));
+                file_write_at(self.file.expect("opened"), Vec::new(), u64::MAX)
+                    .then(FileBoundaryMsg::RawEmpty)
+            }
+            FileBoundaryMsg::RawEmpty(result) => {
+                self.observed
+                    .lock()
+                    .expect("boundary observations")
+                    .push(FileBoundaryObservation::RawEmpty(result));
+                file_write_at_owned(self.file.expect("opened"), Vec::new(), u64::MAX)
+                    .then(FileBoundaryMsg::OwnedEmpty)
+            }
+            FileBoundaryMsg::OwnedEmpty(reply) => {
+                self.observed
+                    .lock()
+                    .expect("boundary observations")
+                    .push(FileBoundaryObservation::OwnedEmpty(observe_owned(reply)));
+                file_size(self.file.expect("opened")).then(FileBoundaryMsg::SizeAfterEmpty)
+            }
+            FileBoundaryMsg::SizeAfterEmpty(result) => {
+                self.observed
+                    .lock()
+                    .expect("boundary observations")
+                    .push(FileBoundaryObservation::SizeAfterEmpty(result));
+                file_write_at(self.file.expect("opened"), b"xy".to_vec(), 6)
+                    .then(FileBoundaryMsg::WroteBoundary)
+            }
+            FileBoundaryMsg::WroteBoundary(result) => {
+                self.observed
+                    .lock()
+                    .expect("boundary observations")
+                    .push(FileBoundaryObservation::WroteBoundary(result));
+                file_write_at(self.file.expect("opened"), b"x".to_vec(), 8)
+                    .then(FileBoundaryMsg::RawPastCap)
+            }
+            FileBoundaryMsg::RawPastCap(result) => {
+                self.observed
+                    .lock()
+                    .expect("boundary observations")
+                    .push(FileBoundaryObservation::RawPastCap(result));
+                file_write_at(self.file.expect("opened"), b"x".to_vec(), u64::MAX)
+                    .then(FileBoundaryMsg::RawHostileOffset)
+            }
+            FileBoundaryMsg::RawHostileOffset(result) => {
+                self.observed
+                    .lock()
+                    .expect("boundary observations")
+                    .push(FileBoundaryObservation::RawHostileOffset(result));
+                file_write_at_owned(self.file.expect("opened"), b"owned".to_vec(), u64::MAX)
+                    .then(FileBoundaryMsg::OwnedHostileOffset)
+            }
+            FileBoundaryMsg::OwnedHostileOffset(reply) => {
+                self.observed.lock().expect("boundary observations").push(
+                    FileBoundaryObservation::OwnedHostileOffset(observe_owned(reply)),
+                );
+                file_size(self.file.expect("opened")).then(FileBoundaryMsg::FinalSize)
+            }
+            FileBoundaryMsg::FinalSize(result) => {
+                self.observed
+                    .lock()
+                    .expect("boundary observations")
+                    .push(FileBoundaryObservation::FinalSize(result));
+                file_close(self.file.expect("opened")).then(FileBoundaryMsg::Closed)
+            }
+            FileBoundaryMsg::Closed(Ok(())) => Effect::Stop,
+            FileBoundaryMsg::DirectoryMade(Err(_), _)
+            | FileBoundaryMsg::Opened(Err(_))
+            | FileBoundaryMsg::Closed(Err(_)) => Effect::Stop,
+        }
+    }
 }
 
 impl Isolate for FileClient {
@@ -1449,6 +1581,134 @@ impl Isolate for WriteProbe {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnedWriteCase {
+    InvalidStream,
+    BusyPrimary,
+    BusyRejected,
+    ClosedStream,
+    InvalidStart,
+    CapacityPrimary,
+    CapacityRejected,
+    PartialWrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnedWriteObservation {
+    case: OwnedWriteCase,
+    error: Option<CallError>,
+    bytes: Vec<u8>,
+    capacity: usize,
+    allocation_preserved: bool,
+    writes: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+enum OwnedWriteProbeMsg {
+    Start { bytes: Vec<u8>, start: usize },
+    Completed(Result<TcpWriteOwnedReply, WriteOwnedError>),
+}
+
+#[derive(Debug)]
+struct OwnedWriteProbe {
+    case: OwnedWriteCase,
+    stream: StreamId,
+    write_all: bool,
+    expected_ptr: usize,
+    expected_capacity: usize,
+    cursor: usize,
+    allocation_preserved: bool,
+    writes: Vec<usize>,
+    observed: Arc<Mutex<Vec<OwnedWriteObservation>>>,
+}
+
+impl OwnedWriteProbe {
+    fn new(
+        case: OwnedWriteCase,
+        stream: StreamId,
+        write_all: bool,
+        observed: Arc<Mutex<Vec<OwnedWriteObservation>>>,
+    ) -> Self {
+        Self {
+            case,
+            stream,
+            write_all,
+            expected_ptr: 0,
+            expected_capacity: 0,
+            cursor: 0,
+            allocation_preserved: true,
+            writes: Vec::new(),
+            observed,
+        }
+    }
+
+    fn write_effect(&self, bytes: Vec<u8>, start: usize) -> Effect<Self> {
+        Effect::Io(RuntimeCall::new(
+            CallInput::TcpWriteOwned {
+                stream: self.stream,
+                bytes,
+                start,
+            },
+            |result| OwnedWriteProbeMsg::Completed(result.into_tcp_wrote_owned()),
+        ))
+    }
+}
+
+impl Isolate for OwnedWriteProbe {
+    tina::isolate_types! {
+        message: OwnedWriteProbeMsg,
+        reply: (),
+        send: Outbound<Infallible>,
+        spawn: Infallible,
+        io: RuntimeCall<OwnedWriteProbeMsg>,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            OwnedWriteProbeMsg::Start { bytes, start } => {
+                self.expected_ptr = bytes.as_ptr() as usize;
+                self.expected_capacity = bytes.capacity();
+                self.cursor = start;
+                self.allocation_preserved = true;
+                self.writes.clear();
+                self.write_effect(bytes, start)
+            }
+            OwnedWriteProbeMsg::Completed(result) => {
+                let (bytes, written, error) = match result {
+                    Ok(reply) => (reply.bytes, Some(reply.written), None),
+                    Err(error) => (error.bytes, None, Some(error.error)),
+                };
+                self.allocation_preserved &= bytes.as_ptr() as usize == self.expected_ptr
+                    && bytes.capacity() == self.expected_capacity;
+                if let Some(written) = written {
+                    self.writes.push(written);
+                    self.cursor = self.cursor.saturating_add(written);
+                    if self.write_all && written > 0 && self.cursor < bytes.len() {
+                        return self.write_effect(bytes, self.cursor);
+                    }
+                }
+                self.observed
+                    .lock()
+                    .expect("owned write observations")
+                    .push(OwnedWriteObservation {
+                        case: self.case,
+                        error,
+                        capacity: bytes.capacity(),
+                        bytes,
+                        allocation_preserved: self.allocation_preserved,
+                        writes: std::mem::take(&mut self.writes),
+                    });
+                Effect::Noop
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum CloserMsg {
     CloseListener,
@@ -2401,7 +2661,7 @@ fn scripted_dns_resolves_fails_times_out_and_replays() {
         DnsProbeMsg::Lookup {
             host: "llama.local".to_string(),
             port: 8080,
-            timeout: Duration::from_millis(50),
+            timeout: Duration::MAX,
         },
     )
     .unwrap();
@@ -2446,7 +2706,7 @@ fn scripted_dns_resolves_fails_times_out_and_replays() {
             DnsProbeMsg::Lookup {
                 host: "llama.local".to_string(),
                 port: 8080,
-                timeout: Duration::from_millis(50),
+                timeout: Duration::MAX,
             },
         )
         .unwrap();
@@ -2558,7 +2818,7 @@ fn scripted_tls_connect_read_write_close_and_replays() {
         TlsProbeMsg::Connect {
             addr: local_addr(48110),
             server_name: "llama.local".to_string(),
-            timeout: Duration::from_millis(50),
+            timeout: Duration::MAX,
         },
     )
     .unwrap();
@@ -2590,7 +2850,7 @@ fn scripted_tls_connect_read_write_close_and_replays() {
             TlsProbeMsg::Connect {
                 addr: local_addr(48110),
                 server_name: "llama.local".to_string(),
-                timeout: Duration::from_millis(50),
+                timeout: Duration::MAX,
             },
         )
         .unwrap();
@@ -3309,7 +3569,7 @@ fn scripted_tcp_connect_client_round_trips_one_peer() {
                         peer_addr(61001),
                         vec![b"pong".to_vec()],
                         Some(4),
-                        2,
+                        1,
                     )],
                 }],
             },
@@ -3318,7 +3578,7 @@ fn scripted_tcp_connect_client_round_trips_one_peer() {
     );
     let client = sim.register(Client {
         payload: b"ping".to_vec(),
-        pending_write: Vec::new(),
+        write_all: None,
         stream: None,
         observed: Arc::clone(&observed),
     });
@@ -3340,12 +3600,13 @@ fn scripted_tcp_connect_client_round_trips_one_peer() {
         vec![b"ping".as_slice()]
     );
     assert_eq!(count_call_completed(sim.trace(), CallKind::TcpConnect), 1);
-    assert_eq!(count_call_completed(sim.trace(), CallKind::TcpWrite), 2);
+    assert_eq!(count_call_completed(sim.trace(), CallKind::TcpWrite), 4);
     assert_eq!(count_call_completed(sim.trace(), CallKind::TcpRead), 1);
     assert_eq!(
         count_call_completed(sim.trace(), CallKind::TcpStreamClose),
         1
     );
+    InvariantSuite::standard().assert(artifact.event_record());
 }
 
 #[test]
@@ -3381,6 +3642,69 @@ fn simulated_file_client_writes_syncs_reads_and_closes() {
     assert_eq!(count_call_completed(sim.trace(), CallKind::FileSize), 1);
     assert_eq!(count_call_completed(sim.trace(), CallKind::FileReadAt), 1);
     assert_eq!(count_call_completed(sim.trace(), CallKind::FileClose), 1);
+}
+
+fn run_file_boundary_scenario() -> (Vec<FileBoundaryObservation>, ReplayArtifact) {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            storage: ScriptedStorageFaultConfig {
+                max_file_bytes: 8,
+                ..ScriptedStorageFaultConfig::default()
+            },
+            ..SimulatorConfig::default()
+        },
+    );
+    let client = sim.register(FileBoundaryClient {
+        file: None,
+        observed: Arc::clone(&observed),
+    });
+    sim.try_send(
+        client,
+        FileBoundaryMsg::Start {
+            dir: PathBuf::from("/tmp/tina-sim-boundary"),
+            path: PathBuf::from("/tmp/tina-sim-boundary/file.bin"),
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+    let observations = observed.lock().expect("boundary observations").clone();
+    (observations, sim.replay_artifact())
+}
+
+#[test]
+fn simulated_positional_writes_enforce_bounds_preserve_buffers_and_replay() {
+    let (observed, artifact) = run_file_boundary_scenario();
+
+    assert_eq!(
+        observed,
+        vec![
+            FileBoundaryObservation::Seeded(Ok(4)),
+            FileBoundaryObservation::RawEmpty(Ok(0)),
+            FileBoundaryObservation::OwnedEmpty(Ok((Vec::new(), 0))),
+            FileBoundaryObservation::SizeAfterEmpty(Ok(4)),
+            FileBoundaryObservation::WroteBoundary(Ok(2)),
+            FileBoundaryObservation::RawPastCap(Err(CallError::StorageFull)),
+            FileBoundaryObservation::RawHostileOffset(Err(CallError::StorageFull)),
+            FileBoundaryObservation::OwnedHostileOffset(Err((
+                CallError::StorageFull,
+                b"owned".to_vec(),
+            ))),
+            FileBoundaryObservation::FinalSize(Ok(8)),
+        ]
+    );
+    assert_eq!(
+        artifact
+            .durable_image()
+            .get("/tmp/tina-sim-boundary/file.bin"),
+        Some(&b"seed\0\0xy"[..])
+    );
+
+    let (replayed_observed, replayed_artifact) = run_file_boundary_scenario();
+    assert_eq!(replayed_observed, observed);
+    assert_eq!(replayed_artifact, artifact);
+    InvariantSuite::standard().assert(artifact.event_record());
 }
 
 #[test]
@@ -3841,6 +4165,299 @@ fn pending_completion_capacity_exhaustion_surfaces_io_failure() {
             }
         )
     }));
+}
+
+fn owned_payload(bytes: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(32);
+    payload.extend_from_slice(bytes);
+    payload
+}
+
+fn owned_write_observation(
+    observed: &[OwnedWriteObservation],
+    case: OwnedWriteCase,
+) -> &OwnedWriteObservation {
+    observed
+        .iter()
+        .find(|observation| observation.case == case)
+        .unwrap_or_else(|| panic!("missing owned write observation for {case:?}"))
+}
+
+#[test]
+fn owned_tcp_write_failures_preserve_allocation_on_invalid_closed_and_busy_paths() {
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            faults: FaultConfig {
+                tcp_completion: TcpCompletionFaultMode::DelayBySteps {
+                    one_in: 1,
+                    steps: 3,
+                },
+                ..Default::default()
+            },
+            tcp: ScriptedTcpConfig {
+                pending_completion_capacity: 8,
+                listeners: vec![ScriptedListenerConfig {
+                    bind_addr: bind_addr(),
+                    local_addr: local_addr(48_560),
+                    backlog_capacity: 1,
+                    peers: vec![peer_script(1, peer_addr(58_560), Vec::new(), None, 2)],
+                }],
+            },
+            ..Default::default()
+        },
+    );
+    let (listener, _) = bind_listener(&mut sim, bind_addr());
+    let (stream, _) = accept_stream(&mut sim, listener);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+
+    for (case, target, bytes, start) in [
+        (
+            OwnedWriteCase::InvalidStream,
+            StreamId::new(999),
+            b"invalid".as_slice(),
+            0,
+        ),
+        (
+            OwnedWriteCase::InvalidStart,
+            stream,
+            b"start".as_slice(),
+            99,
+        ),
+    ] {
+        let probe = sim.register(OwnedWriteProbe::new(
+            case,
+            target,
+            false,
+            Arc::clone(&observed),
+        ));
+        sim.try_send(
+            probe,
+            OwnedWriteProbeMsg::Start {
+                bytes: owned_payload(bytes),
+                start,
+            },
+        )
+        .unwrap();
+    }
+    sim.run_until_quiescent();
+
+    let primary = sim.register(OwnedWriteProbe::new(
+        OwnedWriteCase::BusyPrimary,
+        stream,
+        false,
+        Arc::clone(&observed),
+    ));
+    let rejected = sim.register(OwnedWriteProbe::new(
+        OwnedWriteCase::BusyRejected,
+        stream,
+        false,
+        Arc::clone(&observed),
+    ));
+    sim.try_send(
+        primary,
+        OwnedWriteProbeMsg::Start {
+            bytes: owned_payload(b"primary"),
+            start: 0,
+        },
+    )
+    .unwrap();
+    sim.try_send(
+        rejected,
+        OwnedWriteProbeMsg::Start {
+            bytes: owned_payload(b"busy"),
+            start: 0,
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+
+    let closer = sim.register(StreamCloser { stream });
+    sim.try_send(closer, CloserMsg::CloseStream).unwrap();
+    sim.run_until_quiescent();
+    let closed = sim.register(OwnedWriteProbe::new(
+        OwnedWriteCase::ClosedStream,
+        stream,
+        false,
+        Arc::clone(&observed),
+    ));
+    sim.try_send(
+        closed,
+        OwnedWriteProbeMsg::Start {
+            bytes: owned_payload(b"closed"),
+            start: 0,
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+
+    let observed = observed.lock().expect("owned observations");
+    for (case, error, bytes) in [
+        (
+            OwnedWriteCase::InvalidStream,
+            CallError::InvalidResource,
+            b"invalid".as_slice(),
+        ),
+        (
+            OwnedWriteCase::InvalidStart,
+            CallError::InvariantViolation,
+            b"start".as_slice(),
+        ),
+        (
+            OwnedWriteCase::BusyRejected,
+            CallError::ResourceBusy,
+            b"busy".as_slice(),
+        ),
+        (
+            OwnedWriteCase::ClosedStream,
+            CallError::InvalidResource,
+            b"closed".as_slice(),
+        ),
+    ] {
+        let observation = owned_write_observation(&observed, case);
+        assert_eq!(observation.error, Some(error));
+        assert_eq!(observation.bytes, bytes);
+        assert_eq!(observation.capacity, 32);
+        assert!(observation.allocation_preserved);
+    }
+    assert!(owned_write_observation(&observed, OwnedWriteCase::BusyPrimary).allocation_preserved);
+}
+
+#[test]
+fn owned_tcp_write_completion_capacity_failure_returns_the_original_allocation() {
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            faults: FaultConfig {
+                tcp_completion: TcpCompletionFaultMode::DelayBySteps {
+                    one_in: 1,
+                    steps: 3,
+                },
+                ..Default::default()
+            },
+            tcp: ScriptedTcpConfig {
+                pending_completion_capacity: 1,
+                listeners: vec![ScriptedListenerConfig {
+                    bind_addr: bind_addr(),
+                    local_addr: local_addr(48_570),
+                    backlog_capacity: 2,
+                    peers: vec![
+                        peer_script(1, peer_addr(58_570), Vec::new(), None, 8),
+                        peer_script(1, peer_addr(58_571), Vec::new(), None, 8),
+                    ],
+                }],
+            },
+            ..Default::default()
+        },
+    );
+    let (listener, _) = bind_listener(&mut sim, bind_addr());
+    let (first_stream, _) = accept_stream(&mut sim, listener);
+    let (second_stream, _) = accept_stream(&mut sim, listener);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let primary = sim.register(OwnedWriteProbe::new(
+        OwnedWriteCase::CapacityPrimary,
+        first_stream,
+        false,
+        Arc::clone(&observed),
+    ));
+    let rejected = sim.register(OwnedWriteProbe::new(
+        OwnedWriteCase::CapacityRejected,
+        second_stream,
+        false,
+        Arc::clone(&observed),
+    ));
+    sim.try_send(
+        primary,
+        OwnedWriteProbeMsg::Start {
+            bytes: owned_payload(b"primary"),
+            start: 0,
+        },
+    )
+    .unwrap();
+    sim.try_send(
+        rejected,
+        OwnedWriteProbeMsg::Start {
+            bytes: owned_payload(b"capacity"),
+            start: 0,
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+
+    let observed = observed.lock().expect("owned observations");
+    let rejected = owned_write_observation(&observed, OwnedWriteCase::CapacityRejected);
+    assert_eq!(rejected.error, Some(CallError::Io));
+    assert_eq!(rejected.bytes, b"capacity");
+    assert_eq!(rejected.capacity, 32);
+    assert!(rejected.allocation_preserved);
+}
+
+fn run_owned_partial_write_scenario() -> (Vec<OwnedWriteObservation>, ReplayArtifact) {
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            seed: 0x00A1_10C8,
+            faults: FaultConfig {
+                tcp_completion: TcpCompletionFaultMode::DelayBySteps {
+                    one_in: 2,
+                    steps: 2,
+                },
+                ..Default::default()
+            },
+            tcp: ScriptedTcpConfig {
+                pending_completion_capacity: 8,
+                listeners: vec![ScriptedListenerConfig {
+                    bind_addr: bind_addr(),
+                    local_addr: local_addr(48_580),
+                    backlog_capacity: 1,
+                    peers: vec![peer_script(1, peer_addr(58_580), Vec::new(), None, 2)],
+                }],
+            },
+            ..Default::default()
+        },
+    );
+    let (listener, _) = bind_listener(&mut sim, bind_addr());
+    let (stream, _) = accept_stream(&mut sim, listener);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let probe = sim.register(OwnedWriteProbe::new(
+        OwnedWriteCase::PartialWrite,
+        stream,
+        true,
+        Arc::clone(&observed),
+    ));
+    sim.try_send(
+        probe,
+        OwnedWriteProbeMsg::Start {
+            bytes: owned_payload(b"partial"),
+            start: 0,
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+    let observations = observed.lock().expect("owned observations").clone();
+    (observations, sim.replay_artifact())
+}
+
+#[test]
+fn owned_tcp_partial_writes_preserve_allocation_and_replay() {
+    let (observed, artifact) = run_owned_partial_write_scenario();
+    let (replayed, replayed_artifact) = run_owned_partial_write_scenario();
+    assert_eq!(replayed, observed);
+    assert_eq!(replayed_artifact, artifact);
+    let observation = owned_write_observation(&observed, OwnedWriteCase::PartialWrite);
+    assert_eq!(observation.error, None);
+    assert_eq!(observation.bytes, b"partial");
+    assert_eq!(observation.capacity, 32);
+    assert!(observation.allocation_preserved);
+    assert_eq!(observation.writes, [2, 2, 2, 1]);
+    assert!(
+        artifact
+            .observed_peer_output()
+            .iter()
+            .any(|output| output.bytes() == b"partial"),
+        "the scripted peer must observe the complete partial-write sequence"
+    );
+    InvariantSuite::standard().assert(artifact.event_record());
 }
 
 #[test]

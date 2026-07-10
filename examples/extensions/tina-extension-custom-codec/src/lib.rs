@@ -24,21 +24,15 @@
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use tina::{Address, Context, Effect, Isolate, Outbound, Shard, ShardId};
-use tina_codec::{FrameDecision, SyncCodec};
+use tina_codec::{DecodeStatus, FrameDecision, SyncCodec, decode_chunk};
 use tina_runtime::{
-    RuntimeCall, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerId, UnixReadReply,
-    UnixStreamId, UnixWriteReply, sleep, unix_accept, unix_bind, unix_close_stream, unix_connect,
-    unix_read, unix_write,
+    LoopStep, RuntimeCall, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerId,
+    UnixReadReply, UnixStreamId, UnixWriteAll, UnixWriteOwnedReply, unix_accept, unix_bind,
+    unix_close_stream, unix_connect, unix_read,
 };
 use tina_sim::{Simulator, SimulatorConfig};
-
-/// Max consecutive zero-progress writes before the server gives up on a
-/// wedged peer. Bounds the back-off loop so a peer that never drains its
-/// inbound cannot pin the server forever.
-const MAX_WRITE_BACKOFFS: u32 = 16;
 
 // ---------- The custom codec ----------------------------------------------
 
@@ -76,22 +70,27 @@ impl SyncCodec for SemicolonCodec {
     type Frame = Vec<u8>;
     type Malformed = SemicolonMalformed;
 
-    fn feed(&mut self, bytes: &[u8]) {
+    fn feed(&mut self, bytes: &[u8]) -> usize {
         if self.full {
-            return;
+            return 0;
         }
-        // Bounded per frame: append until the current unframed suffix
-        // crosses the cap. A delimiter that arrives before the cap still
-        // yields its frame, even if later bytes in the same read overflow
-        // the next frame.
-        for byte in bytes {
-            self.buf.push(*byte);
-            let unframed = self.buf.iter().rev().take_while(|b| **b != b';').count();
-            if unframed > self.max_frame {
-                self.full = true;
-                return;
-            }
+        if self.buf.last() == Some(&b';') {
+            return 0;
         }
+        let room = self
+            .max_frame
+            .saturating_add(1)
+            .saturating_sub(self.buf.len());
+        let through_delimiter = bytes
+            .iter()
+            .position(|byte| *byte == b';')
+            .map_or(bytes.len(), |index| index + 1);
+        let consumed = room.min(through_delimiter);
+        self.buf.extend_from_slice(&bytes[..consumed]);
+        if consumed == room && self.buf.last() != Some(&b';') {
+            self.full = true;
+        }
+        consumed
     }
 
     fn next_frame(&mut self) -> FrameDecision<Self::Frame, Self::Malformed> {
@@ -128,10 +127,7 @@ enum ServerMsg {
     Bound(UnixBindReply),
     Accepted(UnixAcceptReply),
     Read(UnixReadReply),
-    Wrote(UnixWriteReply),
-    /// Back-off tick: the previous write made zero progress (peer inbound
-    /// full). Retry after a short pause instead of hot-spinning.
-    RetryWrite,
+    Wrote(UnixWriteOwnedReply),
     Done,
 }
 
@@ -140,9 +136,7 @@ struct CodecServer {
     listener: Option<UnixListenerId>,
     stream: Option<UnixStreamId>,
     codec: SemicolonCodec,
-    write_pending: Vec<u8>,
-    /// Consecutive zero-progress writes since the last byte landed.
-    write_backoffs: u32,
+    write_all: Option<UnixWriteAll>,
     /// After the pending reply flushes, close the connection (a `quit`
     /// frame was seen). Flush first, then close, so the echoes land.
     closing: bool,
@@ -181,30 +175,29 @@ impl Isolate for CodecServer {
                 if bytes.is_empty() {
                     return self.close();
                 }
-                self.codec.feed(&bytes);
                 let mut reply = Vec::new();
                 let mut tear_down = false;
-                loop {
-                    match self.codec.next_frame() {
-                        FrameDecision::NeedMore => break,
-                        FrameDecision::Frame(frame) => {
-                            self.seen.lock().unwrap().push(frame.clone());
-                            if frame == b"quit" {
-                                // Flush whatever we already framed, then close.
-                                self.closing = true;
-                                break;
-                            }
+                let seen = &self.seen;
+                let closing = &mut self.closing;
+                let status = decode_chunk(&mut self.codec, &bytes, |frame| {
+                    if !*closing {
+                        seen.lock().unwrap().push(frame.clone());
+                        if frame == b"quit" {
+                            // Flush whatever we already framed, then close.
+                            *closing = true;
+                        } else {
                             reply.extend_from_slice(b"ok:");
                             reply.extend_from_slice(&frame);
                             reply.push(b';');
                         }
-                        FrameDecision::Malformed(_) | FrameDecision::Full => {
-                            // Bad stream: tear down now, discard partial reply.
-                            *self.rejected.lock().unwrap() = true;
-                            tear_down = true;
-                            break;
-                        }
                     }
+                });
+                if !self.closing
+                    && matches!(status, DecodeStatus::Malformed(_) | DecodeStatus::Full)
+                {
+                    // Bad stream: tear down now, discard partial reply.
+                    *self.rejected.lock().unwrap() = true;
+                    tear_down = true;
                 }
                 if tear_down {
                     return self.close();
@@ -215,39 +208,29 @@ impl Isolate for CodecServer {
                     }
                     unix_read(self.stream.expect("stream"), 64).then(ServerMsg::Read)
                 } else {
-                    self.write_pending = reply.clone();
-                    unix_write(self.stream.expect("stream"), reply).then(ServerMsg::Wrote)
+                    let mut write_all = UnixWriteAll::new(self.stream.expect("stream"), reply);
+                    let effect = write_all
+                        .next_effect(ServerMsg::Wrote)
+                        .expect("reply buffer is non-empty");
+                    self.write_all = Some(write_all);
+                    effect
                 }
             }
             ServerMsg::Read(Err(_)) => Effect::Stop,
-            ServerMsg::Wrote(Ok(count)) => {
-                if count == 0 {
-                    // Peer inbound full: zero-progress write. Back off
-                    // instead of hot-spinning; give up after a bounded
-                    // number of attempts so a wedged peer cannot pin us.
-                    self.write_backoffs += 1;
-                    if self.write_backoffs >= MAX_WRITE_BACKOFFS {
-                        return self.close();
+            ServerMsg::Wrote(reply) => {
+                let write_all = self.write_all.as_mut().expect("write helper armed");
+                match write_all.advance::<Self, _, _>(reply, ServerMsg::Wrote) {
+                    LoopStep::Pending(effect) => effect,
+                    LoopStep::Done(_) => {
+                        self.write_all = None;
+                        if self.closing {
+                            self.close()
+                        } else {
+                            unix_read(self.stream.expect("stream"), 64).then(ServerMsg::Read)
+                        }
                     }
-                    return sleep(Duration::from_millis(1)).then(|_| ServerMsg::RetryWrite);
+                    LoopStep::Failed(_) => self.close(),
                 }
-                self.write_backoffs = 0;
-                let drained = count.min(self.write_pending.len());
-                self.write_pending.drain(..drained);
-                if self.write_pending.is_empty() {
-                    if self.closing {
-                        return self.close();
-                    }
-                    unix_read(self.stream.expect("stream"), 64).then(ServerMsg::Read)
-                } else {
-                    let pending = self.write_pending.clone();
-                    unix_write(self.stream.expect("stream"), pending).then(ServerMsg::Wrote)
-                }
-            }
-            ServerMsg::Wrote(Err(_)) => Effect::Stop,
-            ServerMsg::RetryWrite => {
-                let pending = self.write_pending.clone();
-                unix_write(self.stream.expect("stream"), pending).then(ServerMsg::Wrote)
             }
             ServerMsg::Done => Effect::Stop,
         }
@@ -268,7 +251,7 @@ impl CodecServer {
 enum ClientMsg {
     Start,
     Connected(UnixConnectReply),
-    Wrote(UnixWriteReply),
+    Wrote(UnixWriteOwnedReply),
     Read(UnixReadReply),
     Done,
 }
@@ -277,7 +260,7 @@ struct CodecClient {
     path: PathBuf,
     stream: Option<UnixStreamId>,
     outbound: Vec<u8>,
-    write_pending: Vec<u8>,
+    write_all: Option<UnixWriteAll>,
     received: Arc<Mutex<Vec<u8>>>,
 }
 
@@ -300,22 +283,30 @@ impl Isolate for CodecClient {
             ClientMsg::Start => unix_connect(self.path.clone()).then(ClientMsg::Connected),
             ClientMsg::Connected(Ok(stream)) => {
                 self.stream = Some(stream);
-                self.write_pending = std::mem::take(&mut self.outbound);
-                let bytes = self.write_pending.clone();
-                unix_write(stream, bytes).then(ClientMsg::Wrote)
+                let bytes = std::mem::take(&mut self.outbound);
+                if bytes.is_empty() {
+                    self.stream = None;
+                    return unix_close_stream(stream).then(|_| ClientMsg::Done);
+                }
+                let mut write_all = UnixWriteAll::new(stream, bytes);
+                let effect = write_all
+                    .next_effect(ClientMsg::Wrote)
+                    .expect("non-empty client payload has a write step");
+                self.write_all = Some(write_all);
+                effect
             }
             ClientMsg::Connected(Err(_)) => Effect::Stop,
-            ClientMsg::Wrote(Ok(count)) => {
-                let drained = count.min(self.write_pending.len());
-                self.write_pending.drain(..drained);
-                if self.write_pending.is_empty() {
-                    unix_read(self.stream.expect("stream"), 64).then(ClientMsg::Read)
-                } else {
-                    let pending = self.write_pending.clone();
-                    unix_write(self.stream.expect("stream"), pending).then(ClientMsg::Wrote)
+            ClientMsg::Wrote(reply) => {
+                let write_all = self.write_all.as_mut().expect("write helper armed");
+                match write_all.advance::<Self, _, _>(reply, ClientMsg::Wrote) {
+                    LoopStep::Pending(effect) => effect,
+                    LoopStep::Done(_) => {
+                        self.write_all = None;
+                        unix_read(self.stream.expect("stream"), 64).then(ClientMsg::Read)
+                    }
+                    LoopStep::Failed(_) => Effect::Stop,
                 }
             }
-            ClientMsg::Wrote(Err(_)) => Effect::Stop,
             ClientMsg::Read(Ok(bytes)) => {
                 if bytes.is_empty() {
                     if let Some(stream) = self.stream.take() {
@@ -355,8 +346,7 @@ pub fn run_codec_service(path: PathBuf, payload: Vec<u8>, max_frame: usize) -> C
         listener: None,
         stream: None,
         codec: SemicolonCodec::new(max_frame),
-        write_pending: Vec::new(),
-        write_backoffs: 0,
+        write_all: None,
         closing: false,
         seen: Arc::clone(&seen),
         rejected: Arc::clone(&rejected),
@@ -367,7 +357,7 @@ pub fn run_codec_service(path: PathBuf, payload: Vec<u8>, max_frame: usize) -> C
         path,
         stream: None,
         outbound: payload,
-        write_pending: Vec::new(),
+        write_all: None,
         received: Arc::clone(&received),
     };
     let client_addr: Address<ClientMsg, ()> = sim.register(client);
@@ -461,13 +451,36 @@ mod tests {
     }
 
     #[test]
+    fn empty_payload_does_not_arm_an_empty_write() {
+        let result = run_codec_service(
+            PathBuf::from("/tmp/tina_ext_codec_empty.sock"),
+            Vec::new(),
+            8,
+        );
+        assert!(result.server_saw.is_empty());
+        assert!(result.client_received.is_empty());
+    }
+
+    #[test]
     fn delimiter_before_later_overflow_keeps_finished_frame() {
         let mut codec = SemicolonCodec::new(4);
-        codec.feed(b"ok;abcdef");
-        assert!(matches!(
-            codec.next_frame(),
-            FrameDecision::Frame(ref f) if f == b"ok"
-        ));
-        assert!(matches!(codec.next_frame(), FrameDecision::Full));
+        let mut frames = Vec::new();
+        let status = decode_chunk(&mut codec, b"ok;abcdef", |frame| frames.push(frame));
+        assert_eq!(frames, [b"ok".to_vec()]);
+        assert_eq!(status, DecodeStatus::Full);
+    }
+
+    #[test]
+    fn quit_ignores_an_oversize_suffix_in_the_same_transport_chunk() {
+        let result = run_codec_service(
+            PathBuf::from("/tmp/tina_ext_codec_quit_suffix.sock"),
+            b"quit;abcdef".to_vec(),
+            4,
+        );
+        assert_eq!(result.server_saw, [b"quit".to_vec()]);
+        assert!(
+            !result.rejected,
+            "quit is an intentional close, not bad input"
+        );
     }
 }

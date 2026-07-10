@@ -5,6 +5,7 @@
 //! test thread to inspect.
 
 use std::convert::Infallible;
+use std::error::Error as _;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -914,7 +915,7 @@ fn install_fails_on_bad_pragma() {
     let runtime = make_runtime();
     let res = SqliteWorker::<SingleShard>::install(&runtime, cfg);
     match res {
-        Err(tina_sqlite_bridge::InstallError::Pragma(_)) => {}
+        Err(tina_sqlite_bridge::InstallError::Pragma { .. }) => {}
         Err(other) => panic!("expected Pragma install error, got {other:?}"),
         Ok(_) => panic!("install should fail"),
     }
@@ -1438,30 +1439,63 @@ fn error_display_includes_payload() {
 fn install_error_display_names_phase() {
     let cases: Vec<(tina_sqlite_bridge::InstallError, &str)> = vec![
         (
-            tina_sqlite_bridge::InstallError::Open("perm".into()),
-            "open: perm",
+            tina_sqlite_bridge::InstallError::Open(rusqlite::Error::InvalidQuery),
+            "open:",
         ),
         (
-            tina_sqlite_bridge::InstallError::Setup("bt".into()),
-            "setup: bt",
+            tina_sqlite_bridge::InstallError::Setup {
+                operation: "busy_timeout",
+                source: rusqlite::Error::InvalidQuery,
+            },
+            "setup busy_timeout",
         ),
         (
-            tina_sqlite_bridge::InstallError::Pragma("bad".into()),
-            "pragma: bad",
+            tina_sqlite_bridge::InstallError::Pragma {
+                pragma: "bad".into(),
+                source: rusqlite::Error::InvalidQuery,
+            },
+            "pragma \"bad\"",
         ),
         (
-            tina_sqlite_bridge::InstallError::Spawn("eof".into()),
+            tina_sqlite_bridge::InstallError::Spawn(std::io::Error::other("eof")),
             "spawn: eof",
         ),
         (
-            tina_sqlite_bridge::InstallError::Register("nope".into()),
-            "register: nope",
+            tina_sqlite_bridge::InstallError::Register(
+                tina_runtime::ThreadedRuntimeError::WorkerStopped,
+            ),
+            "register: worker thread stopped",
         ),
     ];
     for (err, fragment) in cases {
         let s = format!("{err}");
         assert!(s.contains(fragment), "{s} missing {fragment}");
     }
+}
+
+#[test]
+fn install_error_keeps_the_concrete_sqlite_source() {
+    let cfg = SqliteConfig {
+        pragmas: vec!["foreign_keys = ;;not valid;;".into()],
+        ..SqliteConfig::memory()
+    };
+    let runtime = make_runtime();
+    let error = SqliteWorker::<SingleShard>::install(&runtime, cfg)
+        .err()
+        .expect("invalid pragma must fail installation");
+
+    assert!(matches!(
+        &error,
+        tina_sqlite_bridge::InstallError::Pragma { .. }
+    ));
+    assert!(
+        error
+            .source()
+            .and_then(|source| source.downcast_ref::<rusqlite::Error>())
+            .is_some(),
+        "callers must be able to inspect the original rusqlite error"
+    );
+    shutdown_runtime(runtime);
 }
 
 // ---------------------------------------------------------------------------

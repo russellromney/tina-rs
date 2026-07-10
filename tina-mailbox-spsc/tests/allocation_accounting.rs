@@ -20,11 +20,15 @@ thread_local! {
     static MEASURING_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
 }
 
+// SAFETY: every operation delegates to `System` with the exact pointer and
+// layout supplied by the allocator contract; the counters do not touch the
+// allocation itself.
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if MEASURING_THIS_THREAD.with(Cell::get) {
             ALLOCATIONS.fetch_add(1, Ordering::SeqCst);
         }
+        // SAFETY: `layout` is passed through unchanged from `GlobalAlloc`.
         unsafe { System.alloc(layout) }
     }
 
@@ -32,6 +36,8 @@ unsafe impl GlobalAlloc for CountingAllocator {
         if MEASURING_THIS_THREAD.with(Cell::get) {
             DEALLOCATIONS.fetch_add(1, Ordering::SeqCst);
         }
+        // SAFETY: the caller guarantees `ptr` and `layout` identify a live
+        // allocation from this allocator, which delegates directly to `System`.
         unsafe { System.dealloc(ptr, layout) }
     }
 
@@ -39,6 +45,8 @@ unsafe impl GlobalAlloc for CountingAllocator {
         if MEASURING_THIS_THREAD.with(Cell::get) {
             REALLOCATIONS.fetch_add(1, Ordering::SeqCst);
         }
+        // SAFETY: the caller guarantees `ptr` and `layout` identify a live
+        // allocation; all arguments are forwarded unchanged to `System`.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }

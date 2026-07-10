@@ -14,7 +14,8 @@
 use tina::Isolate;
 
 use crate::call::{
-    CallError, FileId, FileReadReply, FileWriteReply, RuntimeCall, file_read_at, file_write_at,
+    CallError, FileId, FileReadReply, FileWriteOwnedReply, RuntimeCall, file_read_at,
+    file_write_at_owned_from,
 };
 
 /// Why a file-loop helper stopped.
@@ -156,8 +157,20 @@ impl FileReadChunks {
                 self.high_water_chunk = self.high_water_chunk.max(bytes.len());
                 let room = self.max_total - self.buffer.len() as u64;
                 let take = (bytes.len() as u64).min(room) as usize;
+                let Ok(take_u64) = u64::try_from(take) else {
+                    let report = self
+                        .terminal_report(FileLoopEnd::Error, Some(CallError::InvariantViolation));
+                    let payload = std::mem::take(&mut self.buffer);
+                    return FileLoopStep::Done(payload, report);
+                };
+                let Some(next_offset) = self.offset.checked_add(take_u64) else {
+                    let report = self
+                        .terminal_report(FileLoopEnd::Error, Some(CallError::InvariantViolation));
+                    let payload = std::mem::take(&mut self.buffer);
+                    return FileLoopStep::Done(payload, report);
+                };
                 self.buffer.extend_from_slice(&bytes[..take]);
-                self.offset += take as u64;
+                self.offset = next_offset;
                 if self.buffer.len() as u64 >= self.max_total {
                     let report = self.terminal_report(FileLoopEnd::CapReached, None);
                     let payload = std::mem::take(&mut self.buffer);
@@ -225,7 +238,8 @@ impl FileReadChunks {
 pub struct FileWriteAll {
     file: FileId,
     offset: u64,
-    pending: Vec<u8>,
+    buffer: Option<Vec<u8>>,
+    cursor: usize,
     written: u64,
     high_water_chunk: usize,
     /// Total bytes the helper was asked to write, captured at
@@ -242,7 +256,8 @@ impl FileWriteAll {
         Self {
             file,
             offset: start_offset,
-            pending: bytes,
+            buffer: Some(bytes),
+            cursor: 0,
             written: 0,
             high_water_chunk,
             total,
@@ -251,49 +266,96 @@ impl FileWriteAll {
 
     /// Effect that issues the next `file_write_at`. Returns `None` if
     /// nothing is left to send.
-    pub fn next_effect<I, M, F>(&self, on_progress: F) -> Option<tina::Effect<I>>
+    pub fn next_effect<I, M, F>(&mut self, on_progress: F) -> Option<tina::Effect<I>>
     where
         I: Isolate<Message = M, Io = RuntimeCall<M>>,
-        F: FnOnce(FileWriteReply) -> M + Send + 'static,
+        F: FnOnce(FileWriteOwnedReply) -> M + Send + 'static,
         M: 'static,
     {
-        if self.pending.is_empty() {
-            None
-        } else {
-            Some(file_write_at(self.file, self.pending.clone(), self.offset).then(on_progress))
+        if self.cursor >= self.total as usize {
+            return None;
         }
+        let bytes = self.buffer.take()?;
+        Some(file_write_at_owned_from(self.file, bytes, self.offset, self.cursor).then(on_progress))
     }
 
     /// Record bytes from a `file_write_at` reply. Zero progress on a
     /// non-empty buffer is treated as a stuck write.
-    pub fn advance<I, M, F>(&mut self, reply: FileWriteReply, on_progress: F) -> FileLoopStep<I, ()>
+    pub fn advance<I, M, F>(
+        &mut self,
+        reply: FileWriteOwnedReply,
+        on_progress: F,
+    ) -> FileLoopStep<I, ()>
     where
         I: Isolate<Message = M, Io = RuntimeCall<M>>,
-        F: FnOnce(FileWriteReply) -> M + Send + 'static,
+        F: FnOnce(FileWriteOwnedReply) -> M + Send + 'static,
         M: 'static,
     {
         match reply {
-            Ok(0) if !self.pending.is_empty() => {
-                let report = self.terminal_report(FileLoopEnd::StuckWrite, Some(CallError::Io));
-                FileLoopStep::Ended(report)
-            }
-            Ok(count) => {
-                let drained = count.min(self.pending.len());
-                self.pending.drain(..drained);
-                self.written += drained as u64;
-                self.offset += drained as u64;
-                if self.pending.is_empty() {
+            Ok(reply) => {
+                if reply.bytes.len() as u64 != self.total {
+                    self.buffer = Some(reply.bytes);
+                    return FileLoopStep::Ended(
+                        self.terminal_report(
+                            FileLoopEnd::Error,
+                            Some(CallError::InvariantViolation),
+                        ),
+                    );
+                }
+                let remaining = reply.bytes.len().saturating_sub(self.cursor);
+                if reply.written > remaining {
+                    self.buffer = Some(reply.bytes);
+                    return FileLoopStep::Ended(
+                        self.terminal_report(
+                            FileLoopEnd::Error,
+                            Some(CallError::InvariantViolation),
+                        ),
+                    );
+                }
+                if reply.written == 0 && remaining > 0 {
+                    self.buffer = Some(reply.bytes);
+                    return FileLoopStep::Ended(
+                        self.terminal_report(FileLoopEnd::StuckWrite, Some(CallError::Io)),
+                    );
+                }
+                let Ok(progress) = u64::try_from(reply.written) else {
+                    self.buffer = Some(reply.bytes);
+                    return FileLoopStep::Ended(
+                        self.terminal_report(
+                            FileLoopEnd::Error,
+                            Some(CallError::InvariantViolation),
+                        ),
+                    );
+                };
+                let (Some(next_written), Some(next_offset)) = (
+                    self.written.checked_add(progress),
+                    self.offset.checked_add(progress),
+                ) else {
+                    self.buffer = Some(reply.bytes);
+                    return FileLoopStep::Ended(
+                        self.terminal_report(
+                            FileLoopEnd::Error,
+                            Some(CallError::InvariantViolation),
+                        ),
+                    );
+                };
+                self.cursor += reply.written;
+                self.written = next_written;
+                self.offset = next_offset;
+                if self.cursor == reply.bytes.len() {
+                    self.buffer = Some(reply.bytes);
                     let report = self.terminal_report(FileLoopEnd::Done, None);
                     FileLoopStep::Ended(report)
                 } else {
                     FileLoopStep::Pending(
-                        file_write_at(self.file, self.pending.clone(), self.offset)
+                        file_write_at_owned_from(self.file, reply.bytes, self.offset, self.cursor)
                             .then(on_progress),
                     )
                 }
             }
             Err(error) => {
-                let report = self.terminal_report(FileLoopEnd::Error, Some(error));
+                self.buffer = Some(error.bytes);
+                let report = self.terminal_report(FileLoopEnd::Error, Some(error.error));
                 FileLoopStep::Ended(report)
             }
         }
@@ -306,7 +368,7 @@ impl FileWriteAll {
 
     /// Bytes that still need to ship.
     pub fn remaining(&self) -> usize {
-        self.pending.len()
+        (self.total as usize).saturating_sub(self.cursor)
     }
 
     /// Current offset (start_offset + written).
@@ -357,6 +419,9 @@ pub struct FileCopyBounded {
     transferred: u64,
     high_water_chunk: usize,
     in_flight: Option<Vec<u8>>,
+    in_flight_len: usize,
+    in_flight_cursor: usize,
+    write_in_flight: bool,
     pending_write_offset: u64,
 }
 
@@ -377,7 +442,7 @@ pub enum FileCopyProgress {
     /// Result of the last source `file_read_at`.
     Read(FileReadReply),
     /// Result of the last destination `file_write_at`.
-    Write(FileWriteReply),
+    Write(FileWriteOwnedReply),
 }
 
 /// Unified copy-pump step.
@@ -426,13 +491,16 @@ impl FileCopyBounded {
             transferred: 0,
             high_water_chunk: 0,
             in_flight: None,
+            in_flight_len: 0,
+            in_flight_cursor: 0,
+            write_in_flight: false,
             pending_write_offset: dst_offset,
         }
     }
 
     /// Which leg of the pump is ready to fire next.
     pub fn next_leg(&self) -> CopyLeg {
-        if self.in_flight.is_some() {
+        if self.write_in_flight || self.in_flight.is_some() {
             CopyLeg::Write
         } else if self.transferred >= self.max_total {
             CopyLeg::Done
@@ -459,14 +527,26 @@ impl FileCopyBounded {
 
     /// Build the next `file_write_at` effect when [`Self::next_leg`]
     /// is [`CopyLeg::Write`]. Returns `None` otherwise.
-    pub fn next_effect_write<I, M, F>(&self, on_progress: F) -> Option<tina::Effect<I>>
+    pub fn next_effect_write<I, M, F>(&mut self, on_progress: F) -> Option<tina::Effect<I>>
     where
         I: Isolate<Message = M, Io = RuntimeCall<M>>,
-        F: FnOnce(FileWriteReply) -> M + Send + 'static,
+        F: FnOnce(FileWriteOwnedReply) -> M + Send + 'static,
         M: 'static,
     {
-        let buffer = self.in_flight.as_ref()?;
-        Some(file_write_at(self.dst, buffer.clone(), self.pending_write_offset).then(on_progress))
+        if self.write_in_flight {
+            return None;
+        }
+        let buffer = self.in_flight.take()?;
+        self.write_in_flight = true;
+        Some(
+            file_write_at_owned_from(
+                self.dst,
+                buffer,
+                self.pending_write_offset,
+                self.in_flight_cursor,
+            )
+            .then(on_progress),
+        )
     }
 
     /// Build the next effect for the current leg.
@@ -475,11 +555,15 @@ impl FileCopyBounded {
     /// [`next_leg`](Self::next_leg) / [`next_effect_read`](Self::next_effect_read)
     /// / [`next_effect_write`](Self::next_effect_write) trio remains available
     /// when a service wants to branch manually.
-    pub fn next_effect<I, M, FR, FW>(&self, on_read: FR, on_write: FW) -> Option<tina::Effect<I>>
+    pub fn next_effect<I, M, FR, FW>(
+        &mut self,
+        on_read: FR,
+        on_write: FW,
+    ) -> Option<tina::Effect<I>>
     where
         I: Isolate<Message = M, Io = RuntimeCall<M>>,
         FR: FnOnce(FileReadReply) -> M + Send + 'static,
-        FW: FnOnce(FileWriteReply) -> M + Send + 'static,
+        FW: FnOnce(FileWriteOwnedReply) -> M + Send + 'static,
         M: 'static,
     {
         match self.next_leg() {
@@ -500,7 +584,7 @@ impl FileCopyBounded {
     where
         I: Isolate<Message = M, Io = RuntimeCall<M>>,
         FR: FnOnce(FileReadReply) -> M + Send + 'static,
-        FW: FnOnce(FileWriteReply) -> M + Send + 'static,
+        FW: FnOnce(FileWriteOwnedReply) -> M + Send + 'static,
         M: 'static,
     {
         let leg = match progress {
@@ -533,20 +617,33 @@ impl FileCopyBounded {
     /// the same sharp-edge discipline as the zero-chunk constructor.
     pub fn record_read(&mut self, reply: FileReadReply) -> Result<CopyLeg, FileLoopReport> {
         assert!(
-            self.in_flight.is_none(),
+            !self.write_in_flight && self.in_flight.is_none(),
             "FileCopyBounded::record_read called while a write chunk is in flight; \
              dispatch via next_leg() (expected CopyLeg::Write)"
         );
         match reply {
             Ok(bytes) if bytes.is_empty() => Err(self.terminal_report(FileLoopEnd::Eof, None)),
-            Ok(bytes) => {
+            Ok(mut bytes) => {
                 self.high_water_chunk = self.high_water_chunk.max(bytes.len());
                 let room = self.max_total - self.transferred;
                 let take = (bytes.len() as u64).min(room) as usize;
-                let chunk_bytes = bytes[..take].to_vec();
-                self.src_offset += take as u64;
-                self.pending_write_offset = self.dst_offset + self.transferred;
-                self.in_flight = Some(chunk_bytes);
+                bytes.truncate(take);
+                let Ok(take_u64) = u64::try_from(take) else {
+                    return Err(self
+                        .terminal_report(FileLoopEnd::Error, Some(CallError::InvariantViolation)));
+                };
+                let (Some(next_src_offset), Some(pending_write_offset)) = (
+                    self.src_offset.checked_add(take_u64),
+                    self.dst_offset.checked_add(self.transferred),
+                ) else {
+                    return Err(self
+                        .terminal_report(FileLoopEnd::Error, Some(CallError::InvariantViolation)));
+                };
+                self.src_offset = next_src_offset;
+                self.pending_write_offset = pending_write_offset;
+                self.in_flight = Some(bytes);
+                self.in_flight_len = take;
+                self.in_flight_cursor = 0;
                 Ok(CopyLeg::Write)
             }
             Err(error) => Err(self.terminal_report(FileLoopEnd::Error, Some(error))),
@@ -558,35 +655,64 @@ impl FileCopyBounded {
     /// Must be called only when [`Self::next_leg`] is [`CopyLeg::Write`]
     /// (i.e. a read chunk is buffered). Calling it on the read leg is a
     /// programmer error and panics.
-    pub fn record_write(&mut self, reply: FileWriteReply) -> Result<CopyLeg, FileLoopReport> {
+    pub fn record_write(&mut self, reply: FileWriteOwnedReply) -> Result<CopyLeg, FileLoopReport> {
         assert!(
-            self.in_flight.is_some(),
+            self.write_in_flight || self.in_flight.is_some(),
             "FileCopyBounded::record_write called with no chunk in flight; \
              dispatch via next_leg() (expected CopyLeg::Read)"
         );
+        self.write_in_flight = false;
         match reply {
-            Ok(0) => Err(self.terminal_report(FileLoopEnd::StuckWrite, Some(CallError::Io))),
-            Ok(count) => {
-                let buffer = self
-                    .in_flight
-                    .as_mut()
-                    .expect("in_flight checked by the assert above");
-                let drained = count.min(buffer.len());
-                buffer.drain(..drained);
-                self.transferred += drained as u64;
-                self.pending_write_offset += drained as u64;
-                if buffer.is_empty() {
+            Ok(reply) => {
+                if reply.bytes.len() != self.in_flight_len {
+                    self.in_flight = Some(reply.bytes);
+                    return Err(self
+                        .terminal_report(FileLoopEnd::Error, Some(CallError::InvariantViolation)));
+                }
+                let remaining = reply.bytes.len().saturating_sub(self.in_flight_cursor);
+                if reply.written > remaining {
+                    self.in_flight = Some(reply.bytes);
+                    return Err(self
+                        .terminal_report(FileLoopEnd::Error, Some(CallError::InvariantViolation)));
+                }
+                if reply.written == 0 && remaining > 0 {
+                    self.in_flight = Some(reply.bytes);
+                    return Err(self.terminal_report(FileLoopEnd::StuckWrite, Some(CallError::Io)));
+                }
+                let Ok(progress) = u64::try_from(reply.written) else {
+                    self.in_flight = Some(reply.bytes);
+                    return Err(self
+                        .terminal_report(FileLoopEnd::Error, Some(CallError::InvariantViolation)));
+                };
+                let (Some(next_transferred), Some(next_write_offset)) = (
+                    self.transferred.checked_add(progress),
+                    self.pending_write_offset.checked_add(progress),
+                ) else {
+                    self.in_flight = Some(reply.bytes);
+                    return Err(self
+                        .terminal_report(FileLoopEnd::Error, Some(CallError::InvariantViolation)));
+                };
+                self.in_flight_cursor += reply.written;
+                self.transferred = next_transferred;
+                self.pending_write_offset = next_write_offset;
+                if self.in_flight_cursor == reply.bytes.len() {
                     self.in_flight = None;
+                    self.in_flight_len = 0;
+                    self.in_flight_cursor = 0;
                     if self.transferred >= self.max_total {
                         Err(self.terminal_report(FileLoopEnd::CapReached, None))
                     } else {
                         Ok(CopyLeg::Read)
                     }
                 } else {
+                    self.in_flight = Some(reply.bytes);
                     Ok(CopyLeg::Write)
                 }
             }
-            Err(error) => Err(self.terminal_report(FileLoopEnd::Error, Some(error))),
+            Err(error) => {
+                self.in_flight = Some(error.bytes);
+                Err(self.terminal_report(FileLoopEnd::Error, Some(error.error)))
+            }
         }
     }
 
@@ -600,7 +726,7 @@ impl FileCopyBounded {
         FileLoopReport {
             end,
             bytes_transferred: self.transferred,
-            final_offset: self.dst_offset + self.transferred,
+            final_offset: self.pending_write_offset,
             error: None,
             high_water_chunk: self.high_water_chunk,
             cap: self.max_total,
@@ -611,7 +737,7 @@ impl FileCopyBounded {
         FileLoopReport {
             end,
             bytes_transferred: self.transferred,
-            final_offset: self.dst_offset + self.transferred,
+            final_offset: self.pending_write_offset,
             error,
             high_water_chunk: self.high_water_chunk,
             cap: self.max_total,
@@ -650,11 +776,18 @@ mod tests {
     #[derive(Debug)]
     enum Msg {
         Read(FileReadReply),
-        Wrote(FileWriteReply),
+        Wrote(FileWriteOwnedReply),
     }
 
     fn file(id: u64) -> FileId {
         FileId::new(id)
+    }
+
+    fn wrote(bytes: &[u8], written: usize) -> FileWriteOwnedReply {
+        Ok(crate::TcpWriteOwnedReply {
+            bytes: bytes.to_vec(),
+            written,
+        })
     }
 
     // -- FileReadChunks -----------------------------------------------------
@@ -780,7 +913,7 @@ mod tests {
     #[test]
     fn write_all_finishes_in_one_step() {
         let mut helper = FileWriteAll::new(file(1), 0, b"hello".to_vec());
-        let step: FileLoopStep<DummyIsolate, ()> = helper.advance(Ok(5), Msg::Wrote);
+        let step: FileLoopStep<DummyIsolate, ()> = helper.advance(wrote(b"hello", 5), Msg::Wrote);
         match step {
             FileLoopStep::Ended(report) => {
                 assert_eq!(report.end, FileLoopEnd::Done);
@@ -795,15 +928,30 @@ mod tests {
     }
 
     #[test]
+    fn write_all_keeps_the_owned_allocation() {
+        let mut helper = FileWriteAll::new(file(1), 0, b"hello".to_vec());
+        let bytes = helper.buffer.take().expect("buffer stored");
+        let allocation = bytes.as_ptr();
+        let step: FileLoopStep<DummyIsolate, ()> =
+            helper.advance(Ok(crate::WriteOwnedReply { bytes, written: 5 }), Msg::Wrote);
+        assert!(matches!(step, FileLoopStep::Ended(_)));
+        assert_eq!(
+            helper.buffer.as_ref().expect("buffer returned").as_ptr(),
+            allocation
+        );
+    }
+
+    #[test]
     fn write_all_report_cap_is_stable_across_partial_writes() {
         let mut helper = FileWriteAll::new(file(1), 0, b"hello world".to_vec());
         // Mid-flight partial-progress report.
-        let _ = helper.advance::<DummyIsolate, _, _>(Ok(4), Msg::Wrote);
+        let _ = helper.advance::<DummyIsolate, _, _>(wrote(b"hello world", 4), Msg::Wrote);
         let partial = helper.report(FileLoopEnd::Done);
         assert_eq!(partial.cap, 11, "cap stays at total requested");
         assert_eq!(partial.bytes_transferred, 4);
         // Terminal report keeps the same cap.
-        let step: FileLoopStep<DummyIsolate, ()> = helper.advance(Ok(7), Msg::Wrote);
+        let step: FileLoopStep<DummyIsolate, ()> =
+            helper.advance(wrote(b"hello world", 7), Msg::Wrote);
         match step {
             FileLoopStep::Ended(report) => {
                 assert_eq!(report.cap, 11);
@@ -816,12 +964,12 @@ mod tests {
     #[test]
     fn write_all_loops_on_partial_writes() {
         let mut helper = FileWriteAll::new(file(1), 100, b"hello".to_vec());
-        let step: FileLoopStep<DummyIsolate, ()> = helper.advance(Ok(2), Msg::Wrote);
+        let step: FileLoopStep<DummyIsolate, ()> = helper.advance(wrote(b"hello", 2), Msg::Wrote);
         assert!(matches!(step, FileLoopStep::Pending(_)));
         assert_eq!(helper.written(), 2);
         assert_eq!(helper.offset(), 102);
 
-        let step: FileLoopStep<DummyIsolate, ()> = helper.advance(Ok(3), Msg::Wrote);
+        let step: FileLoopStep<DummyIsolate, ()> = helper.advance(wrote(b"hello", 3), Msg::Wrote);
         match step {
             FileLoopStep::Ended(report) => {
                 assert_eq!(report.end, FileLoopEnd::Done);
@@ -835,7 +983,7 @@ mod tests {
     #[test]
     fn write_all_stuck_write_is_typed() {
         let mut helper = FileWriteAll::new(file(1), 0, b"hello".to_vec());
-        let step: FileLoopStep<DummyIsolate, ()> = helper.advance(Ok(0), Msg::Wrote);
+        let step: FileLoopStep<DummyIsolate, ()> = helper.advance(wrote(b"hello", 0), Msg::Wrote);
         match step {
             FileLoopStep::Ended(report) => {
                 assert_eq!(report.end, FileLoopEnd::StuckWrite);
@@ -847,9 +995,59 @@ mod tests {
     }
 
     #[test]
+    fn write_all_rejects_impossible_completion_count() {
+        let mut helper = FileWriteAll::new(file(1), 0, b"hello".to_vec());
+        let step: FileLoopStep<DummyIsolate, ()> = helper.advance(wrote(b"hello", 6), Msg::Wrote);
+        match step {
+            FileLoopStep::Ended(report) => {
+                assert_eq!(report.end, FileLoopEnd::Error);
+                assert_eq!(report.error, Some(CallError::InvariantViolation));
+            }
+            other => panic!("unexpected step: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_all_reports_offset_overflow_without_advancing() {
+        let mut helper = FileWriteAll::new(file(1), u64::MAX, b"x".to_vec());
+        let step: FileLoopStep<DummyIsolate, ()> = helper.advance(wrote(b"x", 1), Msg::Wrote);
+        match step {
+            FileLoopStep::Ended(report) => {
+                assert_eq!(report.end, FileLoopEnd::Error);
+                assert_eq!(report.error, Some(CallError::InvariantViolation));
+                assert_eq!(report.bytes_transferred, 0);
+                assert_eq!(report.final_offset, u64::MAX);
+            }
+            other => panic!("unexpected step: {other:?}"),
+        }
+        assert_eq!(helper.written(), 0);
+        assert_eq!(helper.offset(), u64::MAX);
+    }
+
+    #[test]
+    fn write_all_rejects_a_changed_owned_buffer_length() {
+        let mut helper = FileWriteAll::new(file(1), 0, b"hello".to_vec());
+        let step: FileLoopStep<DummyIsolate, ()> = helper.advance(wrote(b"hel", 3), Msg::Wrote);
+        match step {
+            FileLoopStep::Ended(report) => {
+                assert_eq!(report.end, FileLoopEnd::Error);
+                assert_eq!(report.error, Some(CallError::InvariantViolation));
+                assert_eq!(report.bytes_transferred, 0);
+            }
+            other => panic!("unexpected step: {other:?}"),
+        }
+    }
+
+    #[test]
     fn write_all_propagates_error() {
         let mut helper = FileWriteAll::new(file(1), 0, b"hello".to_vec());
-        let step: FileLoopStep<DummyIsolate, ()> = helper.advance(Err(CallError::Io), Msg::Wrote);
+        let step: FileLoopStep<DummyIsolate, ()> = helper.advance(
+            Err(crate::WriteOwnedError {
+                error: CallError::Io,
+                bytes: b"hello".to_vec(),
+            }),
+            Msg::Wrote,
+        );
         match step {
             FileLoopStep::Ended(report) => {
                 assert_eq!(report.end, FileLoopEnd::Error);
@@ -867,7 +1065,7 @@ mod tests {
         assert_eq!(pump.next_leg(), CopyLeg::Read);
         let leg = pump.record_read(Ok(b"abcd".to_vec())).expect("read ok");
         assert_eq!(leg, CopyLeg::Write);
-        let leg = pump.record_write(Ok(4)).expect("write ok");
+        let leg = pump.record_write(wrote(b"abcd", 4)).expect("write ok");
         assert_eq!(leg, CopyLeg::Read);
         match pump.record_read(Ok(Vec::new())) {
             Err(report) => {
@@ -880,10 +1078,23 @@ mod tests {
     }
 
     #[test]
+    fn copy_bounded_reports_destination_offset_overflow() {
+        let mut pump = FileCopyBounded::new(file(1), file(2), 0, u64::MAX, 4, 4);
+        assert_eq!(pump.record_read(Ok(b"x".to_vec())).unwrap(), CopyLeg::Write);
+        let report = pump
+            .record_write(wrote(b"x", 1))
+            .expect_err("destination offset must not wrap");
+        assert_eq!(report.end, FileLoopEnd::Error);
+        assert_eq!(report.error, Some(CallError::InvariantViolation));
+        assert_eq!(report.bytes_transferred, 0);
+        assert_eq!(report.final_offset, u64::MAX);
+    }
+
+    #[test]
     fn copy_bounded_stops_at_cap() {
         let mut pump = FileCopyBounded::new(file(1), file(2), 0, 0, 4, 4);
         let _ = pump.record_read(Ok(b"abcd".to_vec())).expect("read ok");
-        match pump.record_write(Ok(4)) {
+        match pump.record_write(wrote(b"abcd", 4)) {
             Err(report) => {
                 assert_eq!(report.end, FileLoopEnd::CapReached);
                 assert_eq!(report.bytes_transferred, 4);
@@ -896,13 +1107,63 @@ mod tests {
     fn copy_bounded_stuck_write_is_typed() {
         let mut pump = FileCopyBounded::new(file(1), file(2), 0, 0, 4, 1024);
         let _ = pump.record_read(Ok(b"abcd".to_vec())).expect("read ok");
-        match pump.record_write(Ok(0)) {
+        match pump.record_write(wrote(b"abcd", 0)) {
             Err(report) => {
                 assert_eq!(report.end, FileLoopEnd::StuckWrite);
                 assert_eq!(report.error, Some(CallError::Io));
             }
             Ok(_) => panic!("expected stuck-write report"),
         }
+    }
+
+    #[test]
+    fn copy_bounded_rejects_a_changed_owned_buffer_length() {
+        let mut pump = FileCopyBounded::new(file(1), file(2), 0, 0, 4, 1024);
+        let _ = pump.record_read(Ok(b"abcd".to_vec())).expect("read ok");
+        match pump.record_write(wrote(b"ab", 2)) {
+            Err(report) => {
+                assert_eq!(report.end, FileLoopEnd::Error);
+                assert_eq!(report.error, Some(CallError::InvariantViolation));
+                assert_eq!(report.bytes_transferred, 0);
+            }
+            Ok(_) => panic!("expected invariant report"),
+        }
+    }
+
+    #[test]
+    fn copy_bounded_rejects_impossible_completion_count() {
+        let mut pump = FileCopyBounded::new(file(1), file(2), 0, 0, 4, 1024);
+        let _ = pump.record_read(Ok(b"abcd".to_vec())).expect("read ok");
+        match pump.record_write(wrote(b"abcd", 5)) {
+            Err(report) => {
+                assert_eq!(report.end, FileLoopEnd::Error);
+                assert_eq!(report.error, Some(CallError::InvariantViolation));
+            }
+            Ok(_) => panic!("expected invariant report"),
+        }
+    }
+
+    #[test]
+    fn copy_bounded_reuses_the_read_allocation_for_partial_writes() {
+        let mut pump = FileCopyBounded::new(file(1), file(2), 0, 0, 4, 1024);
+        let bytes = b"abcd".to_vec();
+        let allocation = bytes.as_ptr();
+        let _ = pump.record_read(Ok(bytes)).expect("read ok");
+        assert_eq!(
+            pump.in_flight.as_ref().expect("chunk buffered").as_ptr(),
+            allocation
+        );
+
+        let bytes = pump.in_flight.take().expect("chunk buffered");
+        pump.write_in_flight = true;
+        let leg = pump
+            .record_write(Ok(crate::WriteOwnedReply { bytes, written: 1 }))
+            .expect("partial write continues");
+        assert_eq!(leg, CopyLeg::Write);
+        assert_eq!(
+            pump.in_flight.as_ref().expect("chunk returned").as_ptr(),
+            allocation
+        );
     }
 
     #[test]
@@ -917,7 +1178,7 @@ mod tests {
         let mut pump = FileCopyBounded::new(file(1), file(2), 0, 0, 4, 1024);
         assert_eq!(pump.next_leg(), CopyLeg::Read);
         // Misuse: feeding a write reply while the pump expects a read.
-        let _ = pump.record_write(Ok(4));
+        let _ = pump.record_write(wrote(b"abcd", 4));
     }
 
     #[test]
@@ -927,6 +1188,18 @@ mod tests {
         let _ = pump.record_read(Ok(b"abcd".to_vec())).expect("read ok");
         assert_eq!(pump.next_leg(), CopyLeg::Write);
         // Misuse: feeding a read reply while a chunk awaits writing.
+        let _ = pump.record_read(Ok(b"efgh".to_vec()));
+    }
+
+    #[test]
+    #[should_panic(expected = "record_read called while a write chunk is in flight")]
+    fn copy_bounded_record_read_after_write_effect_panics() {
+        let mut pump = FileCopyBounded::new(file(1), file(2), 0, 0, 4, 1024);
+        let _ = pump.record_read(Ok(b"abcd".to_vec())).expect("read ok");
+        let effect: Option<Effect<DummyIsolate>> = pump.next_effect_write(Msg::Wrote);
+        assert!(effect.is_some());
+        assert_eq!(pump.next_leg(), CopyLeg::Write);
+        // The bytes moved into the effect, but the write remains outstanding.
         let _ = pump.record_read(Ok(b"efgh".to_vec()));
     }
 }

@@ -6,14 +6,12 @@ use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use std::time::Duration;
-
 use tina::{Address, Context, Effect, Isolate, Outbound, Shard, ShardId};
-use tina_codec::{FrameDecision, LineFramer};
+use tina_codec::{DecodeStatus, LineFramer, decode_chunk};
 use tina_runtime::{
-    RuntimeCall, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerId, UnixReadReply,
-    UnixStreamId, UnixWriteReply, sleep, unix_accept, unix_bind, unix_close_stream, unix_connect,
-    unix_read, unix_write,
+    LoopStep, RuntimeCall, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerId,
+    UnixReadReply, UnixStreamId, UnixWriteAll, UnixWriteOwnedReply, unix_accept, unix_bind,
+    unix_close_stream, unix_connect, unix_read,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -30,21 +28,13 @@ impl Shard for AdminShard {
 
 // ---------- Server ---------------------------------------------------------
 
-/// Max consecutive zero-progress writes the server tolerates before it
-/// gives up on a wedged peer. Bounds the back-off retry loop so a peer
-/// that never drains its inbound cannot pin the server forever.
-const MAX_WRITE_BACKOFFS: u32 = 16;
-
 #[derive(Debug)]
 enum ServerMsg {
     Start,
     Bound(UnixBindReply),
     Accepted(UnixAcceptReply),
     Read(UnixReadReply),
-    Wrote(UnixWriteReply),
-    /// Back-off tick: the previous write made zero progress (peer
-    /// inbound full). Retry after a short pause.
-    RetryWrite,
+    Wrote(UnixWriteOwnedReply),
     Done,
 }
 
@@ -53,9 +43,7 @@ struct AdminServer {
     listener: Option<UnixListenerId>,
     stream: Option<UnixStreamId>,
     framer: LineFramer,
-    write_pending: Vec<u8>,
-    /// Consecutive zero-progress writes since the last byte landed.
-    write_backoffs: u32,
+    write_all: Option<UnixWriteAll>,
     /// Records every command line the server saw, in order.
     seen: Arc<Mutex<Vec<Vec<u8>>>>,
     malformed: Arc<Mutex<bool>>,
@@ -97,29 +85,27 @@ impl Isolate for AdminServer {
                         Effect::Stop
                     }
                 } else {
-                    self.framer.feed(bytes);
                     let mut reply_buffer = Vec::new();
                     let mut should_close = false;
-                    loop {
-                        match self.framer.next_frame() {
-                            FrameDecision::NeedMore => break,
-                            FrameDecision::Frame(line) => {
-                                self.seen.lock().unwrap().push(line.clone());
-                                if line == b"shutdown" {
-                                    should_close = true;
-                                    break;
-                                }
+                    let seen = &self.seen;
+                    let status = decode_chunk(&mut self.framer, &bytes, |line| {
+                        if !should_close {
+                            seen.lock().unwrap().push(line.clone());
+                            if line == b"shutdown" {
+                                should_close = true;
+                            } else {
                                 let mut response = b"ok ".to_vec();
                                 response.extend_from_slice(&line);
                                 response.push(b'\n');
                                 reply_buffer.extend_from_slice(&response);
                             }
-                            FrameDecision::Malformed(_) | FrameDecision::Full => {
-                                *self.malformed.lock().unwrap() = true;
-                                should_close = true;
-                                break;
-                            }
                         }
+                    });
+                    if !should_close
+                        && matches!(status, DecodeStatus::Malformed(_) | DecodeStatus::Full)
+                    {
+                        *self.malformed.lock().unwrap() = true;
+                        should_close = true;
                     }
                     if should_close {
                         if let Some(stream) = self.stream.take() {
@@ -130,41 +116,27 @@ impl Isolate for AdminServer {
                     if reply_buffer.is_empty() {
                         unix_read(self.stream.expect("stream"), 64).then(ServerMsg::Read)
                     } else {
-                        self.write_pending = reply_buffer.clone();
-                        unix_write(self.stream.expect("stream"), reply_buffer)
-                            .then(ServerMsg::Wrote)
+                        let mut write_all =
+                            UnixWriteAll::new(self.stream.expect("stream"), reply_buffer);
+                        let effect = write_all
+                            .next_effect(ServerMsg::Wrote)
+                            .expect("reply buffer is non-empty");
+                        self.write_all = Some(write_all);
+                        effect
                     }
                 }
             }
             ServerMsg::Read(Err(_)) => Effect::Stop,
-            ServerMsg::Wrote(Ok(count)) => {
-                if count == 0 {
-                    // Peer inbound full: zero-progress write. Back off
-                    // instead of hot-spinning; give up after a bounded
-                    // number of attempts so a wedged peer cannot pin us.
-                    self.write_backoffs += 1;
-                    if self.write_backoffs >= MAX_WRITE_BACKOFFS {
-                        if let Some(stream) = self.stream.take() {
-                            return unix_close_stream(stream).then(|_| ServerMsg::Done);
-                        }
-                        return Effect::Stop;
+            ServerMsg::Wrote(reply) => {
+                let write_all = self.write_all.as_mut().expect("write helper armed");
+                match write_all.advance::<Self, _, _>(reply, ServerMsg::Wrote) {
+                    LoopStep::Pending(effect) => effect,
+                    LoopStep::Done(_) => {
+                        self.write_all = None;
+                        unix_read(self.stream.expect("stream"), 64).then(ServerMsg::Read)
                     }
-                    return sleep(Duration::from_millis(1)).then(|_| ServerMsg::RetryWrite);
+                    LoopStep::Failed(_) => Effect::Stop,
                 }
-                self.write_backoffs = 0;
-                let drained = count.min(self.write_pending.len());
-                self.write_pending.drain(..drained);
-                if self.write_pending.is_empty() {
-                    unix_read(self.stream.expect("stream"), 64).then(ServerMsg::Read)
-                } else {
-                    let pending = self.write_pending.clone();
-                    unix_write(self.stream.expect("stream"), pending).then(ServerMsg::Wrote)
-                }
-            }
-            ServerMsg::Wrote(Err(_)) => Effect::Stop,
-            ServerMsg::RetryWrite => {
-                let pending = self.write_pending.clone();
-                unix_write(self.stream.expect("stream"), pending).then(ServerMsg::Wrote)
             }
             ServerMsg::Done => Effect::Stop,
         }
@@ -177,7 +149,7 @@ impl Isolate for AdminServer {
 enum ClientMsg {
     Start,
     Connected(UnixConnectReply),
-    Wrote(UnixWriteReply),
+    Wrote(UnixWriteOwnedReply),
     Read(UnixReadReply),
     Done,
 }
@@ -186,7 +158,7 @@ struct AdminClient {
     path: PathBuf,
     stream: Option<UnixStreamId>,
     outbound: Vec<u8>,
-    write_pending: Vec<u8>,
+    write_all: Option<UnixWriteAll>,
     /// Bytes the client received from the server.
     received: Arc<Mutex<Vec<u8>>>,
 }
@@ -210,22 +182,30 @@ impl Isolate for AdminClient {
             ClientMsg::Start => unix_connect(self.path.clone()).then(ClientMsg::Connected),
             ClientMsg::Connected(Ok(stream)) => {
                 self.stream = Some(stream);
-                self.write_pending = std::mem::take(&mut self.outbound);
-                let bytes = self.write_pending.clone();
-                unix_write(stream, bytes).then(ClientMsg::Wrote)
+                let bytes = std::mem::take(&mut self.outbound);
+                if bytes.is_empty() {
+                    self.stream = None;
+                    return unix_close_stream(stream).then(|_| ClientMsg::Done);
+                }
+                let mut write_all = UnixWriteAll::new(stream, bytes);
+                let effect = write_all
+                    .next_effect(ClientMsg::Wrote)
+                    .expect("non-empty client payload has a write step");
+                self.write_all = Some(write_all);
+                effect
             }
             ClientMsg::Connected(Err(_)) => Effect::Stop,
-            ClientMsg::Wrote(Ok(count)) => {
-                let drained = count.min(self.write_pending.len());
-                self.write_pending.drain(..drained);
-                if self.write_pending.is_empty() {
-                    unix_read(self.stream.expect("stream"), 64).then(ClientMsg::Read)
-                } else {
-                    let pending = self.write_pending.clone();
-                    unix_write(self.stream.expect("stream"), pending).then(ClientMsg::Wrote)
+            ClientMsg::Wrote(reply) => {
+                let write_all = self.write_all.as_mut().expect("write helper armed");
+                match write_all.advance::<Self, _, _>(reply, ClientMsg::Wrote) {
+                    LoopStep::Pending(effect) => effect,
+                    LoopStep::Done(_) => {
+                        self.write_all = None;
+                        unix_read(self.stream.expect("stream"), 64).then(ClientMsg::Read)
+                    }
+                    LoopStep::Failed(_) => Effect::Stop,
                 }
             }
-            ClientMsg::Wrote(Err(_)) => Effect::Stop,
             ClientMsg::Read(Ok(bytes)) => {
                 if bytes.is_empty() {
                     // EOF
@@ -267,8 +247,7 @@ pub fn run_admin_socket(path: PathBuf, commands: Vec<&[u8]>, max_line_len: usize
         listener: None,
         stream: None,
         framer: LineFramer::new(max_line_len),
-        write_pending: Vec::new(),
-        write_backoffs: 0,
+        write_all: None,
         seen: Arc::clone(&server_seen),
         malformed: Arc::clone(&server_malformed),
     };
@@ -281,7 +260,7 @@ pub fn run_admin_socket(path: PathBuf, commands: Vec<&[u8]>, max_line_len: usize
         path,
         stream: None,
         outbound,
-        write_pending: Vec::new(),
+        write_all: None,
         received: Arc::clone(&received),
     };
     let client_addr: Address<ClientMsg, ()> = sim.register(client);
@@ -318,7 +297,7 @@ pub fn smoke() -> SpecimenReport {
 }
 
 /// Bad-input proof: a single line longer than the configured cap must
-/// surface `FrameDecision::Full` and shut the connection down without
+/// surface `DecodeStatus::Full` and shut the connection down without
 /// growing the framer past the cap.
 pub fn bad_input_line_too_long() -> SpecimenReport {
     let mut huge = vec![b'X'; 64];
@@ -337,5 +316,46 @@ pub fn bad_input_line_too_long() -> SpecimenReport {
             "rejected_oversize_line={}",
             result.server_saw_malformed_or_full
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simulator_delivers_coalesced_maximum_line_and_following_line() {
+        let result = run_admin_socket(
+            PathBuf::from("/tmp/specimen_admin_coalesced.sock"),
+            vec![b"abcdefgh\n", b"x\n", b"shutdown\n"],
+            8,
+        );
+        assert_eq!(
+            result.server_saw,
+            [b"abcdefgh".to_vec(), b"x".to_vec(), b"shutdown".to_vec()]
+        );
+        assert!(!result.server_saw_malformed_or_full);
+    }
+
+    #[test]
+    fn empty_command_batch_does_not_arm_an_empty_write() {
+        let result = run_admin_socket(
+            PathBuf::from("/tmp/specimen_admin_empty.sock"),
+            Vec::new(),
+            8,
+        );
+        assert!(result.server_saw.is_empty());
+        assert!(result.client_received.is_empty());
+    }
+
+    #[test]
+    fn shutdown_ignores_an_oversize_suffix_in_the_same_transport_chunk() {
+        let result = run_admin_socket(
+            PathBuf::from("/tmp/specimen_admin_shutdown_suffix.sock"),
+            vec![b"shutdown\n", b"xxxxxxxxxxxxxxxx\n"],
+            8,
+        );
+        assert_eq!(result.server_saw, [b"shutdown".to_vec()]);
+        assert!(!result.server_saw_malformed_or_full);
     }
 }

@@ -14,7 +14,7 @@ use aws_sdk_secretsmanager::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_secretsmanager::operation::get_secret_value::GetSecretValueError;
 use tina::CallContext;
 use tina::prelude::*;
-use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, sleep};
+use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeError, sleep};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 #[cfg(feature = "tracing")]
@@ -130,9 +130,9 @@ pub enum SecretsInstallError {
     /// Invalid config.
     Config(SecretsConfigError),
     /// Tokio runtime or AWS client construction failed.
-    Build(String),
+    Build(SecretsError),
     /// Tina runtime registration failed.
-    Register(String),
+    Register(ThreadedRuntimeError),
 }
 
 impl std::fmt::Display for SecretsInstallError {
@@ -145,7 +145,15 @@ impl std::fmt::Display for SecretsInstallError {
     }
 }
 
-impl std::error::Error for SecretsInstallError {}
+impl std::error::Error for SecretsInstallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(source) => Some(source),
+            Self::Build(source) => Some(source),
+            Self::Register(source) => Some(source),
+        }
+    }
+}
 
 impl From<SecretsConfigError> for SecretsInstallError {
     fn from(value: SecretsConfigError) -> Self {
@@ -447,12 +455,11 @@ impl<S: Shard + Send + 'static> SecretsWorker<S> {
     {
         config.validate()?;
         let cap = config.mailbox_capacity;
-        let (worker, metrics) =
-            Self::new(config).map_err(|e| SecretsInstallError::Build(e.to_string()))?;
+        let (worker, metrics) = Self::new(config).map_err(SecretsInstallError::Build)?;
         let closer = worker.closer();
         let address = runtime
             .register_with_capacity::<_, Infallible>(worker, cap)
-            .map_err(|e| SecretsInstallError::Register(format!("{e:?}")))?;
+            .map_err(SecretsInstallError::Register)?;
         Ok(InstalledSecretsBridge {
             address,
             closer,

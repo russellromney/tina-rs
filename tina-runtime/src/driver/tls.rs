@@ -387,7 +387,7 @@ impl TlsLane {
         self.pending.push(TlsPending {
             call_id,
             lane: TlsLaneKey::Connect(call_id),
-            deadline: now + timeout,
+            deadline: deadline_after(now, timeout),
             cancelled: false,
             state: TlsOpState::Connect { io, alpn_offered },
         });
@@ -482,7 +482,7 @@ impl TlsLane {
         self.pending.push(TlsPending {
             call_id,
             lane,
-            deadline: now + timeout,
+            deadline: deadline_after(now, timeout),
             cancelled: false,
             state: TlsOpState::Accept {
                 config,
@@ -548,7 +548,7 @@ impl TlsLane {
         self.pending.push(TlsPending {
             call_id,
             lane,
-            deadline: now + timeout,
+            deadline: deadline_after(now, timeout),
             cancelled: false,
             state: TlsOpState::Read { stream, max_len },
         });
@@ -601,7 +601,7 @@ impl TlsLane {
         self.pending.push(TlsPending {
             call_id,
             lane,
-            deadline: now + timeout,
+            deadline: deadline_after(now, timeout),
             cancelled: false,
             state: TlsOpState::ReadBuf {
                 stream,
@@ -639,7 +639,7 @@ impl TlsLane {
         self.pending.push(TlsPending {
             call_id,
             lane,
-            deadline: now + timeout,
+            deadline: deadline_after(now, timeout),
             cancelled: false,
             state: TlsOpState::Write {
                 stream,
@@ -695,7 +695,7 @@ impl TlsLane {
         self.pending.push(TlsPending {
             call_id,
             lane,
-            deadline: now + timeout,
+            deadline: deadline_after(now, timeout),
             cancelled: false,
             state: TlsOpState::WriteOwned {
                 stream,
@@ -747,7 +747,7 @@ impl TlsLane {
         self.pending.push(TlsPending {
             call_id,
             lane: TlsLaneKey::Stream(stream),
-            deadline: now + timeout,
+            deadline: deadline_after(now, timeout),
             cancelled: false,
             state: TlsOpState::Close {
                 io: entry.io,
@@ -1198,11 +1198,10 @@ impl TlsLane {
         // the cancelled result. Drain TLS-owned boxes here before TCP performs
         // the final shared-loop shutdown check.
         //
-        // This must NOT run from `Drop`: on a bare runtime drop the TCP lane's
-        // field drops first and frees its boxes, leaving the backend's watch
-        // list dangling — walking it here would be use-after-free. A dropped
-        // lane simply lets its boxes (and the io_loop handle) fall; the backend
-        // is torn down without ever dereferencing the stale pointers.
+        // This must NOT run from this lane's `Drop`: whole-loop destruction is
+        // coordinated by `SharedIoLanes` while every sibling lane remains
+        // alive. If release cannot be proven, that owner quarantines every lane
+        // and loop handle together rather than freeing referenced boxes.
         for pending in &mut self.pending {
             pending.cancelled = true;
         }
@@ -1289,10 +1288,8 @@ impl TlsLane {
 }
 
 // No `Drop` impl on purpose: the TLS lane shares its Betelgeuse loop with the
-// TCP lane, and `cancel_pending_completions` is a whole-loop operation that is
-// only safe before any lane has dropped (see `cancel_pending`). On a bare drop
-// the lane's boxes and io_loop handle simply fall; the backend tears down
-// without dereferencing them.
+// TCP/storage/Unix lanes. `SharedIoLanes` owns whole-loop cancellation and the
+// reclaim-or-quarantine decision before any completion storage can drop.
 
 impl TlsPending {
     /// Whether the backend still holds a pointer to one of this op's
@@ -2121,6 +2118,56 @@ mod tests {
         assert!(matches!(
             drive(&mut lane, &mut completed, CallId::new(7)),
             CallOutput::TlsClosed
+        ));
+    }
+
+    #[test]
+    fn maximum_timeout_survives_a_live_tls_handshake() {
+        let mut lane = fresh_lane(2);
+        let mut completed = Vec::new();
+        let (cert, key) = localhost_identity();
+        let bound = lane
+            .submit_bind(
+                CallId::new(1),
+                loopback(),
+                vec![cert.clone()],
+                key,
+                Vec::new(),
+                Instant::now(),
+            )
+            .expect("bind completes inline");
+        let (listener, addr) = match bound.result {
+            CallOutput::TlsBound {
+                listener,
+                local_addr,
+            } => (listener, local_addr),
+            other => panic!("unexpected bind: {other:?}"),
+        };
+
+        assert!(
+            lane.submit_accept(CallId::new(2), listener, Duration::MAX, Instant::now())
+                .is_none()
+        );
+        assert!(
+            lane.submit_connect(
+                CallId::new(3),
+                addr,
+                "localhost".to_string(),
+                vec![cert],
+                Vec::new(),
+                Duration::MAX,
+                Instant::now(),
+            )
+            .is_none()
+        );
+
+        assert!(matches!(
+            drive(&mut lane, &mut completed, CallId::new(2)),
+            CallOutput::TlsAccepted { .. }
+        ));
+        assert!(matches!(
+            drive(&mut lane, &mut completed, CallId::new(3)),
+            CallOutput::TlsConnected { .. }
         ));
     }
 }

@@ -16,7 +16,7 @@ use aws_sdk_sqs::operation::receive_message::ReceiveMessageError;
 use aws_sdk_sqs::operation::send_message::SendMessageError;
 use tina::CallContext;
 use tina::prelude::*;
-use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, sleep};
+use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeError, sleep};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 #[cfg(feature = "tracing")]
@@ -134,9 +134,9 @@ pub enum SqsInstallError {
     /// Invalid config.
     Config(SqsConfigError),
     /// Tokio runtime or AWS client construction failed.
-    Build(String),
+    Build(SqsError),
     /// Tina runtime registration failed.
-    Register(String),
+    Register(ThreadedRuntimeError),
 }
 
 impl std::fmt::Display for SqsInstallError {
@@ -149,7 +149,15 @@ impl std::fmt::Display for SqsInstallError {
     }
 }
 
-impl std::error::Error for SqsInstallError {}
+impl std::error::Error for SqsInstallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(source) => Some(source),
+            Self::Build(source) => Some(source),
+            Self::Register(source) => Some(source),
+        }
+    }
+}
 
 impl From<SqsConfigError> for SqsInstallError {
     fn from(value: SqsConfigError) -> Self {
@@ -450,12 +458,11 @@ impl<S: Shard + Send + 'static> SqsWorker<S> {
     {
         config.validate()?;
         let cap = config.mailbox_capacity;
-        let (worker, metrics) =
-            Self::new(config).map_err(|e| SqsInstallError::Build(e.to_string()))?;
+        let (worker, metrics) = Self::new(config).map_err(SqsInstallError::Build)?;
         let closer = worker.closer();
         let address = runtime
             .register_with_capacity::<_, Infallible>(worker, cap)
-            .map_err(|e| SqsInstallError::Register(format!("{e:?}")))?;
+            .map_err(SqsInstallError::Register)?;
         Ok(InstalledSqsBridge {
             address,
             closer,

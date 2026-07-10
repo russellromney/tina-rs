@@ -86,6 +86,7 @@ enum PendingKind {
     },
     FileRead(Box<PReadCompletion>),
     FileWrite(Box<PWriteCompletion>),
+    FileWriteOwned(Box<PWriteOwnedCompletion>),
     FileFsync(Box<FsyncCompletion>),
     FileSize(Box<SizeCompletion>),
     Mkdir(Box<MkdirCompletion>),
@@ -295,6 +296,36 @@ impl BetelgeuseTcp {
                     Err(result) => Some(DriverCompletion { call_id, result }),
                 }
             }
+            CallInput::FileWriteAtOwned {
+                file,
+                bytes,
+                offset,
+                start,
+            } => {
+                let lane = PendingLane::FileWrite(file);
+                if self.lane_has_pending(lane) {
+                    return Some(DriverCompletion {
+                        call_id,
+                        result: CallOutput::FileWroteOwnedFailed {
+                            bytes,
+                            error: CallError::ResourceBusy,
+                        },
+                    });
+                }
+                match self.arm_file_write_owned(file, bytes, start, offset) {
+                    Ok(pending) => {
+                        self.pending.push(PendingOperation {
+                            call_id,
+                            kind: pending,
+                            lane,
+                            user_cancelled: false,
+                            shutdown_marked: false,
+                        });
+                        None
+                    }
+                    Err(result) => Some(DriverCompletion { call_id, result }),
+                }
+            }
             CallInput::FileFsync { file } => {
                 let lane = PendingLane::FileFsync(file);
                 if self.lane_has_pending(lane) {
@@ -450,7 +481,11 @@ impl BetelgeuseTcp {
                     Err(result) => Some(DriverCompletion { call_id, result }),
                 }
             }
-            CallInput::TcpWriteOwned { stream, bytes } => {
+            CallInput::TcpWriteOwned {
+                stream,
+                bytes,
+                start,
+            } => {
                 let lane = PendingLane::StreamWrite(stream);
                 if self.lane_has_pending(lane) {
                     return Some(DriverCompletion {
@@ -461,7 +496,7 @@ impl BetelgeuseTcp {
                         },
                     });
                 }
-                match self.arm_write_owned(stream, bytes) {
+                match self.arm_write_owned_from(stream, bytes, start) {
                     Ok(pending) => {
                         self.pending.push(PendingOperation {
                             call_id,
@@ -516,6 +551,7 @@ impl BetelgeuseTcp {
             | CallInput::UnixConnect { .. }
             | CallInput::UnixRead { .. }
             | CallInput::UnixWrite { .. }
+            | CallInput::UnixWriteOwned { .. }
             | CallInput::UnixListenerClose { .. }
             | CallInput::UnixStreamClose { .. } => {
                 unreachable!("Unix-domain calls are routed to the dedicated unix lane")
@@ -672,14 +708,6 @@ impl BetelgeuseTcp {
         // The loop yields between steps so a stalled backend cannot pin
         // shutdown forever.
         loop {
-            if self.pending.is_empty() {
-                return;
-            }
-            if Instant::now() >= deadline {
-                return;
-            }
-
-            let _ = self.io_loop.step();
             let mut index = 0;
             while index < self.pending.len() {
                 if self.pending[index].kind.has_result()
@@ -690,6 +718,11 @@ impl BetelgeuseTcp {
                     index += 1;
                 }
             }
+            if self.pending.is_empty() || Instant::now() >= deadline {
+                return;
+            }
+
+            let _ = self.io_loop.step();
         }
     }
 
@@ -885,6 +918,21 @@ impl BetelgeuseTcp {
                 match result {
                     Ok(count) => Some(CallOutput::FileWrote { count }),
                     Err(_) => Some(CallOutput::Failed(CallError::Io)),
+                }
+            }
+            PendingKind::FileWriteOwned(completion) => {
+                if !completion.has_result() {
+                    return None;
+                }
+                let result = completion
+                    .take_result()
+                    .expect("owned pwrite completion advertised a result");
+                match result {
+                    Ok((bytes, count)) => Some(CallOutput::FileWroteOwned { bytes, count }),
+                    Err((_error, bytes)) => Some(CallOutput::FileWroteOwnedFailed {
+                        bytes,
+                        error: CallError::Io,
+                    }),
                 }
             }
             PendingKind::FileFsync(completion) => {
@@ -1163,10 +1211,11 @@ impl BetelgeuseTcp {
         Ok(PendingKind::Write(completion))
     }
 
-    fn arm_write_owned(
+    fn arm_write_owned_from(
         &mut self,
         stream: StreamId,
         bytes: Vec<u8>,
+        start: usize,
     ) -> Result<PendingKind, CallOutput> {
         let Some(entry) = self.streams.iter().find(|entry| entry.id == stream) else {
             return Err(CallOutput::TcpWroteOwnedFailed {
@@ -1174,8 +1223,14 @@ impl BetelgeuseTcp {
                 error: CallError::InvalidResource,
             });
         };
+        if start > bytes.len() {
+            return Err(CallOutput::TcpWroteOwnedFailed {
+                bytes,
+                error: CallError::InvariantViolation,
+            });
+        }
         let mut completion = Box::new(SendOwnedCompletion::new());
-        if let Err((_error, bytes)) = entry.socket.send_owned(&mut completion, bytes) {
+        if let Err((_error, bytes)) = entry.socket.send_owned_from(&mut completion, bytes, start) {
             return Err(CallOutput::TcpWroteOwnedFailed {
                 bytes,
                 error: CallError::Io,
@@ -1252,6 +1307,42 @@ impl BetelgeuseTcp {
         Ok(PendingKind::FileWrite(completion))
     }
 
+    fn arm_file_write_owned(
+        &mut self,
+        file: FileId,
+        bytes: Vec<u8>,
+        start: usize,
+        offset: u64,
+    ) -> Result<PendingKind, CallOutput> {
+        let entry = match self.files.iter().find(|entry| entry.id == file) {
+            Some(entry) => entry,
+            None => {
+                return Err(CallOutput::FileWroteOwnedFailed {
+                    bytes,
+                    error: CallError::InvalidResource,
+                });
+            }
+        };
+        if start > bytes.len() {
+            return Err(CallOutput::FileWroteOwnedFailed {
+                bytes,
+                error: CallError::InvariantViolation,
+            });
+        }
+        let mut completion = Box::new(PWriteOwnedCompletion::new());
+        if let Err((_error, bytes)) =
+            entry
+                .file
+                .pwrite_owned_from(&mut completion, bytes, start, offset)
+        {
+            return Err(CallOutput::FileWroteOwnedFailed {
+                bytes,
+                error: CallError::Io,
+            });
+        }
+        Ok(PendingKind::FileWriteOwned(completion))
+    }
+
     fn arm_file_fsync(&mut self, file: FileId) -> Result<PendingKind, CallOutput> {
         let entry = self
             .files
@@ -1300,6 +1391,7 @@ impl PendingKind {
             Self::UdpRecv { .. } => false,
             Self::FileRead(completion) => completion.has_result(),
             Self::FileWrite(completion) => completion.has_result(),
+            Self::FileWriteOwned(completion) => completion.has_result(),
             Self::FileFsync(completion) => completion.has_result(),
             Self::FileSize(completion) => completion.has_result(),
             Self::Mkdir(completion) => completion.has_result(),

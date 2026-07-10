@@ -542,7 +542,8 @@ where
         let latency_capacity = latency_capacity_for_worker(op_cap, run.workers);
         let handle = thread::spawn(move || -> WorkerObs {
             start_gate.wait();
-            let stop_at = stop_after.map(|d| Instant::now() + d);
+            let stop_at = stop_after
+                .map(|duration| tina::Deadline::from_instant(Instant::now(), duration).instant());
             let mut obs = WorkerObs::with_latency_capacity(latency_capacity);
             let mut current_streak: u64 = 0;
             loop {
@@ -776,6 +777,24 @@ mod tests {
         assert_eq!(report.ops_timeout, 0);
         assert!(!report.leak_checked, "no leak check was supplied");
         assert_eq!(counter.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn maximum_duration_can_be_combined_with_an_operation_cap() {
+        let report = run(
+            LoadRun {
+                workers: 1,
+                stop: LoadStop {
+                    op_count: Some(1),
+                    duration: Some(Duration::MAX),
+                },
+                label: "maximum_duration",
+            },
+            |_| OpOutcome::Ok,
+            None::<fn() -> bool>,
+        );
+        assert_eq!(report.ops_attempted, 1);
+        assert_eq!(report.ops_ok, 1);
     }
 
     #[test]

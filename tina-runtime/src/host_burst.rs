@@ -120,7 +120,7 @@ impl HostBurstOutcomes {
     /// the entire `timeout`.
     pub fn wait_complete(&self, timeout: Duration) -> Result<(), HostBurstWaitError> {
         let target = self.inner.submitted.load(Ordering::Acquire);
-        let deadline = Instant::now() + timeout;
+        let deadline = tina::Deadline::from_instant(Instant::now(), timeout).instant();
         // Sub-millisecond polling: typical bursts resolve in a handful
         // of iterations on a healthy worker, while a stalled worker
         // costs at most ~10k wakeups/s instead of pinning a core.

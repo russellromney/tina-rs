@@ -840,6 +840,7 @@ pub fn restart_skipped_reason_name(reason: RestartSkippedReason) -> &'static str
 /// Stable string name for a [`CallError`].
 pub fn call_error_name(error: CallError) -> &'static str {
     match error {
+        CallError::InvariantViolation => "InvariantViolation",
         CallError::InvalidResource => "InvalidResource",
         CallError::NotFound => "NotFound",
         CallError::Io => "Io",

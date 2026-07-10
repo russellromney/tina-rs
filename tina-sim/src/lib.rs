@@ -105,7 +105,8 @@ where
     /// `Instant` anchor that pairs with `virtual_now` to give the
     /// simulator a same-shape "now" as the live runtime's `Clock`.
     /// Stamped once at construction (from `Instant::now()`) and never
-    /// mutated; handlers see `virtual_anchor + virtual_now`.
+    /// mutated; handlers see `virtual_anchor + virtual_now`, saturated through
+    /// [`tina::Deadline`] when virtual time exceeds `Instant`'s range.
     ///
     /// **Determinism scope.** Within a single simulator run the anchor
     /// is stable, so every `Context::now()` and every `Deadline` built
@@ -136,6 +137,7 @@ where
     pub(crate) pending_unix_accepts: Vec<PendingUnixAccept>,
     pub(crate) pending_unix_connects: Vec<PendingUnixConnect>,
     pub(crate) pending_unix_reads: Vec<PendingUnixRead>,
+    pub(crate) pending_unix_writes: Vec<PendingUnixWrite>,
     pub(crate) file_storage: BTreeMap<PathBuf, Vec<u8>>,
     pub(crate) directories: Vec<PathBuf>,
     pub(crate) pending_accepts: Vec<PendingAccept>,
@@ -227,6 +229,7 @@ where
             pending_unix_accepts: Vec::with_capacity(INITIAL_CALL_CAPACITY),
             pending_unix_connects: Vec::with_capacity(INITIAL_CALL_CAPACITY),
             pending_unix_reads: Vec::with_capacity(INITIAL_CALL_CAPACITY),
+            pending_unix_writes: Vec::with_capacity(INITIAL_CALL_CAPACITY),
             file_storage: BTreeMap::new(),
             directories: Vec::with_capacity(INITIAL_TCP_RESOURCE_CAPACITY),
             pending_accepts: Vec::with_capacity(INITIAL_CALL_CAPACITY),
@@ -294,6 +297,7 @@ where
             || !self.pending_unix_accepts.is_empty()
             || !self.pending_unix_connects.is_empty()
             || !self.pending_unix_reads.is_empty()
+            || !self.pending_unix_writes.is_empty()
     }
 }
 

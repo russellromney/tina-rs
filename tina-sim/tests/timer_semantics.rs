@@ -220,6 +220,37 @@ fn timer_fires_once_after_due_time() {
 }
 
 #[test]
+fn maximum_duration_timer_saturates_and_replays() {
+    let run = || {
+        let observations = Rc::new(RefCell::new(Vec::new()));
+        let mut sim = Simulator::new(
+            TestShard,
+            SimulatorConfig {
+                seed: 12,
+                ..Default::default()
+            },
+        );
+        let sleeper = sim.register(Sleeper {
+            delay: Duration::MAX,
+            observations: Rc::clone(&observations),
+        });
+        sim.try_send(sleeper, TimerMsg::Start).unwrap();
+
+        assert_eq!(sim.step(), 1);
+        sim.advance_time(Duration::MAX);
+        assert_eq!(sim.step(), 1);
+        let observed = observations.borrow().clone();
+        (sim.replay_artifact(), observed)
+    };
+
+    let first = run();
+    let second = run();
+    assert_eq!(first, second, "maximum-duration timer must replay exactly");
+    assert_eq!(first.0.final_time(), Duration::MAX);
+    assert_eq!(first.1, [TimerObservation::Fired]);
+}
+
+#[test]
 fn terminal_stop_completion_records_action_and_stops_in_sim() {
     let observations = Rc::new(RefCell::new(Vec::new()));
     let mut sim = Simulator::new(

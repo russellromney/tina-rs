@@ -76,11 +76,14 @@ impl UnixLane {
         }
         #[cfg(not(unix))]
         {
-            let _ = request;
-            Some(DriverCompletion {
-                call_id,
-                result: CallOutput::Failed(CallError::Unsupported),
-            })
+            let result = match request {
+                CallInput::UnixWriteOwned { bytes, .. } => CallOutput::UnixWroteOwnedFailed {
+                    bytes,
+                    error: CallError::Unsupported,
+                },
+                _ => CallOutput::Failed(CallError::Unsupported),
+            };
+            Some(DriverCompletion { call_id, result })
         }
     }
 
@@ -222,7 +225,7 @@ mod imp {
 
     use betelgeuse::{
         AcceptCompletion, ConnectCompletion, IO, IOLoop, IOLoopHandle, IOSocket, RecvCompletion,
-        SendCompletion,
+        SendCompletion, SendOwnedCompletion,
     };
 
     use super::super::{
@@ -285,6 +288,7 @@ mod imp {
         },
         Read(Box<RecvCompletion>),
         Write(Box<SendCompletion>),
+        WriteOwned(Box<SendOwnedCompletion>),
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,6 +372,29 @@ mod imp {
                         return Some(self.fail(call_id, CallError::ResourceBusy));
                     }
                     match self.arm_write(stream, bytes) {
+                        Ok(kind) => {
+                            self.push_pending(call_id, kind, lane);
+                            None
+                        }
+                        Err(result) => Some(DriverCompletion { call_id, result }),
+                    }
+                }
+                CallInput::UnixWriteOwned {
+                    stream,
+                    bytes,
+                    start,
+                } => {
+                    let lane = PendingLane::StreamWrite(stream);
+                    if self.lane_has_pending(lane) {
+                        return Some(DriverCompletion {
+                            call_id,
+                            result: CallOutput::UnixWroteOwnedFailed {
+                                bytes,
+                                error: CallError::ResourceBusy,
+                            },
+                        });
+                    }
+                    match self.arm_write_owned(stream, bytes, start) {
                         Ok(kind) => {
                             self.push_pending(call_id, kind, lane);
                             None
@@ -512,10 +539,6 @@ mod imp {
             // the per-shard shutdown budget elapses. Each step gives the
             // backend a chance to release ownership of completion slots.
             loop {
-                if self.pending.is_empty() || Instant::now() >= deadline {
-                    return;
-                }
-                let _ = self.io_loop.step();
                 let mut index = 0;
                 while index < self.pending.len() {
                     if self.pending[index].kind.has_result() {
@@ -524,6 +547,10 @@ mod imp {
                         index += 1;
                     }
                 }
+                if self.pending.is_empty() || Instant::now() >= deadline {
+                    return;
+                }
+                let _ = self.io_loop.step();
             }
         }
 
@@ -624,6 +651,21 @@ mod imp {
                     match result {
                         Ok(count) => Some(CallOutput::UnixWrote { count }),
                         Err(_) => Some(CallOutput::Failed(CallError::Io)),
+                    }
+                }
+                PendingKind::WriteOwned(completion) => {
+                    if !completion.has_result() {
+                        return None;
+                    }
+                    let result = completion
+                        .take_result()
+                        .expect("owned send completion advertised a result");
+                    match result {
+                        Ok((bytes, count)) => Some(CallOutput::UnixWroteOwned { bytes, count }),
+                        Err((_error, bytes)) => Some(CallOutput::UnixWroteOwnedFailed {
+                            bytes,
+                            error: CallError::Io,
+                        }),
                     }
                 }
             }
@@ -747,6 +789,39 @@ mod imp {
             }
             Ok(PendingKind::Write(completion))
         }
+
+        fn arm_write_owned(
+            &mut self,
+            stream: UnixStreamId,
+            bytes: Vec<u8>,
+            start: usize,
+        ) -> Result<PendingKind, CallOutput> {
+            let entry = match self.streams.iter().find(|entry| entry.id == stream) {
+                Some(entry) => entry,
+                None => {
+                    return Err(CallOutput::UnixWroteOwnedFailed {
+                        bytes,
+                        error: CallError::InvalidResource,
+                    });
+                }
+            };
+            if start > bytes.len() {
+                return Err(CallOutput::UnixWroteOwnedFailed {
+                    bytes,
+                    error: CallError::InvariantViolation,
+                });
+            }
+            let mut completion = Box::new(SendOwnedCompletion::new());
+            if let Err((_error, bytes)) =
+                entry.socket.send_owned_from(&mut completion, bytes, start)
+            {
+                return Err(CallOutput::UnixWroteOwnedFailed {
+                    bytes,
+                    error: CallError::Io,
+                });
+            }
+            Ok(PendingKind::WriteOwned(completion))
+        }
     }
 
     impl PendingKind {
@@ -756,15 +831,14 @@ mod imp {
                 Self::Connect { completion, .. } => completion.has_result(),
                 Self::Read(completion) => completion.has_result(),
                 Self::Write(completion) => completion.has_result(),
+                Self::WriteOwned(completion) => completion.has_result(),
             }
         }
     }
 
-    // No `Drop` impl on purpose: the Unix lane shares its Betelgeuse loop
-    // with the TCP lane, and `cancel_pending_completions` is a whole-loop
-    // operation only safe before any lane has dropped (see the TLS lane's
-    // note). On a bare runtime drop the lane's boxes and io_loop handle
-    // simply fall; the backend is torn down without dereferencing them.
+    // No `Drop` impl on purpose: the Unix lane shares its Betelgeuse loop with
+    // TCP/storage/TLS. `SharedIoLanes` owns whole-loop cancellation and the
+    // reclaim-or-quarantine decision before any completion storage can drop.
 
     impl std::fmt::Debug for BetelgeuseUnix {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

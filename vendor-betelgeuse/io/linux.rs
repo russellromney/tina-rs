@@ -17,13 +17,30 @@ use log::trace;
 use crate::{
     AcceptCompletion, AcceptOp, CompletionInner, ConnectCompletion, ConnectOp, FsyncCompletion,
     FsyncOp, IO, IOFile, IOLoop, IOSocket, MkdirCompletion, MkdirOp, OpenOptions, Operation,
-    PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, RecvBufCompletion, RecvCompletion,
-    RecvOp, SendCompletion, SendOp, SendOwnedCompletion, SizeCompletion, SizeOp,
+    PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, PWriteOwnedCompletion, RecvBufCompletion,
+    RecvCompletion, RecvOp, SendCompletion, SendOp, SendOwnedCompletion, SizeCompletion, SizeOp,
 };
 
 enum SocketKind {
     Listener,
     Stream,
+}
+
+fn validate_file_range(offset: u64, len: usize) -> io::Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let len = u64::try_from(len).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    i64::try_from(end)
+        .map(|_| ())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+}
+
+fn io_uring_len(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
 }
 
 struct OwnedFd {
@@ -121,6 +138,7 @@ impl IoUringIO {
             Operation::Connect(_) => errno == libc::EINTR,
             Operation::PRead(_)
             | Operation::PWrite(_)
+            | Operation::PWriteOwned(_)
             | Operation::Fsync(_)
             | Operation::Mkdir(_) => errno == libc::EINTR,
             Operation::Size(_) | Operation::Nop => false,
@@ -139,23 +157,29 @@ impl IoUringIO {
                 op.len,
             )
             .build(),
-            Operation::Recv(op) | Operation::RecvBuf(op) => {
-                opcode::Recv::new(types::Fd(op.fd), op.buf.as_mut_ptr(), op.buf.len() as u32)
-                    .flags(op.flags)
-                    .build()
-            }
+            Operation::Recv(op) | Operation::RecvBuf(op) => opcode::Recv::new(
+                types::Fd(op.fd),
+                op.buf.as_mut_ptr(),
+                io_uring_len(op.buf.len()),
+            )
+            .flags(op.flags)
+            .build(),
             Operation::Send(op) | Operation::SendOwned(op) => {
-                opcode::Send::new(types::Fd(op.fd), op.buf.as_ptr(), op.buf.len() as u32)
+                let bytes = &op.buf[op.start..];
+                opcode::Send::new(types::Fd(op.fd), bytes.as_ptr(), io_uring_len(bytes.len()))
                     .flags(op.flags)
                     .build()
             }
-            Operation::PRead(op) => {
-                opcode::Read::new(types::Fd(op.fd), op.buf.as_mut_ptr(), op.buf.len() as u32)
-                    .offset(op.offset)
-                    .build()
-            }
-            Operation::PWrite(op) => {
-                opcode::Write::new(types::Fd(op.fd), op.buf.as_ptr(), op.buf.len() as u32)
+            Operation::PRead(op) => opcode::Read::new(
+                types::Fd(op.fd),
+                op.buf.as_mut_ptr(),
+                io_uring_len(op.buf.len()),
+            )
+            .offset(op.offset)
+            .build(),
+            Operation::PWrite(op) | Operation::PWriteOwned(op) => {
+                let bytes = &op.buf[op.start..];
+                opcode::Write::new(types::Fd(op.fd), bytes.as_ptr(), io_uring_len(bytes.len()))
                     .offset(op.offset)
                     .build()
             }
@@ -170,6 +194,11 @@ impl IoUringIO {
             }
             Operation::Nop => unreachable!("Nop cannot be queued"),
         };
+        // The completion remains at a stable address from submission through
+        // dispatch; runtime drivers keep submitted completions in pinned
+        // `Box` allocations. io_uring returns this identity without
+        // dereferencing it, and dispatch removes it from `inflight` before the
+        // caller may reclaim the completion.
         entry.user_data(c as *mut CompletionInner as u64)
     }
 
@@ -249,6 +278,9 @@ impl IoUringIO {
                     };
                     Ok((mem::take(&mut op.buf), result as usize))
                 };
+                // SAFETY: `SendOwned` can only be armed through a
+                // `SendOwnedCompletion`; the buffer was moved out before the
+                // cast, so completing cannot invalidate a live borrow of it.
                 unsafe { SendOwnedCompletion::from_inner_mut(c) }.complete(r);
             }
             Operation::PRead(_) => {
@@ -270,6 +302,23 @@ impl IoUringIO {
                     Ok(result as usize)
                 };
                 unsafe { PWriteCompletion::from_inner_mut(c) }.complete(r);
+            }
+            Operation::PWriteOwned(_) => {
+                let r = if result < 0 {
+                    let Operation::PWriteOwned(op) = c.operation_mut() else {
+                        unreachable!()
+                    };
+                    Err((io_uring_err(result), mem::take(&mut op.buf)))
+                } else {
+                    let Operation::PWriteOwned(op) = c.operation_mut() else {
+                        unreachable!()
+                    };
+                    Ok((mem::take(&mut op.buf), result as usize))
+                };
+                // SAFETY: `PWriteOwned` can only be armed through a
+                // `PWriteOwnedCompletion`; the buffer was moved out before
+                // the cast, so completing cannot invalidate a live borrow.
+                unsafe { PWriteOwnedCompletion::from_inner_mut(c) }.complete(r);
             }
             Operation::Fsync(_) => {
                 let r = if result < 0 {
@@ -392,6 +441,7 @@ impl IoUringIO {
 
 impl IOFile for IoUringFile {
     fn pread(&self, c: &mut PReadCompletion, len: usize, offset: u64) -> io::Result<()> {
+        validate_file_range(offset, len)?;
         let inner = c.inner_mut();
         inner.prepare(Operation::PRead(PReadOp {
             fd: self.fd.raw(),
@@ -403,10 +453,86 @@ impl IOFile for IoUringFile {
     }
 
     fn pwrite(&self, c: &mut PWriteCompletion, buf: Vec<u8>, offset: u64) -> io::Result<()> {
+        validate_file_range(offset, buf.len())?;
+        if buf.is_empty() {
+            c.inner_mut().prepare(Operation::PWrite(PWriteOp {
+                fd: self.fd.raw(),
+                buf,
+                start: 0,
+                offset,
+            }));
+            c.complete(Ok(0));
+            return Ok(());
+        }
         let inner = c.inner_mut();
         inner.prepare(Operation::PWrite(PWriteOp {
             fd: self.fd.raw(),
             buf,
+            start: 0,
+            offset,
+        }));
+        queue(&self.state, inner);
+        Ok(())
+    }
+
+    fn pwrite_owned(
+        &self,
+        c: &mut PWriteOwnedCompletion,
+        buf: Vec<u8>,
+        offset: u64,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
+        if let Err(error) = validate_file_range(offset, buf.len()) {
+            return Err((error, buf));
+        }
+        if buf.is_empty() {
+            c.inner_mut().prepare(Operation::PWriteOwned(PWriteOp {
+                fd: self.fd.raw(),
+                buf: Vec::new(),
+                start: 0,
+                offset,
+            }));
+            c.complete(Ok((buf, 0)));
+            return Ok(());
+        }
+        let inner = c.inner_mut();
+        inner.prepare(Operation::PWriteOwned(PWriteOp {
+            fd: self.fd.raw(),
+            buf,
+            start: 0,
+            offset,
+        }));
+        queue(&self.state, inner);
+        Ok(())
+    }
+
+    fn pwrite_owned_from(
+        &self,
+        c: &mut PWriteOwnedCompletion,
+        buf: Vec<u8>,
+        start: usize,
+        offset: u64,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
+        if start > buf.len() {
+            return Err((io::Error::from(io::ErrorKind::InvalidInput), buf));
+        }
+        if let Err(error) = validate_file_range(offset, buf.len() - start) {
+            return Err((error, buf));
+        }
+        if start == buf.len() {
+            c.inner_mut().prepare(Operation::PWriteOwned(PWriteOp {
+                fd: self.fd.raw(),
+                buf: Vec::new(),
+                start: 0,
+                offset,
+            }));
+            c.complete(Ok((buf, 0)));
+            return Ok(());
+        }
+        let inner = c.inner_mut();
+        inner.prepare(Operation::PWriteOwned(PWriteOp {
+            fd: self.fd.raw(),
+            buf,
+            start,
             offset,
         }));
         queue(&self.state, inner);
@@ -429,6 +555,9 @@ impl IOFile for IoUringFile {
 }
 
 fn queue(state: &Rc<RefCell<IoUringState>>, c: &mut CompletionInner) {
+    // `NonNull` is an identity token until `submit_queued` builds the SQE. The
+    // caller must keep the completion at a stable address while it is queued,
+    // the same lifetime invariant required while it is in `inflight`.
     state.borrow_mut().queued.push_back(NonNull::from(c));
 }
 
@@ -690,7 +819,12 @@ impl IOSocket for IoUringSocket {
         }
         let inner = c.inner_mut();
         let flags = libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT;
-        inner.prepare(Operation::Send(SendOp { fd, buf, flags }));
+        inner.prepare(Operation::Send(SendOp {
+            fd,
+            buf,
+            start: 0,
+            flags,
+        }));
         queue(&self.state, inner);
         Ok(())
     }
@@ -726,7 +860,44 @@ impl IOSocket for IoUringSocket {
         }
         let inner = c.inner_mut();
         let flags = libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT;
-        inner.prepare(Operation::SendOwned(SendOp { fd, buf, flags }));
+        inner.prepare(Operation::SendOwned(SendOp {
+            fd,
+            buf,
+            start: 0,
+            flags,
+        }));
+        queue(&self.state, inner);
+        Ok(())
+    }
+
+    fn send_owned_from(
+        &self,
+        c: &mut SendOwnedCompletion,
+        buf: Vec<u8>,
+        start: usize,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
+        if start > buf.len() {
+            return Err((io::Error::from(io::ErrorKind::InvalidInput), buf));
+        }
+        let fd = match self.fd.borrow().as_ref() {
+            Some(fd) => fd.raw(),
+            None => {
+                return Err((
+                    io::Error::new(io::ErrorKind::NotConnected, "send called on closed socket"),
+                    buf,
+                ));
+            }
+        };
+        if !matches!(&*self.kind.borrow(), Some(SocketKind::Stream)) {
+            return Err((io::Error::from(io::ErrorKind::InvalidInput), buf));
+        }
+        let inner = c.inner_mut();
+        inner.prepare(Operation::SendOwned(SendOp {
+            fd,
+            buf,
+            start,
+            flags: libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+        }));
         queue(&self.state, inner);
         Ok(())
     }

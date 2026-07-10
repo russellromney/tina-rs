@@ -151,24 +151,30 @@ async fn bridge_drives_real_client_against_real_server_over_tcp() {
 
     // Drive one request through the real Client / bridge and await a real
     // reply. Raw request/decoder (no macro) so the assertion is byte-exact.
+    let spawned_bridge = bridge.clone();
     let reply = tokio::time::timeout(
         Duration::from_secs(5),
-        bridge.call(
-            |corr, reply_to| {
-                Ok::<_, EncodingError>(ClientRequest {
-                    service: "echo".into(),
-                    method: "ping".into(),
-                    payload: b"hello-real-path".to_vec(),
-                    deadline: Duration::from_secs(5),
-                    correlator: corr,
-                    reply_to,
-                })
-            },
-            |bytes: &[u8]| Ok::<_, EncodingError>(bytes.to_vec()),
-        ),
+        tokio::spawn(async move {
+            spawned_bridge
+                .call(
+                    |corr, reply_to| {
+                        Ok::<_, EncodingError>(ClientRequest {
+                            service: "echo".into(),
+                            method: "ping".into(),
+                            payload: b"hello-real-path".to_vec(),
+                            deadline: Duration::from_secs(5),
+                            correlator: corr,
+                            reply_to,
+                        })
+                    },
+                    |bytes: &[u8]| Ok::<_, EncodingError>(bytes.to_vec()),
+                )
+                .await
+        }),
     )
     .await
-    .expect("bridge call must not hang against a live server")
+    .expect("spawned bridge call must not hang against a live server")
+    .expect("spawned bridge task must not panic")
     .expect("real client round trip must return a reply");
 
     assert_eq!(

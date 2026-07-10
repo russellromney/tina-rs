@@ -223,6 +223,7 @@ where
 /// `execute` / `prepare` reject it with
 /// [`SqliteError::Sqlite`]. Use one statement per request.
 #[derive(Debug, Clone)]
+#[must_use = "SQLite requests must be submitted or retained after adding parameters"]
 pub enum SqliteRequest {
     /// Run one row-less statement. Reply carries `rows_changed`.
     Execute {
@@ -465,6 +466,7 @@ impl std::error::Error for SqliteConfigError {}
 /// All three reject any other value at validate time. A pooled form
 /// would lift these pins and inherit the same named caps.
 #[derive(Debug, Clone)]
+#[must_use = "SQLite configuration changes must be retained or installed"]
 pub struct SqliteConfig {
     /// Where to open the SQLite database.
     pub path: SqlitePath,
@@ -638,36 +640,61 @@ impl SqliteConfig {
 }
 
 /// Why install failed. Each variant points at one phase of bring-up.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum InstallError {
     /// Config rejected by [`SqliteConfig::validate`].
     Config(SqliteConfigError),
     /// Could not open the SQLite connection.
-    Open(String),
+    Open(rusqlite::Error),
     /// `busy_timeout` or other connection setup call failed.
-    Setup(String),
+    Setup {
+        /// Setup operation that failed.
+        operation: &'static str,
+        /// Original SQLite error.
+        source: rusqlite::Error,
+    },
     /// One of the configured pragmas failed.
-    Pragma(String),
+    Pragma {
+        /// Configured pragma text.
+        pragma: String,
+        /// Original SQLite error.
+        source: rusqlite::Error,
+    },
     /// Could not spawn the blocking worker thread.
-    Spawn(String),
+    Spawn(std::io::Error),
     /// Tina runtime registration failed.
-    Register(String),
+    Register(tina_runtime::ThreadedRuntimeError),
 }
 
 impl std::fmt::Display for InstallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Config(e) => write!(f, "sqlite bridge install: {e}"),
-            Self::Open(msg) => write!(f, "sqlite bridge install: open: {msg}"),
-            Self::Setup(msg) => write!(f, "sqlite bridge install: setup: {msg}"),
-            Self::Pragma(msg) => write!(f, "sqlite bridge install: pragma: {msg}"),
-            Self::Spawn(msg) => write!(f, "sqlite bridge install: spawn: {msg}"),
-            Self::Register(msg) => write!(f, "sqlite bridge install: register: {msg}"),
+            Self::Open(source) => write!(f, "sqlite bridge install: open: {source}"),
+            Self::Setup { operation, source } => {
+                write!(f, "sqlite bridge install: setup {operation}: {source}")
+            }
+            Self::Pragma { pragma, source } => {
+                write!(f, "sqlite bridge install: pragma {pragma:?}: {source}")
+            }
+            Self::Spawn(source) => write!(f, "sqlite bridge install: spawn: {source}"),
+            Self::Register(source) => write!(f, "sqlite bridge install: register: {source}"),
         }
     }
 }
 
-impl std::error::Error for InstallError {}
+impl std::error::Error for InstallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(source) => Some(source),
+            Self::Open(source) => Some(source),
+            Self::Setup { source, .. } => Some(source),
+            Self::Pragma { source, .. } => Some(source),
+            Self::Spawn(source) => Some(source),
+            Self::Register(source) => Some(source),
+        }
+    }
+}
 
 impl From<SqliteConfigError> for InstallError {
     fn from(e: SqliteConfigError) -> Self {

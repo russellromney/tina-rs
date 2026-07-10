@@ -10,7 +10,9 @@ impl Framer for MyFramer {
     type Frame = Vec<u8>;
     type Malformed = ();
 
-    fn feed(&mut self, _bytes: &[u8]) {}
+    fn feed(&mut self, bytes: &[u8]) -> usize {
+        bytes.len()
+    }
 
     fn next_frame(&mut self) -> FrameDecision<Self::Frame, Self::Malformed> {
         FrameDecision::NeedMore

@@ -590,6 +590,77 @@ fn threaded_runtime_shutdown_rejects_outstanding_tcp_accept_completion() {
     }));
 }
 
+#[test]
+fn native_threaded_zero_drain_shutdown_is_safe_and_bounded() {
+    let published = Arc::new(Mutex::new(None));
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        TestMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 8,
+            idle_wait: Duration::from_millis(1),
+            shutdown_lane_drain_timeout: Duration::ZERO,
+            ..Default::default()
+        },
+    );
+    let worker = runtime
+        .register_with_capacity::<TcpAcceptWorker, _>(
+            TcpAcceptWorker {
+                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+                listener: None,
+                published: Arc::clone(&published),
+                observed: Arc::clone(&observed),
+            },
+            8,
+        )
+        .expect("tcp worker register accepts");
+
+    runtime
+        .try_send(worker, TcpAcceptMsg::Bind)
+        .expect("bind handoff accepted");
+    wait_until(Duration::from_secs(2), "native tcp bind published", || {
+        published.lock().expect("published addr mutex").is_some()
+    });
+    runtime
+        .try_send(worker, TcpAcceptMsg::StartAccept)
+        .expect("accept handoff accepted");
+    wait_until(Duration::from_secs(2), "native tcp accept pending", || {
+        runtime
+            .has_in_flight_calls()
+            .expect("in-flight query succeeds")
+    });
+
+    let shutdown_started = Instant::now();
+    let report = runtime.shutdown_report();
+    let shutdown_elapsed = shutdown_started.elapsed();
+    assert!(
+        shutdown_elapsed < Duration::from_secs(2),
+        "zero-budget shutdown took {shutdown_elapsed:?}"
+    );
+    #[cfg(target_os = "linux")]
+    // A locally queued accept cancels synchronously; an io_uring-submitted
+    // accept may require the bounded quarantine path.
+    assert!(
+        matches!(
+            report.error(),
+            None | Some(ThreadedRuntimeError::DriverShutdownFailed)
+        ),
+        "zero-budget Linux shutdown returned unexpected error: {:?}",
+        report.error()
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        report.error(),
+        None,
+        "kqueue deletes the watch synchronously, so zero-budget shutdown should reclaim immediately"
+    );
+    assert!(
+        observed.lock().expect("observed mutex").is_empty(),
+        "shutdown must not translate the cancelled accept"
+    );
+}
+
 #[derive(Clone)]
 struct StuckReleaseIo {
     state: Arc<Mutex<StuckReleaseState>>,
@@ -698,6 +769,18 @@ impl IOSocket for StuckReleaseSocket {
     ) -> Result<(), (io::Error, Vec<u8>)> {
         Err((
             io::Error::new(io::ErrorKind::Unsupported, "stuck send_owned"),
+            buf,
+        ))
+    }
+
+    fn send_owned_from(
+        &self,
+        _c: &mut SendOwnedCompletion,
+        buf: Vec<u8>,
+        _start: usize,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
+        Err((
+            io::Error::new(io::ErrorKind::Unsupported, "stuck send_owned_from"),
             buf,
         ))
     }

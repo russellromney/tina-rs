@@ -579,6 +579,23 @@ mod replay_case_tests {
     }
 
     #[test]
+    fn storage_write_caps_are_part_of_the_replay_config_hash() {
+        let baseline = ReplayConfig::new();
+        let mut per_write = baseline.clone();
+        per_write.simulator.storage.file_write_cap = Some(7);
+        let mut per_file = baseline.clone();
+        per_file.simulator.storage.max_file_bytes = 7;
+
+        let baseline_hash = replay_config_hash(&baseline);
+        assert_ne!(replay_config_hash(&per_write), baseline_hash);
+        assert_ne!(replay_config_hash(&per_file), baseline_hash);
+        assert_ne!(
+            replay_config_hash(&per_write),
+            replay_config_hash(&per_file)
+        );
+    }
+
+    #[test]
     fn replay_config_with_mailbox_last_call_wins() {
         let cfg = ReplayConfig::new()
             .with_mailbox("sink", 4)

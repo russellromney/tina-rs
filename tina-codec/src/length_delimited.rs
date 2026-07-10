@@ -74,10 +74,9 @@ pub enum MalformedLengthReason {
 /// hidden allocation: the caller chooses [`LengthPrefix`] and
 /// `max_body_len`.
 ///
-/// `feed` only buffers raw bytes. `next_frame` walks the parser
-/// state machine: it consumes the prefix, checks the body length
-/// against the configured cap *before* any body bytes are
-/// allocated, then drains the body and returns it as a frame.
+/// `feed` buffers at most the current prefix or body and reports bytes consumed.
+/// `next_frame` advances the parser state, checks the body length against the
+/// configured cap *before* body allocation, and moves a completed body out.
 #[derive(Debug, Clone)]
 pub struct LengthDelimitedFramer {
     prefix: LengthPrefix,
@@ -118,38 +117,25 @@ impl LengthDelimitedFramer {
 
     /// Push received bytes into the parser.
     ///
-    /// Bytes are buffered; parsing happens in [`Self::next_frame`].
-    /// The buffer is hard-capped at `prefix_width + max_body_len`:
-    /// once that cap is reached, additional bytes are dropped and
-    /// [`Self::next_frame`] will return [`FrameDecision::Full`] for
-    /// the offending frame.
-    ///
-    /// Note on the cap: the bound includes one prefix width so a frame
-    /// at exactly `max_body_len` plus its prefix fits. When residual
-    /// bytes for a *following* frame are already buffered, the cap is
-    /// measured against current buffer occupancy, so a maximal frame
-    /// arriving while up to `prefix_width` trailing bytes are buffered
-    /// can be truncated and reported `Full` `prefix_width` bytes early.
-    /// This errs strict (never under-strict): a frame is never accepted
-    /// past the cap. The real authority is the body-length check in
-    /// [`Self::next_frame`], which rejects an oversized *declared*
-    /// length before allocating any body bytes regardless of buffering.
-    pub fn feed(&mut self, bytes: impl AsRef<[u8]>) {
+    /// Bytes are buffered only until the current prefix or body is complete;
+    /// parsing happens in [`Self::next_frame`]. Returns the number of input
+    /// bytes consumed. Use [`crate::decode_chunk`] to alternate feeding and
+    /// draining until an entire coalesced transport chunk has been consumed.
+    #[must_use = "retain and resubmit unconsumed bytes, or use decode_chunk"]
+    pub fn feed(&mut self, bytes: impl AsRef<[u8]>) -> usize {
         if self.overflowed || self.poisoned {
-            return;
+            return 0;
         }
         let chunk = bytes.as_ref();
         if chunk.is_empty() {
-            return;
+            return 0;
         }
-        let max_buffered = self.prefix.width().saturating_add(self.max_body_len);
-        let room = max_buffered.saturating_sub(self.buffer.len());
-        if chunk.len() > room {
-            self.buffer.extend_from_slice(&chunk[..room]);
-            self.overflowed = true;
-        } else {
-            self.buffer.extend_from_slice(chunk);
-        }
+        let target = self
+            .expected_body_len
+            .unwrap_or_else(|| self.prefix.width());
+        let consumed = target.saturating_sub(self.buffer.len()).min(chunk.len());
+        self.buffer.extend_from_slice(&chunk[..consumed]);
+        consumed
     }
 
     /// Try to extract the next complete frame.
@@ -173,7 +159,7 @@ impl LengthDelimitedFramer {
                 self.buffer.clear();
                 return FrameDecision::Full;
             }
-            self.buffer.drain(..width);
+            self.buffer.clear();
             self.expected_body_len = Some(body_len as usize);
         }
         // We have a decoded body length; pull the body bytes if ready.
@@ -186,7 +172,7 @@ impl LengthDelimitedFramer {
             }
             return FrameDecision::NeedMore;
         }
-        let frame: Vec<u8> = self.buffer.drain(..body_len).collect();
+        let frame = std::mem::take(&mut self.buffer);
         self.expected_body_len = None;
         FrameDecision::Frame(frame)
     }
@@ -261,37 +247,44 @@ pub fn encode_into(prefix: LengthPrefix, body: &[u8], into: &mut Vec<u8>) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DecodeStatus, decode_chunk};
 
     #[test]
     fn decodes_one_frame() {
         let mut framer = LengthDelimitedFramer::new(LengthPrefix::U16, 64);
-        framer.feed([0u8, 5, b'h', b'e', b'l', b'l', b'o']);
-        match framer.next_frame() {
-            FrameDecision::Frame(body) => assert_eq!(body, b"hello"),
-            other => panic!("unexpected decision: {other:?}"),
-        }
-        assert_eq!(framer.next_frame(), FrameDecision::NeedMore);
+        let mut frames = Vec::new();
+        let status = decode_chunk(
+            &mut framer,
+            &[0u8, 5, b'h', b'e', b'l', b'l', b'o'],
+            |frame| frames.push(frame),
+        );
+        assert_eq!(frames, [b"hello".to_vec()]);
+        assert_eq!(status, DecodeStatus::NeedMore);
     }
 
     #[test]
     fn decodes_back_to_back_frames() {
         let mut framer = LengthDelimitedFramer::new(LengthPrefix::U8, 64);
-        framer.feed([3, b'f', b'o', b'o', 4, b'q', b'u', b'u', b'x']);
-        assert_eq!(framer.next_frame(), FrameDecision::Frame(b"foo".to_vec()));
-        assert_eq!(framer.next_frame(), FrameDecision::Frame(b"quux".to_vec()));
-        assert_eq!(framer.next_frame(), FrameDecision::NeedMore);
+        let mut frames = Vec::new();
+        let status = decode_chunk(
+            &mut framer,
+            &[3, b'f', b'o', b'o', 4, b'q', b'u', b'u', b'x'],
+            |frame| frames.push(frame),
+        );
+        assert_eq!(frames, [b"foo".to_vec(), b"quux".to_vec()]);
+        assert_eq!(status, DecodeStatus::NeedMore);
     }
 
     #[test]
     fn split_prefix_and_body() {
         let mut framer = LengthDelimitedFramer::new(LengthPrefix::U16, 64);
-        framer.feed([0u8]);
+        let _ = framer.feed([0u8]);
         assert_eq!(framer.next_frame(), FrameDecision::NeedMore);
-        framer.feed([5u8]);
+        let _ = framer.feed([5u8]);
         assert_eq!(framer.next_frame(), FrameDecision::NeedMore);
-        framer.feed(b"he");
+        let _ = framer.feed(b"he");
         assert_eq!(framer.next_frame(), FrameDecision::NeedMore);
-        framer.feed(b"llo");
+        let _ = framer.feed(b"llo");
         assert_eq!(framer.next_frame(), FrameDecision::Frame(b"hello".to_vec()));
     }
 
@@ -299,10 +292,10 @@ mod tests {
     fn rejects_frame_too_large_before_allocation() {
         let mut framer = LengthDelimitedFramer::new(LengthPrefix::U16, 4);
         // Announces 8-byte body; cap is 4. Reject before any body byte is read.
-        framer.feed([0u8, 8]);
+        let _ = framer.feed([0u8, 8]);
         assert_eq!(framer.next_frame(), FrameDecision::Full);
-        // Further feeds are dropped.
-        framer.feed(b"AAAAAAAA");
+        // Further feeds are ignored after the terminal decision.
+        let _ = framer.feed(b"AAAAAAAA");
         assert_eq!(framer.next_frame(), FrameDecision::Full);
     }
 
@@ -310,32 +303,36 @@ mod tests {
     fn valid_frame_before_oversize_frame_is_delivered_intact() {
         // A complete valid frame, then an oversize declaration (5 > cap 4).
         let mut framer = LengthDelimitedFramer::new(LengthPrefix::U8, 4);
-        framer.feed([3u8, b'a', b'b', b'c', 5u8, b'X']);
-        // The good frame comes out clean first...
-        assert_eq!(framer.next_frame(), FrameDecision::Frame(b"abc".to_vec()));
-        // ...and only the oversize frame is rejected. The malformed tail did
-        // not corrupt the valid frame that preceded it.
-        assert_eq!(framer.next_frame(), FrameDecision::Full);
+        let mut frames = Vec::new();
+        let status = decode_chunk(&mut framer, &[3, b'a', b'b', b'c', 5, b'X'], |frame| {
+            frames.push(frame);
+        });
+        assert_eq!(frames, [b"abc".to_vec()]);
+        assert_eq!(status, DecodeStatus::Full);
     }
 
     #[test]
     fn rejects_frame_at_cap_plus_one() {
         let mut framer = LengthDelimitedFramer::new(LengthPrefix::U8, 4);
-        framer.feed([5u8]);
+        let _ = framer.feed([5u8]);
         assert_eq!(framer.next_frame(), FrameDecision::Full);
     }
 
     #[test]
     fn accepts_frame_at_exact_cap() {
         let mut framer = LengthDelimitedFramer::new(LengthPrefix::U8, 4);
-        framer.feed([4u8, b'a', b'b', b'c', b'd']);
-        assert_eq!(framer.next_frame(), FrameDecision::Frame(b"abcd".to_vec()));
+        let mut frames = Vec::new();
+        let status = decode_chunk(&mut framer, &[4, b'a', b'b', b'c', b'd'], |frame| {
+            frames.push(frame);
+        });
+        assert_eq!(frames, [b"abcd".to_vec()]);
+        assert_eq!(status, DecodeStatus::NeedMore);
     }
 
     #[test]
     fn empty_body_frame_is_valid() {
         let mut framer = LengthDelimitedFramer::new(LengthPrefix::U8, 8);
-        framer.feed([0u8]);
+        let _ = framer.feed([0u8]);
         assert_eq!(framer.next_frame(), FrameDecision::Frame(Vec::new()));
     }
 
@@ -348,7 +345,7 @@ mod tests {
     #[test]
     fn finish_partial_prefix_is_malformed() {
         let mut framer = LengthDelimitedFramer::new(LengthPrefix::U16, 64);
-        framer.feed([1u8]); // only half a u16 prefix
+        let _ = framer.feed([1u8]); // only half a u16 prefix
         assert_eq!(
             framer.finish(),
             FrameDecision::Malformed(MalformedLengthReason::UnexpectedEof)
@@ -358,7 +355,9 @@ mod tests {
     #[test]
     fn finish_partial_body_is_malformed() {
         let mut framer = LengthDelimitedFramer::new(LengthPrefix::U16, 64);
-        framer.feed([0u8, 5, b'h', b'e']);
+        let _ = framer.feed([0u8, 5]);
+        assert_eq!(framer.next_frame(), FrameDecision::NeedMore);
+        let _ = framer.feed(b"he");
         assert_eq!(
             framer.finish(),
             FrameDecision::Malformed(MalformedLengthReason::UnexpectedEof)
@@ -373,8 +372,10 @@ mod tests {
         assert_eq!(buffer, [0u8, 5, b'h', b'e', b'l', b'l', b'o']);
 
         let mut framer = LengthDelimitedFramer::new(LengthPrefix::U16, 64);
-        framer.feed(&buffer);
-        assert_eq!(framer.next_frame(), FrameDecision::Frame(b"hello".to_vec()));
+        let mut frames = Vec::new();
+        let status = decode_chunk(&mut framer, &buffer, |frame| frames.push(frame));
+        assert_eq!(frames, [b"hello".to_vec()]);
+        assert_eq!(status, DecodeStatus::NeedMore);
     }
 
     #[test]
@@ -390,10 +391,9 @@ mod tests {
     fn buffer_does_not_grow_past_cap_under_flood() {
         let mut framer = LengthDelimitedFramer::new(LengthPrefix::U8, 4);
         for _ in 0..10 {
-            framer.feed(b"AAAAAAAAA");
+            let _ = framer.feed(b"AAAAAAAAA");
         }
-        // Cap = prefix(1) + body(4) = 5
-        assert!(framer.buffered() <= 5);
+        assert!(framer.buffered() <= framer.prefix().width());
     }
 
     #[test]
@@ -413,10 +413,16 @@ mod tests {
             framer: &mut F,
             bytes: &[u8],
         ) -> Option<Vec<u8>> {
-            framer.feed(bytes);
-            match framer.next_frame() {
-                FrameDecision::Frame(frame) => Some(frame),
-                _ => None,
+            let mut remaining = bytes;
+            loop {
+                match framer.next_frame() {
+                    FrameDecision::Frame(frame) => return Some(frame),
+                    FrameDecision::NeedMore if !remaining.is_empty() => {
+                        let consumed = framer.feed(remaining);
+                        remaining = &remaining[consumed..];
+                    }
+                    _ => return None,
+                }
             }
         }
         let mut framer = LengthDelimitedFramer::new(LengthPrefix::U8, 16);

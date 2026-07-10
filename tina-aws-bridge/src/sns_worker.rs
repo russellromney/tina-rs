@@ -16,7 +16,7 @@ use aws_sdk_sns::primitives::Blob;
 use aws_sdk_sns::types::MessageAttributeValue;
 use tina::CallContext;
 use tina::prelude::*;
-use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, sleep};
+use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeError, sleep};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 #[cfg(feature = "tracing")]
@@ -133,9 +133,9 @@ pub enum SnsInstallError {
     /// Invalid config.
     Config(SnsConfigError),
     /// Tokio runtime or AWS client construction failed.
-    Build(String),
+    Build(SnsError),
     /// Tina runtime registration failed.
-    Register(String),
+    Register(ThreadedRuntimeError),
 }
 
 impl std::fmt::Display for SnsInstallError {
@@ -148,7 +148,15 @@ impl std::fmt::Display for SnsInstallError {
     }
 }
 
-impl std::error::Error for SnsInstallError {}
+impl std::error::Error for SnsInstallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(source) => Some(source),
+            Self::Build(source) => Some(source),
+            Self::Register(source) => Some(source),
+        }
+    }
+}
 
 impl From<SnsConfigError> for SnsInstallError {
     fn from(value: SnsConfigError) -> Self {
@@ -446,12 +454,11 @@ impl<S: Shard + Send + 'static> SnsWorker<S> {
     {
         config.validate()?;
         let cap = config.mailbox_capacity;
-        let (worker, metrics) =
-            Self::new(config).map_err(|e| SnsInstallError::Build(e.to_string()))?;
+        let (worker, metrics) = Self::new(config).map_err(SnsInstallError::Build)?;
         let closer = worker.closer();
         let address = runtime
             .register_with_capacity::<_, Infallible>(worker, cap)
-            .map_err(|e| SnsInstallError::Register(format!("{e:?}")))?;
+            .map_err(SnsInstallError::Register)?;
         Ok(InstalledSnsBridge {
             address,
             closer,

@@ -48,7 +48,8 @@ use tina_rpc::{
     ClientMsg, ClientRequest, ClientResult, ClientResultMsg, EncodingError, FrameError,
 };
 use tina_runtime::{
-    MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedSendObservedError, ThreadedTrySendError,
+    MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeError, ThreadedSendObservedError,
+    ThreadedTrySendError,
 };
 
 #[cfg(feature = "tracing")]
@@ -124,6 +125,67 @@ impl BridgeError {
 
     fn is_retryable_timeout(&self) -> bool {
         matches!(self, Self::Timeout)
+    }
+}
+
+/// Error returned while constructing a [`BridgeClient`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeBuildError {
+    /// The bridge admission limit was zero.
+    ZeroMaxInFlight,
+    /// The underlying client's in-flight limit was smaller than the bridge's.
+    ClientCapacityTooSmall {
+        /// Bridge admission limit.
+        bridge_max_in_flight: usize,
+        /// Underlying client admission limit.
+        client_max_in_flight: usize,
+    },
+    /// The capacities could not be added to size the reply shim mailbox.
+    ShimCapacityOverflow {
+        /// Bridge admission limit.
+        bridge_max_in_flight: usize,
+        /// Underlying client admission limit.
+        client_max_in_flight: usize,
+    },
+    /// The reply shim could not be registered with the runtime.
+    ShimRegistration(ThreadedRuntimeError),
+}
+
+impl std::fmt::Display for BridgeBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroMaxInFlight => {
+                f.write_str("rpc bridge max_in_flight must be greater than zero")
+            }
+            Self::ClientCapacityTooSmall {
+                bridge_max_in_flight,
+                client_max_in_flight,
+            } => write!(
+                f,
+                "rpc client max_in_flight {client_max_in_flight} is smaller than bridge max_in_flight {bridge_max_in_flight}",
+            ),
+            Self::ShimCapacityOverflow {
+                bridge_max_in_flight,
+                client_max_in_flight,
+            } => write!(
+                f,
+                "rpc bridge shim capacity overflows usize: {client_max_in_flight} + {bridge_max_in_flight}",
+            ),
+            Self::ShimRegistration(error) => {
+                write!(f, "rpc bridge reply shim could not be registered: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BridgeBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ShimRegistration(error) => Some(error),
+            Self::ZeroMaxInFlight
+            | Self::ClientCapacityTooSmall { .. }
+            | Self::ShimCapacityOverflow { .. } => None,
+        }
     }
 }
 
@@ -365,7 +427,7 @@ where
     slots: Arc<Semaphore>,
     next_correlator: AtomicU64,
     send_and_observe: SendAndObserve,
-    _shard: std::marker::PhantomData<S>,
+    _shard: std::marker::PhantomData<fn() -> S>,
 }
 
 impl<S> BridgeClient<S>
@@ -409,18 +471,19 @@ where
         client_addr: Address<ClientMsg>,
         max_in_flight: usize,
         client_max_in_flight: usize,
-    ) -> Result<Self, BridgeError>
+    ) -> Result<Self, BridgeBuildError>
     where
         F: MailboxFactory + Send + Clone + 'static,
     {
-        assert!(
-            max_in_flight > 0,
-            "BridgeClient::new requires max_in_flight > 0",
-        );
-        assert!(
-            client_max_in_flight >= max_in_flight,
-            "BridgeClient::new requires client_max_in_flight ({client_max_in_flight}) >= max_in_flight ({max_in_flight})",
-        );
+        if max_in_flight == 0 {
+            return Err(BridgeBuildError::ZeroMaxInFlight);
+        }
+        if client_max_in_flight < max_in_flight {
+            return Err(BridgeBuildError::ClientCapacityTooSmall {
+                bridge_max_in_flight: max_in_flight,
+                client_max_in_flight,
+            });
+        }
         let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
         let slots = Arc::new(Semaphore::new(max_in_flight));
         let shim = ReplyShim::<S> {
@@ -432,12 +495,15 @@ where
         // fan-out bound), not the bridge's, plus headroom for the bridge's
         // own admitted-in-flight replies. A full close burst can never
         // overflow the shim and drop a live reply.
-        let shim_mailbox = client_max_in_flight
-            .checked_add(max_in_flight)
-            .expect("BridgeClient::new client_max_in_flight + max_in_flight overflows usize");
+        let shim_mailbox = client_max_in_flight.checked_add(max_in_flight).ok_or(
+            BridgeBuildError::ShimCapacityOverflow {
+                bridge_max_in_flight: max_in_flight,
+                client_max_in_flight,
+            },
+        )?;
         let shim_addr = runtime
             .register_with_capacity::<ReplyShim<S>, Infallible>(shim, shim_mailbox)
-            .map_err(|_| BridgeError::ClientUnavailable)?;
+            .map_err(BridgeBuildError::ShimRegistration)?;
         // We keep the runtime in a closure rather than carrying
         // `<S, F>` through `BridgeClient`'s public type. The
         // closure erases the runtime's generics at the API
@@ -834,7 +900,9 @@ where
                 last_err = Some(err);
                 let delay = policy.delay.duration_for_attempt(attempt);
                 if !delay.is_zero() {
-                    tokio::time::sleep(delay).await;
+                    let deadline = tina::Deadline::from_instant(std::time::Instant::now(), delay);
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline.instant()))
+                        .await;
                 }
             }
         }
@@ -856,6 +924,16 @@ mod tests {
         assert_eq!(p.attempts, 3);
         assert!(p.on_full);
         assert!(!p.on_timeout);
+    }
+
+    #[test]
+    fn bridge_build_registration_error_preserves_runtime_source() {
+        let error = BridgeBuildError::ShimRegistration(ThreadedRuntimeError::WorkerStopped);
+        let source = std::error::Error::source(&error).expect("typed runtime source");
+        assert_eq!(
+            source.downcast_ref::<ThreadedRuntimeError>(),
+            Some(&ThreadedRuntimeError::WorkerStopped),
+        );
     }
 
     #[test]
@@ -1002,6 +1080,40 @@ mod tests {
         .unwrap();
         assert_eq!(result, 3);
         assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn maximum_retry_delay_parks_without_panicking() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let attempts = Arc::new(AtomicU32::new(0));
+        let policy = RetryPolicy {
+            attempts: 2,
+            delay: RetryDelay::Fixed(Duration::MAX),
+            on_full: true,
+            on_timeout: false,
+        };
+        let task_attempts = Arc::clone(&attempts);
+        let task = tokio::spawn(async move {
+            call_with_retry::<_, _, ()>(&policy, move || {
+                let attempts = Arc::clone(&task_attempts);
+                async move {
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                    Err(BridgeError::Full)
+                }
+            })
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert!(
+            !task.is_finished(),
+            "maximum retry delay should park rather than panic or retry"
+        );
+        task.abort();
+        assert!(task.await.expect_err("aborted task").is_cancelled());
     }
 
     #[test]
