@@ -1,10 +1,6 @@
 # Tina User Guide
 
-Grug guide for using Tina.
-
-This guide is for builders. That includes humans and LLM sessions. It should
-answer "what shape should I write?" before anyone has to read five examples and
-guess.
+Guide for building services with Tina's current public API.
 
 Tina is small machine:
 
@@ -16,14 +12,12 @@ Tina is small machine:
 - overload should say `Full`, `Closed`, or `Timeout`
 - same isolate should run live and in simulation
 
-The rule: docs teach the Tina model. Specimen examples test the model.
-
-If you are an LLM session, or reviewing code written by one, read
-[Agent Quickstart](00-agent-quickstart.md) first. It is the short checklist.
+The rule: user docs teach the Tina model. The repository's specimen examples
+are an R&D corpus used to test the model and discover API problems; they are
+not yet a curated tutorial.
 
 Read in order if new:
 
-0. [Agent Quickstart](00-agent-quickstart.md)
 1. [Mental Model](01-mental-model.md)
 2. [First Isolate](02-first-isolate.md)
 3. [Effects And Runtime Calls](03-effects-and-runtime-calls.md)
@@ -53,23 +47,22 @@ Read in order if new:
 27. [Which Noun Do I Use?](27-which-noun-do-i-use.md)
 28. [Outbound Clients: Endpoint → Policy → Manager](28-outbound-clients.md)
 29. [Continuation Flows](29-continuation-flows.md)
-30. [Bridge Author Kit (copied path)](30-bridge-author-kit.md)
+30. [Bridge Author Kit](30-bridge-author-kit.md)
 
-The reading order separates **learn core** (pages 0–17, 19, 21) from
+[Agent Quickstart](00-agent-quickstart.md) is a compact checklist for coding
+agents and contributors who already understand the model.
+
+The reading order separates **learn core** (pages 1–17, 19, 21) from
 **choose batteries** (pages 18, 20, 22, 25, 28, plus 23–24 which explain the
 boundary itself). New users should not need to read battery docs to
 understand Tina core.
 
-For runnable specimens, see repo-root `examples/`.
+For the smallest runnable program, use
+[`tina-runtime/examples/hello_world.rs`](../../tina-runtime/examples/hello_world.rs).
+When in doubt, prefer a plain message enum, a small state struct, and a handler
+that returns one explicit effect.
 
-If Tina feels awkward, record the paper cut in `examples/FINDINGS.md` or a
-focused design note. Docs explain the current blessed shape. Docs are not the
-paper-cut inbox.
-
-The docs are intentionally plain. When in doubt, prefer a boring message enum,
-a boring state struct, and a boring handler that returns one explicit effect.
-
-## Pekka Questions
+## Runtime Questions
 
 If someone with a runtime/substrate brain reads Tina, they will ask:
 
@@ -81,7 +74,7 @@ If someone with a runtime/substrate brain reads Tina, they will ask:
 - What perf claim is proved, and what is only possible later?
 
 The short answer: Tina owns semantics and resource truth; Betelgeuse is the
-canonical portable live I/O substrate; `tina-sim` is the deterministic oracle;
-Linux uses Betelgeuse's native backend, and macOS uses Betelgeuse's native
-backend. Tina does not plan a duplicate I/O substrate unless Betelgeuse cannot
-satisfy a named Tina contract.
+canonical portable live I/O substrate; `tina-sim` is the deterministic oracle.
+Linux and macOS use their Betelgeuse platform backends. Named bounded fallback
+lanes remain for blocking DNS/process work and storage metadata operations not
+provided by the substrate.

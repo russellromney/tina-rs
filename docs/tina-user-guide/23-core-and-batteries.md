@@ -14,10 +14,10 @@ A new user should be able to read just the core docs and the first three core
 crates to understand what Tina is. HTTP, databases, AWS, and bridge crates are
 batteries on top of the same nouns — not prerequisites.
 
-## The four layers
+## The shipped layers
 
-Tina ships as four layers of crates. They depend in one direction: batteries
-depend on core, never the other way.
+Tina's shipped crates fall into four dependency layers. Batteries depend on
+core, never the other way. Test and R&D support is listed separately.
 
 ### 1. Core model crates
 
@@ -85,7 +85,7 @@ and pressure visible while letting Tokio speak the wire format.
 Bridges plug into runtime hooks (install, closer, metrics, pressure,
 classifier) just like official batteries.
 
-### 5. Test, proof, and specimen support
+### Test, proof, and specimen support
 
 Not a runtime layer but worth naming so newcomers do not mistake it for the
 core:
@@ -150,13 +150,11 @@ path.
 
 1. Read [Mental Model](01-mental-model.md), [First Isolate](02-first-isolate.md),
    [Effects And Runtime Calls](03-effects-and-runtime-calls.md).
-2. Run a specimen that uses only core + runtime — e.g.
-   `examples/specimen_persistent_counter` or
-   `examples/specimen_supervised_worker`.
+2. Run `cargo run --locked -p tina-runtime --example hello_world`.
 3. Open `tina::prelude` in your editor and read the names. That is the
    working vocabulary.
 4. When you actually need HTTP, gRPC, SQL, or AWS, pick the battery, read
    its short page, and follow its closer/pressure/replay rules.
 
-You should not have to read `tina-http` to learn what a `Call` effect is.
-If a doc makes that necessary, it is a bug — file it on `examples/FINDINGS.md`.
+You should not have to read `tina-http` or an R&D specimen to learn what a
+`Call` effect is.

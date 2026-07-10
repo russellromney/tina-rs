@@ -77,8 +77,8 @@ caller handles timeout
 The caller always writes `call(...).then(...)`. The service picks how it
 answers. Three shapes cover almost everything:
 
-- **Same turn.** The service can answer from the handler that received the
-  request. Return `reply(value)`.
+- **Same turn.** The service can answer from `handle_call`. Consume the
+  `CallContext` with `call.reply(value)`.
 - **More than one turn.** The service must do one runtime call before it can
   answer. Use `call_ctx.defer(work).reply(...)`.
 - **A pipeline.** The service does several runtime calls in sequence. Use
@@ -87,17 +87,28 @@ answers. Three shapes cover almost everything:
 Reach for the first that fits. The rest of this page is those three shapes,
 then the lower-level tools for when they do not fit.
 
-## Same Turn: `reply`
+## Same Turn: `call.reply`
 
-The worker declares a reply type and returns `reply(...)` from the handler that
-received the message.
+The worker declares a reply type and consumes the visible `CallContext`.
 
 ```rust
 #[tina::isolate(message = WorkerMsg, reply = WorkerReply, shard = AppShard)]
 impl Worker {
-    fn handle(&mut self, msg: WorkerMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        _msg: WorkerMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
+        noop()
+    }
+
+    fn handle_call(
+        &mut self,
+        msg: WorkerMsg,
+        call: CallContext<'_, Self>,
+    ) -> Effect<Self> {
         match msg {
-            WorkerMsg::Run(job) => reply(self.run(job)),
+            WorkerMsg::Run(job) => call.reply(self.run(job)),
         }
     }
 }
@@ -148,7 +159,11 @@ enum ServiceMsg {
 
 #[tina_runtime::isolate(message = ServiceMsg, reply = StoreReply, shard = AppShard)]
 impl StoreService {
-    fn handle(&mut self, msg: ServiceMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ServiceMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ServiceMsg::Store(_) => noop(),
 

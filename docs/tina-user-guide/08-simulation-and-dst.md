@@ -1,14 +1,12 @@
 # Simulation And DST
 
-Tina runs the same isolate code live and in simulation.
-
-That is the big testing bet.
+Tina runs the same isolate code live and in simulation. That is the central
+testing bet.
 
 ```text
-same seed, same story
-saved seed, saved bug
 seed alone is not replay
-seed + config + history + expected trace shape is replay
+version + config + initial state + history identifies a deterministic run
+seed selects choices only inside enabled perturbation axes
 ```
 
 Sim proves state-machine interleavings. Live proves physics.
@@ -16,8 +14,24 @@ Sim proves state-machine interleavings. Live proves physics.
 That line is exact, and worth being precise about. The simulator is
 single-threaded on purpose — that is *why* replay works. It proves **logical**
 interleavings: the order messages arrive, timers wake, mailboxes fill, children
-restart, and I/O completes. Same `(seed, config, history)`, same trace,
+restart, and I/O completes. Under one simulator version, the same complete
+configuration, initial state, and materialized history produce the same trace
 byte-for-byte.
+
+`SimulatorConfig::seed` is not a global "randomize everything" switch. It is an
+input to perturbation modes enabled under `FaultConfig`. With the default
+configuration every seeded mode is `None`, so changing only the seed normally
+changes nothing. Current seeded axes are:
+
+- within-round ready-isolate order (`SchedulerFaultMode::PermuteReadyOrder`);
+- local-send delivery delay;
+- timer-wake delay;
+- TCP-completion delay or ready-completion reordering.
+
+Scripted TCP, UDP, DNS, TLS, signal, process, and storage behavior is configured
+separately; Unix simulation has explicit per-stream caps. A different seed may
+select the same choices, and it cannot affect an axis the workload never
+exercises.
 
 It does **not** prove **physical** memory ordering on the live parallel
 substrate. Events across shards interleave freely there; that is physics, not a
@@ -28,9 +42,9 @@ live on a separate, tiny shared-memory surface that loom checks instead — see
 ## What Sim Gives You
 
 - deterministic time
-- deterministic scheduling
-- seeded faults (timer wake delay, local-send delay, TCP completion delay)
-- byte-for-byte replay of saved seeds
+- deterministic baseline scheduling
+- opt-in seeded scheduler, send, timer, and TCP perturbations
+- byte-for-byte replay of a saved complete case
 - scripted I/O for TCP, UDP, DNS, TLS, signals, processes, storage faults
 - tiny tests for ugly interleavings
 
@@ -47,9 +61,9 @@ For the first five you still need real I/O and real processes. The last one is
 different: shared-nothing isolates keep the cross-thread shared-memory surface
 tiny, and the custom lock-free structures on it — the SPSC mailbox and
 `SharedCapacityScope` — are proven by loom models, not by the simulator. The
-verified surface and the guard that keeps it honest are recorded in
-[`.intent/SYSTEM.md`](../../.intent/SYSTEM.md) ("Shared-memory race surface")
-and [`.intent/race-surface-allowlist.txt`](../../.intent/race-surface-allowlist.txt).
+machine-checked inventory and classification of that surface lives in
+[`.intent/race-surface-allowlist.txt`](../../.intent/race-surface-allowlist.txt);
+the lock-free structures have focused loom models.
 
 ## The Workflow
 
@@ -58,10 +72,10 @@ DST is not one huge random test. It is a normal debug loop:
 ```text
 1. write service logic once
 2. run it in sim with an explicit history
-3. sweep seeds locally to find a bad one
-4. save the bad seed as a ReplayCase
+3. enable relevant perturbation axes and sweep seeds to find a bad run
+4. save the full failing configuration and history as a `ReplayCase`
 5. shrink the history while the bug still reproduces
-6. commit the saved ReplayCase as a regression test
+6. commit the saved `ReplayCase` with a semantic regression assertion
 7. live tests still cover physics
 ```
 
@@ -281,8 +295,9 @@ whether behavior changed or only trace vocabulary/order changed.
 
 ## Sweep Seeds Locally
 
-`sweep_seeds` is the hand-cranked search for a bad seed. It is not
-QuickCheck.
+`sweep_seeds` is the hand-cranked search for a bad seed. It is not QuickCheck,
+and it is inert unless the case enables a seeded perturbation axis that the
+workload reaches.
 
 ```rust
 use tina_sim::dst::sweep_seeds;
@@ -629,7 +644,7 @@ Good Tina simulation targets:
 
 ## See Also
 
-- `examples/specimen_replay_dst` — the copyable specimen.
+- `examples/specimen_replay_dst` — an R&D replay specimen.
 - `tina_sim::dst` module — `History`, `ReplayCase` (with `new` /
   `expecting` / `simulator_config`), `ReplayReport` (with
   `from_case_and_events` / `pinned_constants`), `ReplayConfig` (with

@@ -9,9 +9,9 @@
 # genuine cross-thread structure before it lands.
 #
 # Surrogate proof: catches additions to the surface; does not prove the
-# existing set race-free (the per-structure loom models do that). See
-# `.intent/race-surface-allowlist.txt` and `.intent/SYSTEM.md`
-# ("Shared-memory race surface").
+# existing set race-free (the per-structure loom models do that). The
+# classifications and model locations live in
+# `.intent/race-surface-allowlist.txt`.
 #
 set -euo pipefail
 

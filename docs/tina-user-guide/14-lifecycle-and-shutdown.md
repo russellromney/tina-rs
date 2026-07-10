@@ -140,7 +140,7 @@ the helper stays at `Draining` until the runtime tears the controller down.
 
 ## Service Shutdown Skeleton
 
-`examples/systems/mini_saas_api` has the current copyable local-service
+`examples/systems/mini_saas_api` is the current R&D proof of this local-service
 shutdown order:
 
 1. Begin the controller `DrainState` so the next public request reads

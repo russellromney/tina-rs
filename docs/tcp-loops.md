@@ -17,7 +17,7 @@ effect and later one continuation message.
 
 ## Same-Stream Batch Caveat
 
-`tina::batch(...)` (and `tina::batch(...)`) execute effects in
+`tina::batch(...)` executes effects in
 source order, but they do **not** serialize calls that target the same
 I/O resource. Two writes against the same stream in one batch still
 compete for the same write lane. The second one returns

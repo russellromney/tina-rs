@@ -467,8 +467,9 @@ clear.
 The north star is not merely "actor-style services." It is bounded services
 with deterministic simulation and replay of logical interleavings as a
 first-class design constraint. Physical memory ordering is the honest
-exception: it is loom-checked on a small enumerated shared-memory surface, not
-replayed (`.intent/SYSTEM.md`). New capabilities must preserve:
+exception: it is loom-checked on the small shared-memory surface enumerated in
+`.intent/race-surface-allowlist.txt`, not replayed. New capabilities must
+preserve:
 
 - bounded admission or explicit bounded-exception policy
 - typed `Full` / `Closed` / `Timeout` / cancel outcomes

@@ -1,48 +1,49 @@
 # Service Client Worked Example
 
-This page shows the important pattern:
+A service client may need several runtime I/O turns before it can answer one
+caller. The caller authority must move through those continuation messages; an
+ordinary `then(...)` continuation does not preserve it automatically.
+
+The shape is:
 
 ```text
 one caller call
-client service does many runtime I/O turns
-client service replies once
-caller sees CallOutcome
+client captures caller authority while starting I/O
+each continuation carries the RequestContext
+one terminal continuation replies or rejects
+caller still owns the outer timeout
 ```
 
-This is the shape for HTTP clients, RPC clients, database clients, gRPC
-clients, and other outbound services.
+## Public Call
 
-Native gRPC now follows this rule: `GrpcClient` is a small wrapper over the
-native `Http2ClientConnection` service, while `GrpcRouter` is the server.
-Host-only blocking helpers remain test conveniences; production Tina code
-should use service-shaped clients so pressure, cancellation, and protocol
-facts stay visible.
-
-## Public Call Shape
-
-Caller code should look boring:
+Caller code remains a normal bounded isolate call:
 
 ```rust
 call(http_client, HttpClientMsg::Fetch(request), Duration::from_secs(2))
     .then(AppMsg::HttpReturned)
 ```
 
-The caller does not spawn a temporary child. It calls a service.
+The client does not spawn a temporary child or retain an application-owned
+oneshot channel.
 
-## Client Service State Machine
+## Client State Machine
 
-Simplified sketch:
+This sketch omits HTTP framing details so the authority path stays visible:
 
 ```rust
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum HttpClientMsg {
     Fetch(HttpRequest),
-    Connected(Result<StreamId, CallError>, HttpRequest),
-    Wrote(Result<usize, CallError>),
-    Read(Result<Vec<u8>, CallError>),
+    Connected(
+        RequestContext<HttpClientReply>,
+        Result<StreamId, CallError>,
+        HttpRequest,
+    ),
+    Wrote(RequestContext<HttpClientReply>, Result<usize, CallError>),
+    Read(RequestContext<HttpClientReply>, Result<Vec<u8>, CallError>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum HttpClientReply {
     Response(HttpResponse),
     Failed(HttpClientError),
@@ -51,7 +52,6 @@ enum HttpClientReply {
 struct HttpClient {
     target: SocketAddr,
     stream: Option<StreamId>,
-    response_buf: Vec<u8>,
 }
 
 #[tina_runtime::isolate(
@@ -63,128 +63,91 @@ impl HttpClient {
     fn handle(
         &mut self,
         msg: HttpClientMsg,
-        _ctx: &mut Context<'_, AppShard>,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            HttpClientMsg::Fetch(request) => {
-                tcp_connect(self.target)
-                    .then(|result| HttpClientMsg::Connected(result, request))
-            }
+            HttpClientMsg::Fetch(_) => noop(),
 
-            HttpClientMsg::Connected(Ok(stream), request) => {
+            HttpClientMsg::Connected(request, Ok(stream), outbound) => {
                 self.stream = Some(stream);
-                let bytes = encode_request(request);
-                tcp_write(stream, bytes).then(HttpClientMsg::Wrote)
+                tcp_write(stream, encode_request(outbound)).then_with_request(
+                    request,
+                    HttpClientMsg::Wrote,
+                )
+            }
+            HttpClientMsg::Connected(request, Err(_), _) => {
+                reply_to(request, HttpClientReply::Failed(HttpClientError::Connect))
             }
 
-            HttpClientMsg::Connected(Err(_), _request) => {
-                reply(HttpClientReply::Failed(HttpClientError::Connect))
-            }
-
-            HttpClientMsg::Wrote(Ok(_)) => {
+            HttpClientMsg::Wrote(request, Ok(_)) => {
                 let stream = self.stream.expect("connected before write");
-                tcp_read(stream, 8192).then(HttpClientMsg::Read)
+                tcp_read(stream, 8192).then_with_request(request, HttpClientMsg::Read)
+            }
+            HttpClientMsg::Wrote(request, Err(_)) => {
+                reply_to(request, HttpClientReply::Failed(HttpClientError::Write))
             }
 
-            HttpClientMsg::Wrote(Err(_)) => {
-                reply(HttpClientReply::Failed(HttpClientError::Write))
+            HttpClientMsg::Read(request, Ok(bytes)) => match decode_response(bytes) {
+                Ok(response) => reply_to(request, HttpClientReply::Response(response)),
+                Err(_) => reply_to(
+                    request,
+                    HttpClientReply::Failed(HttpClientError::Parse),
+                ),
+            },
+            HttpClientMsg::Read(request, Err(_)) => {
+                reply_to(request, HttpClientReply::Failed(HttpClientError::Read))
             }
+        }
+    }
 
-            HttpClientMsg::Read(Ok(bytes)) => {
-                self.response_buf.extend(bytes);
-                match try_parse_response(&self.response_buf) {
-                    Ok(Some(response)) => reply(HttpClientReply::Response(response)),
-                    Ok(None) => {
-                        let stream = self.stream.expect("connected before read");
-                        tcp_read(stream, 8192).then(HttpClientMsg::Read)
-                    }
-                    Err(_err) => reply(HttpClientReply::Failed(HttpClientError::Parse)),
-                }
-            }
-
-            HttpClientMsg::Read(Err(_)) => {
-                reply(HttpClientReply::Failed(HttpClientError::Read))
-            }
+    fn handle_call(
+        &mut self,
+        msg: HttpClientMsg,
+        call: CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        match msg {
+            HttpClientMsg::Fetch(request) => call
+                .defer(tcp_connect(self.target))
+                .reply(move |caller, result| {
+                    HttpClientMsg::Connected(caller, result, request)
+                }),
+            _ => call.reject(CallRejectedReason::UnsupportedMessage),
         }
     }
 }
 ```
 
-The example is intentionally incomplete. It omits close, body limits, write-all
-state, redirects, keep-alive, and pooling.
+The first `call.defer(...).reply(...)` consumes the current `CallContext` and
+creates the first continuation carrying `RequestContext<HttpClientReply>`.
+Later runtime calls use `then_with_request(...)` to move that same one-shot
+authority forward. Every terminal branch consumes it with `reply_to(...)`.
 
-The important truth is complete: the original caller can get a reply after
-`tcp_connect`, `tcp_write`, and one or more `tcp_read` continuations.
+For a single runtime call, prefer the shorter
+`call.defer(work).reply(Continuation)` form. For longer workflows, keep the
+request context in every continuation or use `tina::flow!` when its generated
+step vocabulary fits.
 
-## Timeout Still Belongs To Caller
+## Timeout And Cancellation
 
-The caller owns the outer deadline:
+The caller's timeout is still mandatory. If it expires, a later `reply_to`
+cannot resurrect the call; the runtime records the late terminal outcome. A
+client that needs to stop physical work too should retain the matching
+cancelable call handle and close it through the explicit cancellation path.
 
-```rust
-call(http_client, HttpClientMsg::Fetch(request), Duration::from_secs(2))
-    .then(AppMsg::HttpReturned)
-```
+Do not interpret a Tina call timeout as proof that the kernel, a database
+library, or a bridged SDK stopped executing. Each runtime rail and bridge
+documents its cancellation strength separately.
 
-If the client service takes too long, the caller receives `CallOutcome::Timeout`.
+## Production Details
 
-The client service may later finish. Tina should discard the late reply visibly.
+A real HTTP client must additionally own:
 
-## Pool Shape
+- bounded request and response bodies;
+- partial-write and incremental-read loops;
+- connection reuse and retirement;
+- per-stage and outer deadlines;
+- close and shutdown reporting;
+- protocol facts and simulator support.
 
-One client isolate is sequential. That is fine.
-
-For parallel outbound work, use explicit topology:
-
-```text
-App -> ClientPoolFrontend -> HttpClient worker 0
-                        -> HttpClient worker 1
-                        -> HttpClient worker N
-```
-
-The pool frontend is still one address:
-
-```rust
-call(pool, PoolMsg::Fetch(request), timeout).then(AppMsg::HttpReturned)
-```
-
-Pressure remains visible at the pool mailbox, worker mailboxes, in-flight
-limits, and caller timeout.
-
-## What Not To Do
-
-Avoid this as the default service-client shape:
-
-```text
-spawn one temporary client child
-give it a callback address
-route result back manually
-```
-
-That may be useful for a special topology. It is not the normal Tina service
-shape.
-# Service Client Worked Example
-
-For a full HTTP + DB + outbound client service shape, start with
-`examples/systems/mini_saas_api`.
-
-The key path is:
-
-```text
-POST /items/{id}/notify
-  -> controller uses call_ctx.defer(SQLite query).reply(...)
-  -> acquire native tina-http keepalive lease
-  -> POST /notify upstream
-  -> release lease as Reuse
-  -> reply to original HTTP caller
-```
-
-Exact commands:
-
-```sh
-cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml
-cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- smoke
-cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- pressure
-```
-
-The system README contains the route table, capacity table, readiness meanings,
-shutdown order, and out-of-scope list.
+Use the native `tina-http` client for HTTP rather than reproducing this sketch.
+The sketch exists to explain caller authority across multiple turns.

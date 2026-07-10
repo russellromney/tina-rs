@@ -31,11 +31,23 @@ struct Counter {
 
 #[tina_runtime::isolate(message = CounterMsg, reply = CounterReply, shard = AppShard)]
 impl Counter {
-    fn handle(&mut self, msg: CounterMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        _msg: CounterMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
+        noop()
+    }
+
+    fn handle_call(
+        &mut self,
+        msg: CounterMsg,
+        call: CallContext<'_, Self>,
+    ) -> Effect<Self> {
         match msg {
             CounterMsg::Add(n) => {
                 self.value += n;
-                reply(CounterReply::Value(self.value))
+                call.reply(CounterReply::Value(self.value))
             }
         }
     }
@@ -72,12 +84,13 @@ This is the right shape for:
 Do not turn these into spawn-and-route-back helpers just because the answer is
 not immediate. Tina can carry the reply context through continuation chains.
 
-## Production Service Skeleton
+## Production-Shaped R&D System
 
-The copyable service skeleton lives in
-`examples/systems/mini_saas_api`.
+`examples/systems/mini_saas_api` is the current production-shaped R&D system.
+It is useful evidence for how the pieces compose, but it is not yet a stable
+user template.
 
-It assembles the blessed local-service layers:
+It assembles these local-service layers:
 
 | Layer | Skeleton choice |
 | --- | --- |
