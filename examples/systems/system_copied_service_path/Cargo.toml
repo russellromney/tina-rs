@@ -7,7 +7,7 @@ publish = false
 [workspace]
 
 [dependencies]
-tina-http = { path = "../../../tina-http" }
+anyhow = "1"
+tina = { path = "../../../tina" }
 tina-proof-harness = { path = "../../../tina-proof-harness" }
 tina-runtime = { path = "../../../tina-runtime" }
-tina-sim = { path = "../../../tina-sim" }
