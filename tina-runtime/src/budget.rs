@@ -47,7 +47,7 @@ use crate::service_pressure::{ServicePressureReport, ServiceSurfaceState};
 /// invalidate a saved replay case.
 pub const BUDGET_SCHEMA_VERSION: u32 = 1;
 
-/// What a budget surface bounds. Closed set for this phase: a new
+/// What a budget surface bounds. Closed set for now: a new
 /// kind is a deliberate vocabulary change, not a free-text string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetKind {

@@ -1,11 +1,11 @@
 //! Signal-driven shutdown composes through
 //! `ShutdownChoreography`.
 //!
-//! The plan requires "signal-driven shutdown works in live runtime." The
-//! lifecycle helper is data; the actual signal capture lives in the
-//! runtime's signal driver (Unix SIGINT/SIGTERM). What needs proving is
-//! that the helper composes correctly when triggered from a separate
-//! thread, which is the signal-handler shape.
+//! Signal-driven shutdown must work in the live runtime. The lifecycle
+//! helper is data; the actual signal capture lives in the runtime's signal
+//! driver (Unix SIGINT/SIGTERM). What needs proving is that the helper
+//! composes correctly when triggered from a separate thread, which is the
+//! signal-handler shape.
 //!
 //! This test uses `ThreadedShutdownHandle` (the cloneable, cross-thread
 //! shutdown trigger) as the signal-handler

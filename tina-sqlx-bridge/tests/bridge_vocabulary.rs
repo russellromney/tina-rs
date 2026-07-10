@@ -109,10 +109,9 @@ fn pressure_report_renders_into_shared_bridge_pressure_with_installed_capacity()
 
 #[test]
 fn pressure_unavailable_carries_explicit_reason() {
-    // The plan says missing surfaces are reported, never silently
-    // omitted. The shared vocab's `unavailable` constructor enforces
-    // this — a bad name returns Err rather than letting the dashboard
-    // drift.
+    // Missing surfaces are reported, never silently omitted. The shared
+    // vocab's `unavailable` constructor enforces this — a bad name returns
+    // Err rather than letting the dashboard drift.
     let s = BridgePressure::unavailable(PG_BRIDGE_SURFACE, "no client supplied").unwrap();
     assert_eq!(s.name, PG_BRIDGE_SURFACE);
     let line = s.discovery_line();

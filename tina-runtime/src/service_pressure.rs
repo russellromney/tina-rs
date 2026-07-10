@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn unavailable_surfaces_are_listed_explicitly() {
-        // Critical: Rock 1 says missing surfaces are *explicit*
+        // Critical: missing surfaces are *explicit*
         // `Unavailable`, never silently omitted.
         let mut r = ServicePressureReport::new("billing");
         r.add_unavailable("billing.bridge", "bridge", "stub");

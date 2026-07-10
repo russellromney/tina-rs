@@ -618,7 +618,7 @@ fn downstream_consumer_sees_isolate_call_completion_rejected_when_requester_mail
 
 #[test]
 fn downstream_consumer_sees_call_cancelled_owner_stopped_when_requester_stops() {
-    // Rock 5: stopping a requester with a pending call now emits
+    // Stopping a requester with a pending call emits
     // `CallCancelled { OwnerStopped }`. The worker's later reply is
     // rejected as `CallReplyRejected { NoPendingCall }` because the
     // pending entry was already cleaned up.

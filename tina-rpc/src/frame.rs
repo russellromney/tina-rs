@@ -27,7 +27,7 @@
 //! format. Generic serde formats (postcard, bincode) read varint or fixed
 //! lengths and call `Vec::with_capacity(declared_length)` *before* reading
 //! the body bytes, which lets a few bytes on the wire force a multi-gigabyte
-//! allocation. The plan's "decode before allocate" rule rules that out.
+//! allocation. Decode-before-allocate rules that out.
 //!
 //! # No public wire compatibility promise
 //!

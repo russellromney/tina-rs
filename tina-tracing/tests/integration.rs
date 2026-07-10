@@ -135,7 +135,7 @@ fn evt(id: u64, cause: Option<u64>, kind: RuntimeEventKind) -> RuntimeEvent {
 }
 
 // ---------------------------------------------------------------------------
-// Lifecycle / handler / supervisor mapping (Rock 2)
+// Lifecycle / handler / supervisor mapping
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -310,7 +310,7 @@ fn restart_child_lifecycle_carries_ordinal_and_generations() {
 }
 
 // ---------------------------------------------------------------------------
-// Pressure mapping (Rock 3)
+// Pressure mapping
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -488,7 +488,7 @@ fn deferred_reply_capture_send_drop_keep_correlation() {
 }
 
 // ---------------------------------------------------------------------------
-// Call / resource correlation (Rock 4)
+// Call / resource correlation
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -692,7 +692,7 @@ fn trace_retention_variants_are_referenced_for_doc_compile() {
 }
 
 // ---------------------------------------------------------------------------
-// Live snapshot helper-name mapping (Rock 5, lightweight)
+// Live snapshot helper-name mapping
 // ---------------------------------------------------------------------------
 //
 // `LiveTopologyReport` constructors are crate-private in tina-runtime,

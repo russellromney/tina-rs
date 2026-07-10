@@ -5,7 +5,7 @@
 //! - bounded admission for `ThreadedRuntime::call_blocking` and the new
 //!   `ThreadedMultiShardRuntime::call_blocking`.
 //! - `ThreadedShutdownHandle::{request_shutdown, wait_report}` against
-//!   the pinned contract in `.intent/phases/102-host-control-ergonomics/plan.md`.
+//!   the pinned shutdown-handle contract.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -257,7 +257,7 @@ fn multi_runtime(
     )
 }
 
-// ------------------------- Rock 1: bounded admission -------------------------
+// ------------------------- bounded admission -------------------------
 
 #[test]
 fn single_shard_call_blocking_returns_command_full_when_queue_saturated() {
@@ -502,7 +502,7 @@ fn multi_shard_call_blocking_panics_on_unknown_shard() {
     let _ = runtime.shutdown();
 }
 
-// ------------------------- Rock 2: ThreadedShutdownHandle -------------------
+// ------------------------- ThreadedShutdownHandle -------------------
 
 #[test]
 fn shutdown_handle_request_then_wait_returns_terminal_report_without_consuming_runtime() {

@@ -165,8 +165,8 @@ fn saved_replay_proof_http2_reset_under_flow_pressure() {
 }
 
 // A synthetic isolate that emits one HTTP/2, one WebSocket, and one gRPC
-// fact in a single turn. Phase 114 Rock 8 needs the named projection
-// helpers to keep only their family in a trace that mixes all three.
+// fact in a single turn. Named projection helpers must keep only their
+// family in a trace that mixes all three.
 #[derive(Debug, Clone, Copy)]
 enum MixedMsg {
     EmitAll,

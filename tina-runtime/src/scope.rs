@@ -725,7 +725,7 @@ where
 
 // ---------- ScopedRequestReport ----------
 
-/// One rail a request used that Tina cannot scope-cancel in this phase.
+/// One rail a request used that Tina cannot scope-cancel today.
 ///
 /// A rail with no cancel handle — a fire-and-forget send, a buffered body
 /// already consumed, a bridge that accepted work without a cancel token —
@@ -766,7 +766,7 @@ pub struct ScopedRequestReport {
     /// Tombstoned timers that fired after cancel and were ignored. Sourced
     /// from [`ScopedTimerSet::ignored_late`](crate::scope_timer::ScopedTimerSet::ignored_late).
     pub timers_ignored_late: u64,
-    /// Rails that could not be scope-cancelled in this phase.
+    /// Rails that could not be scope-cancelled today.
     pub unsupported: Vec<UnsupportedScopeRow>,
 }
 

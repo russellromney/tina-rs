@@ -1370,8 +1370,8 @@ mod tests {
     fn stuck_child_close_produces_typed_timeout_in_terminal_report() {
         // Integration-shaped scenario: a service drives the canonical
         // shutdown sequence and one resource (the outbound pool here)
-        // is stuck. The plan's "shutdown with stuck child returns a
-        // timeout report" requirement is met by:
+        // is stuck. Shutdown with a stuck child must return a timeout
+        // report, which is met by:
         //
         //   * `ServiceShutdownReport::clean` is `false`
         //   * exactly one step has `StepOutcome::Timeout`

@@ -321,9 +321,9 @@ fn fill_cancel_refill_reclaims_capacity() {
 
 // ---------- Timeout-driven cleanup proof ----------
 //
-// 072 plan rule: "every stored handle must have a completion,
-// cancellation, or *timeout* continuation that removes its key."
-// The cancel path is exercised above. This test pins the timeout path:
+// Every stored handle must have a completion, cancellation, or *timeout*
+// continuation that removes its key. The cancel path is exercised above.
+// This test pins the timeout path:
 // the driver fires calls with a short call timeout against a worker
 // that will not finish in time, the runtime delivers
 // `CallOutcome::Timeout` to the translator, the translator removes the

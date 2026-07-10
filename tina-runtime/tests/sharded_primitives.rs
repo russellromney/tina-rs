@@ -431,7 +431,7 @@ impl Isolate for ShardedMap {
                 // Reads must re-check placement too. Returning `None`
                 // when the request landed on the wrong shard would make a
                 // routing bug indistinguishable from a real absent key —
-                // exactly the partial-failure fog this phase rejects.
+                // exactly the partial-failure fog this API rejects.
                 if let Err(w) = self.placement.require_owner_str(&key, ctx.shard_id()) {
                     return send(
                         reply_to,

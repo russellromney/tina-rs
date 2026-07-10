@@ -251,7 +251,7 @@ fn try_send_outcome_marks_mailbox_closed_after_stop() {
     let _ = runtime.shutdown();
 }
 
-// ---------- send_observed_until (Rock 4) ----------
+// ---------- send_observed_until ----------
 
 #[test]
 fn send_observed_until_succeeds_immediately_when_mailbox_has_room() {
@@ -308,11 +308,10 @@ fn send_observed_until_returns_closed_when_target_stopped() {
 
 #[test]
 fn send_observed_until_past_deadline_returns_timeout_without_attempting() {
-    // Phase-062 P2-2: with a past deadline at entry, the helper must
-    // not enqueue a command (which would race with the bounded recv
-    // and risk delivering the message *and* reporting Timeout). It
-    // must return Timeout up-front so the caller knows the side
-    // effect did not happen.
+    // With a past deadline at entry, the helper must not enqueue a
+    // command (which would race with the bounded recv and risk delivering
+    // the message *and* reporting Timeout). It must return Timeout
+    // up-front so the caller knows the side effect did not happen.
     let runtime = make_runtime();
     let processed = Arc::new(AtomicU32::new(0));
     let worker = runtime

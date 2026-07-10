@@ -1587,7 +1587,7 @@ fn shutdown_runtime(
 //
 // These are Tina-only rows (`comparison_baseline=none`): a fair hyper/tonic or
 // tungstenite baseline would dwarf the row and make semantic equality a lie, so
-// the plan keeps the first form Tina-only. Each row drives the *real* Tina
+// the first form stays Tina-only. Each row drives the *real* Tina
 // server isolate (Http2Listener / HttpListener+WebSocket gateway) over a raw
 // socket client, exactly like the HTTP/1 rows drive the real server over a raw
 // `TcpStream`. Allocation counts include the raw client work inside the row
@@ -3101,11 +3101,11 @@ pub fn websocket_text_round_trip_app_turns(messages: usize) -> anyhow::Result<u6
 
 /// Deterministic WebSocket capacity-fill pressure probe.
 ///
-/// The plan allows replacing a timing-sensitive `slow_peer_pressure` row with a
-/// deterministic capacity-fill that uses the public send path and proves *typed*
-/// pressure without sleeping on a slow client. Each op opens a fresh session and
-/// sends one `overfill` text; the echo reply is larger than the session's
-/// bounded `max_queued_outbound_bytes`, so the connection raises a typed
+/// Replaces a timing-sensitive `slow_peer_pressure` row with a deterministic
+/// capacity-fill that uses the public send path and proves *typed* pressure
+/// without sleeping on a slow client. Each op opens a fresh session and sends
+/// one `overfill` text; the echo reply is larger than the session's bounded
+/// `max_queued_outbound_bytes`, so the connection raises a typed
 /// `SessionPressure` to the app and closes without writing the over-cap frame.
 ///
 /// Two independent facts are asserted: the client sees the closed/no-echo signal

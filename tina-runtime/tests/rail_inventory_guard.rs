@@ -110,8 +110,8 @@ fn guard_fails_on_new_offlist_bypass_primitive() {
 fn guard_fails_on_new_blocking_unix_socket() {
     let fx = unique_dir("unix");
     let driver = fx.join("driver");
-    // A regression of exactly the thing Phase 140 removed: a hidden std
-    // blocking Unix-domain socket lane, not inventoried.
+    // Regression: a hidden std blocking Unix-domain socket lane that is
+    // not inventoried must be rejected.
     write(
         &driver.join("unix.rs"),
         "use std::os::unix::net::UnixListener;\nfn lane() { let _ = UnixListener::bind(\"/tmp/x\"); }\n",

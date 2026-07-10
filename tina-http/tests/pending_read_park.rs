@@ -28,9 +28,8 @@ fn pending_tcp_read_is_serviced_by_bounded_explicit_repoll() {
     // Let the accept settle so the worker is idling with a pending recv.
     std::thread::sleep(Duration::from_millis(50));
 
-    // While the peer is silent the worker re-polls explicitly. This is the
-    // intended Phase 157 behavior: the pending read is not serviced by a hidden
-    // cross-thread I/O wake channel.
+    // While the peer is silent the worker re-polls explicitly. The pending
+    // read is not serviced by a hidden cross-thread I/O wake channel.
     let before = harness.runtime_handle().park_wakeups();
     std::thread::sleep(Duration::from_millis(80));
     let idle_wakeups = harness.runtime_handle().park_wakeups() - before;

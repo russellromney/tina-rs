@@ -21,8 +21,7 @@
 //! Admission backpressure surfaces on the `call`-side future as
 //! `Err(Full)`, never as `Pending`. This is deliberate: Tina ingress
 //! cannot back-press a Tower readiness check without an unbounded
-//! wait, and the plan rule is that bridges show pressure rather than
-//! hide it.
+//! wait, and bridges must show pressure rather than hide it.
 //!
 //! # Use
 //!

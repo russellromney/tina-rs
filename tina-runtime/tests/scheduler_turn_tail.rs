@@ -1,6 +1,6 @@
-//! Rock 2 proofs: the bounded worker hot-drain and the pending-work-aware
-//! park. These pin behaviour, not wall-clock perf (the perf_native hot-path
-//! probes own the timing rows). The idle-CPU wake-count proof lives in the
+//! Proofs for the bounded worker hot-drain and the pending-work-aware park.
+//! These pin behaviour, not wall-clock perf (the perf_native hot-path probes
+//! own the timing rows). The idle-CPU wake-count proof lives in the
 //! soak/CPU-sanity work; here we prove the park *policy*:
 //!
 //! - a pending runtime timer is serviced at `idle_repoll_interval`, not the

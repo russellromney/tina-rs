@@ -200,7 +200,7 @@ pub fn flatten_outcome(outcome: ReqwestCallOutcome) -> Result<ReqwestResponse, R
     }
 }
 
-// ---------- Classification (Phase 062 Rock 6) ----------
+// ---------- Classification ----------
 
 /// Three-way classification of a [`ReqwestCallOutcome`].
 ///

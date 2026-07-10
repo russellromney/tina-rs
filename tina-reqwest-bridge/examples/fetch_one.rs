@@ -1,6 +1,5 @@
 //! Small Tina service that fetches one URL through the reqwest bridge
-//! and prints the outcome. The shape mirrors `call(...).then(...)`
-//! from the plan.
+//! and prints the outcome. The shape is ordinary `call(...).then(...)`.
 //!
 //! Run with:
 //!

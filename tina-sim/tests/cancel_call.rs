@@ -3,8 +3,7 @@
 //! must also satisfy (see `tina-runtime/tests/cancel_call.rs` for the
 //! live-runtime parity smoke tests).
 //!
-//! Coverage map (keep in sync with the 066 plan's Rock 2/3/5 proof
-//! lists):
+//! Coverage map:
 //! - cancel before delivery → `Cancelled` + `CallCancelled { CallerCancelled }`
 //! - cancel after deferred capture → `DeferredReplyRejected { CallerCancelled }`
 //! - cancel after settle → `AlreadyCompleted`
@@ -669,8 +668,8 @@ fn cancel_admit_cycle_does_not_leak_capacity() {
     // matching pairs of CallDispatchAttempted and a terminal outcome
     // for each cycle.
     //
-    // This pins Plan Rock 3's "fill table, cancel/drop/complete all
-    // entries, then admit new entries without stale `Full`" proof item.
+    // Fill table, cancel/drop/complete all entries, then admit new
+    // entries without stale `Full`.
     let (mut sim, driver, _worker, observations) = build();
 
     const CYCLES: usize = 32;

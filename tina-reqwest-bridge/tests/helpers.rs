@@ -155,7 +155,7 @@ fn from_reqwest_error_into_reqwest_call_error() {
     ));
 }
 
-// ---------- classify (Phase 062 Rock 6) ----------
+// ---------- classify ----------
 
 fn response_with_status(status: http::StatusCode) -> ReqwestResponse {
     ReqwestResponse {

@@ -1045,10 +1045,10 @@ fn cancel_on_timeout_config_is_noop_until_connection_quarantine_exists() {
         None => return,
     };
     let runtime = make_runtime();
-    // Phase 123 deliberately disables DB-side pg_cancel_backend(pid):
-    // the old sidecar could race connection reuse and cancel a later
-    // query on the same backend. The config remains accepted for
-    // compatibility, but timeout means "Tina stopped waiting."
+    // DB-side pg_cancel_backend(pid) is deliberately disabled: the old
+    // sidecar could race connection reuse and cancel a later query on the
+    // same backend. The config remains accepted for compatibility, but
+    // timeout means "Tina stopped waiting."
     let cfg = PgConfig::new()
         .with_pool(
             PgPoolConfig::new(&url)

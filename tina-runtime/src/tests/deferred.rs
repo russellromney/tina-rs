@@ -1,9 +1,9 @@
 //! Runtime tests for deferred reply slots.
 //!
-//! Cover lifecycle facts the plan calls out: capture, send, drop,
-//! caller-closed, and double-reply rejection. Live and sim must agree
-//! on the externally visible meaning, so each scenario is named for the
-//! semantic fact the trace must carry.
+//! Cover lifecycle facts: capture, send, drop, caller-closed, and
+//! double-reply rejection. Live and sim must agree on the externally
+//! visible meaning, so each scenario is named for the semantic fact the
+//! trace must carry.
 
 use std::cell::RefCell;
 use std::convert::Infallible;

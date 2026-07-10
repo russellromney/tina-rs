@@ -62,7 +62,7 @@ const BLUE_WHALE_CHECKLIST: &[BlueWhaleItem] = &[
     BlueWhaleItem {
         name: "scheduler groups",
         status: BlueWhaleStatus::Future,
-        evidence: "cooperative turn fairness is pinned; service-class weights are not in this phase",
+        evidence: "cooperative turn fairness is pinned; service-class weights are not shipped yet",
     },
     BlueWhaleItem {
         name: "DST/replay",

@@ -1,8 +1,7 @@
 //! Deterministic simulation for tina-rpc framed calls.
 //!
 //! These tests wire the [`tina_rpc::Client`] isolate against the simulator's
-//! scripted-TCP layer to exercise end-to-end framed-RPC scenarios required
-//! by the phase plan:
+//! scripted-TCP layer to exercise end-to-end framed-RPC scenarios:
 //!
 //! - reply before timeout
 //! - out-of-order replies
@@ -406,7 +405,7 @@ fn client_observed_wire_request_matches_frame_codec() {
     );
 }
 
-/// Plan rule: "saved seed for at least one reordered history."
+/// Saved seed for at least one reordered history.
 ///
 /// The "saved seed" is the fixed `SimulatorConfig` plus the pinned
 /// message-injection sequence below; together they fully determine the
