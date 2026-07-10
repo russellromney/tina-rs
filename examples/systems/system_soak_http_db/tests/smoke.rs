@@ -98,9 +98,8 @@ fn soak_emits_grep_friendly_discovery_lines() {
 fn event_sink_drops_visibly_under_load() {
     // Force the slow-event sink to overflow by setting its cap small
     // and the slow threshold low enough that most requests exceed it.
-    // The smoke test then asserts the dropped counter advanced — this
-    // is the plan's required "bounded event sink drops visibly under
-    // load" proof.
+    // The smoke test then asserts the dropped counter advanced: a bounded
+    // event sink must drop visibly under load.
     let config = RunConfig {
         workers: 8,
         requests_per_worker: 16,

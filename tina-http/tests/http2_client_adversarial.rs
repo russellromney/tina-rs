@@ -1286,11 +1286,10 @@ fn caller_cancel_returns_local_cancel_and_keeps_connection_alive() {
 
 #[test]
 fn client_emits_outbound_open_and_close_lifecycle_facts() {
-    // The plan requires the client to emit stream-lifecycle protocol
-    // facts (not just private counters). A happy-path GET against the
-    // foreign peer must produce an `Http2StreamOpened { direction:
-    // Outbound }` and a matching `Http2StreamClosed` fact, captured from
-    // the runtime trace.
+    // The client must emit stream-lifecycle protocol facts (not just
+    // private counters). A happy-path GET against the foreign peer must
+    // produce an `Http2StreamOpened { direction: Outbound }` and a matching
+    // `Http2StreamClosed` fact, captured from the runtime trace.
     let (addr, peer) = spawn_peer(|sock, stream_id| {
         send_response(sock, stream_id, "200", b"ok");
     });

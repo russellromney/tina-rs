@@ -1711,11 +1711,11 @@ where
 
     // Register the persistent host-call dispatcher pool and publish their
     // addresses back to the host so `call_blocking` can target them without
-    // a per-call isolate registration (phase 145 Rock 5). Each dispatcher's
-    // mailbox is sized to `command_capacity`: at peak, an in-flight host
-    // call routed to a given dispatcher occupies at most one slot in that
-    // dispatcher's mailbox (Begin pending or Returned pending, never both),
-    // matching the command-queue backpressure bound.
+    // a per-call isolate registration. Each dispatcher's mailbox is sized to
+    // `command_capacity`: at peak, an in-flight host call routed to a given
+    // dispatcher occupies at most one slot in that dispatcher's mailbox
+    // (Begin pending or Returned pending, never both), matching the
+    // command-queue backpressure bound.
     let mut dispatcher_addrs = Vec::with_capacity(HOST_CALL_DISPATCHER_POOL_SIZE);
     for _ in 0..HOST_CALL_DISPATCHER_POOL_SIZE {
         let addr = runtime.register_with_capacity::<HostCallDispatcher<S>, Infallible>(
@@ -1741,8 +1741,8 @@ where
 
     // Refresh the live resource snapshot on idle and command turns, but not
     // after a fast delivery turn: recomputing the O(pending) resource report on
-    // every hot turn is the per-op tax this phase removes. Counts refresh again
-    // as soon as the worker parks or runs a command (phase 145).
+    // every hot turn is a per-op tax. Counts refresh again as soon as the
+    // worker parks or runs a command.
     let mut refresh_metrics = true;
     'worker: loop {
         if refresh_metrics {
@@ -1768,10 +1768,10 @@ where
         }
 
         // Bounded hot-drain. Step while the shard makes progress so a tiny
-        // local call finishes without a per-turn sleep tax (phase 145), but
-        // cap the burst by rounds AND elapsed time and re-poll the command
-        // queue between steps so a flood of always-progressing local work
-        // cannot hide a Run/Shutdown or monopolise the turn unboundedly.
+        // local call finishes without a per-turn sleep tax, but cap the burst
+        // by rounds AND elapsed time and re-poll the command queue between
+        // steps so a flood of always-progressing local work cannot hide a
+        // Run/Shutdown or monopolise the turn unboundedly.
         let drain_start = Instant::now();
         let mut rounds = 0usize;
         let mut drained_any = false;

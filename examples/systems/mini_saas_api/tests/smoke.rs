@@ -220,11 +220,10 @@ fn smoke_covers_service_layers() {
     assert_eq!(capacity["http.body_timeout"], "0");
     assert_eq!(capacity["http.body_io_error"], "0");
 
-    // Typed lifecycle transitions: the plan's "service starts NotReady,
-    // becomes Ready, enters Draining, then Stopped" assertion. The
-    // canonical sequence is recorded explicitly by the host so a
-    // regression that skips a state is caught here, not implied by
-    // separate field equality.
+    // Typed lifecycle transitions: starts NotReady, becomes Ready, enters
+    // Draining, then Stopped. The canonical sequence is recorded explicitly
+    // by the host so a regression that skips a state is caught here, not
+    // implied by separate field equality.
     assert_eq!(
         report.lifecycle_transitions,
         vec![

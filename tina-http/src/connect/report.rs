@@ -1,9 +1,9 @@
 //! Typed connect reports.
 //!
 //! A connect either returns a resolved low-level target or one
-//! [`ConnectReport`]. The report keeps every fact the plan requires:
-//! endpoint identity, DNS truth, the ordered attempt list with per-attempt
-//! family and terminal reason, the winner, and the cancelled-loser /
+//! [`ConnectReport`]. The report keeps every load-bearing fact: endpoint
+//! identity, DNS truth, the ordered attempt list with per-attempt family
+//! and terminal reason, the winner, and the cancelled-loser /
 //! late-completion (tombstone) counts. Nothing is collapsed into a generic
 //! "failed".
 

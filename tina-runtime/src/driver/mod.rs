@@ -786,10 +786,10 @@ impl RuntimeDriver for BetelgeuseDriver {
             files: tcp.files,
             // Worker-held: TLS in-flight ops parking cloned listener/stream
             // arcs, plus process calls owning a live Child. The Unix lane is
-            // now completion-backed like TCP (its in-flight connect socket is
-            // not a separate OS-handle clone), and DNS/storage workers hold no
+            // completion-backed like TCP (its in-flight connect socket is not
+            // a separate OS-handle clone), and DNS/storage workers hold no
             // runtime-visible OS handle beyond table-owned ids, so they
-            // contribute zero here per the plan's count rules.
+            // contribute zero here.
             worker_held: tls.worker_held + process_pending,
             // Pending counts use physical entries (not filtered on the
             // user-cancel flag) so that work the runtime asked to cancel
@@ -1450,10 +1450,9 @@ mod tests {
         assert_eq!(report.pending_driver_call_count(), 1);
 
         assert!(driver.cancel(CallId::new(2)));
-        // After Phase 043, the pending count tracks physical entries so
-        // cancelled-but-not-yet-drained ops stay visible until the
-        // backend releases the completion slot. After a shutdown drain
-        // the count must reach zero again.
+        // The pending count tracks physical entries, so cancelled-but-not-yet-
+        // drained ops stay visible until the backend releases the completion
+        // slot. After a shutdown drain the count must reach zero again.
         let _ = driver.cancel_pending(Instant::now() + Duration::from_millis(100));
         assert_eq!(driver.resource_report().pending_driver_call_count(), 0);
     }

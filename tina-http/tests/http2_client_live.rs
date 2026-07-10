@@ -227,11 +227,11 @@ fn h2c_multiple_streams_share_one_client_connection() {
 
 #[test]
 fn response_body_above_cap_returns_typed_body_too_large() {
-    // The plan: "oversized received message is `ResourceExhausted` /
-    // typed cap failure before unbounded allocation." For raw HTTP/2
-    // we map that to `Http2ProtocolError::BodyTooLarge { cap_bytes }`.
-    // POST 4 KB to /echo with a 1 KB response cap; client RSTs and
-    // returns the typed error, NOT `HeadersTooLarge`.
+    // Oversized received message must be a typed cap failure before
+    // unbounded allocation. For raw HTTP/2 that is
+    // `Http2ProtocolError::BodyTooLarge { cap_bytes }`. POST 4 KB to /echo
+    // with a 1 KB response cap; client RSTs and returns the typed error,
+    // NOT `HeadersTooLarge`.
     let (runtime, listener, addr) = start_server();
     let target = Http2Target::H2c {
         authority: "test".into(),
@@ -759,8 +759,8 @@ fn h2c_streaming_request_source_is_cancelled_on_completion() {
 #[test]
 fn tls_target_route_key_distinguishes_from_h2c_route_key() {
     // Reuse keying: TLS and h2c with the same authority must not share a
-    // pool entry. This is a unit-shape proof, but it pins the route key
-    // shape that pool work in Phase 119 will read.
+    // pool entry. This is a unit-shape proof that pins the route key shape
+    // the connection pool reads.
     let h2c = Http2Target::H2c {
         authority: "x".into(),
         addr: "127.0.0.1:8080".parse().unwrap(),

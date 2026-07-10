@@ -183,7 +183,7 @@ impl Isolate for CodecServer {
                     if !*closing {
                         seen.lock().unwrap().push(frame.clone());
                         if frame == b"quit" {
-                            // Flush whatever we already framed, then close.
+                            // Keep any reply already framed this turn, then close.
                             *closing = true;
                         } else {
                             reply.extend_from_slice(b"ok:");
@@ -195,7 +195,7 @@ impl Isolate for CodecServer {
                 if !self.closing
                     && matches!(status, DecodeStatus::Malformed(_) | DecodeStatus::Full)
                 {
-                    // Bad stream: tear down now, discard partial reply.
+                    // Unrecoverable decode: discard partial reply and close.
                     *self.rejected.lock().unwrap() = true;
                     tear_down = true;
                 }

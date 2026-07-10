@@ -403,7 +403,7 @@ pub struct HotPathReport {
     pub label: &'static str,
     pub iterations: u64,
     pub p50_ns: u64,
-    /// 90th percentile total. Tail shape, not the median, is what this phase
+    /// 90th percentile total. Tail shape, not the median, is what the row
     /// chases: a row can win p50 while p90/p99 stay messy.
     pub p90_ns: u64,
     /// 99th percentile total.

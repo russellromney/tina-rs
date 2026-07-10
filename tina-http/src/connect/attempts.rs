@@ -170,7 +170,7 @@ impl<R> ConnectAttempts<R> {
     ///
     /// The ordered, family-policy address list is capped to the
     /// service-owned attempt cap before any of it can become a connect
-    /// effect — this is the `BoundedItems` admission the plan requires.
+    /// effect — this is the required `BoundedItems` admission.
     pub fn record_dns(&mut self, result: Result<Vec<SocketAddr>, CallError>) -> DnsClassification {
         match result {
             Ok(addrs) => {

@@ -77,9 +77,8 @@ fn caller_timeout_is_retryable_caller_timeout() {
 #[test]
 fn serial_pressure_reports_capacity_one_not_unavailable() {
     // Serial admission is still bounded admission — capacity 1, not
-    // "absent". This is the test the plan calls out explicitly:
-    // SQLite serial pressure maps to one bridge surface with capacity
-    // `1`.
+    // "absent". SQLite serial pressure maps to one bridge surface with
+    // capacity `1`.
     let r = SqlitePressureReport {
         capacity: 1,
         available: 1,

@@ -40,9 +40,9 @@ pub struct RunReport {
     /// Lifecycle states the service was observed in, in order. The
     /// canonical sequence is
     /// `[Starting, Ready, Draining, Stopped]`. Built explicitly by the
-    /// host so the plan's "service starts NotReady, becomes Ready,
-    /// enters Draining, then Stopped" assertion is a typed witness
-    /// rather than implied by separate fields.
+    /// host so the "starts NotReady, becomes Ready, enters Draining,
+    /// then Stopped" sequence is a typed witness rather than implied by
+    /// separate fields.
     pub lifecycle_transitions: Vec<Lifecycle>,
     pub health_ok: bool,
     pub ready_ok: bool,

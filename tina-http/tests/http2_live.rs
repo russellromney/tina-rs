@@ -1413,10 +1413,9 @@ fn http2_peer_max_frame_size_splits_large_user_response() {
 
 #[test]
 fn http2_multi_frame_response_marks_end_stream_only_on_last_data_frame() {
-    // Guards the Phase 152 buffered-response framing rewrite: the server now
-    // builds each DATA frame straight into the write queue (header bytes, then
-    // the borrowed body slice) instead of cloning each chunk into a `Frame`
-    // and re-encoding it. The exact edges that change could break: byte order,
+    // The server builds each DATA frame straight into the write queue (header
+    // bytes, then the borrowed body slice) instead of cloning each chunk into
+    // a `Frame` and re-encoding it. The edges that can break: byte order,
     // END_STREAM placement, and the HEADERS terminal flag.
     let config = Http2ServerConfig {
         limits: Http2Limits {

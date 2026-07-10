@@ -716,7 +716,7 @@ impl<S, M, R> SpawnObservedBuilder<S, M, R> {
     /// `spawn_observed` is unaffected — this method is the only place the
     /// `Send` requirement appears.
     ///
-    /// Scope and sharp edges (this is the first cross-shard sub-phase):
+    /// Scope and sharp edges:
     ///
     /// - Only [`ChildDefinition`] is supported as the spawn payload.
     ///   [`RestartableChildDefinition`] is `!Send` (it holds boxed `Fn`

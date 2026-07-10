@@ -262,9 +262,9 @@ fn call_typed_round_trips_through_call_lane() {
 }
 
 // ---------------------------------------------------------------------------
-// Positive fixture #5: split event/request service. This is the Phase 109
-// copied path: fire-and-forget events and callable requests are separate
-// domain types, even though they share one mailbox internally.
+// Positive fixture #5: split event/request service. Fire-and-forget events
+// and callable requests are separate domain types, even though they share
+// one mailbox internally.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]

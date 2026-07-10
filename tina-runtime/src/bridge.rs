@@ -845,9 +845,9 @@ mod tests {
     #[test]
     fn service_pressure_report_consumes_bridge_pressure_end_to_end() {
         use crate::service_pressure::ServicePressureReport;
-        // The plan-required proof: the service pressure builder can
-        // consume a BridgePressure via service_pressure_surface and
-        // produce a meaningful discovery line plus capacity_summary.
+        // The service pressure builder can consume a BridgePressure via
+        // service_pressure_surface and produce a meaningful discovery line
+        // plus capacity_summary.
         let s3 = BridgePressure::measured("aws.s3", 32, 5, 17, 3, 0, 0, 4, 4).unwrap();
         let pg = BridgePressure::measured("pg.bridge", 8, 2, 6, 1, 0, 0, 0, 0).unwrap();
         let absent = BridgePressure::unavailable("aws.sqs", "no client supplied").unwrap();

@@ -3611,7 +3611,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Phase 112 protocol-fact emission coverage.
+    // Protocol-fact emission coverage.
     //
     // These tests pin the *emission points*: each named protocol fact
     // must show up in the effects vector at the moment its truth becomes

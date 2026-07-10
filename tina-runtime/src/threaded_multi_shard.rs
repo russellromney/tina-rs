@@ -975,8 +975,8 @@ where
     let mut drain_terminal_first = true;
     // Refresh the live resource snapshot on idle and command turns, but not
     // after a fast delivery turn: recomputing the O(pending) resource report on
-    // every hot turn is the per-op tax this phase removes. Counts refresh again
-    // as soon as the worker parks or runs a command (phase 145).
+    // every hot turn is a per-op tax. Counts refresh again as soon as the
+    // worker parks or runs a command.
     let mut refresh_metrics = true;
     loop {
         if refresh_metrics {

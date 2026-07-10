@@ -52,9 +52,9 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     seed_db(&db_path)?;
 
     // Typed lifecycle witness. The host records every state the service
-    // passes through so the plan's "Starting → Ready → Draining →
-    // Stopped" assertion is one Vec<Lifecycle> instead of being implied
-    // across the topology/health/shutdown fields.
+    // passes through so Starting → Ready → Draining → Stopped is one
+    // Vec<Lifecycle> instead of being implied across the
+    // topology/health/shutdown fields.
     let mut lifecycle_transitions: Vec<Lifecycle> = vec![Lifecycle::Starting];
 
     let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);

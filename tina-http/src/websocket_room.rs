@@ -561,9 +561,8 @@ mod tests {
 
     #[test]
     fn fill_close_refill_keeps_member_high_water_high() {
-        // Phase 094's "fill-close-refill" pattern: peak occupancy must be
-        // remembered across reset cycles so a later refill doesn't lower
-        // the high-water mark.
+        // Fill-close-refill: peak occupancy must be remembered across reset
+        // cycles so a later refill doesn't lower the high-water mark.
         let mut table = WebSocketMemberTable::new(4);
         for i in 0..4 {
             table.admit(dummy_handle(i));

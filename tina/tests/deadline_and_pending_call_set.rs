@@ -57,9 +57,8 @@ fn context_deadline_after_uses_stamped_now() {
 }
 
 /// Regression: a `Context` constructed without `with_now` must panic on
-/// `now()` rather than silently fall through to `Instant::now()`. The
-/// 072 plan rule is "DST-claimed code cannot silently depend on
-/// `std::time::Instant::now()`," and the panic is what enforces it.
+/// `now()` rather than silently fall through to `Instant::now()`. DST-
+/// claimed code cannot silently depend on wall time; the panic enforces it.
 #[test]
 #[should_panic(expected = "Context::now() requires the runtime/simulator to have stamped")]
 fn context_now_panics_when_not_stamped() {

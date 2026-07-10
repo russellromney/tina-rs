@@ -466,7 +466,7 @@ impl RailClass {
 ///
 /// This is a faithful view over a [`ResourceCapability`] — it renames
 /// nothing and invents nothing. The predicate helpers exist so callers,
-/// dashboards, and extension authors can ask the plan's questions
+/// dashboards, and extension authors can ask capability questions
 /// ("is this supported? sim-backed? cancel-backed? drain-backed?")
 /// against one stable vocabulary instead of matching four enums by hand.
 ///

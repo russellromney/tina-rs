@@ -704,11 +704,10 @@ fn downstream_consumer_can_replay_isolate_call_reply_full_closed_timeout() {
 
 #[test]
 fn downstream_consumer_replays_isolate_call_owner_stopped_when_requester_stops() {
-    // Rock 5: when the requester isolate stops with a pending call,
-    // the runtime proactively cancels the call with cause
-    // `OwnerStopped`. The worker's later reply hits the same
-    // `CallReplyRejected { NoPendingCall }` rejection path as a late
-    // reply against an already-cancelled call.
+    // When the requester isolate stops with a pending call, the runtime
+    // proactively cancels the call with cause `OwnerStopped`. The worker's
+    // later reply hits the same `CallReplyRejected { NoPendingCall }`
+    // rejection path as a late reply against an already-cancelled call.
     let (outcomes, first) = run_stopped_requester_isolate_call_scenario();
     let (replayed_outcomes, replayed) = run_stopped_requester_isolate_call_scenario();
 

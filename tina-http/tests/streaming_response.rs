@@ -5,7 +5,7 @@
 //! the declared `Content-Length`, then pulls chunks via `call(source,
 //! Next, t).then(StreamChunk)` and writes each one to the wire. Each
 //! pull happens *after* the previous chunk has fully drained — this is
-//! the per-chunk backpressure rock 4 calls for.
+//! the required per-chunk backpressure.
 
 mod common;
 

@@ -63,7 +63,7 @@ pub struct LoadRun {
     pub label: &'static str,
 }
 
-/// Phase-121 name for a configured load run. Alias kept so older
+/// Historical name for a configured load run. Alias kept so older
 /// specimens using `LoadRun` keep compiling.
 pub type LoadProfile = LoadRun;
 
@@ -291,7 +291,7 @@ pub struct LoadReport {
     pub pressure: PressureSummary,
 }
 
-/// Phase-121 name for the report returned by [`LoadProfile`]. Alias kept
+/// Historical name for the report returned by [`LoadProfile`]. Alias kept
 /// alongside [`LoadReport`] for existing call sites.
 pub type LoadRunReport = LoadReport;
 

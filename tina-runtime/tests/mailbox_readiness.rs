@@ -1,4 +1,4 @@
-//! Rock 3 proof: the skip-empty scan is correct at scale.
+//! Proof: the skip-empty scan is correct at scale.
 //!
 //! The per-step scheduler scan now probes `Mailbox::is_empty()` and skips the
 //! expensive `recv` on quiet isolates. `is_empty()` reflects real mailbox state

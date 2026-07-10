@@ -1803,7 +1803,7 @@ fn two_stream_reads_can_be_pending_in_driver_at_once() {
 }
 
 // ---------------------------------------------------------------------------
-// Timer semantics tests (Phase 015)
+// Timer semantics tests
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3642,9 +3642,9 @@ where
         .collect()
 }
 
-/// Rock 3: with a drain budget of 1, four backend completions that are all
-/// ready at one advance must be delivered one-per-step, in deterministic
-/// submit (FIFO) order, with none dropped.
+/// With a drain budget of 1, four backend completions that are all ready
+/// at one advance must be delivered one-per-step, in deterministic submit
+/// (FIFO) order, with none dropped.
 #[test]
 fn bounded_completion_drain_delivers_one_per_step_in_fifo_order() {
     let (mut runtime, clock) = new_manual_runtime();
@@ -3696,8 +3696,8 @@ fn bounded_completion_drain_delivers_one_per_step_in_fifo_order() {
     );
 }
 
-/// Rock 3: the default (large) budget delivers every ready completion in a
-/// single advance — bounding does not force unnecessary extra steps.
+/// The default (large) budget delivers every ready completion in a single
+/// advance — bounding does not force unnecessary extra steps.
 #[test]
 fn default_budget_delivers_all_ready_completions_in_one_advance() {
     let (mut runtime, clock) = new_manual_runtime();

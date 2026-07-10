@@ -2133,8 +2133,8 @@ mod stable_hash_tests {
         assert!(!trace.any_matching(|kind| matches!(kind, RuntimeEventKind::Spawned { .. })));
     }
 
-    // Phase 112 safety-rail tests: existing stable tags must not move and the
-    // new `Fact`/`FactObserved` tags must take the assigned slots.
+    // Safety-rail tests: existing stable tags must not move and the new
+    // `Fact`/`FactObserved` tags must take the assigned slots.
 
     #[test]
     fn effect_kind_tags_are_stable() {
@@ -2170,7 +2170,7 @@ mod stable_hash_tests {
 
     #[test]
     fn protocol_fact_tags_are_stable() {
-        // Names are stable; tag must match the plan exactly.
+        // Names are stable; tag values are part of the trace contract.
         let dummy_http2 = ProtocolFact::Http2StreamOpened {
             connection: ProtocolConnectionId::new(0),
             stream: Http2StreamId::new(0),
@@ -2258,12 +2258,11 @@ mod stable_hash_tests {
     }
 
     #[test]
-    fn non_fact_event_stable_hash_did_not_change_in_phase_112() {
-        // Golden hash for a fixed non-fact event. Phase 112 added a new
-        // RuntimeEventKind variant and a new EffectKind variant; this
-        // test pins that those additions did NOT change the hash of an
-        // event that does not use them. If a future change accidentally
-        // shifts the tag mixing for old variants, this number changes.
+    fn non_fact_event_stable_hash_did_not_change_when_fact_variants_added() {
+        // Golden hash for a fixed non-fact event. Adding RuntimeEventKind or
+        // EffectKind variants must not change the hash of an event that does
+        // not use them. If a future change accidentally shifts the tag mixing
+        // for old variants, this number changes.
         let event = RuntimeEvent::new(
             EventId::new(7),
             Some(CauseId::new(EventId::new(3))),
@@ -2275,10 +2274,9 @@ mod stable_hash_tests {
                 target_generation: AddressGeneration::new(1),
             },
         );
-        // Pinned at the Phase 112 commit. If this assertion fires, either
-        // we shifted a tag for an existing variant (regression) or we
-        // intentionally rebased the trace contract (in which case the
-        // user-facing replay docs must call it out).
+        // If this assertion fires, either we shifted a tag for an existing
+        // variant (regression) or we intentionally rebased the trace contract
+        // (in which case the user-facing replay docs must call it out).
         assert_eq!(event.stable_hash(), 0x7ebc64a1613463c7);
     }
 
@@ -2373,7 +2371,7 @@ mod stable_hash_tests {
             (CallKind::ObservedSend, 39),
             (CallKind::IsolateCall, 40),
             (CallKind::CancelCall, 41),
-            // Phase 117 Unix-domain rails, appended.
+            // Unix-domain rails (appended; do not renumber earlier tags).
             (CallKind::UnixBind, 42),
             (CallKind::UnixAccept, 43),
             (CallKind::UnixConnect, 44),
@@ -2381,7 +2379,7 @@ mod stable_hash_tests {
             (CallKind::UnixWrite, 46),
             (CallKind::UnixListenerClose, 47),
             (CallKind::UnixStreamClose, 48),
-            // Phase 147 terminal TCP write-close rail, appended.
+            // Terminal TCP write-close rail (appended).
             (CallKind::TcpWriteClose, 49),
         ];
         for (kind, expected) in cases {

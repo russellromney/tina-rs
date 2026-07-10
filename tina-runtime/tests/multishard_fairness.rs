@@ -423,11 +423,10 @@ fn pending_timer_parks_multishard_worker_on_the_repoll_interval() {
     runtime.shutdown().expect("shutdown");
 }
 
-/// Required test (Rock 4, bullet 1): a sustained cross-shard inbound
-/// flood on the target shard must not starve a local host `Run` command.
-/// `observe_result` routes the registration through
-/// `ThreadedCommand::Run`, which is the same queue `call_blocking` setup
-/// and direct `Run` commands use.
+/// A sustained cross-shard inbound flood on the target shard must not
+/// starve a local host `Run` command. `observe_result` routes the
+/// registration through `ThreadedCommand::Run`, which is the same queue
+/// `call_blocking` setup and direct `Run` commands use.
 #[test]
 fn remote_flood_does_not_starve_local_run_command() {
     let runtime = make_runtime();
@@ -473,10 +472,10 @@ fn remote_flood_does_not_starve_local_run_command() {
     let _ = runtime.shutdown();
 }
 
-/// Required test (Rock 4, bullet 3): shutdown under sustained remote inbound
-/// flood must complete, not deadlock. The fairness fix guarantees the worker
-/// reads its command queue between every bounded remote-drain pass, so the
-/// `Shutdown` command does not have to wait for the flood to drain.
+/// Shutdown under sustained remote inbound flood must complete, not
+/// deadlock. The fairness fix guarantees the worker reads its command
+/// queue between every bounded remote-drain pass, so the `Shutdown`
+/// command does not have to wait for the flood to drain.
 ///
 /// The property is completion, not latency. Without the fairness step the
 /// `Shutdown` starves and `shutdown()` blocks forever — a permanent deadlock,
@@ -531,9 +530,8 @@ fn shutdown_under_remote_flood_completes_without_deadlock() {
     );
 }
 
-/// Required test (Rock 4, bullet 4): the fairness change does not break
-/// ordinary cross-shard throughput — finite cross-shard work still
-/// drains and reaches the target.
+/// The fairness change must not break ordinary cross-shard throughput —
+/// finite cross-shard work still drains and reaches the target.
 #[test]
 fn ordinary_remote_throughput_still_progresses() {
     const N: usize = 500;

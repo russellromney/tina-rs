@@ -354,11 +354,11 @@ fn fill_cancel_refill_reclaims_capacity() {
 
 /// Sim-side proof that fill -> timeout -> refill reclaims capacity.
 ///
-/// The plan rule under test: every stored handle has a completion,
-/// cancel, or *timeout* continuation that removes its key. This test
-/// exercises the timeout path by giving every batch-1 call a tight
-/// 50 ms call timeout against a 200 ms worker sleep, advancing virtual
-/// time past the timeout, and confirming the next `insert` cycle
+/// Every stored handle must have a completion, cancel, or *timeout*
+/// continuation that removes its key. This test exercises the timeout path
+/// by giving every batch-1 call a tight 50 ms call timeout against a 200 ms
+/// worker sleep, advancing virtual time past the timeout, and confirming
+/// the next `insert` cycle
 /// admits the same keys without `Full` / `DuplicateKey`.
 #[test]
 fn fill_timeout_refill_reclaims_capacity() {
@@ -387,11 +387,11 @@ fn fill_timeout_refill_reclaims_capacity() {
         "every batch-1 IsolateCall should report Timeout",
     );
 
-    // The plan's load-bearing claim: the next insert must succeed
-    // under the same keys without stale `Full` / `DuplicateKey`.
-    // Refill batch 2 (worker sleeps will time out again — that is
-    // not what we are testing here; we are testing that the slots
-    // were reclaimed). The fill itself succeeding without panic IS
+    // Load-bearing claim: the next insert must succeed under the same
+    // keys without stale `Full` / `DuplicateKey`. Refill batch 2 (worker
+    // sleeps will time out again — that is not what we are testing here;
+    // we are testing that the slots were reclaimed). The fill itself
+    // succeeding without panic IS
     // the proof.
     sim.try_send(driver, DriverMsg::FillBatch2)
         .expect("fill batch 2");
