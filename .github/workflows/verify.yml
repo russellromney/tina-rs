@@ -320,6 +320,69 @@ jobs:
   # revisit promoting it to a scheduled job once we see how often examples
   # actually break.
 
+  # Two systems examples ARE a per-PR gate, unlike the sweep above: they are
+  # the two examples the root README and docs point new users at first
+  # (`system_copied_service_path` is the copied-path skeleton; `mini_saas_api`
+  # is the larger HTTP-fronted shape), so a change that breaks what a user
+  # would actually copy must fail CI, not just a local sweep nobody runs.
+  # Found by an external P0 review: `system_copied_service_path` used to
+  # build its report from constants without running an isolate, runtime, or
+  # shutdown at all, and its own smoke test failed
+  # (`assert_no_leaked_capacity_at_shutdown` panicked with `leak=unchecked`)
+  # — nothing in CI ever ran it, so the break shipped silently. Measured
+  # locally: `mini_saas_api`'s full non-ignored suite (smoke, budget,
+  # graceful_drain, scope_drain, soak, perf) finishes in ~4s once warm, so it
+  # rides along here instead of only in the opt-in `proof-soak` /
+  # `proof-long-soak` Makefile targets; `long_soak` stays `#[ignore]`d and
+  # PR-gate-exempt (`make proof-long-soak` remains the way to run it). Both
+  # crates are separate, unlocked cargo workspaces (same convention as the
+  # `verify-examples` sweep above), so this job caches them individually via
+  # `rust-cache`'s multi-workspace `workspaces:` input instead of relying on
+  # the root workspace's cache key.
+  systems-examples:
+    name: systems examples (copied-path + mini_saas_api) (${{ matrix.os }})
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up mold linker (Linux)
+        uses: rui314/setup-mold@v1
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo + target (per example workspace)
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+          workspaces: |
+            examples/systems/system_copied_service_path -> target
+            examples/systems/mini_saas_api -> target
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: system_copied_service_path (test + clippy)
+        run: |
+          cargo test --manifest-path examples/systems/system_copied_service_path/Cargo.toml --tests
+          cargo clippy --manifest-path examples/systems/system_copied_service_path/Cargo.toml --all-targets -- -D warnings
+
+      - name: mini_saas_api (test + clippy; long_soak stays opt-in via make proof-long-soak)
+        run: |
+          cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --tests
+          cargo clippy --manifest-path examples/systems/mini_saas_api/Cargo.toml --all-targets -- -D warnings
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
   # Packaging-readiness smoke check (crates.io 0.1.0 prep): guards against
   # regressing back to an unpublishable crate graph, e.g. a new internal
   # `path`-only dependency with no `version =`, or a crate losing its
@@ -354,7 +417,4 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: cargo package --no-verify (publishable-today crates)
-        env:
-          RUSTC_WRAPPER: sccache
-          CARGO_INCREMENTAL: "0"
         run: make verify-packaging

@@ -1278,6 +1278,24 @@ pending/results, explicit loser cancellation, partial reports, and late-reply
 truth visible. The companion proof and smoke-copy crate exist so a cheap model
 or tired human can tell whether the path is actually copyable.
 
+**Correction (external review, P0):** the claim above did not hold. The
+skeleton built `CopiedServiceReport` from constants — no isolate, runtime,
+listener, or shutdown ever ran — and its own smoke test failed
+(`assert_no_leaked_capacity_at_shutdown` panicked with `leak=unchecked`
+because the run never supplied a real leak check). `system_copied_service_path`
+is rebuilt around one real `#[tina_runtime::isolate]` on a real
+`ThreadedRuntime`: bounded admission via `SharedCapacityScope`, a durable-state
+ledger step, real concurrent callers through `tina_proof_harness::load`, and a
+leak check that reads the scope's real post-shutdown state. Skipping the
+release (`Gateway::hold_done`'s `drop(lease)`) now makes the smoke test fail
+for a real reason. `system_copied_service_path_companion` and
+`system_copied_service_path_smoke` were deleted — they only re-verified the
+same fake fields (`session_control`, `replay_roles`, `join`/`select`
+capacities) and added no coverage beyond the rebuilt crate's own smoke test.
+Systems examples are now gated in CI (`.github/workflows/`) and in
+`Makefile`'s example-verification target, so this class of bug fails a PR
+instead of shipping silently.
+
 The config/budget half of the copied path is now closed too. Services used to
 scatter caps through handlers and `register_*` literals, so a reader could not
 see all knobs before the service ran. `tina_runtime::budget::ServiceBudgetManifest`
