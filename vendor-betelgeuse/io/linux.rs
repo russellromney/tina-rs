@@ -126,18 +126,12 @@ impl IoUringIO {
                 opcode::Accept::new(types::Fd(op.fd), std::ptr::null_mut(), std::ptr::null_mut())
                     .build()
             }
-            Operation::Connect(op) => {
-                let (storage, len) = socket_addr_to_raw(op.addr);
-                // Store address bytes in the op to keep them alive for io_uring.
-                op.addr_storage = storage;
-                op.addr_len = len;
-                opcode::Connect::new(
-                    types::Fd(op.fd),
-                    (&op.addr_storage as *const libc::sockaddr_storage).cast(),
-                    op.addr_len,
-                )
-                .build()
-            }
+            Operation::Connect(op) => opcode::Connect::new(
+                types::Fd(op.fd),
+                (&op.addr as *const libc::sockaddr_storage).cast(),
+                op.len,
+            )
+            .build(),
             Operation::Recv(op) => {
                 opcode::Recv::new(types::Fd(op.fd), op.buf.as_mut_ptr(), op.buf.len() as u32)
                     .flags(op.flags)
@@ -425,40 +419,6 @@ impl IOSocket for IoUringSocket {
         Ok(())
     }
 
-    fn connect(&self, c: &mut ConnectCompletion, addr: SocketAddr) -> io::Result<()> {
-        match &*self.kind.borrow() {
-            Some(SocketKind::Listener) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "connect called on listener socket",
-                ));
-            }
-            Some(SocketKind::Stream) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "connect called on already-initialized stream socket",
-                ));
-            }
-            None => {}
-        }
-
-        let fd = IoUringIO::socket_fd(addr)?;
-        let raw_fd = fd.raw();
-        *self.fd.borrow_mut() = Some(fd);
-        *self.kind.borrow_mut() = Some(SocketKind::Stream);
-
-        let inner = c.inner_mut();
-        inner.prepare(Operation::Connect(ConnectOp {
-            fd: raw_fd,
-            addr,
-            started: false,
-            addr_storage: unsafe { mem::zeroed::<libc::sockaddr_storage>() },
-            addr_len: 0,
-        }));
-        queue(&self.state, inner);
-        Ok(())
-    }
-
     fn accept(&self, c: &mut AcceptCompletion) -> io::Result<()> {
         let fd = match &*self.kind.borrow() {
             Some(SocketKind::Listener) => self
@@ -482,6 +442,28 @@ impl IOSocket for IoUringSocket {
         };
         let inner = c.inner_mut();
         inner.prepare(Operation::Accept(AcceptOp { fd }));
+        queue(&self.state, inner);
+        Ok(())
+    }
+
+    fn connect(&self, c: &mut ConnectCompletion, addr: SocketAddr) -> io::Result<()> {
+        if self.fd.borrow().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "connect called on initialized socket",
+            ));
+        }
+        let fd = IoUringIO::socket_fd(addr)?;
+        let (storage, len) = socket_addr_to_raw(addr);
+        let inner = c.inner_mut();
+        inner.prepare(Operation::Connect(ConnectOp {
+            fd: fd.raw(),
+            addr: storage,
+            len,
+            attempted: false,
+        }));
+        *self.fd.borrow_mut() = Some(fd);
+        *self.kind.borrow_mut() = Some(SocketKind::Stream);
         queue(&self.state, inner);
         Ok(())
     }

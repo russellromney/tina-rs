@@ -118,11 +118,11 @@ pub trait IOSocket {
     /// Binds the socket to `addr`.
     fn bind(&self, addr: SocketAddr) -> stdio::Result<()>;
 
-    /// Connects a stream socket to `addr`.
-    fn connect(&self, c: &mut ConnectCompletion, addr: SocketAddr) -> stdio::Result<()>;
-
     /// Accepts one inbound connection on a listening socket.
     fn accept(&self, c: &mut AcceptCompletion) -> stdio::Result<()>;
+
+    /// Connects this socket to `addr`.
+    fn connect(&self, c: &mut ConnectCompletion, addr: SocketAddr) -> stdio::Result<()>;
 
     /// Receives up to `len` bytes from a connected socket.
     fn recv(&self, c: &mut RecvCompletion, len: usize) -> stdio::Result<()>;

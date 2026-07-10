@@ -291,40 +291,6 @@ impl IOSocket for DarwinSocket {
         Ok(())
     }
 
-    fn connect(&self, c: &mut ConnectCompletion, addr: SocketAddr) -> io::Result<()> {
-        match &*self.kind.borrow() {
-            Some(SocketKind::Listener) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "connect called on listener socket",
-                ));
-            }
-            Some(SocketKind::Stream) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "connect called on already-initialized stream socket",
-                ));
-            }
-            None => {}
-        }
-
-        let fd = DarwinIO::socket_fd(addr)?;
-        let raw_fd = fd.raw();
-        *self.fd.borrow_mut() = Some(fd);
-        *self.kind.borrow_mut() = Some(SocketKind::Stream);
-
-        let inner = c.inner_mut();
-        inner.prepare(Operation::Connect(ConnectOp {
-            fd: raw_fd,
-            addr,
-            started: false,
-            addr_storage: unsafe { mem::zeroed::<libc::sockaddr_storage>() },
-            addr_len: 0,
-        }));
-        queue(&self.state, inner);
-        Ok(())
-    }
-
     fn accept(&self, c: &mut AcceptCompletion) -> io::Result<()> {
         let fd = match &*self.kind.borrow() {
             Some(SocketKind::Listener) => self
@@ -418,6 +384,28 @@ impl IOSocket for DarwinSocket {
             buf,
             flags: libc::MSG_DONTWAIT,
         }));
+        queue(&self.state, inner);
+        Ok(())
+    }
+
+    fn connect(&self, c: &mut ConnectCompletion, addr: SocketAddr) -> io::Result<()> {
+        if self.fd.borrow().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "connect called on initialized socket",
+            ));
+        }
+        let fd = DarwinIO::socket_fd(addr)?;
+        let (storage, len) = socket_addr_to_raw(addr);
+        let inner = c.inner_mut();
+        inner.prepare(Operation::Connect(ConnectOp {
+            fd: fd.raw(),
+            addr: storage,
+            len,
+            attempted: false,
+        }));
+        *self.fd.borrow_mut() = Some(fd);
+        *self.kind.borrow_mut() = Some(SocketKind::Stream);
         queue(&self.state, inner);
         Ok(())
     }
@@ -628,58 +616,48 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
         }
         Operation::Connect(op) => {
             let result = {
-                if !op.started {
-                    let (storage, len) = socket_addr_to_raw(op.addr);
-                    op.addr_storage = storage;
-                    op.addr_len = len;
-
+                if !op.attempted {
+                    op.attempted = true;
                     let rc = unsafe {
                         libc::connect(
                             op.fd,
-                            (&op.addr_storage as *const libc::sockaddr_storage).cast(),
-                            op.addr_len,
+                            (&op.addr as *const libc::sockaddr_storage).cast(),
+                            op.len,
                         )
                     };
                     if rc == 0 {
                         Ok(())
                     } else {
                         let err = io::Error::last_os_error();
-                        if err.raw_os_error() == Some(libc::EINTR) {
-                            return PollResult::Retry;
-                        }
-                        if err.kind() == io::ErrorKind::WouldBlock
-                            || err.raw_os_error() == Some(libc::EINPROGRESS)
-                            || err.raw_os_error() == Some(libc::EALREADY)
+                        if err.raw_os_error() == Some(libc::EINPROGRESS)
+                            || err.kind() == io::ErrorKind::WouldBlock
                         {
-                            op.started = true;
                             return PollResult::Wait;
+                        }
+                        if err.raw_os_error() == Some(libc::EINTR) {
+                            op.attempted = false;
+                            return PollResult::Retry;
                         }
                         Err(err)
                     }
                 } else {
-                    let mut so_error: libc::c_int = 0;
-                    let mut so_error_len = mem::size_of::<libc::c_int>() as libc::socklen_t;
+                    let mut error: libc::c_int = 0;
+                    let mut len = mem::size_of_val(&error) as libc::socklen_t;
                     let rc = unsafe {
                         libc::getsockopt(
                             op.fd,
                             libc::SOL_SOCKET,
                             libc::SO_ERROR,
-                            (&mut so_error as *mut libc::c_int).cast(),
-                            &mut so_error_len,
+                            (&mut error as *mut libc::c_int).cast(),
+                            &mut len,
                         )
                     };
                     if rc < 0 {
-                        let err = io::Error::last_os_error();
-                        if err.raw_os_error() == Some(libc::EINTR) {
-                            return PollResult::Retry;
-                        }
-                        Err(err)
-                    } else if so_error == 0 {
+                        Err(io::Error::last_os_error())
+                    } else if error == 0 {
                         Ok(())
-                    } else if so_error == libc::EINPROGRESS || so_error == libc::EALREADY {
-                        return PollResult::Wait;
                     } else {
-                        Err(io::Error::from_raw_os_error(so_error))
+                        Err(io::Error::from_raw_os_error(error))
                     }
                 }
             };
