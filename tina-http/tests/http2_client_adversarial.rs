@@ -273,7 +273,8 @@ fn run_client(
     };
     let client = runtime
         .register_with_capacity::<Http2ClientConnection<TestShard>, _>(
-            Http2ClientConnection::<TestShard>::new(target, Http2ClientLimits::default()),
+            Http2ClientConnection::<TestShard>::new(target, Http2ClientLimits::default())
+                .expect("default HTTP/2 client limits are valid"),
             32,
         )
         .expect("register client");
@@ -282,6 +283,93 @@ fn run_client(
         .try_send(client, Http2ClientMsg::Begin)
         .expect("begin");
     (runtime, client)
+}
+
+#[test]
+fn client_uses_default_peer_frame_cap_before_server_settings() {
+    const BODY_LEN: usize = 40_000;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind raw peer");
+    let addr = listener.local_addr().expect("peer addr");
+    let peer = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept client");
+        sock.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut preface = [0_u8; CLIENT_PREFACE.len()];
+        sock.read_exact(&mut preface).expect("read client preface");
+        assert_eq!(&preface, CLIENT_PREFACE);
+
+        let mut stream_id = None;
+        let mut body_bytes = 0;
+        loop {
+            let frame = read_frame(&mut sock).expect("request frame before server SETTINGS");
+            match frame.ty {
+                FRAME_SETTINGS => {}
+                FRAME_HEADERS => stream_id = Some(frame.stream_id),
+                FRAME_DATA => {
+                    assert!(
+                        frame.payload.len() <= 16 * 1024,
+                        "client used its local 64 KiB receive cap as the peer's outbound cap"
+                    );
+                    body_bytes += frame.payload.len();
+                    if frame.flags & FLAG_END_STREAM != 0 {
+                        break;
+                    }
+                }
+                other => panic!("unexpected pre-SETTINGS client frame {other}: {frame:?}"),
+            }
+        }
+        assert_eq!(body_bytes, BODY_LEN);
+        let stream_id = stream_id.expect("request HEADERS observed");
+
+        write_frame(&mut sock, FRAME_SETTINGS, 0, 0, &[]);
+        write_frame(&mut sock, FRAME_SETTINGS, FLAG_ACK, 0, &[]);
+        send_response(&mut sock, stream_id, "200", b"ok");
+    });
+
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let target = Http2Target::H2c {
+        authority: "peer".into(),
+        addr,
+    };
+    let client = runtime
+        .register_with_capacity::<Http2ClientConnection<TestShard>, _>(
+            Http2ClientConnection::<TestShard>::new(
+                target,
+                Http2ClientLimits {
+                    max_frame_size: 64 * 1024,
+                    ..Http2ClientLimits::default()
+                },
+            )
+            .expect("valid HTTP/2 client limits"),
+            32,
+        )
+        .expect("register client");
+    runtime.try_send(client, Http2ClientMsg::Begin).unwrap();
+    let outcome = runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::Submit(Http2ClientRequest::post("/upload", vec![b'x'; BODY_LEN])),
+            Duration::from_secs(5),
+        )
+        .expect("client request returns");
+    assert!(matches!(
+        outcome,
+        CallOutcome::Replied(Http2ClientReply::Outcome {
+            outcome: Http2ClientOutcome::Replied(_),
+            ..
+        })
+    ));
+    let _ = runtime.try_send(client, Http2ClientMsg::Stop);
+    let _ = runtime.shutdown();
+    peer.join().expect("raw peer joins");
 }
 
 #[test]
@@ -813,7 +901,8 @@ fn abandoned_streamed_response_is_cancelled_and_slot_reused() {
     };
     let client = runtime
         .register_with_capacity::<Http2ClientConnection<TestShard>, _>(
-            Http2ClientConnection::<TestShard>::new(target, limits),
+            Http2ClientConnection::<TestShard>::new(target, limits)
+                .expect("valid HTTP/2 client limits"),
             32,
         )
         .expect("register client");
@@ -922,7 +1011,8 @@ fn abandoned_streamed_response_after_end_stream_is_reaped_without_reset_and_slot
     };
     let client = runtime
         .register_with_capacity::<Http2ClientConnection<TestShard>, _>(
-            Http2ClientConnection::<TestShard>::new(target, limits),
+            Http2ClientConnection::<TestShard>::new(target, limits)
+                .expect("valid HTTP/2 client limits"),
             32,
         )
         .expect("register client");
@@ -1013,7 +1103,8 @@ fn pre_connect_queue_capacity_is_shared_across_request_shapes() {
     };
     let client = runtime
         .register_with_capacity::<Http2ClientConnection<TestShard>, _>(
-            Http2ClientConnection::<TestShard>::new(target, limits),
+            Http2ClientConnection::<TestShard>::new(target, limits)
+                .expect("valid HTTP/2 client limits"),
             32,
         )
         .expect("register client");

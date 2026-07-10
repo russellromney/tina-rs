@@ -47,7 +47,7 @@ use crate::streaming::{ResponseChunkMsg, ResponseChunkReply};
 
 use super::errors::{
     ERR_CANCEL, ERR_FLOW_CONTROL_ERROR, ERR_FRAME_SIZE_ERROR, ERR_NO_ERROR, ERR_PROTOCOL_ERROR,
-    ERR_SETTINGS_ERROR, ERR_STREAM_CLOSED, Http2ProtocolError, classify_h2_reset,
+    ERR_SETTINGS_ERROR, ERR_STREAM_CLOSED, Http2ConfigError, Http2ProtocolError, classify_h2_reset,
 };
 #[cfg(test)]
 use super::frame::try_decode_frame;
@@ -136,6 +136,47 @@ impl Default for Http2ClientLimits {
             tls_io_timeout: Duration::from_secs(30),
             response_stream_idle_timeout: Duration::from_secs(30),
         }
+    }
+}
+
+impl Http2ClientLimits {
+    /// Validate protocol ranges and bounded client queues before construction.
+    ///
+    /// A zero stream limit is valid: RFC 9113 permits advertising zero, and
+    /// the local client then rejects every submit with bounded `Full`.
+    pub fn validate(&self) -> Result<(), Http2ConfigError> {
+        if !(MIN_MAX_FRAME_SIZE as usize..=MAX_MAX_FRAME_SIZE as usize)
+            .contains(&self.max_frame_size)
+        {
+            return Err(Http2ConfigError::FrameSizeOutOfRange {
+                value: self.max_frame_size,
+            });
+        }
+        if u32::try_from(self.max_concurrent_streams).is_err() {
+            return Err(Http2ConfigError::ConcurrentStreamsOutOfRange {
+                value: self.max_concurrent_streams,
+            });
+        }
+        if self.initial_connection_window < DEFAULT_WINDOW {
+            return Err(Http2ConfigError::InitialConnectionWindowTooSmall {
+                value: self.initial_connection_window,
+            });
+        }
+        if self.initial_stream_window < 0 {
+            return Err(Http2ConfigError::InitialStreamWindowNegative {
+                value: self.initial_stream_window,
+            });
+        }
+        if self.connection_outbound_queue_capacity == 0 {
+            return Err(Http2ConfigError::ZeroOutboundQueueCapacity);
+        }
+        if self.pre_connect_submit_capacity == 0 {
+            return Err(Http2ConfigError::ZeroPreConnectSubmitCapacity);
+        }
+        if self.tls_io_timeout.is_zero() {
+            return Err(Http2ConfigError::ZeroTlsIoTimeout);
+        }
+        Ok(())
     }
 }
 
@@ -785,37 +826,14 @@ pub struct Http2ClientConnection<S: Shard + 'static> {
 }
 
 impl<S: Shard + 'static> Http2ClientConnection<S> {
-    pub fn new(target: Http2Target, limits: Http2ClientLimits) -> Self {
-        // These are public caller-supplied budgets. Keep bad values loud
-        // in release too; otherwise a service can ship with a client that
-        // silently rejects every request or advertises an invalid HTTP/2
-        // frame size.
-        assert!(
-            limits.max_concurrent_streams >= 1,
-            "Http2ClientLimits::max_concurrent_streams must be >= 1 (got {})",
-            limits.max_concurrent_streams,
-        );
-        assert!(
-            limits.connection_outbound_queue_capacity >= 1,
-            "Http2ClientLimits::connection_outbound_queue_capacity must be >= 1 (got {})",
-            limits.connection_outbound_queue_capacity,
-        );
-        assert!(
-            limits.pre_connect_submit_capacity >= 1,
-            "Http2ClientLimits::pre_connect_submit_capacity must be >= 1 (got {})",
-            limits.pre_connect_submit_capacity,
-        );
-        assert!(
-            limits.max_frame_size >= MIN_MAX_FRAME_SIZE as usize
-                && limits.max_frame_size <= MAX_MAX_FRAME_SIZE as usize,
-            "Http2ClientLimits::max_frame_size must be in HTTP/2 range {MIN_MAX_FRAME_SIZE}..={MAX_MAX_FRAME_SIZE} (got {})",
-            limits.max_frame_size,
-        );
-        assert!(
-            !limits.tls_io_timeout.is_zero(),
-            "Http2ClientLimits::tls_io_timeout must be non-zero",
-        );
-        Self {
+    /// Construct a client only after validating protocol and capacity limits.
+    pub fn new(target: Http2Target, limits: Http2ClientLimits) -> Result<Self, Http2ConfigError> {
+        limits.validate()?;
+        const INITIAL_STREAM_TABLE_CAPACITY: usize = 64;
+        let initial_stream_capacity = limits
+            .max_concurrent_streams
+            .min(INITIAL_STREAM_TABLE_CAPACITY);
+        Ok(Self {
             target,
             limits,
             stream: None,
@@ -824,8 +842,8 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             queued_grpc_unary: VecDeque::new(),
             queued_streaming: VecDeque::new(),
             queued_open: VecDeque::new(),
-            streams: Vec::with_capacity(limits.max_concurrent_streams),
-            stream_index: HashMap::with_capacity(limits.max_concurrent_streams),
+            streams: Vec::with_capacity(initial_stream_capacity),
+            stream_index: HashMap::with_capacity(initial_stream_capacity),
             next_stream_id: 1,
             read_buf: Vec::new(),
             read_scratch: Vec::new(),
@@ -833,7 +851,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             hpack_decoder: hpack::Decoder::new(),
             preface_sent: false,
             peer_initial_stream_window: DEFAULT_WINDOW,
-            peer_max_frame_size: limits.max_frame_size,
+            peer_max_frame_size: MIN_MAX_FRAME_SIZE as usize,
             peer_max_concurrent_streams: None,
             recv_window: limits.initial_connection_window,
             pending_recv_window_credit: 0,
@@ -848,7 +866,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             report: Http2ClientReport::default(),
             self_isolate_id: None,
             _shard: PhantomData,
-        }
+        })
     }
 
     pub fn report(&self) -> &Http2ClientReport {
@@ -1049,23 +1067,31 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         push_setting(
             &mut settings_payload,
             SETTINGS_INITIAL_WINDOW_SIZE,
-            self.limits.initial_stream_window as u32,
+            u32::try_from(self.limits.initial_stream_window)
+                .expect("validated stream window is non-negative"),
         );
         push_setting(
             &mut settings_payload,
             SETTINGS_MAX_FRAME_SIZE,
-            self.limits.max_frame_size as u32,
+            u32::try_from(self.limits.max_frame_size)
+                .expect("validated frame size fits SETTINGS u32"),
         );
         push_setting(
             &mut settings_payload,
             SETTINGS_MAX_CONCURRENT_STREAMS,
-            self.limits.max_concurrent_streams as u32,
+            u32::try_from(self.limits.max_concurrent_streams)
+                .expect("validated stream limit fits SETTINGS u32"),
         );
         push_setting(&mut settings_payload, SETTINGS_ENABLE_PUSH, 0);
         preface.extend_from_slice(&Frame::new(FRAME_SETTINGS, 0, 0, settings_payload).encode());
-        let extra = self.limits.initial_connection_window - DEFAULT_WINDOW;
+        let extra = self
+            .limits
+            .initial_connection_window
+            .checked_sub(DEFAULT_WINDOW)
+            .expect("validated connection window is at least the HTTP/2 default");
         if extra > 0 {
-            preface.extend_from_slice(&window_update_frame(0, extra as u32).encode());
+            let increment = u32::try_from(extra).expect("positive i32 window increment fits u32");
+            preface.extend_from_slice(&window_update_frame(0, increment).encode());
         }
         self.preface_sent = true;
         self.pending_write = preface;
@@ -1247,7 +1273,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             return;
         }
         if let Some(peer_cap) = self.peer_max_concurrent_streams {
-            if (self.streams.len() as u32) >= peer_cap {
+            if self.active_stream_count() >= peer_cap {
                 self.report.admission_full += 1;
                 effects.push(reject_outcome(waiter, 0, Http2ClientOutcome::Full));
                 return;
@@ -1332,7 +1358,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             return;
         }
         if let Some(peer_cap) = self.peer_max_concurrent_streams {
-            if (self.streams.len() as u32) >= peer_cap {
+            if self.active_stream_count() >= peer_cap {
                 self.report.admission_full += 1;
                 effects.push(reject_outcome(waiter, 0, Http2ClientOutcome::Full));
                 return;
@@ -1407,7 +1433,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         if self.streams.len() >= self.limits.max_concurrent_streams
             || self
                 .peer_max_concurrent_streams
-                .is_some_and(|cap| self.streams.len() as u32 >= cap)
+                .is_some_and(|cap| self.active_stream_count() >= cap)
             || self.write_queue.len() >= self.limits.connection_outbound_queue_capacity
         {
             self.report.admission_full += 1;
@@ -1504,7 +1530,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         if self.streams.len() >= self.limits.max_concurrent_streams
             || self
                 .peer_max_concurrent_streams
-                .is_some_and(|cap| self.streams.len() as u32 >= cap)
+                .is_some_and(|cap| self.active_stream_count() >= cap)
             || self.write_queue.len() >= self.limits.connection_outbound_queue_capacity
         {
             self.report.admission_full += 1;
@@ -1574,6 +1600,11 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
     fn push_stream(&mut self, stream: ActiveClientStream) {
         self.stream_index.insert(stream.id, self.streams.len());
         self.streams.push(stream);
+    }
+
+    fn active_stream_count(&self) -> u32 {
+        u32::try_from(self.streams.len())
+            .expect("validated local stream limit bounds the active stream count")
     }
 
     /// Remove the stream at `idx` with `swap_remove`, keeping the index
@@ -2060,9 +2091,10 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
                 }
             }
             SETTINGS_ENABLE_PUSH => {
-                if value > 1 {
-                    return Err(Http2ProtocolError::InvalidSettingsValue);
-                }
+                let _ = value;
+                // RFC 9113 allows this setting only from clients. Receiving it
+                // from a server is a connection-level protocol error.
+                return Err(Http2ProtocolError::InvalidSettingsValue);
             }
             SETTINGS_MAX_CONCURRENT_STREAMS => {
                 self.peer_max_concurrent_streams = Some(value);
@@ -2592,7 +2624,9 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             self.write_queue.push_back(bytes);
         } else if self.pending_write.is_empty() {
             self.pending_write = bytes;
-        } else if self.pending_write.len() + bytes.len() <= self.peer_max_frame_size {
+        } else if self.write_queue.is_empty()
+            && self.pending_write.len() + bytes.len() <= self.peer_max_frame_size
+        {
             self.pending_write.append(&mut bytes);
         } else {
             self.write_queue.push_back(bytes);
@@ -3001,7 +3035,8 @@ mod tests {
             addr: (Ipv4Addr::LOCALHOST, 80).into(),
         };
         let mut client =
-            Http2ClientConnection::<tina::SingleShard>::new(target, Http2ClientLimits::default());
+            Http2ClientConnection::<tina::SingleShard>::new(target, Http2ClientLimits::default())
+                .expect("default client limits are valid");
 
         client.enqueue_frame(headers_frame(1, false, b"headers".to_vec()));
         client.enqueue_frame(data_frame(1, true, b"body".to_vec()));
@@ -3033,7 +3068,8 @@ mod tests {
             addr: (Ipv4Addr::LOCALHOST, 80).into(),
         };
         let mut client =
-            Http2ClientConnection::<tina::SingleShard>::new(target, Http2ClientLimits::default());
+            Http2ClientConnection::<tina::SingleShard>::new(target, Http2ClientLimits::default())
+                .expect("default client limits are valid");
         client.write_in_flight = true;
         client
             .write_queue
@@ -3070,7 +3106,8 @@ mod tests {
             addr: (Ipv4Addr::LOCALHOST, 80).into(),
         };
         let mut client =
-            Http2ClientConnection::<tina::SingleShard>::new(target, Http2ClientLimits::default());
+            Http2ClientConnection::<tina::SingleShard>::new(target, Http2ClientLimits::default())
+                .expect("default client limits are valid");
 
         let frame_cap = client.peer_max_frame_size;
         client.enqueue_bytes(vec![1; frame_cap]);
@@ -3097,7 +3134,8 @@ mod tests {
             addr: (Ipv4Addr::LOCALHOST, 80).into(),
         };
         let mut client =
-            Http2ClientConnection::<tina::SingleShard>::new(target, Http2ClientLimits::default());
+            Http2ClientConnection::<tina::SingleShard>::new(target, Http2ClientLimits::default())
+                .expect("default client limits are valid");
 
         let _ = client.wrong_lane_message();
         assert_eq!(client.report.wrong_lane_messages, 1);
@@ -3106,51 +3144,124 @@ mod tests {
         assert_eq!(client.report.wrong_lane_messages, 2);
     }
 
+    fn test_target() -> Http2Target {
+        Http2Target::H2c {
+            authority: "x".into(),
+            addr: (Ipv4Addr::LOCALHOST, 80).into(),
+        }
+    }
+
     #[test]
-    #[should_panic(expected = "max_concurrent_streams must be >= 1")]
-    fn client_limits_reject_zero_concurrency_in_release_too() {
+    fn client_limit_boundaries_are_typed_before_allocation() {
+        let mut limits = Http2ClientLimits {
+            max_frame_size: MIN_MAX_FRAME_SIZE as usize - 1,
+            ..Http2ClientLimits::default()
+        };
+        assert_eq!(
+            limits.validate(),
+            Err(Http2ConfigError::FrameSizeOutOfRange {
+                value: MIN_MAX_FRAME_SIZE as usize - 1
+            })
+        );
+        limits.max_frame_size = MIN_MAX_FRAME_SIZE as usize;
+        limits.validate().expect("minimum frame size is valid");
+        limits.max_frame_size = MAX_MAX_FRAME_SIZE as usize;
+        limits.validate().expect("maximum frame size is valid");
+        limits.max_frame_size = MAX_MAX_FRAME_SIZE as usize + 1;
+        assert!(matches!(
+            limits.validate(),
+            Err(Http2ConfigError::FrameSizeOutOfRange { .. })
+        ));
+
+        limits = Http2ClientLimits {
+            max_concurrent_streams: 0,
+            ..Http2ClientLimits::default()
+        };
+        limits
+            .validate()
+            .expect("zero streams is an intentional cap");
+        limits.max_concurrent_streams = u32::MAX as usize;
+        let client = Http2ClientConnection::<tina::SingleShard>::new(test_target(), limits)
+            .expect("u32::MAX stream limit is wire-valid");
+        assert!(client.streams.capacity() <= 64);
+        assert!(client.stream_index.capacity() < 1_024);
+        #[cfg(target_pointer_width = "64")]
+        {
+            limits.max_concurrent_streams = u32::MAX as usize + 1;
+            assert!(matches!(
+                limits.validate(),
+                Err(Http2ConfigError::ConcurrentStreamsOutOfRange { .. })
+            ));
+        }
+
+        limits = Http2ClientLimits {
+            initial_connection_window: DEFAULT_WINDOW - 1,
+            ..Http2ClientLimits::default()
+        };
+        assert!(matches!(
+            limits.validate(),
+            Err(Http2ConfigError::InitialConnectionWindowTooSmall { .. })
+        ));
+        limits.initial_connection_window = DEFAULT_WINDOW;
+        limits.initial_stream_window = -1;
+        assert!(matches!(
+            limits.validate(),
+            Err(Http2ConfigError::InitialStreamWindowNegative { .. })
+        ));
+        limits.initial_stream_window = 0;
+        limits.initial_connection_window = i32::MAX;
+        limits.validate().expect("maximum signed windows are valid");
+    }
+
+    #[test]
+    fn client_zero_operational_capacities_are_typed_errors() {
+        let mut limits = Http2ClientLimits {
+            connection_outbound_queue_capacity: 0,
+            ..Http2ClientLimits::default()
+        };
+        assert_eq!(
+            limits.validate(),
+            Err(Http2ConfigError::ZeroOutboundQueueCapacity)
+        );
+        limits.connection_outbound_queue_capacity = 1;
+        limits.pre_connect_submit_capacity = 0;
+        assert_eq!(
+            limits.validate(),
+            Err(Http2ConfigError::ZeroPreConnectSubmitCapacity)
+        );
+        limits.pre_connect_submit_capacity = 1;
+        limits.tls_io_timeout = Duration::ZERO;
+        assert_eq!(limits.validate(), Err(Http2ConfigError::ZeroTlsIoTimeout));
+    }
+
+    #[test]
+    fn zero_concurrency_constructs_without_preallocating_streams() {
         let target = Http2Target::H2c {
             authority: "x".into(),
             addr: (Ipv4Addr::LOCALHOST, 80).into(),
         };
-        let _ = Http2ClientConnection::<tina::SingleShard>::new(
+        let client = Http2ClientConnection::<tina::SingleShard>::new(
             target,
             Http2ClientLimits {
                 max_concurrent_streams: 0,
                 ..Http2ClientLimits::default()
             },
-        );
+        )
+        .expect("zero stream cap is valid");
+        assert_eq!(client.streams.capacity(), 0);
     }
 
     #[test]
-    #[should_panic(expected = "pre_connect_submit_capacity must be >= 1")]
-    fn client_limits_reject_zero_pre_connect_queue_in_release_too() {
-        let target = Http2Target::H2c {
-            authority: "x".into(),
-            addr: (Ipv4Addr::LOCALHOST, 80).into(),
-        };
-        let _ = Http2ClientConnection::<tina::SingleShard>::new(
-            target,
-            Http2ClientLimits {
-                pre_connect_submit_capacity: 0,
-                ..Http2ClientLimits::default()
-            },
-        );
-    }
+    fn client_rejects_enable_push_from_server() {
+        let mut client = Http2ClientConnection::<tina::SingleShard>::new(
+            test_target(),
+            Http2ClientLimits::default(),
+        )
+        .expect("default client limits are valid");
 
-    #[test]
-    #[should_panic(expected = "max_frame_size must be in HTTP/2 range")]
-    fn client_limits_reject_invalid_frame_size_in_release_too() {
-        let target = Http2Target::H2c {
-            authority: "x".into(),
-            addr: (Ipv4Addr::LOCALHOST, 80).into(),
-        };
-        let _ = Http2ClientConnection::<tina::SingleShard>::new(
-            target,
-            Http2ClientLimits {
-                max_frame_size: MIN_MAX_FRAME_SIZE as usize - 1,
-                ..Http2ClientLimits::default()
-            },
+        assert_eq!(
+            client.apply_setting(SETTINGS_ENABLE_PUSH, 0),
+            Err(Http2ProtocolError::InvalidSettingsValue)
         );
     }
 

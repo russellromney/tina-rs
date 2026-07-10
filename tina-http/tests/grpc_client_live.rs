@@ -178,7 +178,8 @@ fn start_server(
                 "127.0.0.1:0".parse().unwrap(),
                 service,
                 config,
-            ),
+            )
+            .expect("valid HTTP/2 server config"),
             config.listener_mailbox_capacity,
         )
         .expect("register listener");
@@ -358,7 +359,8 @@ fn oversized_request_is_rejected_before_the_wire() {
     };
     let conn = runtime
         .register_with_capacity::<Http2ClientConnection<TestShard>, _>(
-            Http2ClientConnection::<TestShard>::new(target, Http2ClientLimits::default()),
+            Http2ClientConnection::<TestShard>::new(target, Http2ClientLimits::default())
+                .expect("default HTTP/2 client limits are valid"),
             32,
         )
         .expect("register connection");

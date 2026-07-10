@@ -33,7 +33,7 @@ use crate::{HttpRequest, HttpRequestBody, HttpResponse, HttpResponseBody};
 use super::errors::{
     ERR_ENHANCE_YOUR_CALM, ERR_FLOW_CONTROL_ERROR, ERR_FRAME_SIZE_ERROR, ERR_NO_ERROR,
     ERR_PROTOCOL_ERROR, ERR_REFUSED_STREAM, ERR_SETTINGS_ERROR, ERR_STREAM_CLOSED,
-    Http2ProtocolError, classify_h2_reset,
+    Http2ConfigError, Http2ProtocolError, classify_h2_reset,
 };
 #[cfg(test)]
 use super::frame::try_decode_frame;
@@ -109,6 +109,45 @@ impl Default for Http2Limits {
     }
 }
 
+impl Http2Limits {
+    /// Validate protocol ranges and bounded per-connection capacities.
+    ///
+    /// A zero stream limit is valid and advertises that the peer may not open
+    /// streams on this connection. Queue and chunk capacities remain nonzero
+    /// because zero would prevent the connection state machine from progressing.
+    pub fn validate(&self) -> Result<(), Http2ConfigError> {
+        if !(MIN_MAX_FRAME_SIZE as usize..=MAX_MAX_FRAME_SIZE as usize)
+            .contains(&self.max_frame_size)
+        {
+            return Err(Http2ConfigError::FrameSizeOutOfRange {
+                value: self.max_frame_size,
+            });
+        }
+        if u32::try_from(self.max_concurrent_streams).is_err() {
+            return Err(Http2ConfigError::ConcurrentStreamsOutOfRange {
+                value: self.max_concurrent_streams,
+            });
+        }
+        if self.initial_connection_window < DEFAULT_WINDOW {
+            return Err(Http2ConfigError::InitialConnectionWindowTooSmall {
+                value: self.initial_connection_window,
+            });
+        }
+        if self.initial_stream_window < 0 {
+            return Err(Http2ConfigError::InitialStreamWindowNegative {
+                value: self.initial_stream_window,
+            });
+        }
+        if self.connection_outbound_queue_capacity == 0 {
+            return Err(Http2ConfigError::ZeroOutboundQueueCapacity);
+        }
+        if self.request_stream_chunk_size == 0 {
+            return Err(Http2ConfigError::ZeroRequestStreamChunkSize);
+        }
+        Ok(())
+    }
+}
+
 /// Server-side knobs for [`Http2Listener`].
 #[derive(Debug, Clone, Copy)]
 pub struct Http2ServerConfig {
@@ -126,6 +165,18 @@ impl Http2ServerConfig {
             connection_mailbox_capacity: 16,
             listener_mailbox_capacity: 8,
         }
+    }
+
+    /// Validate the connection limits and runtime mailbox capacities.
+    pub fn validate(&self) -> Result<(), Http2ConfigError> {
+        self.limits.validate()?;
+        if self.connection_mailbox_capacity == 0 {
+            return Err(Http2ConfigError::ZeroConnectionMailboxCapacity);
+        }
+        if self.listener_mailbox_capacity == 0 {
+            return Err(Http2ConfigError::ZeroListenerMailboxCapacity);
+        }
+        Ok(())
     }
 }
 
@@ -515,8 +566,13 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         service: Address<M, HttpResponse>,
         limits: Http2Limits,
         service_call_timeout: Duration,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, Http2ConfigError> {
+        limits.validate()?;
+        const INITIAL_STREAM_TABLE_CAPACITY: usize = 64;
+        let initial_stream_capacity = limits
+            .max_concurrent_streams
+            .min(INITIAL_STREAM_TABLE_CAPACITY);
+        Ok(Self {
             stream,
             service,
             limits,
@@ -526,14 +582,14 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             hpack_decoder: hpack::Decoder::new(),
             path_cache: PathInternCache::with_capacity(PATH_INTERN_CACHE_CAP),
             preface_seen: false,
-            streams: Vec::with_capacity(limits.max_concurrent_streams),
-            stream_index: HashMap::with_capacity(limits.max_concurrent_streams),
+            streams: Vec::with_capacity(initial_stream_capacity),
+            stream_index: HashMap::with_capacity(initial_stream_capacity),
             highest_client_stream_id: 0,
             recv_window: limits.initial_connection_window,
             pending_recv_window_credit: 0,
             send_window: DEFAULT_WINDOW,
             peer_initial_stream_window: DEFAULT_WINDOW,
-            peer_max_frame_size: limits.max_frame_size,
+            peer_max_frame_size: MIN_MAX_FRAME_SIZE as usize,
             response_flush_cursor: None,
             reset_churn: 0,
             goaway: false,
@@ -545,7 +601,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             self_shard_id: None,
             self_isolate_id: None,
             _shard: PhantomData,
-        }
+        })
     }
 
     pub fn report(&self) -> &Http2ConnectionReport {
@@ -714,7 +770,8 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             self.closing_after_write = true;
             self.drain_streams_for_connection_close(&mut effects);
         }
-        if self.pending_write.is_empty() && !self.write_queue.is_empty() {
+        if !self.write_in_flight && (!self.pending_write.is_empty() || !self.write_queue.is_empty())
+        {
             effects.push(self.write_more());
         }
         if !self.closing_after_write {
@@ -741,7 +798,8 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             }
             self.read_buf.drain(..CLIENT_PREFACE.len());
             self.preface_seen = true;
-            self.enqueue_frame(self.initial_settings_frame())?;
+            debug_assert!(self.pending_write.is_empty());
+            self.pending_write = self.initial_handshake_bytes();
         }
 
         // Process frames as borrowed slices of the read buffer. Take the
@@ -2460,28 +2518,44 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         }
     }
 
-    /// Build the server's initial (non-ACK) SETTINGS from config. The peer
-    /// learns our caps only from this frame; an empty one leaves it on
-    /// protocol defaults (unlimited streams, 65535 window, 16384 frame).
-    /// Mirrors the client's advertisement.
+    /// Build the server's initial SETTINGS and optional connection credit as
+    /// one pending write, leaving the bounded queue available for the peer's
+    /// SETTINGS ACK even when its capacity is one.
+    fn initial_handshake_bytes(&self) -> Vec<u8> {
+        let mut bytes = self.initial_settings_frame().encode();
+        let extra = self
+            .limits
+            .initial_connection_window
+            .checked_sub(DEFAULT_WINDOW)
+            .expect("validated connection window is at least the HTTP/2 default");
+        if extra > 0 {
+            let increment = u32::try_from(extra).expect("positive i32 window increment fits u32");
+            bytes.extend_from_slice(&window_update_frame(0, increment).encode());
+        }
+        bytes
+    }
+
+    /// Build the server's initial (non-ACK) SETTINGS from validated config.
     fn initial_settings_frame(&self) -> Frame {
-        let mut payload = Vec::with_capacity(24);
+        let mut payload = Vec::with_capacity(18);
         push_setting(
             &mut payload,
             SETTINGS_MAX_CONCURRENT_STREAMS,
-            self.limits.max_concurrent_streams as u32,
+            u32::try_from(self.limits.max_concurrent_streams)
+                .expect("validated stream limit fits SETTINGS u32"),
         );
         push_setting(
             &mut payload,
             SETTINGS_INITIAL_WINDOW_SIZE,
-            self.limits.initial_stream_window as u32,
+            u32::try_from(self.limits.initial_stream_window)
+                .expect("validated stream window is non-negative"),
         );
         push_setting(
             &mut payload,
             SETTINGS_MAX_FRAME_SIZE,
-            self.limits.max_frame_size as u32,
+            u32::try_from(self.limits.max_frame_size)
+                .expect("validated frame size fits SETTINGS u32"),
         );
-        push_setting(&mut payload, SETTINGS_ENABLE_PUSH, 0);
         Frame::new(FRAME_SETTINGS, 0, 0, payload)
     }
 
@@ -2581,8 +2655,9 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Listener<S, M> {
         bind_addr: SocketAddr,
         service: Address<M, HttpResponse>,
         config: Http2ServerConfig,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, Http2ConfigError> {
+        config.validate()?;
+        Ok(Self {
             bind_addr,
             service,
             config,
@@ -2590,7 +2665,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Listener<S, M> {
             started: false,
             stopping: false,
             _shard: PhantomData,
-        }
+        })
     }
 }
 
@@ -2641,7 +2716,8 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Isolate for Http2Listener<S, M>
                                 self.service,
                                 self.config.limits,
                                 self.config.service_call_timeout,
-                            ),
+                            )
+                            .expect("listener config was validated at construction"),
                             self.config.connection_mailbox_capacity,
                         )
                         .with_initial_message(Http2ConnectionMsg::Begin),
@@ -2695,7 +2771,9 @@ mod tests {
         }
     }
 
-    fn unit_connection() -> Http2Connection<UnitShard> {
+    fn unit_connection_with_limits(
+        limits: Http2Limits,
+    ) -> Result<Http2Connection<UnitShard>, Http2ConfigError> {
         Http2Connection::new(
             StreamId::new(99),
             Address::new_with_generation(
@@ -2703,9 +2781,14 @@ mod tests {
                 IsolateId::new(1),
                 tina::AddressGeneration::new(0),
             ),
-            Http2Limits::default(),
+            limits,
             Duration::from_secs(1),
         )
+    }
+
+    fn unit_connection() -> Http2Connection<UnitShard> {
+        unit_connection_with_limits(Http2Limits::default())
+            .expect("default server limits are valid")
     }
 
     #[test]
@@ -3029,7 +3112,7 @@ mod tests {
         conn.process_buffer(&mut effects)
             .expect("preface processes cleanly");
 
-        let (settings, _) = try_decode_frame(&conn.write_queue[0], conn.limits.max_frame_size)
+        let (settings, _) = try_decode_frame(&conn.pending_write, conn.limits.max_frame_size)
             .expect("complete queued frame")
             .expect("queued SETTINGS decodes");
         assert_eq!(settings.ty, FRAME_SETTINGS);
@@ -3040,27 +3123,118 @@ mod tests {
             advertised
                 .iter()
                 .any(|&(id, v)| id == SETTINGS_MAX_CONCURRENT_STREAMS
-                    && v == limits.max_concurrent_streams as u32),
+                    && v == u32::try_from(limits.max_concurrent_streams).unwrap()),
             "SETTINGS must advertise MAX_CONCURRENT_STREAMS, got {advertised:?}"
         );
         assert!(
             advertised
                 .iter()
                 .any(|&(id, v)| id == SETTINGS_INITIAL_WINDOW_SIZE
-                    && v == limits.initial_stream_window as u32),
+                    && v == u32::try_from(limits.initial_stream_window).unwrap()),
             "SETTINGS must advertise INITIAL_WINDOW_SIZE, got {advertised:?}"
         );
         assert!(
             advertised
                 .iter()
-                .any(|&(id, v)| id == SETTINGS_MAX_FRAME_SIZE && v == limits.max_frame_size as u32),
+                .any(|&(id, v)| id == SETTINGS_MAX_FRAME_SIZE
+                    && v == u32::try_from(limits.max_frame_size).unwrap()),
             "SETTINGS must advertise MAX_FRAME_SIZE, got {advertised:?}"
         );
         assert!(
-            advertised
-                .iter()
-                .any(|&(id, v)| id == SETTINGS_ENABLE_PUSH && v == 0),
-            "SETTINGS must disable server push, got {advertised:?}"
+            advertised.iter().all(|&(id, _)| id != SETTINGS_ENABLE_PUSH),
+            "servers must not send SETTINGS_ENABLE_PUSH, got {advertised:?}"
+        );
+    }
+
+    #[test]
+    fn server_limit_boundaries_are_typed_before_allocation() {
+        let mut limits = Http2Limits {
+            max_frame_size: MIN_MAX_FRAME_SIZE as usize - 1,
+            ..Http2Limits::default()
+        };
+        assert!(matches!(
+            limits.validate(),
+            Err(Http2ConfigError::FrameSizeOutOfRange { .. })
+        ));
+        limits.max_frame_size = MIN_MAX_FRAME_SIZE as usize;
+        limits.validate().expect("minimum frame size is valid");
+        limits.max_frame_size = MAX_MAX_FRAME_SIZE as usize;
+        limits.validate().expect("maximum frame size is valid");
+        limits.max_frame_size = MAX_MAX_FRAME_SIZE as usize + 1;
+        assert!(matches!(
+            limits.validate(),
+            Err(Http2ConfigError::FrameSizeOutOfRange { .. })
+        ));
+
+        limits = Http2Limits {
+            max_concurrent_streams: 0,
+            ..Http2Limits::default()
+        };
+        limits
+            .validate()
+            .expect("zero streams is an intentional cap");
+        limits.max_concurrent_streams = u32::MAX as usize;
+        let conn =
+            unit_connection_with_limits(limits).expect("u32::MAX stream limit is wire-valid");
+        assert!(conn.streams.capacity() <= 64);
+        assert!(conn.stream_index.capacity() < 1_024);
+        #[cfg(target_pointer_width = "64")]
+        {
+            limits.max_concurrent_streams = u32::MAX as usize + 1;
+            assert!(matches!(
+                limits.validate(),
+                Err(Http2ConfigError::ConcurrentStreamsOutOfRange { .. })
+            ));
+        }
+
+        limits = Http2Limits {
+            initial_connection_window: DEFAULT_WINDOW - 1,
+            ..Http2Limits::default()
+        };
+        assert!(matches!(
+            limits.validate(),
+            Err(Http2ConfigError::InitialConnectionWindowTooSmall { .. })
+        ));
+        limits.initial_connection_window = i32::MAX;
+        limits.initial_stream_window = -1;
+        assert!(matches!(
+            limits.validate(),
+            Err(Http2ConfigError::InitialStreamWindowNegative { .. })
+        ));
+        limits.initial_stream_window = 0;
+        limits.validate().expect("maximum signed windows are valid");
+    }
+
+    #[test]
+    fn server_zero_operational_capacities_are_typed_errors() {
+        let mut limits = Http2Limits {
+            connection_outbound_queue_capacity: 0,
+            ..Http2Limits::default()
+        };
+        assert_eq!(
+            limits.validate(),
+            Err(Http2ConfigError::ZeroOutboundQueueCapacity)
+        );
+        limits.connection_outbound_queue_capacity = 1;
+        limits.request_stream_chunk_size = 0;
+        assert_eq!(
+            limits.validate(),
+            Err(Http2ConfigError::ZeroRequestStreamChunkSize)
+        );
+
+        let mut config = Http2ServerConfig {
+            connection_mailbox_capacity: 0,
+            ..Http2ServerConfig::default()
+        };
+        assert_eq!(
+            config.validate(),
+            Err(Http2ConfigError::ZeroConnectionMailboxCapacity)
+        );
+        config.connection_mailbox_capacity = 1;
+        config.listener_mailbox_capacity = 0;
+        assert_eq!(
+            config.validate(),
+            Err(Http2ConfigError::ZeroListenerMailboxCapacity)
         );
     }
 
