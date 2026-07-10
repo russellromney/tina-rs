@@ -1652,6 +1652,23 @@ where
         ))
     }
 
+    /// Turns this prepared call into a split service's later event.
+    ///
+    /// The translator works only with the domain event. The split-service
+    /// envelope is an implementation detail of this continuation.
+    pub fn then_service_event<I, F, E, Q>(self, translator: F) -> tina::Effect<I>
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<E, Q>,
+                Io = RuntimeCall<tina::ServiceMessage<E, Q>>,
+            >,
+        F: FnOnce(CallOutcome<R>) -> E + 'static,
+        E: 'static,
+        Q: 'static,
+    {
+        self.then(move |outcome| tina::ServiceMessage::Event(translator(outcome)))
+    }
+
     /// Like [`reply`](Self::reply), but also carries the caller's
     /// [`RequestContext`] into the continuation message so a multi-turn
     /// service can still answer the original caller after the child call
@@ -1694,6 +1711,30 @@ where
             move |outcome| translator(req, outcome),
         ))
     }
+
+    /// Carries caller authority into a split service's later event.
+    ///
+    /// This is the service-envelope sibling of [`Self::then_with_request`];
+    /// it preserves the same explicit [`tina::RequestContext`] flow.
+    pub fn then_service_event_with_request<I, F, E, S, Q>(
+        self,
+        req: tina::RequestContext<Q>,
+        translator: F,
+    ) -> tina::Effect<I>
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<E, S>,
+                Io = RuntimeCall<tina::ServiceMessage<E, S>>,
+            >,
+        F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> E + 'static,
+        E: 'static,
+        S: 'static,
+        Q: 'static,
+    {
+        self.then_with_request(req, move |req, outcome| {
+            tina::ServiceMessage::Event(translator(req, outcome))
+        })
+    }
 }
 
 impl<T, R, Q> DeferredIsolateCall<T, R, Q>
@@ -1732,6 +1773,24 @@ where
         M: 'static,
     {
         self.permit.apply(self.inner.reply(translator))
+    }
+
+    /// Builds a request effect whose continuation is a split service event.
+    pub fn reply_service_event<I, F, E, S>(self, translator: F) -> tina::RequestEffect<I>
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<E, S>,
+                Reply = Q,
+                Io = RuntimeCall<tina::ServiceMessage<E, S>>,
+            >,
+        F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> E + 'static,
+        E: 'static,
+        S: 'static,
+    {
+        crate::call::request_effect_from_consumed_effect(
+            self.inner
+                .reply(move |req, outcome| tina::ServiceMessage::Event(translator(req, outcome))),
+        )
     }
 }
 

@@ -125,10 +125,14 @@ impl Frontend {
                     Ok((_ticket, permit)) => {
                         let worker = self.workers[self.next_worker];
                         self.next_worker = (self.next_worker + 1) % self.workers.len();
-                        let dispatch_effect = call_request(worker, WorkerRequest::Do(payload), CALL_TIMEOUT)
-                            .then(move |outcome| {
-                                tina::ServiceMessage::Event(FrontendEvent::WorkerDone(qid, outcome))
-                            });
+                        let dispatch_effect = call_request(
+                            worker,
+                            WorkerRequest::Do(payload),
+                            CALL_TIMEOUT,
+                        )
+                        .then_service_event(move |outcome| {
+                            FrontendEvent::WorkerDone(qid, outcome)
+                        });
                         request_effect_after_park(permit, dispatch_effect)
                     }
                     Err(ParkError::Full { call, .. }) => call.reply(FrontendReply::PendingFull),

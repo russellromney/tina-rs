@@ -1,8 +1,8 @@
 //! Time-and-sleep rail vocabulary.
 //!
 //! Owns the `sleep` constructor, the `sleep_then` shortcut, and
-//! `SleepCall` with its `then` / `then_with_request` / `then_event`
-//! continuations.
+//! `SleepCall` with its `then` / `then_service_event` / `then_with_request` /
+//! `then_event` continuations.
 
 use std::time::Duration;
 
@@ -168,6 +168,24 @@ where
     {
         self.permit.apply(self.inner.reply(translator))
     }
+
+    /// Builds a request effect whose continuation is a split service event.
+    pub fn reply_service_event<I, F, Event, Request>(self, translator: F) -> tina::RequestEffect<I>
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Reply = Q,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        F: FnOnce(tina::RequestContext<Q>, Result<T, E>) -> Event + 'static,
+        Event: 'static,
+        Request: 'static,
+    {
+        crate::call::request_effect_from_consumed_effect(
+            self.inner
+                .reply(move |req, result| tina::ServiceMessage::Event(translator(req, result))),
+        )
+    }
 }
 
 impl<T, E, I> tina::DeferThrough<I> for TypedCall<T, E>
@@ -251,6 +269,24 @@ impl SleepCall {
         F: FnOnce(Result<(), CallError>) -> M + 'static,
     {
         self.inner.then(translator)
+    }
+
+    /// Turns this timer completion into a split service's later event.
+    ///
+    /// Unlike [`Self::then_event`], this keeps the timer result visible to the
+    /// domain-event translator and only hides `ServiceMessage::Event(...)`.
+    pub fn then_service_event<I, F, E, Q>(self, translator: F) -> tina::Effect<I>
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<E, Q>,
+                Io = RuntimeCall<tina::ServiceMessage<E, Q>>,
+            >,
+        F: FnOnce(Result<(), CallError>) -> E + 'static,
+        E: 'static,
+        Q: 'static,
+    {
+        self.inner
+            .then(move |result| tina::ServiceMessage::Event(translator(result)))
     }
 
     /// Carry caller authority into the wake continuation.
