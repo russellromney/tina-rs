@@ -12,6 +12,7 @@ pub enum TaskYield {
 }
 
 pub struct Task<T = (), A: Allocator = std::alloc::Global> {
+    #[allow(clippy::type_complexity)]
     coroutine:
         Option<Pin<Box<dyn Coroutine<IOHandle, Yield = TaskYield, Return = io::Result<T>>, A>>>,
 }

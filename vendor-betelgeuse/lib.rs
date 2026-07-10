@@ -22,7 +22,6 @@
 
 #![feature(allocator_api)]
 #![feature(coroutine_trait)]
-#![feature(coroutines)]
 #![feature(stmt_expr_attributes)]
 
 use std::{alloc::Allocator, io as stdio, net::SocketAddr, path::Path, rc::Rc};
@@ -46,7 +45,7 @@ pub use completion::{CompletionInner, Operation};
 /// An implementation is expected to:
 /// - submit queued work to the kernel as needed
 /// - harvest completed operations
-/// - complete the caller-owned [`Completion`] objects associated with them
+/// - complete the caller-owned completion objects associated with them
 ///
 /// The return value indicates whether this tick observed or produced useful
 /// work. Callers may use that signal for blocking, idling, or simulation logic.
@@ -197,12 +196,12 @@ pub fn io_loop<A: Allocator + Clone>(allocator: A) -> stdio::Result<IOLoopHandle
     #[cfg(target_os = "linux")]
     {
         let inner: Rc<dyn IOLoop> = Rc::new(io::linux::IoUringIO::new()?);
-        return Ok(IOLoopHandle::new(inner, allocator));
+        Ok(IOLoopHandle::new(inner, allocator))
     }
     #[cfg(target_os = "macos")]
     {
         let inner: Rc<dyn IOLoop> = Rc::new(io::darwin::DarwinIO::new()?);
-        return Ok(IOLoopHandle::new(inner, allocator));
+        Ok(IOLoopHandle::new(inner, allocator))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
