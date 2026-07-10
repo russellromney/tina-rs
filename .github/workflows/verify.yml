@@ -417,4 +417,4 @@ jobs:
         uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: cargo package --no-verify (publishable-today crates)
-        run: make verify-packaging
+        run: make SHELL=/bin/bash verify-packaging
