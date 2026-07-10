@@ -58,28 +58,30 @@ if [[ -n "$meta_offenders" ]]; then
 fi
 
 # --- 2. versionless internal path deps --------------------------------------
-# A `{ path = "../x" }` dep with no `version =` publishes a broken crate.
-# `cargo package` rejects it, but only for crates that can package today, so
-# grep the raw manifests to cover every workspace crate. Every internal path
-# dep in this repo is a one-line inline table, so a same-line check is
-# sufficient. Scope to WORKSPACE-member manifests only: the `examples/**`
-# crates are separate, unpublished workspaces that legitimately path-dep
-# without a version.
-# `while read` into an array (not `mapfile`): macOS ships bash 3.2, which has
-# no `mapfile`.
-member_manifests=()
-while IFS= read -r line; do
-    [[ -n "$line" ]] && member_manifests+=("$line")
-done < <(
-  cargo metadata --format-version 1 --no-deps --manifest-path "$MANIFEST" 2>/dev/null | jq -r --arg except "$EXCEPT" '
-    .packages[] | select(.name != $except) | .manifest_path
-  '
-)
+# A `{ path = "../x" }` normal/build dep with no `version =` publishes a broken
+# crate. `cargo package` rejects it, but only for crates that can package
+# today, so read `cargo metadata` to cover every workspace member.
+#
+# Use metadata, NOT a raw manifest grep, so dev-dependencies are excluded:
+# `cargo publish` strips a path-only dev-dep from the published manifest, so a
+# versionless path DEV-dep is legitimate (cargo package exits 0 on it) and must
+# NOT be flagged. In metadata a normal dep is kind=null, build dep kind="build",
+# dev dep kind="dev"; a path dep has a non-null `path`; and no `version =` shows
+# up as `req == "*"`. So the offenders are exactly the non-dev path deps with
+# req "*" (minus the documented $EXCEPT betelgeuse path dep). This also covers
+# target-specific `[target.'cfg(...)'.dependencies]`, which metadata flattens in.
 dep_offenders="$(
-  { [[ ${#member_manifests[@]} -gt 0 ]] && grep -Hn 'path = "\.\./' "${member_manifests[@]}" || true; } \
-    | grep -v 'version =' \
-    | grep -v "vendor-$EXCEPT" \
-    || true
+  cargo metadata --format-version 1 --no-deps --manifest-path "$MANIFEST" 2>/dev/null | jq -r --arg except "$EXCEPT" '
+    .packages[]
+    | select(.name != $except)
+    | .name as $pkg | .manifest_path as $mp
+    | .dependencies[]
+    | select(.kind != "dev")
+    | select(.path != null)
+    | select(.req == "*")
+    | select(.name != $except)
+    | "\($mp): dependency `\(.name)` has a path but no version requirement"
+  '
 )"
 
 if [[ -n "$dep_offenders" ]]; then
