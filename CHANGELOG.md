@@ -14,11 +14,12 @@ the exact call-site that surfaced it:
 - `tina_sim::Simulator::register_split_service` mirrors
   `tina_runtime::Runtime::register_split_service`; `specimen_multi_turn_request_context`'s
   sim path no longer hand-wraps `SplitServiceHandle::from_address(sim.register(...))`.
-- `tina_runtime::PendingCancelableCall::reply_request` turns a
-  `Full`/`DuplicateKey` admission-rejected token into a `RequestEffect`, so a
-  split-service `handle_request` arm can answer typed instead of panicking.
-  `system_job_queue`'s `Queue::submit` drops its `is_full()` pre-check +
-  panic; the Full path now replies `QueueReply::Busy`.
+- `tina_runtime::RequestPendingCancelableInsertError::reply` consumes the
+  matching one-use request-effect permit returned with a `Full`/`DuplicateKey`
+  admission rejection, so a split-service `handle_request` arm can answer
+  typed without reopening the generic request-effect escape. `system_job_queue`'s
+  `Queue::submit` drops its `is_full()` pre-check + panic; the Full path now
+  replies `QueueReply::Busy`.
 - `tina_runtime::call_cancelable_request` is the request-lane sibling of
   `call_cancelable`. Migrates the hand-wrapped `WorkerMsg::Request(...)`
   dispatch sites in `specimen_request_scope_fanout` and `system_job_queue`.

@@ -3442,7 +3442,6 @@ where
     pub(crate) marker: PhantomData<fn(Outbound) -> Outbound>,
 }
 
-#[allow(unsafe_code)]
 impl<I, S, F, Outbound> ErasedHandler<S, F> for HandlerAdapter<I, Outbound>
 where
     I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
@@ -3457,6 +3456,7 @@ where
     S: Shard,
     F: MailboxFactory,
 {
+    #[allow(unsafe_code)]
     fn handle_boxed(
         &mut self,
         message: Box<dyn Any>,
@@ -3484,6 +3484,7 @@ where
         erase_effect::<I, S, F, Outbound>(effect)
     }
 
+    #[allow(unsafe_code)]
     fn handle_call_boxed(
         &mut self,
         message: Box<dyn Any>,
@@ -3522,7 +3523,6 @@ where
     pub(crate) marker: PhantomData<fn(Outbound) -> Outbound>,
 }
 
-#[allow(unsafe_code)]
 impl<I, S, F, Outbound> ErasedHandler<S, F> for SendableHandlerAdapter<I, Outbound>
 where
     I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
@@ -3537,6 +3537,7 @@ where
     S: Shard,
     F: MailboxFactory,
 {
+    #[allow(unsafe_code)]
     fn handle_boxed(
         &mut self,
         message: Box<dyn Any>,
@@ -3564,6 +3565,7 @@ where
         erase_effect_sendable::<I, S, F, Outbound>(effect)
     }
 
+    #[allow(unsafe_code)]
     fn handle_call_boxed(
         &mut self,
         message: Box<dyn Any>,
