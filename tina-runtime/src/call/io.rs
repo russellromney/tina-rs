@@ -1090,6 +1090,11 @@ pub enum CallError {
     /// Tina attempted process kill/reap after timeout or cancel, but the
     /// platform did not prove the child was gone.
     KillUncertain,
+
+    /// The bounded runtime timer lane was full when the runtime tried to arm a
+    /// sleep. Mirrors the other `*Full` overload outcomes: the caller sees the
+    /// timer refused instead of the lane growing without bound.
+    TimerFull,
 }
 
 /// User-visible outcome for an observed send.

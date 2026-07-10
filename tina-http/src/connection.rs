@@ -2507,6 +2507,7 @@ fn response_for_call_error(error: &CallError) -> HttpResponse {
         | CallError::ProcessFull
         | CallError::ProcessClosed
         | CallError::KillUncertain
+        | CallError::TimerFull
         | CallError::Rejected(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     HttpResponse::with_status(status)

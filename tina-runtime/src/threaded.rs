@@ -74,6 +74,12 @@ pub struct ThreadedRuntimeConfig {
     /// Capacity of runtime-owned signal waits.
     pub signal_capacity: usize,
 
+    /// Max concurrently armed runtime timers per shard. A full timer lane
+    /// refuses new sleeps with [`crate::CallError::TimerFull`] instead of
+    /// growing without bound. The default (262144 per shard) is generous;
+    /// healthy workloads never see it.
+    pub timer_capacity: usize,
+
     /// OS CPU id to hard-pin this shard worker to.
     ///
     /// `Some(n)` means "pin this worker to OS CPU id `n` if the platform can."
@@ -151,6 +157,7 @@ impl Default for ThreadedRuntimeConfig {
             tls_lane_capacity: driver::DEFAULT_TLS_LANE_CAPACITY,
             process_lane_capacity: driver::DEFAULT_PROCESS_LANE_CAPACITY,
             signal_capacity: driver::DEFAULT_SIGNAL_CAPACITY,
+            timer_capacity: driver::DEFAULT_DRIVER_TIMER_CAPACITY,
             configured_core: None,
             preallocation: PreallocationConfig::default(),
             // Live worker: bounded ring so trace does not grow with uptime.
@@ -443,6 +450,9 @@ where
         }
         if config.signal_capacity == 0 {
             panic!("ThreadedRuntime requires signal capacity > 0");
+        }
+        if config.timer_capacity == 0 {
+            panic!("ThreadedRuntime requires timer capacity > 0");
         }
         if config.remote_inbound_drain_budget == 0 {
             panic!("ThreadedRuntime requires remote inbound drain budget > 0");
@@ -1577,6 +1587,7 @@ where
             self.metrics.config.tls_lane_capacity,
             self.metrics.config.process_lane_capacity,
             self.metrics.config.signal_capacity,
+            self.metrics.config.timer_capacity,
         )
     }
 
@@ -1689,6 +1700,7 @@ where
             config.tls_lane_capacity,
             config.process_lane_capacity,
             config.signal_capacity,
+            config.timer_capacity,
         )),
         config.preallocation,
     );

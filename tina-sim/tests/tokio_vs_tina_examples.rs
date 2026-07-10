@@ -317,6 +317,7 @@ impl Client {
                         | CallError::ProcessFull
                         | CallError::ProcessClosed
                         | CallError::KillUncertain
+                        | CallError::TimerFull
                         | CallError::Rejected(_),
                     ) => push(&self.events, "unexpected_call_error"),
                 }
