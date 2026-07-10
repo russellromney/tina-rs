@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 description = "Proc macros for tina-rpc service traits"
 repository = "https://github.com/russellromney/tina-rs"
+keywords = ["proc-macro", "rpc"]
+categories = ["development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true

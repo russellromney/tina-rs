@@ -10,7 +10,7 @@ EXAMPLES_TARGET_DIR ?= $(CURDIR)/target/verify-examples
 # hit rate.
 
 .PHONY: fmt fmt-check check test loom miri doc clippy portable-runtime-cost perf \
-	perf-compare verify verify-static verify-guards verify-examples proof-fast proof-soak \
+	perf-compare verify verify-static verify-guards verify-examples verify-packaging proof-fast proof-soak \
 	proof-long-soak proof-bad-peer proof-replay-regression race-surface-guard rail-inventory-guard
 
 fmt:
@@ -170,3 +170,24 @@ verify-guards: loom race-surface-guard rail-inventory-guard
 # Full sequential gate, for a single local command. CI runs the groups above
 # (plus a per-platform `clippy`) as parallel jobs instead of this target.
 verify: verify-static clippy test verify-guards
+
+# Packaging-readiness smoke check: `cargo package` fails outright if any
+# workspace crate has a `path`-only internal dependency (no `version =`) or
+# missing publish metadata (description/license/repository) -- see the
+# crates.io 0.1.0 packaging-readiness work. --no-verify skips the build (that's
+# already covered by `test`/`clippy`); this only proves the manifest packages.
+#
+# Only the crates below can run this today: any crate that depends on
+# tina-runtime (directly or transitively) pulls in the vendored
+# ../vendor-betelgeuse path dependency, which has no published version to
+# fall back to, so `cargo package` on it fails with "no matching package"
+# regardless of manifest correctness (tracked as the open Betelgeuse
+# question). And even among these, a crate that depends on another workspace
+# crate can only pass once that dependency is actually live on crates.io at
+# the required version -- that's inherent to first-time interdependent
+# releases, not a bug here. tina-macros, tina-rpc-macros, and tina-codec have
+# zero internal dependencies, so they package cleanly with no prerequisite.
+verify-packaging:
+	cargo package --allow-dirty --no-verify -p tina-macros
+	cargo package --allow-dirty --no-verify -p tina-rpc-macros
+	cargo package --allow-dirty --no-verify -p tina-codec

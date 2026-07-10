@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 description = "Bounded single-producer/single-consumer mailbox for tina-rs"
 repository = "https://github.com/russellromney/tina-rs"
+keywords = ["spsc", "mailbox", "lock-free"]
+categories = ["concurrency", "data-structures"]
 
 [lib]
 path = "src/lib.rs"
@@ -14,5 +16,5 @@ path = "src/lib.rs"
 loom = ["dep:loom"]
 
 [dependencies]
-tina = { path = "../tina" }
+tina = { path = "../tina", version = "0.1.0" }
 loom = { version = "0.7.2", optional = true }

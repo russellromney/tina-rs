@@ -6,9 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 description = "Trait crate for the tina-rs isolate/effect discipline"
 repository = "https://github.com/russellromney/tina-rs"
+keywords = ["isolate", "effects", "actor"]
+categories = ["asynchronous", "concurrency"]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-tina-macros = { path = "../tina-macros" }
+tina-macros = { path = "../tina-macros", version = "0.1.0" }

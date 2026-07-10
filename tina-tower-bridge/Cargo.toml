@@ -6,14 +6,16 @@ rust-version.workspace = true
 license.workspace = true
 description = "tower::Service adapter over a Tina bridge handle"
 repository = "https://github.com/russellromney/tina-rs"
+keywords = ["tower", "service", "adapter"]
+categories = ["web-programming", "asynchronous"]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-tina = { path = "../tina" }
-tina-runtime = { path = "../tina-runtime" }
-tina-tokio-bridge = { path = "../tina-tokio-bridge" }
+tina = { path = "../tina", version = "0.1.0" }
+tina-runtime = { path = "../tina-runtime", version = "0.1.0" }
+tina-tokio-bridge = { path = "../tina-tokio-bridge", version = "0.1.0" }
 tower-service = "0.3"
 tokio = { version = "1.48.0", default-features = false, features = ["rt", "sync", "time"] }
 # Optional tracing emission. Enables tower-layer events under

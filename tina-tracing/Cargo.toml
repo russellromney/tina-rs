@@ -6,13 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 description = "Adapter from tina-runtime trace events and live reports to tracing events"
 repository = "https://github.com/russellromney/tina-rs"
+keywords = ["tracing", "observability"]
+categories = ["development-tools::debugging"]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-tina = { path = "../tina" }
-tina-runtime = { path = "../tina-runtime" }
+tina = { path = "../tina", version = "0.1.0" }
+tina-runtime = { path = "../tina-runtime", version = "0.1.0" }
 serde_json = "1"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 # Optional dep that backs `install_global_default_subscriber` behind

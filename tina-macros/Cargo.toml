@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 description = "Proc macros for tina-rs isolate authoring"
 repository = "https://github.com/russellromney/tina-rs"
+keywords = ["proc-macro", "macros"]
+categories = ["development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true

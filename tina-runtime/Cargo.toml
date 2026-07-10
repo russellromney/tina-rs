@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 description = "Deterministic single-shard runtime core for tina-rs"
 repository = "https://github.com/russellromney/tina-rs"
+keywords = ["runtime", "deterministic", "actor"]
+categories = ["asynchronous", "concurrency"]
 
 [lib]
 path = "src/lib.rs"
@@ -17,12 +19,22 @@ path = "src/lib.rs"
 loom = ["dep:loom"]
 
 [dependencies]
-tina = { path = "../tina" }
-tina-macros = { path = "../tina-macros" }
-tina-supervisor = { path = "../tina-supervisor" }
+tina = { path = "../tina", version = "0.1.0" }
+tina-macros = { path = "../tina-macros", version = "0.1.0" }
+tina-supervisor = { path = "../tina-supervisor", version = "0.1.0" }
 # Runtime substrate target. Vendored from Pekka Enberg's Betelgeuse with
 # a tiny local address-introspection patch (`local_addr` / `peer_addr`) so the
 # TCP call family can report socket addresses honestly.
+#
+# Deliberately left WITHOUT a `version =`: this is a vendored, patched fork
+# living at ../vendor-betelgeuse, not a published crate. It has no crates.io
+# release to point a `version` requirement at (the name itself is currently
+# unclaimed on crates.io), so packaging `tina-runtime` today strips the path
+# and has nothing to fall back to. This is the open "Betelgeuse question"
+# tracked in the packaging-readiness PR description -- until it's resolved
+# (publish the fork under its own name, vendor the source directly into
+# tina-runtime, or feature-gate it out), `tina-runtime` and everything that
+# depends on it cannot pass `cargo package`.
 betelgeuse = { path = "../vendor-betelgeuse" }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 # Only compiled under `--features loom` for the shared-capacity-scope model.

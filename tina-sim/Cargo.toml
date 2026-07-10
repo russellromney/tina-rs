@@ -4,12 +4,16 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Deterministic simulation-testing harness for tina-rs services"
+repository = "https://github.com/russellromney/tina-rs"
+keywords = ["simulation", "dst", "testing"]
+categories = ["development-tools::testing"]
 
 [dependencies]
-tina = { path = "../tina" }
-tina-runtime = { path = "../tina-runtime" }
-tina-supervisor = { path = "../tina-supervisor" }
+tina = { path = "../tina", version = "0.1.0" }
+tina-runtime = { path = "../tina-runtime", version = "0.1.0" }
+tina-supervisor = { path = "../tina-supervisor", version = "0.1.0" }
 
 [dev-dependencies]
-tina-rpc = { path = "../tina-rpc" }
+tina-rpc = { path = "../tina-rpc", version = "0.1.0" }
 tokio = { version = "1.48.0", default-features = false, features = ["rt", "rt-multi-thread", "sync", "time", "test-util"] }

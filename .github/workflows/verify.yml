@@ -319,3 +319,42 @@ jobs:
   # Run it locally before a bridge change with downstream consumers, or
   # revisit promoting it to a scheduled job once we see how often examples
   # actually break.
+
+  # Packaging-readiness smoke check (crates.io 0.1.0 prep): guards against
+  # regressing back to an unpublishable crate graph, e.g. a new internal
+  # `path`-only dependency with no `version =`, or a crate losing its
+  # description/license/repository. `cargo package --no-verify` builds
+  # nothing (the `test`/`clippy` jobs already cover that); it only proves
+  # each manifest is packageable. Deliberately NOT part of the required-check
+  # critical path: `main` has no branch protection today, and this only
+  # covers the three crates that can package with zero prerequisites
+  # (tina-macros, tina-rpc-macros, tina-codec -- no internal deps). Every
+  # other workspace crate either depends on the vendor-betelgeuse path
+  # dependency (no published version to fall back to -- the open Betelgeuse
+  # question) or depends on another workspace crate that isn't live on
+  # crates.io yet, which is expected pre-first-publish and not something this
+  # job can pass until the real, ordered `cargo publish` sequence has run.
+  packaging:
+    name: packaging check (cargo package --no-verify)
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: cargo package --no-verify (publishable-today crates)
+        env:
+          RUSTC_WRAPPER: sccache
+          CARGO_INCREMENTAL: "0"
+        run: make verify-packaging

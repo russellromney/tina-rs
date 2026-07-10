@@ -6,9 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 description = "Supervisor configuration types for tina-rs"
 repository = "https://github.com/russellromney/tina-rs"
+keywords = ["supervisor", "actor", "config"]
+categories = ["config"]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-tina = { path = "../tina" }
+tina = { path = "../tina", version = "0.1.0" }
