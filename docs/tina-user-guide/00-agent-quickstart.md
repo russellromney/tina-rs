@@ -24,14 +24,13 @@ channel unless the boundary is explicitly an adapter.
 ```rust
 use std::time::Duration;
 use tina::prelude::*;
-use tina_runtime::{
-    call, noop, reply, send, stop,
-    sleep, tcp_read, tcp_write,
-    CallError, CallOutcome,
-};
+use tina_runtime::{call, sleep, tcp_read, tcp_write, CallError, CallOutcome};
 ```
 
-Names move sometimes. The shape matters more than the exact path.
+The effect constructors (`noop`, `reply`, `send`, `stop`, `batch`, `spawn`)
+come with `tina::prelude::*`; the runtime calls (`call`, `sleep`, `tcp_*`)
+come from `tina_runtime`. Names move sometimes. The shape matters more than
+the exact path.
 
 ## First Shape To Reach For
 
