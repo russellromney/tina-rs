@@ -142,7 +142,23 @@ const FRAME_DATA: u8 = 0x0;
 const FRAME_WINDOW_UPDATE: u8 = 0x8;
 const FLAG_END_STREAM: u8 = 0x1;
 const FLAG_END_HEADERS: u8 = 0x4;
+const SETTINGS_ENABLE_PUSH: u16 = 0x2;
 const SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 0x3;
+const SETTINGS_INITIAL_WINDOW_SIZE: u16 = 0x4;
+const SETTINGS_MAX_FRAME_SIZE: u16 = 0x5;
+
+fn decode_settings(payload: &[u8]) -> Vec<(u16, u32)> {
+    assert_eq!(payload.len() % 6, 0);
+    payload
+        .chunks_exact(6)
+        .map(|entry| {
+            (
+                u16::from_be_bytes([entry[0], entry[1]]),
+                u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]),
+            )
+        })
+        .collect()
+}
 
 fn write_settings(stream: &mut TcpStream, settings: &[(u16, u32)]) {
     let mut payload = Vec::with_capacity(settings.len() * 6);
@@ -303,7 +319,18 @@ fn client_uses_default_peer_frame_cap_before_server_settings() {
         loop {
             let frame = read_frame(&mut sock).expect("request frame before server SETTINGS");
             match frame.ty {
-                FRAME_SETTINGS => {}
+                FRAME_SETTINGS => {
+                    let advertised = decode_settings(&frame.payload);
+                    assert!(advertised.contains(&(SETTINGS_ENABLE_PUSH, 0)));
+                    assert!(advertised.contains(&(SETTINGS_INITIAL_WINDOW_SIZE, 65_535)));
+                    assert!(advertised.contains(&(SETTINGS_MAX_FRAME_SIZE, 64 * 1024)));
+                    assert!(
+                        advertised
+                            .iter()
+                            .all(|(id, _)| *id != SETTINGS_MAX_CONCURRENT_STREAMS),
+                        "client request concurrency is local; a client-sent setting would govern server-initiated streams"
+                    );
+                }
                 FRAME_HEADERS => stream_id = Some(frame.stream_id),
                 FRAME_DATA => {
                     assert!(

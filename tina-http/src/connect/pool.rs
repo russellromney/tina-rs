@@ -192,6 +192,26 @@ pub enum FixedEndpointPoolError {
     },
 }
 
+impl std::fmt::Display for FixedEndpointPoolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroStreams => f.write_str("max_in_flight_per_conn must be positive"),
+            Self::ZeroPreConnectQueueCap => f.write_str("pre_connect_queue_cap must be positive"),
+            Self::ZeroRetainedReports => f.write_str("retained_reports must be positive"),
+            Self::NoEndpoints => f.write_str("at least one endpoint is required"),
+            Self::MismatchedConnections {
+                targets,
+                connections,
+            } => write!(
+                f,
+                "target and connection counts differ ({targets} targets, {connections} connections)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FixedEndpointPoolError {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EndpointSlot {
     route_key: String,
@@ -642,6 +662,7 @@ where
 }
 
 /// Why building an HTTP/2 pool failed.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum Http2PoolBuildError {
     /// The shared HTTP/2 connection limits were invalid.
@@ -656,13 +677,21 @@ impl std::fmt::Display for Http2PoolBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Config(e) => write!(f, "HTTP/2 config invalid: {e}"),
-            Self::Runtime(e) => write!(f, "runtime register failed: {e:?}"),
-            Self::Pool(e) => write!(f, "pool config invalid: {e:?}"),
+            Self::Runtime(e) => write!(f, "runtime register failed: {e}"),
+            Self::Pool(e) => write!(f, "pool config invalid: {e}"),
         }
     }
 }
 
-impl std::error::Error for Http2PoolBuildError {}
+impl std::error::Error for Http2PoolBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(error) => Some(error),
+            Self::Runtime(error) => Some(error),
+            Self::Pool(error) => Some(error),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -732,6 +761,20 @@ mod tests {
             Http2PoolBuildError::Config(Http2ConfigError::ZeroConnectionMailboxCapacity)
         ));
         runtime.shutdown().expect("runtime shuts down");
+    }
+
+    #[test]
+    fn pool_build_error_preserves_typed_source() {
+        let error = Http2PoolBuildError::Config(Http2ConfigError::ZeroOutboundQueueCapacity);
+        let source = std::error::Error::source(&error).expect("config source is retained");
+        assert_eq!(
+            source.to_string(),
+            "connection_outbound_queue_capacity must be positive"
+        );
+
+        let error = Http2PoolBuildError::Pool(FixedEndpointPoolError::NoEndpoints);
+        let source = std::error::Error::source(&error).expect("pool source is retained");
+        assert_eq!(source.to_string(), "at least one endpoint is required");
     }
 
     fn picked_index(outcome: Http2PickOutcome) -> usize {

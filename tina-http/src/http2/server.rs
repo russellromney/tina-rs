@@ -60,11 +60,15 @@ use super::headers::{decode_headers_block, encode_literal_header};
 /// Configurable limits for the HTTP/2 first form.
 #[derive(Debug, Clone, Copy)]
 pub struct Http2Limits {
-    /// Maximum payload bytes in a single frame.
+    /// Largest inbound frame payload accepted from the client. Advertised as
+    /// `SETTINGS_MAX_FRAME_SIZE`; outbound frames follow the peer's setting.
     pub max_frame_size: usize,
-    /// Maximum decoded header-list bytes for one HEADERS block.
+    /// Maximum decoded header-list bytes for one HEADERS block. This
+    /// implementation does not currently advertise
+    /// `SETTINGS_MAX_HEADER_LIST_SIZE`.
     pub max_header_bytes: usize,
-    /// Maximum simultaneously open streams on one connection.
+    /// Maximum simultaneously open client-initiated streams on one connection.
+    /// Advertised as `SETTINGS_MAX_CONCURRENT_STREAMS`.
     pub max_concurrent_streams: usize,
     /// Maximum buffered request body bytes for one stream.
     pub max_body_bytes: usize,
@@ -82,9 +86,11 @@ pub struct Http2Limits {
     pub request_stream_chunk_size: usize,
     /// Timeout for one response source pull.
     pub response_stream_call_timeout: Duration,
-    /// Initial connection receive window.
+    /// Initial connection receive window granted to the client. Values above
+    /// 65,535 are established with an initial `WINDOW_UPDATE`.
     pub initial_connection_window: i32,
-    /// Initial stream receive window.
+    /// Initial stream receive window granted to the client and advertised as
+    /// `SETTINGS_INITIAL_WINDOW_SIZE`.
     pub initial_stream_window: i32,
     /// Maximum peer reset churn before this connection sends GOAWAY
     /// with `ENHANCE_YOUR_CALM`.

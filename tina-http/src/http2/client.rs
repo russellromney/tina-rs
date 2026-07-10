@@ -98,8 +98,14 @@ fn tls_write_reply_to_tcp(reply: TlsWriteOwnedReply) -> TcpWriteOwnedReply {
 /// struct-update syntax. New fields go through a major-version bump.
 #[derive(Debug, Clone, Copy)]
 pub struct Http2ClientLimits {
+    /// Largest inbound frame payload accepted from the server. Advertised as
+    /// `SETTINGS_MAX_FRAME_SIZE`; outbound frames follow the peer's setting.
     pub max_frame_size: usize,
+    /// Local decoded response-header cap. This implementation does not
+    /// currently advertise `SETTINGS_MAX_HEADER_LIST_SIZE`.
     pub max_header_bytes: usize,
+    /// Local cap on concurrently active client-initiated request streams.
+    /// The server's setting may lower effective admission further.
     pub max_concurrent_streams: usize,
     pub max_response_body_bytes: usize,
     /// Bounded outbound frame queue length. Submits that arrive when the
@@ -110,7 +116,11 @@ pub struct Http2ClientLimits {
     /// flush are queued here, up to this cap, then rejected with
     /// [`Http2ClientOutcome::Full`].
     pub pre_connect_submit_capacity: usize,
+    /// Initial connection-level receive credit granted to the server. Values
+    /// above 65,535 are established with an initial `WINDOW_UPDATE`.
     pub initial_connection_window: i32,
+    /// Initial per-stream receive credit granted to the server and advertised
+    /// as `SETTINGS_INITIAL_WINDOW_SIZE`.
     pub initial_stream_window: i32,
     /// Per-call timeout for TLS rail read/write/close on an
     /// `Http2Target::Tls` connection. (The TCP rail's read/write are
@@ -142,8 +152,10 @@ impl Default for Http2ClientLimits {
 impl Http2ClientLimits {
     /// Validate protocol ranges and bounded client queues before construction.
     ///
-    /// A zero stream limit is valid: RFC 9113 permits advertising zero, and
-    /// the local client then rejects every submit with bounded `Full`.
+    /// A zero stream limit is valid: the local client then rejects every
+    /// submit with bounded `Full`. This local request-admission cap is not
+    /// advertised: client-sent `SETTINGS_MAX_CONCURRENT_STREAMS` governs
+    /// server-initiated streams, and this client disables server push.
     pub fn validate(&self) -> Result<(), Http2ConfigError> {
         if !(MIN_MAX_FRAME_SIZE as usize..=MAX_MAX_FRAME_SIZE as usize)
             .contains(&self.max_frame_size)
@@ -1063,7 +1075,7 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
         self.stream = Some(stream);
         let mut preface = Vec::with_capacity(CLIENT_PREFACE.len() + 64);
         preface.extend_from_slice(CLIENT_PREFACE);
-        let mut settings_payload = Vec::with_capacity(24);
+        let mut settings_payload = Vec::with_capacity(18);
         push_setting(
             &mut settings_payload,
             SETTINGS_INITIAL_WINDOW_SIZE,
@@ -1076,12 +1088,10 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             u32::try_from(self.limits.max_frame_size)
                 .expect("validated frame size fits SETTINGS u32"),
         );
-        push_setting(
-            &mut settings_payload,
-            SETTINGS_MAX_CONCURRENT_STREAMS,
-            u32::try_from(self.limits.max_concurrent_streams)
-                .expect("validated stream limit fits SETTINGS u32"),
-        );
+        // SETTINGS_MAX_CONCURRENT_STREAMS is directional. Sent by a client,
+        // it would cap server-initiated streams, not our outbound requests.
+        // ENABLE_PUSH=0 already forbids those streams, so omit the redundant
+        // and misleading setting while retaining the local admission cap.
         push_setting(&mut settings_payload, SETTINGS_ENABLE_PUSH, 0);
         preface.extend_from_slice(&Frame::new(FRAME_SETTINGS, 0, 0, settings_payload).encode());
         let extra = self
