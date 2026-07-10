@@ -49,6 +49,17 @@ directory against the upstream commit above to regenerate any of them.
 - **Honest socket address introspection** — `local_addr` / `peer_addr`.
 - **Lint/feature hygiene** — drop unused nightly features, satisfy the
   workspace's clippy -D warnings gate.
+- **Owned positional writes + cursor sends (#285)** — `pwrite_owned` /
+  `pwrite_owned_from` / `send_owned_from` and `PWriteOwnedCompletion`;
+  `SendOp`/`PWriteOp` carry a `start` cursor so retries resend only the
+  unwritten suffix while the completion returns the whole allocation on
+  success and failure. Also from #285: file ranges validated against
+  `off_t` before arming, io_uring lengths clamp to `u32::MAX` instead of
+  wrapping, and darwin `cancel_pending_completions` keeps each watch
+  recorded until its `EV_DELETE` succeeds (a failed delete no longer
+  orphans ownership bookkeeping for the remaining watches). Landed after
+  the 2026-07-09 re-vendor, so no re-apply commit exists for this family;
+  diff against the upstream commit above to regenerate it.
 
 Parallel substrate lanes (cloned `IOLoopHandle` sharing one loop) need no
 patch: upstream's `IOLoopHandle` already derives `Clone`; tina merely uses it.
