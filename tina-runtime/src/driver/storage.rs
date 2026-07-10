@@ -154,11 +154,9 @@ impl StorageLane {
     }
 }
 
-impl Drop for StorageLane {
-    fn drop(&mut self) {
-        self.cancel_pending(Instant::now());
-    }
-}
+// No `Drop` impl on purpose. Reactor storage shares its Betelgeuse loop with
+// TCP, TLS, and Unix; `SharedIoLanes` is the sole owner allowed to cancel, step,
+// and either reclaim or quarantine that lifetime unit during destruction.
 
 // -----------------------------------------------------------------------------
 // Reactor storage lane

@@ -708,14 +708,6 @@ impl BetelgeuseTcp {
         // The loop yields between steps so a stalled backend cannot pin
         // shutdown forever.
         loop {
-            if self.pending.is_empty() {
-                return;
-            }
-            if Instant::now() >= deadline {
-                return;
-            }
-
-            let _ = self.io_loop.step();
             let mut index = 0;
             while index < self.pending.len() {
                 if self.pending[index].kind.has_result()
@@ -726,6 +718,11 @@ impl BetelgeuseTcp {
                     index += 1;
                 }
             }
+            if self.pending.is_empty() || Instant::now() >= deadline {
+                return;
+            }
+
+            let _ = self.io_loop.step();
         }
     }
 

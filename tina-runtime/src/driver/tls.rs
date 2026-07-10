@@ -1198,11 +1198,10 @@ impl TlsLane {
         // the cancelled result. Drain TLS-owned boxes here before TCP performs
         // the final shared-loop shutdown check.
         //
-        // This must NOT run from `Drop`: on a bare runtime drop the TCP lane's
-        // field drops first and frees its boxes, leaving the backend's watch
-        // list dangling — walking it here would be use-after-free. A dropped
-        // lane simply lets its boxes (and the io_loop handle) fall; the backend
-        // is torn down without ever dereferencing the stale pointers.
+        // This must NOT run from this lane's `Drop`: whole-loop destruction is
+        // coordinated by `SharedIoLanes` while every sibling lane remains
+        // alive. If release cannot be proven, that owner quarantines every lane
+        // and loop handle together rather than freeing referenced boxes.
         for pending in &mut self.pending {
             pending.cancelled = true;
         }
@@ -1289,10 +1288,8 @@ impl TlsLane {
 }
 
 // No `Drop` impl on purpose: the TLS lane shares its Betelgeuse loop with the
-// TCP lane, and `cancel_pending_completions` is a whole-loop operation that is
-// only safe before any lane has dropped (see `cancel_pending`). On a bare drop
-// the lane's boxes and io_loop handle simply fall; the backend tears down
-// without dereferencing them.
+// TCP/storage/Unix lanes. `SharedIoLanes` owns whole-loop cancellation and the
+// reclaim-or-quarantine decision before any completion storage can drop.
 
 impl TlsPending {
     /// Whether the backend still holds a pointer to one of this op's

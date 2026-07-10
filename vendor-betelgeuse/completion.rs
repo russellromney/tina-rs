@@ -12,6 +12,16 @@
 //! the backend records an [`Operation`] in the underlying slot, submits the
 //! work, and later finishes the same object with a typed result.
 //!
+//! ## Address and lifetime
+//!
+//! Backends retain a pointer to an armed completion after the submission call
+//! returns. Callers must therefore place every completion in stable storage
+//! before submission and keep it alive until it has a terminal result or the
+//! backend confirms cancellation. A `Box<...Completion>` satisfies the address
+//! requirement: moving the box handle does not move its allocation. Cancelling
+//! the higher-level request does not by itself permit dropping the box while
+//! the backend still owns its pointer.
+//!
 //! ## Backend dispatch
 //!
 //! Every typed completion is `#[repr(C)]` with `inner: CompletionInner` as
