@@ -1344,6 +1344,105 @@ mod tests {
     }
 
     #[test]
+    fn arm_then_cancel_loop_far_past_capacity_never_reports_timer_full() {
+        // Cancel must actually drop the map entry, not leak it. The BTreeMap has
+        // no secondary CallId index, so a cancel that failed to remove the key
+        // would leak an entry and — after enough cycles — refill the lane and
+        // start refusing arms with TimerFull. Arm+cancel 250x past capacity and
+        // prove the lane returns to empty every cycle and still admits at the
+        // end. Break `cancel`'s `retain` (e.g. make the predicate always keep)
+        // and the in-loop `len == 0` assert fires immediately.
+        let io_loop = io_loop(Global).expect("init io loop");
+        let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+        driver.timer_capacity = 4;
+        let now = Instant::now();
+        let after = Duration::from_secs(60);
+        for i in 0..1_000u64 {
+            assert!(
+                driver
+                    .submit(CallId::new(i), CallInput::Sleep { after }, now)
+                    .is_none(),
+                "arming under capacity must not complete inline"
+            );
+            assert!(
+                driver.cancel(CallId::new(i)),
+                "cancel must find and drop the just-armed timer"
+            );
+            assert_eq!(
+                driver.timers.len(),
+                0,
+                "cancel leaked a map entry: lane not empty after cancel"
+            );
+        }
+        assert!(
+            driver
+                .submit(CallId::new(10_000), CallInput::Sleep { after }, now)
+                .is_none(),
+            "arm after 1000 arm+cancel cycles must not report TimerFull"
+        );
+    }
+
+    #[test]
+    fn zero_duration_arm_during_budgeted_drain_never_jumps_the_backlog() {
+        // The crown-jewel no-reorder invariant under the harvest budget. While a
+        // synchronized due backlog drains across ticks, a NEW zero-duration
+        // timer armed mid-drain at the same instant as the backlog (the sharpest
+        // adversarial case: equal deadline, so only the insertion-order
+        // tie-break separates them) must sort BEHIND every not-yet-fired backlog
+        // entry. It carries a strictly larger insertion_order, so its key can
+        // never sort ahead of an already-due timer, and budgeted delivery order
+        // equals the unbudgeted order. Reverse the tie-break and the interloper
+        // jumps the queue -> this fails.
+        let io_loop = io_loop(Global).expect("init io loop");
+        let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+        driver.timer_harvest_budget = 4;
+        let t0 = Instant::now();
+        for i in 0..20u64 {
+            driver.submit(
+                CallId::new(i),
+                CallInput::Sleep {
+                    after: Duration::ZERO,
+                },
+                t0,
+            );
+        }
+        // Harvest at t1 > t0 so the whole backlog is due; the interloper is armed
+        // at t0 (equal deadline to the backlog) after the first budgeted tick.
+        let t1 = t0 + Duration::from_millis(1);
+        let mut fired = Vec::new();
+        let mut interloper_armed = false;
+        let mut ticks = 0u64;
+        while !driver.timers.is_empty() {
+            let mut completed = Vec::new();
+            driver.harvest_timers(t1, &mut completed);
+            for c in &completed {
+                fired.push(c.call_id.get());
+            }
+            if !interloper_armed {
+                driver.submit(
+                    CallId::new(999),
+                    CallInput::Sleep {
+                        after: Duration::ZERO,
+                    },
+                    t0,
+                );
+                interloper_armed = true;
+            }
+            ticks += 1;
+            assert!(ticks <= 30, "harvest made no progress");
+        }
+        assert!(interloper_armed, "interloper was never armed mid-drain");
+        // Backlog fires first in FIFO order; the equal-deadline interloper fires
+        // last because its insertion_order is the largest.
+        let mut expected: Vec<u64> = (0..20).collect();
+        expected.push(999);
+        assert_eq!(
+            fired, expected,
+            "a mid-drain zero-duration arm reordered the due backlog"
+        );
+    }
+
+    #[test]
     fn storage_park_counts_as_pending_only() {
         let io_loop = io_loop(Global).expect("init io loop");
         let mut lane = StorageLane::reactor(io_loop, 1);
