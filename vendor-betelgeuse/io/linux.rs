@@ -17,8 +17,8 @@ use log::trace;
 use crate::{
     AcceptCompletion, AcceptOp, CompletionInner, ConnectCompletion, ConnectOp, FsyncCompletion,
     FsyncOp, IO, IOFile, IOLoop, IOSocket, MkdirCompletion, MkdirOp, OpenOptions, Operation,
-    PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, RecvBufCompletion, RecvCompletion,
-    RecvOp, SendCompletion, SendOp, SendOwnedCompletion, SizeCompletion, SizeOp,
+    PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, PWriteOwnedCompletion, RecvBufCompletion,
+    RecvCompletion, RecvOp, SendCompletion, SendOp, SendOwnedCompletion, SizeCompletion, SizeOp,
 };
 
 enum SocketKind {
@@ -121,6 +121,7 @@ impl IoUringIO {
             Operation::Connect(_) => errno == libc::EINTR,
             Operation::PRead(_)
             | Operation::PWrite(_)
+            | Operation::PWriteOwned(_)
             | Operation::Fsync(_)
             | Operation::Mkdir(_) => errno == libc::EINTR,
             Operation::Size(_) | Operation::Nop => false,
@@ -145,7 +146,8 @@ impl IoUringIO {
                     .build()
             }
             Operation::Send(op) | Operation::SendOwned(op) => {
-                opcode::Send::new(types::Fd(op.fd), op.buf.as_ptr(), op.buf.len() as u32)
+                let bytes = &op.buf[op.start..];
+                opcode::Send::new(types::Fd(op.fd), bytes.as_ptr(), bytes.len() as u32)
                     .flags(op.flags)
                     .build()
             }
@@ -154,8 +156,9 @@ impl IoUringIO {
                     .offset(op.offset)
                     .build()
             }
-            Operation::PWrite(op) => {
-                opcode::Write::new(types::Fd(op.fd), op.buf.as_ptr(), op.buf.len() as u32)
+            Operation::PWrite(op) | Operation::PWriteOwned(op) => {
+                let bytes = &op.buf[op.start..];
+                opcode::Write::new(types::Fd(op.fd), bytes.as_ptr(), bytes.len() as u32)
                     .offset(op.offset)
                     .build()
             }
@@ -270,6 +273,20 @@ impl IoUringIO {
                     Ok(result as usize)
                 };
                 unsafe { PWriteCompletion::from_inner_mut(c) }.complete(r);
+            }
+            Operation::PWriteOwned(_) => {
+                let r = if result < 0 {
+                    let Operation::PWriteOwned(op) = c.operation_mut() else {
+                        unreachable!()
+                    };
+                    Err((io_uring_err(result), mem::take(&mut op.buf)))
+                } else {
+                    let Operation::PWriteOwned(op) = c.operation_mut() else {
+                        unreachable!()
+                    };
+                    Ok((mem::take(&mut op.buf), result as usize))
+                };
+                unsafe { PWriteOwnedCompletion::from_inner_mut(c) }.complete(r);
             }
             Operation::Fsync(_) => {
                 let r = if result < 0 {
@@ -407,6 +424,45 @@ impl IOFile for IoUringFile {
         inner.prepare(Operation::PWrite(PWriteOp {
             fd: self.fd.raw(),
             buf,
+            start: 0,
+            offset,
+        }));
+        queue(&self.state, inner);
+        Ok(())
+    }
+
+    fn pwrite_owned(
+        &self,
+        c: &mut PWriteOwnedCompletion,
+        buf: Vec<u8>,
+        offset: u64,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
+        let inner = c.inner_mut();
+        inner.prepare(Operation::PWriteOwned(PWriteOp {
+            fd: self.fd.raw(),
+            buf,
+            start: 0,
+            offset,
+        }));
+        queue(&self.state, inner);
+        Ok(())
+    }
+
+    fn pwrite_owned_from(
+        &self,
+        c: &mut PWriteOwnedCompletion,
+        buf: Vec<u8>,
+        start: usize,
+        offset: u64,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
+        if start > buf.len() {
+            return Err((io::Error::from(io::ErrorKind::InvalidInput), buf));
+        }
+        let inner = c.inner_mut();
+        inner.prepare(Operation::PWriteOwned(PWriteOp {
+            fd: self.fd.raw(),
+            buf,
+            start,
             offset,
         }));
         queue(&self.state, inner);
@@ -690,7 +746,12 @@ impl IOSocket for IoUringSocket {
         }
         let inner = c.inner_mut();
         let flags = libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT;
-        inner.prepare(Operation::Send(SendOp { fd, buf, flags }));
+        inner.prepare(Operation::Send(SendOp {
+            fd,
+            buf,
+            start: 0,
+            flags,
+        }));
         queue(&self.state, inner);
         Ok(())
     }
@@ -726,7 +787,44 @@ impl IOSocket for IoUringSocket {
         }
         let inner = c.inner_mut();
         let flags = libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT;
-        inner.prepare(Operation::SendOwned(SendOp { fd, buf, flags }));
+        inner.prepare(Operation::SendOwned(SendOp {
+            fd,
+            buf,
+            start: 0,
+            flags,
+        }));
+        queue(&self.state, inner);
+        Ok(())
+    }
+
+    fn send_owned_from(
+        &self,
+        c: &mut SendOwnedCompletion,
+        buf: Vec<u8>,
+        start: usize,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
+        if start > buf.len() {
+            return Err((io::Error::from(io::ErrorKind::InvalidInput), buf));
+        }
+        let fd = match self.fd.borrow().as_ref() {
+            Some(fd) => fd.raw(),
+            None => {
+                return Err((
+                    io::Error::new(io::ErrorKind::NotConnected, "send called on closed socket"),
+                    buf,
+                ));
+            }
+        };
+        if !matches!(&*self.kind.borrow(), Some(SocketKind::Stream)) {
+            return Err((io::Error::from(io::ErrorKind::InvalidInput), buf));
+        }
+        let inner = c.inner_mut();
+        inner.prepare(Operation::SendOwned(SendOp {
+            fd,
+            buf,
+            start,
+            flags: libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+        }));
         queue(&self.state, inner);
         Ok(())
     }

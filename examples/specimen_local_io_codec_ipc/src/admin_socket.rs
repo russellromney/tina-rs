@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tina::{Address, Context, Effect, Isolate, Outbound, Shard, ShardId};
-use tina_codec::{FrameDecision, LineFramer};
+use tina_codec::{DecodeStatus, LineFramer, decode_chunk};
 use tina_runtime::{
     RuntimeCall, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerId, UnixReadReply,
     UnixStreamId, UnixWriteReply, sleep, unix_accept, unix_bind, unix_close_stream, unix_connect,
@@ -97,29 +97,27 @@ impl Isolate for AdminServer {
                         Effect::Stop
                     }
                 } else {
-                    self.framer.feed(bytes);
                     let mut reply_buffer = Vec::new();
                     let mut should_close = false;
-                    loop {
-                        match self.framer.next_frame() {
-                            FrameDecision::NeedMore => break,
-                            FrameDecision::Frame(line) => {
-                                self.seen.lock().unwrap().push(line.clone());
-                                if line == b"shutdown" {
-                                    should_close = true;
-                                    break;
-                                }
+                    let seen = &self.seen;
+                    let status = decode_chunk(&mut self.framer, &bytes, |line| {
+                        if !should_close {
+                            seen.lock().unwrap().push(line.clone());
+                            if line == b"shutdown" {
+                                should_close = true;
+                            } else {
                                 let mut response = b"ok ".to_vec();
                                 response.extend_from_slice(&line);
                                 response.push(b'\n');
                                 reply_buffer.extend_from_slice(&response);
                             }
-                            FrameDecision::Malformed(_) | FrameDecision::Full => {
-                                *self.malformed.lock().unwrap() = true;
-                                should_close = true;
-                                break;
-                            }
                         }
+                    });
+                    if !should_close
+                        && matches!(status, DecodeStatus::Malformed(_) | DecodeStatus::Full)
+                    {
+                        *self.malformed.lock().unwrap() = true;
+                        should_close = true;
                     }
                     if should_close {
                         if let Some(stream) = self.stream.take() {
@@ -318,7 +316,7 @@ pub fn smoke() -> SpecimenReport {
 }
 
 /// Bad-input proof: a single line longer than the configured cap must
-/// surface `FrameDecision::Full` and shut the connection down without
+/// surface `DecodeStatus::Full` and shut the connection down without
 /// growing the framer past the cap.
 pub fn bad_input_line_too_long() -> SpecimenReport {
     let mut huge = vec![b'X'; 64];
@@ -337,5 +335,35 @@ pub fn bad_input_line_too_long() -> SpecimenReport {
             "rejected_oversize_line={}",
             result.server_saw_malformed_or_full
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simulator_delivers_coalesced_maximum_line_and_following_line() {
+        let result = run_admin_socket(
+            PathBuf::from("/tmp/specimen_admin_coalesced.sock"),
+            vec![b"abcdefgh\n", b"x\n", b"shutdown\n"],
+            8,
+        );
+        assert_eq!(
+            result.server_saw,
+            [b"abcdefgh".to_vec(), b"x".to_vec(), b"shutdown".to_vec()]
+        );
+        assert!(!result.server_saw_malformed_or_full);
+    }
+
+    #[test]
+    fn shutdown_ignores_an_oversize_suffix_in_the_same_transport_chunk() {
+        let result = run_admin_socket(
+            PathBuf::from("/tmp/specimen_admin_shutdown_suffix.sock"),
+            vec![b"shutdown\n", b"xxxxxxxxxxxxxxxx\n"],
+            8,
+        );
+        assert_eq!(result.server_saw, [b"shutdown".to_vec()]);
+        assert!(!result.server_saw_malformed_or_full);
     }
 }

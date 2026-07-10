@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    DefaultThreadedMailboxFactory, LoopStep, StreamId, TcpConnectReply, TcpReadReply,
-    TcpReadToEof, TcpStreamCloseReply, TcpWriteAll, TcpWriteReply, ThreadedRuntime,
+    DefaultThreadedMailboxFactory, LoopStep, StreamId, TcpConnectReply, TcpReadReply, TcpReadToEof,
+    TcpStreamCloseReply, TcpWriteAll, ThreadedRuntime, WriteOwnedError, WriteOwnedReply,
     tcp_close_stream, tcp_connect,
 };
 
@@ -35,7 +35,7 @@ struct FetchOutcome {
 enum FetchMsg {
     Begin,
     Connected(TcpConnectReply),
-    Wrote(TcpWriteReply),
+    Wrote(Result<WriteOwnedReply, WriteOwnedError>),
     Read(TcpReadReply),
     /// Payload is kept for trace shape but not inspected at the
     /// handler — close is fire-and-forget here.
@@ -60,7 +60,11 @@ struct Fetcher {
 
 #[tina_runtime::isolate(message = FetchMsg)]
 impl Fetcher {
-    fn handle(&mut self, msg: FetchMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: FetchMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             FetchMsg::Begin => {
                 if self.remaining == 0 {
@@ -70,7 +74,7 @@ impl Fetcher {
             }
             FetchMsg::Connected(Ok((stream, _local, _peer))) => {
                 self.state.stream = Some(stream);
-                let writer = TcpWriteAll::new(stream, b"GET\n".to_vec());
+                let mut writer = TcpWriteAll::new(stream, b"GET\n".to_vec());
                 let effect = writer
                     .next_effect(FetchMsg::Wrote)
                     .expect("write helper has bytes to ship");

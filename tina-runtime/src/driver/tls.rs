@@ -387,7 +387,7 @@ impl TlsLane {
         self.pending.push(TlsPending {
             call_id,
             lane: TlsLaneKey::Connect(call_id),
-            deadline: now + timeout,
+            deadline: deadline_after(now, timeout),
             cancelled: false,
             state: TlsOpState::Connect { io, alpn_offered },
         });
@@ -482,7 +482,7 @@ impl TlsLane {
         self.pending.push(TlsPending {
             call_id,
             lane,
-            deadline: now + timeout,
+            deadline: deadline_after(now, timeout),
             cancelled: false,
             state: TlsOpState::Accept {
                 config,
@@ -548,7 +548,7 @@ impl TlsLane {
         self.pending.push(TlsPending {
             call_id,
             lane,
-            deadline: now + timeout,
+            deadline: deadline_after(now, timeout),
             cancelled: false,
             state: TlsOpState::Read { stream, max_len },
         });
@@ -601,7 +601,7 @@ impl TlsLane {
         self.pending.push(TlsPending {
             call_id,
             lane,
-            deadline: now + timeout,
+            deadline: deadline_after(now, timeout),
             cancelled: false,
             state: TlsOpState::ReadBuf {
                 stream,
@@ -639,7 +639,7 @@ impl TlsLane {
         self.pending.push(TlsPending {
             call_id,
             lane,
-            deadline: now + timeout,
+            deadline: deadline_after(now, timeout),
             cancelled: false,
             state: TlsOpState::Write {
                 stream,
@@ -695,7 +695,7 @@ impl TlsLane {
         self.pending.push(TlsPending {
             call_id,
             lane,
-            deadline: now + timeout,
+            deadline: deadline_after(now, timeout),
             cancelled: false,
             state: TlsOpState::WriteOwned {
                 stream,
@@ -747,7 +747,7 @@ impl TlsLane {
         self.pending.push(TlsPending {
             call_id,
             lane: TlsLaneKey::Stream(stream),
-            deadline: now + timeout,
+            deadline: deadline_after(now, timeout),
             cancelled: false,
             state: TlsOpState::Close {
                 io: entry.io,
@@ -2121,6 +2121,56 @@ mod tests {
         assert!(matches!(
             drive(&mut lane, &mut completed, CallId::new(7)),
             CallOutput::TlsClosed
+        ));
+    }
+
+    #[test]
+    fn maximum_timeout_survives_a_live_tls_handshake() {
+        let mut lane = fresh_lane(2);
+        let mut completed = Vec::new();
+        let (cert, key) = localhost_identity();
+        let bound = lane
+            .submit_bind(
+                CallId::new(1),
+                loopback(),
+                vec![cert.clone()],
+                key,
+                Vec::new(),
+                Instant::now(),
+            )
+            .expect("bind completes inline");
+        let (listener, addr) = match bound.result {
+            CallOutput::TlsBound {
+                listener,
+                local_addr,
+            } => (listener, local_addr),
+            other => panic!("unexpected bind: {other:?}"),
+        };
+
+        assert!(
+            lane.submit_accept(CallId::new(2), listener, Duration::MAX, Instant::now())
+                .is_none()
+        );
+        assert!(
+            lane.submit_connect(
+                CallId::new(3),
+                addr,
+                "localhost".to_string(),
+                vec![cert],
+                Vec::new(),
+                Duration::MAX,
+                Instant::now(),
+            )
+            .is_none()
+        );
+
+        assert!(matches!(
+            drive(&mut lane, &mut completed, CallId::new(2)),
+            CallOutput::TlsAccepted { .. }
+        ));
+        assert!(matches!(
+            drive(&mut lane, &mut completed, CallId::new(3)),
+            CallOutput::TlsConnected { .. }
         ));
     }
 }

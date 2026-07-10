@@ -140,7 +140,7 @@ impl DnsWorkerLane {
             Ok(()) => {
                 self.pending.push(DnsPending {
                     call_id,
-                    deadline: now + timeout,
+                    deadline: deadline_after(now, timeout),
                     cancelled,
                     timed_out: false,
                 });

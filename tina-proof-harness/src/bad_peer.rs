@@ -299,7 +299,7 @@ fn run_slowloris(
     }
     outcome.bytes_sent = prelude.len();
     let _ = stream.flush();
-    let deadline = started + give_up_after;
+    let deadline = tina::Deadline::from_instant(started, give_up_after).instant();
     for byte in trailer {
         if Instant::now() >= deadline {
             outcome.error = Some("slowloris: give_up_after elapsed".to_string());
@@ -465,7 +465,7 @@ fn drain_into(stream: &mut TcpStream, drain_for: Duration, outcome: &mut BadPeer
     let _ = stream.set_read_timeout(Some(drain_for.min(Duration::from_secs(2))));
     let mut buffer = [0u8; 1024];
     let mut reply = Vec::new();
-    let deadline = Instant::now() + drain_for;
+    let deadline = tina::Deadline::from_instant(Instant::now(), drain_for).instant();
     loop {
         if Instant::now() >= deadline {
             break;

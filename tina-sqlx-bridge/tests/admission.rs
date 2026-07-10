@@ -3,6 +3,7 @@
 //! Postgres is required.
 
 use std::convert::Infallible;
+use std::error::Error as _;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -224,6 +225,27 @@ fn install_with_invalid_config_errors_with_config() {
         Err(e) => e,
     };
     assert!(matches!(err, InstallError::Config(_)), "got {err:?}");
+    shutdown(runtime);
+}
+
+#[test]
+fn install_error_keeps_the_concrete_sqlx_source() {
+    let runtime = make_runtime();
+    let config = PgConfig::from_url("not a postgres connection URL")
+        .with_default_timeout(Duration::from_secs(1))
+        .with_poll_interval(Duration::from_millis(1));
+    let error = PgWorker::<SingleShard>::install(&runtime, config)
+        .err()
+        .expect("malformed Postgres URL must fail pool installation");
+
+    assert!(matches!(&error, InstallError::Pool(_)), "got {error:?}");
+    assert!(
+        error
+            .source()
+            .and_then(|source| source.downcast_ref::<sqlx::Error>())
+            .is_some(),
+        "callers must be able to inspect the original sqlx error"
+    );
     shutdown(runtime);
 }
 

@@ -365,7 +365,7 @@ where
         if state.joiner_failed {
             return Err(ShutdownWaitError::WorkerStopped);
         }
-        let deadline = Instant::now() + timeout;
+        let deadline = tina::Deadline::from_instant(Instant::now(), timeout).instant();
         loop {
             let now = Instant::now();
             if now >= deadline {

@@ -188,9 +188,10 @@ where
         }
     }
 
-    /// Advances virtual monotonic time by `by`.
+    /// Advances virtual monotonic time by `by`, saturating at
+    /// [`Duration::MAX`] instead of wrapping or panicking.
     pub fn advance_time(&mut self, by: Duration) {
-        self.virtual_now += by;
+        self.virtual_now = self.virtual_now.saturating_add(by);
     }
 
     /// Advances virtual time directly to the next due timer, if any.
@@ -318,7 +319,7 @@ where
 
             let incoming_call_context = message.call_context;
             let caller = self.build_message_caller(incoming_call_context, isolate_id);
-            let now = self.virtual_anchor + self.virtual_now;
+            let now = tina::Deadline::from_instant(self.virtual_anchor, self.virtual_now).instant();
 
             let effect = {
                 let mut handler = self.entries[index].handler.borrow_mut();
@@ -1384,25 +1385,26 @@ where
         let config = self.supervisors[supervisor_index].config;
         let policy = config.policy();
         let budget_state = self.supervisors[supervisor_index].budget_state;
-        let budget_state =
-            match budget_state.record_restart_at(self.virtual_anchor + self.virtual_now) {
-                Ok(next) => next,
-                Err(error) => {
-                    self.push_event(
-                        parent,
-                        Some(cause),
-                        RuntimeEventKind::SupervisorRestartRejected {
-                            failed_child: failed_child.isolate,
-                            failed_ordinal,
-                            reason: SupervisionRejectedReason::BudgetExceeded {
-                                attempted_restart: error.attempted_restart(),
-                                max_restarts: error.max_restarts(),
-                            },
+        let virtual_now =
+            tina::Deadline::from_instant(self.virtual_anchor, self.virtual_now).instant();
+        let budget_state = match budget_state.record_restart_at(virtual_now) {
+            Ok(next) => next,
+            Err(error) => {
+                self.push_event(
+                    parent,
+                    Some(cause),
+                    RuntimeEventKind::SupervisorRestartRejected {
+                        failed_child: failed_child.isolate,
+                        failed_ordinal,
+                        reason: SupervisionRejectedReason::BudgetExceeded {
+                            attempted_restart: error.attempted_restart(),
+                            max_restarts: error.max_restarts(),
                         },
-                    );
-                    return;
-                }
-            };
+                    },
+                );
+                return;
+            }
+        };
         self.supervisors[supervisor_index].budget_state = budget_state;
 
         let triggered = self.push_event(
@@ -1659,10 +1661,20 @@ where
         match request {
             CallInput::Sleep { after } => {
                 let insertion_order = self.next_timer_ordinal;
-                let deadline = self.virtual_now
-                    + after
-                    + self.fault_delay(self.config.faults.timer_wake, insertion_order, 0x5449_4d45);
-                self.next_timer_ordinal += 1;
+                let after = tina::Deadline::from_instant(self.virtual_anchor, after)
+                    .remaining_or_zero(self.virtual_anchor);
+                let deadline =
+                    self.virtual_now
+                        .saturating_add(after)
+                        .saturating_add(self.fault_delay(
+                            self.config.faults.timer_wake,
+                            insertion_order,
+                            0x5449_4d45,
+                        ));
+                self.next_timer_ordinal = self
+                    .next_timer_ordinal
+                    .checked_add(1)
+                    .expect("timer insertion ordinal exhausted after 2^64 submissions");
                 self.timers.push(TimerEntry {
                     call_id,
                     deadline,
@@ -1681,9 +1693,11 @@ where
                 max_len,
             } => self.handle_tcp_read_buf(call_id, stream, buffer, max_len),
             CallInput::TcpWrite { stream, bytes } => self.handle_tcp_write(call_id, stream, bytes),
-            CallInput::TcpWriteOwned { stream, bytes } => {
-                self.handle_tcp_write_owned(call_id, stream, bytes)
-            }
+            CallInput::TcpWriteOwned {
+                stream,
+                bytes,
+                start,
+            } => self.handle_tcp_write_owned(call_id, stream, bytes, start),
             CallInput::TcpWriteOwnedClose { stream, bytes } => {
                 self.handle_tcp_write_owned_close(call_id, stream, bytes)
             }
@@ -1772,6 +1786,12 @@ where
                 bytes,
                 offset,
             } => self.handle_file_write_at(call_id, file, bytes, offset),
+            CallInput::FileWriteAtOwned {
+                file,
+                bytes,
+                offset,
+                start,
+            } => self.handle_file_write_at_owned(call_id, file, bytes, start, offset),
             CallInput::FileFsync { file } => self.handle_file_fsync(call_id, file),
             CallInput::FileSize { file } => self.handle_file_size(call_id, file),
             CallInput::FileClose { file } => self.handle_file_close(call_id, file),
@@ -1802,6 +1822,11 @@ where
             CallInput::UnixWrite { stream, bytes } => {
                 self.handle_unix_write(call_id, stream, bytes)
             }
+            CallInput::UnixWriteOwned {
+                stream,
+                bytes,
+                start,
+            } => self.handle_unix_write_owned(call_id, stream, bytes, start),
             CallInput::UnixListenerClose { listener } => {
                 self.handle_unix_listener_close(call_id, listener)
             }
@@ -1942,7 +1967,10 @@ where
                         call_id: context.call_id,
                         requester: context.requester,
                         cause: context.cause,
-                        deadline: self.virtual_now + timeout,
+                        deadline: self.virtual_now.saturating_add(
+                            tina::Deadline::from_instant(self.virtual_anchor, timeout)
+                                .remaining_or_zero(self.virtual_anchor),
+                        ),
                         insertion_order,
                         continuation_context: context.continuation_context,
                         translator,
@@ -2014,7 +2042,10 @@ where
                     call_id: context.call_id,
                     requester: context.requester,
                     cause: context.cause,
-                    deadline: self.virtual_now + timeout,
+                    deadline: self.virtual_now.saturating_add(
+                        tina::Deadline::from_instant(self.virtual_anchor, timeout)
+                            .remaining_or_zero(self.virtual_anchor),
+                    ),
                     insertion_order,
                     continuation_context: context.continuation_context,
                     translator,
@@ -2283,6 +2314,7 @@ where
         call_id: CallId,
         stream: tina_runtime::StreamId,
         bytes: Vec<u8>,
+        start: usize,
     ) {
         let Some(stream_index) = self.stream_index(stream) else {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
@@ -2295,7 +2327,7 @@ where
             return;
         }
 
-        let Some(result) = self.stream_write_owned_result(stream_index, bytes) else {
+        let Some(result) = self.stream_write_owned_result(stream_index, bytes, start) else {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::InvalidResource));
             return;
         };
@@ -3246,7 +3278,10 @@ where
         }
         let path = self.files[index].path.clone();
         let start = offset as usize;
-        let end = start.saturating_add(bytes.len());
+        let count = bytes
+            .len()
+            .min(self.config.storage.file_write_cap.unwrap_or(usize::MAX));
+        let end = start.saturating_add(count);
         let storage = self
             .file_storage
             .get_mut(&path)
@@ -3254,11 +3289,79 @@ where
         if storage.len() < end {
             storage.resize(end, 0);
         }
-        storage[start..end].copy_from_slice(&bytes);
+        storage[start..end].copy_from_slice(&bytes[..count]);
         self.schedule_tcp_completion(
             call_id,
             TcpResourceKey::FileWrite(file),
-            CallOutput::FileWrote { count: bytes.len() },
+            CallOutput::FileWrote { count },
+        );
+    }
+
+    pub(crate) fn handle_file_write_at_owned(
+        &mut self,
+        call_id: CallId,
+        file: tina_runtime::FileId,
+        bytes: Vec<u8>,
+        buffer_start: usize,
+        offset: u64,
+    ) {
+        let Some(index) = self.file_index(file) else {
+            self.deliver_completion(
+                call_id,
+                CallOutput::FileWroteOwnedFailed {
+                    bytes,
+                    error: CallError::InvalidResource,
+                },
+            );
+            return;
+        };
+        if self.file_has_active_pending(file) {
+            self.deliver_completion(
+                call_id,
+                CallOutput::FileWroteOwnedFailed {
+                    bytes,
+                    error: CallError::ResourceBusy,
+                },
+            );
+            return;
+        }
+        if !self.files[index].options.write {
+            self.deliver_completion(
+                call_id,
+                CallOutput::FileWroteOwnedFailed {
+                    bytes,
+                    error: CallError::Io,
+                },
+            );
+            return;
+        }
+        let path = self.files[index].path.clone();
+        if buffer_start > bytes.len() {
+            self.deliver_completion(
+                call_id,
+                CallOutput::FileWroteOwnedFailed {
+                    bytes,
+                    error: CallError::InvariantViolation,
+                },
+            );
+            return;
+        }
+        let count = (bytes.len() - buffer_start)
+            .min(self.config.storage.file_write_cap.unwrap_or(usize::MAX));
+        let file_start = offset as usize;
+        let end = file_start.saturating_add(count);
+        let storage = self
+            .file_storage
+            .get_mut(&path)
+            .unwrap_or_else(|| panic!("open file has no simulated storage"));
+        if storage.len() < end {
+            storage.resize(end, 0);
+        }
+        storage[file_start..end].copy_from_slice(&bytes[buffer_start..buffer_start + count]);
+        self.schedule_tcp_completion(
+            call_id,
+            TcpResourceKey::FileWrite(file),
+            CallOutput::FileWroteOwned { bytes, count },
         );
     }
 
@@ -3809,6 +3912,108 @@ where
             );
         }
         self.schedule_tcp_completion(call_id, resource, CallOutput::UnixWrote { count: allowed });
+    }
+
+    pub(crate) fn handle_unix_write_owned(
+        &mut self,
+        call_id: CallId,
+        stream: UnixStreamId,
+        bytes: Vec<u8>,
+        start: usize,
+    ) {
+        let Some(stream_index) = self.unix_stream_index(stream) else {
+            self.deliver_completion(
+                call_id,
+                CallOutput::UnixWroteOwnedFailed {
+                    bytes,
+                    error: CallError::InvalidResource,
+                },
+            );
+            return;
+        };
+        let resource = TcpResourceKey::UnixStreamWrite(stream);
+        if self.resource_has_active_pending(resource) {
+            self.deliver_completion(
+                call_id,
+                CallOutput::UnixWroteOwnedFailed {
+                    bytes,
+                    error: CallError::ResourceBusy,
+                },
+            );
+            return;
+        }
+        let Some(peer_id) = self.unix_streams[stream_index].peer else {
+            self.schedule_tcp_completion(
+                call_id,
+                resource,
+                CallOutput::UnixWroteOwnedFailed {
+                    bytes,
+                    error: CallError::Io,
+                },
+            );
+            return;
+        };
+        let write_cap = self.unix_streams[stream_index].write_cap;
+        let Some(peer_index) = self.unix_stream_index_any(peer_id) else {
+            self.schedule_tcp_completion(
+                call_id,
+                resource,
+                CallOutput::UnixWroteOwnedFailed {
+                    bytes,
+                    error: CallError::Io,
+                },
+            );
+            return;
+        };
+        let peer = &mut self.unix_streams[peer_index];
+        if peer.closed {
+            self.schedule_tcp_completion(
+                call_id,
+                resource,
+                CallOutput::UnixWroteOwnedFailed {
+                    bytes,
+                    error: CallError::Io,
+                },
+            );
+            return;
+        }
+        if start > bytes.len() {
+            self.schedule_tcp_completion(
+                call_id,
+                resource,
+                CallOutput::UnixWroteOwnedFailed {
+                    bytes,
+                    error: CallError::InvariantViolation,
+                },
+            );
+            return;
+        }
+        let room = peer.inbound_capacity.saturating_sub(peer.inbound.len());
+        let count = room.min(write_cap).min(bytes.len() - start);
+        peer.inbound
+            .extend(bytes[start..start + count].iter().copied());
+        // Match the borrowed write rail: bytes becoming available must wake a
+        // read that was already parked on the peer.
+        if let Some(idx) = self
+            .pending_unix_reads
+            .iter()
+            .position(|pending| pending.stream == peer_id)
+        {
+            let pending = self.pending_unix_reads.remove(idx);
+            let peer = &mut self.unix_streams[peer_index];
+            let take = peer.inbound.len().min(pending.max_len);
+            let read_bytes: Vec<u8> = peer.inbound.drain(..take).collect();
+            self.schedule_tcp_completion(
+                pending.call_id,
+                TcpResourceKey::UnixStreamRead(peer_id),
+                CallOutput::UnixRead { bytes: read_bytes },
+            );
+        }
+        self.schedule_tcp_completion(
+            call_id,
+            resource,
+            CallOutput::UnixWroteOwned { bytes, count },
+        );
     }
 
     pub(crate) fn handle_unix_listener_close(&mut self, call_id: CallId, listener: UnixListenerId) {
@@ -4389,15 +4594,26 @@ where
         &mut self,
         stream_index: usize,
         bytes: Vec<u8>,
+        start: usize,
     ) -> Option<CallOutput> {
         let stream = self.streams.get_mut(stream_index)?;
         if stream.closed {
             return None;
         }
 
+        if start > bytes.len() {
+            return Some(CallOutput::TcpWroteOwnedFailed {
+                bytes,
+                error: CallError::InvariantViolation,
+            });
+        }
         let remaining_capacity = stream.output_capacity.saturating_sub(stream.output.len());
-        let count = bytes.len().min(stream.write_cap).min(remaining_capacity);
-        stream.output.extend_from_slice(&bytes[..count]);
+        let count = (bytes.len() - start)
+            .min(stream.write_cap)
+            .min(remaining_capacity);
+        stream
+            .output
+            .extend_from_slice(&bytes[start..start + count]);
         Some(CallOutput::TcpWroteOwned { bytes, count })
     }
 
@@ -6047,7 +6263,7 @@ pub(crate) fn call_kind(request: &CallInput) -> CallKind {
         CallInput::ProcessRun { .. } => CallKind::ProcessRun,
         CallInput::FileOpen { .. } => CallKind::FileOpen,
         CallInput::FileReadAt { .. } => CallKind::FileReadAt,
-        CallInput::FileWriteAt { .. } => CallKind::FileWriteAt,
+        CallInput::FileWriteAt { .. } | CallInput::FileWriteAtOwned { .. } => CallKind::FileWriteAt,
         CallInput::FileFsync { .. } => CallKind::FileFsync,
         CallInput::FileSize { .. } => CallKind::FileSize,
         CallInput::FileClose { .. } => CallKind::FileClose,
@@ -6066,7 +6282,7 @@ pub(crate) fn call_kind(request: &CallInput) -> CallKind {
         CallInput::UnixAccept { .. } => CallKind::UnixAccept,
         CallInput::UnixConnect { .. } => CallKind::UnixConnect,
         CallInput::UnixRead { .. } => CallKind::UnixRead,
-        CallInput::UnixWrite { .. } => CallKind::UnixWrite,
+        CallInput::UnixWrite { .. } | CallInput::UnixWriteOwned { .. } => CallKind::UnixWrite,
         CallInput::UnixListenerClose { .. } => CallKind::UnixListenerClose,
         CallInput::UnixStreamClose { .. } => CallKind::UnixStreamClose,
     }

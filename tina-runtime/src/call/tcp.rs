@@ -72,7 +72,26 @@ pub fn tcp_write_owned(
     bytes: Vec<u8>,
 ) -> TypedCall<TcpWriteOwnedReply, TcpWriteOwnedError> {
     TypedCall::new(
-        CallInput::TcpWriteOwned { stream, bytes },
+        CallInput::TcpWriteOwned {
+            stream,
+            bytes,
+            start: 0,
+        },
+        CallOutput::into_tcp_wrote_owned,
+    )
+}
+
+pub(crate) fn tcp_write_owned_from(
+    stream: StreamId,
+    bytes: Vec<u8>,
+    start: usize,
+) -> TypedCall<TcpWriteOwnedReply, TcpWriteOwnedError> {
+    TypedCall::new(
+        CallInput::TcpWriteOwned {
+            stream,
+            bytes,
+            start,
+        },
         CallOutput::into_tcp_wrote_owned,
     )
 }

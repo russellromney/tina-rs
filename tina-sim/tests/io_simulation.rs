@@ -12,11 +12,12 @@ use tina::{
 };
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutput, FileId,
-    FileOpenOptions, ListenerId, PathKind, ProcessRunResult, RuntimeCall, RuntimeEvent,
-    RuntimeEventKind, StreamId, TlsListenerId, TlsStreamId, UdpSocketId, dns_lookup, file_close,
-    file_create, file_write, mkdir, path_metadata, process_run, read_dir, remove_file,
-    rename_replace, signal_wait, sync_parent, tls_accept, tls_bind, tls_close, tls_close_listener,
-    tls_connect, tls_read, tls_write, udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
+    FileOpenOptions, ListenerId, LoopStep, PathKind, ProcessRunResult, RuntimeCall, RuntimeEvent,
+    RuntimeEventKind, StreamId, TcpWriteAll, TcpWriteOwnedReply, TlsListenerId, TlsStreamId,
+    UdpSocketId, WriteOwnedError, dns_lookup, file_close, file_create, file_write, mkdir,
+    path_metadata, process_run, read_dir, remove_file, rename_replace, signal_wait, sync_parent,
+    tls_accept, tls_bind, tls_close, tls_close_listener, tls_connect, tls_read, tls_write,
+    udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
 };
 use tina_sim::{
     Checker, CheckerDecision, FaultConfig, ObservedPeerOutput, ReplayArtifact, ScriptedDnsConfig,
@@ -100,7 +101,7 @@ impl Isolate for Connection {
 enum ClientMsg {
     Start(SocketAddr),
     Connected(Result<(StreamId, SocketAddr, SocketAddr), CallError>),
-    Wrote(Result<(Vec<u8>, usize), CallError>),
+    Wrote(Result<TcpWriteOwnedReply, WriteOwnedError>),
     Read(Result<(Vec<u8>, usize), CallError>),
     Closed(Result<(), CallError>),
 }
@@ -108,7 +109,7 @@ enum ClientMsg {
 #[derive(Debug)]
 struct Client {
     payload: Vec<u8>,
-    pending_write: Vec<u8>,
+    write_all: Option<TcpWriteAll>,
     stream: Option<StreamId>,
     observed: Arc<Mutex<Option<Vec<u8>>>>,
 }
@@ -143,50 +144,36 @@ impl Isolate for Client {
             )),
             ClientMsg::Connected(Ok((stream, _local_addr, _peer_addr))) => {
                 self.stream = Some(stream);
-                self.pending_write = std::mem::take(&mut self.payload);
-                Effect::Io(RuntimeCall::new(
-                    CallInput::TcpWriteOwned {
-                        stream,
-                        bytes: std::mem::take(&mut self.pending_write),
-                    },
-                    |result| match result {
-                        CallOutput::TcpWroteOwned { bytes, count } => {
-                            ClientMsg::Wrote(Ok((bytes, count)))
-                        }
-                        CallOutput::Failed(error) => ClientMsg::Wrote(Err(error)),
-                        other => panic!("unexpected write result {other:?}"),
-                    },
-                ))
+                let mut write_all = TcpWriteAll::new(stream, std::mem::take(&mut self.payload));
+                let effect = write_all
+                    .next_effect(ClientMsg::Wrote)
+                    .expect("client payload is non-empty");
+                self.write_all = Some(write_all);
+                effect
             }
-            ClientMsg::Wrote(Ok((mut bytes, count))) => {
+            ClientMsg::Wrote(reply) => {
                 let stream = self.stream.expect("stream set after connect");
-                if count >= bytes.len() {
-                    Effect::Io(RuntimeCall::new(
-                        CallInput::TcpReadBuf {
-                            stream,
-                            buffer: Vec::with_capacity(16),
-                            max_len: 4,
-                        },
-                        |result| match result {
-                            CallOutput::TcpReadBuf { buffer, len } => {
-                                ClientMsg::Read(Ok((buffer, len)))
-                            }
-                            CallOutput::Failed(error) => ClientMsg::Read(Err(error)),
-                            other => panic!("unexpected read result {other:?}"),
-                        },
-                    ))
-                } else {
-                    bytes.drain(..count);
-                    Effect::Io(RuntimeCall::new(
-                        CallInput::TcpWriteOwned { stream, bytes },
-                        |result| match result {
-                            CallOutput::TcpWroteOwned { bytes, count } => {
-                                ClientMsg::Wrote(Ok((bytes, count)))
-                            }
-                            CallOutput::Failed(error) => ClientMsg::Wrote(Err(error)),
-                            other => panic!("unexpected write result {other:?}"),
-                        },
-                    ))
+                let write_all = self.write_all.as_mut().expect("write helper armed");
+                match write_all.advance::<Self, _, _>(reply, ClientMsg::Wrote) {
+                    LoopStep::Pending(effect) => effect,
+                    LoopStep::Done(_) => {
+                        self.write_all = None;
+                        Effect::Io(RuntimeCall::new(
+                            CallInput::TcpReadBuf {
+                                stream,
+                                buffer: Vec::with_capacity(16),
+                                max_len: 4,
+                            },
+                            |result| match result {
+                                CallOutput::TcpReadBuf { buffer, len } => {
+                                    ClientMsg::Read(Ok((buffer, len)))
+                                }
+                                CallOutput::Failed(error) => ClientMsg::Read(Err(error)),
+                                other => panic!("unexpected read result {other:?}"),
+                            },
+                        ))
+                    }
+                    LoopStep::Failed(_) => Effect::Stop,
                 }
             }
             ClientMsg::Read(Ok((buffer, len))) => {
@@ -202,10 +189,9 @@ impl Isolate for Client {
                 ))
             }
             ClientMsg::Closed(Ok(())) => Effect::Stop,
-            ClientMsg::Connected(Err(_))
-            | ClientMsg::Wrote(Err(_))
-            | ClientMsg::Read(Err(_))
-            | ClientMsg::Closed(Err(_)) => Effect::Stop,
+            ClientMsg::Connected(Err(_)) | ClientMsg::Read(Err(_)) | ClientMsg::Closed(Err(_)) => {
+                Effect::Stop
+            }
         }
     }
 }
@@ -2401,7 +2387,7 @@ fn scripted_dns_resolves_fails_times_out_and_replays() {
         DnsProbeMsg::Lookup {
             host: "llama.local".to_string(),
             port: 8080,
-            timeout: Duration::from_millis(50),
+            timeout: Duration::MAX,
         },
     )
     .unwrap();
@@ -2446,7 +2432,7 @@ fn scripted_dns_resolves_fails_times_out_and_replays() {
             DnsProbeMsg::Lookup {
                 host: "llama.local".to_string(),
                 port: 8080,
-                timeout: Duration::from_millis(50),
+                timeout: Duration::MAX,
             },
         )
         .unwrap();
@@ -2558,7 +2544,7 @@ fn scripted_tls_connect_read_write_close_and_replays() {
         TlsProbeMsg::Connect {
             addr: local_addr(48110),
             server_name: "llama.local".to_string(),
-            timeout: Duration::from_millis(50),
+            timeout: Duration::MAX,
         },
     )
     .unwrap();
@@ -2590,7 +2576,7 @@ fn scripted_tls_connect_read_write_close_and_replays() {
             TlsProbeMsg::Connect {
                 addr: local_addr(48110),
                 server_name: "llama.local".to_string(),
-                timeout: Duration::from_millis(50),
+                timeout: Duration::MAX,
             },
         )
         .unwrap();
@@ -3309,7 +3295,7 @@ fn scripted_tcp_connect_client_round_trips_one_peer() {
                         peer_addr(61001),
                         vec![b"pong".to_vec()],
                         Some(4),
-                        2,
+                        1,
                     )],
                 }],
             },
@@ -3318,7 +3304,7 @@ fn scripted_tcp_connect_client_round_trips_one_peer() {
     );
     let client = sim.register(Client {
         payload: b"ping".to_vec(),
-        pending_write: Vec::new(),
+        write_all: None,
         stream: None,
         observed: Arc::clone(&observed),
     });
@@ -3340,12 +3326,13 @@ fn scripted_tcp_connect_client_round_trips_one_peer() {
         vec![b"ping".as_slice()]
     );
     assert_eq!(count_call_completed(sim.trace(), CallKind::TcpConnect), 1);
-    assert_eq!(count_call_completed(sim.trace(), CallKind::TcpWrite), 2);
+    assert_eq!(count_call_completed(sim.trace(), CallKind::TcpWrite), 4);
     assert_eq!(count_call_completed(sim.trace(), CallKind::TcpRead), 1);
     assert_eq!(
         count_call_completed(sim.trace(), CallKind::TcpStreamClose),
         1
     );
+    InvariantSuite::standard().assert(artifact.event_record());
 }
 
 #[test]

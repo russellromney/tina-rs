@@ -354,10 +354,10 @@ impl ResponseBytes {
         self.len() == 0
     }
 
-    fn chunks(&self, chunk_size: usize) -> std::slice::Chunks<'_, u8> {
+    fn as_slice(&self) -> &[u8] {
         match self {
-            Self::Owned(bytes) => bytes.chunks(chunk_size),
-            Self::Shared(bytes) => bytes.chunks(chunk_size),
+            Self::Owned(bytes) => bytes,
+            Self::Shared(bytes) => bytes,
         }
     }
 }
@@ -366,7 +366,14 @@ impl ResponseBytes {
 struct PendingResponse {
     header_block: Vec<u8>,
     body: ResponseBytes,
+    body_offset: usize,
     trailers: Option<Vec<u8>>,
+}
+
+impl PendingResponse {
+    fn remaining_body(&self) -> &[u8] {
+        &self.body.as_slice()[self.body_offset..]
+    }
 }
 
 impl ActiveStream {
@@ -1567,6 +1574,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             PendingResponse {
                 header_block: block,
                 body,
+                body_offset: 0,
                 trailers,
             },
             effects,
@@ -1595,53 +1603,12 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         Ok(())
     }
 
-    // KNOWN LIMITATION (tracked for a future "server response streaming"
-    // slice): a buffered response is sent only when the *entire* body
-    // fits both the stream and connection send-windows. A response larger
-    // than the peer's window is parked whole until a WINDOW_UPDATE opens
-    // enough credit. A strict HTTP/2 peer that does not pre-credit its
-    // receive window (it has no reason to before it sees any DATA) will
-    // therefore deadlock on responses larger than ~64 KB: the server
-    // waits for window, the peer waits for bytes. Browsers paper over
-    // this by sending a large connection WINDOW_UPDATE on connect; the
-    // native Tina client (Phase 116) does not. The fix is to slice the
-    // response across DATA frames as windows open — the mirror of the
-    // client's `flush_outbound_data` pacer — and is deliberately out of
-    // scope for the client slice.
     fn queue_or_send_response(
         &mut self,
         stream_id: u32,
         pending: PendingResponse,
         effects: &mut Vec<Effect<Self>>,
     ) -> Result<(), Http2ProtocolError> {
-        let idx = self
-            .find_stream(stream_id)
-            .ok_or(Http2ProtocolError::StreamClosed)?;
-        let body_len_i32 = match i32::try_from(pending.body.len()) {
-            Ok(len) => len,
-            Err(_) => {
-                self.report.flow_control_blocked += 1;
-                self.streams[idx].pending_response = Some(pending);
-                return Ok(());
-            }
-        };
-        if body_len_i32 > self.send_window || body_len_i32 > self.streams[idx].send_window {
-            self.report.flow_control_blocked += 1;
-            self.emit_protocol_fact(
-                effects,
-                ProtocolFact::Http2FlowControlFull {
-                    connection: self.connection_fact_id(),
-                    stream: Http2StreamId::new(stream_id),
-                    side: if (pending.body.len() as i32) > self.send_window {
-                        Http2FlowControlSide::ConnectionSend
-                    } else {
-                        Http2FlowControlSide::StreamSend
-                    },
-                },
-            );
-            self.streams[idx].pending_response = Some(pending);
-            return Ok(());
-        }
         self.send_pending_response(stream_id, pending, effects)
     }
 
@@ -1651,87 +1618,115 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         pending: PendingResponse,
         effects: &mut Vec<Effect<Self>>,
     ) -> Result<(), Http2ProtocolError> {
+        let frame_cap = self.peer_max_frame_size.max(1);
         let idx = self
             .find_stream(stream_id)
             .ok_or(Http2ProtocolError::StreamClosed)?;
-        let frame_cap = self.peer_max_frame_size.max(1);
-        let PendingResponse {
-            header_block,
-            body,
-            trailers,
-        } = pending;
-        let data_frames = if body.is_empty() {
-            0
+        let mut pending = pending;
+        let send_len = self.outbound_response_credit(idx, pending.remaining_body().len())?;
+        let send_len_i32 = i32::try_from(send_len).map_err(|_| Http2ProtocolError::FlowControl)?;
+        let headers_len = pending.header_block.len();
+        let data_frames = send_len.div_ceil(frame_cap);
+        let body_done = pending.body_offset + send_len == pending.body.len();
+        let trailers_len = if body_done {
+            pending
+                .trailers
+                .as_ref()
+                .map_or(0, |trailers| FRAME_HEADER_LEN + trailers.len())
         } else {
-            body.len().div_ceil(frame_cap)
+            0
         };
-        // Coalesce the whole buffered response — HEADERS, every DATA frame, and
-        // the optional trailers HEADERS — into one queued buffer, so it takes a
-        // single outbound-queue slot and is written in one TCP write instead of
-        // one per frame. Frame boundaries on the wire, the peer max frame size
-        // split, END_STREAM placement, and flow-control accounting are all
-        // preserved; only the per-frame `Vec` and the extra write turns go away.
-        self.ensure_outbound_slots(1)?;
-        if !body.is_empty() {
-            let body_len_i32 =
-                i32::try_from(body.len()).map_err(|_| Http2ProtocolError::FlowControl)?;
-            self.send_window -= body_len_i32;
-            self.streams[idx].send_window -= body_len_i32;
-        }
-        let headers_end_stream = body.is_empty() && trailers.is_none();
-        let trailers_framed_len = trailers
-            .as_ref()
-            .map_or(0, |trailers| FRAME_HEADER_LEN + trailers.len());
-        let capacity = FRAME_HEADER_LEN
-            + header_block.len()
-            + data_frames * FRAME_HEADER_LEN
-            + body.len()
-            + trailers_framed_len;
-        let mut out = Vec::with_capacity(capacity);
-        push_frame_header(
-            &mut out,
-            FRAME_HEADERS,
-            FLAG_END_HEADERS
-                | if headers_end_stream {
-                    FLAG_END_STREAM
-                } else {
-                    0
-                },
-            stream_id,
-            header_block.len(),
-        );
-        out.extend_from_slice(&header_block);
-        if !body.is_empty() {
-            for (chunk_index, chunk) in body.chunks(frame_cap).enumerate() {
-                let end_stream = chunk_index + 1 == data_frames && trailers.is_none();
+        let will_write = headers_len > 0 || send_len > 0 || (body_done && trailers_len > 0);
+
+        if will_write {
+            self.ensure_outbound_slots(1)?;
+            let mut out = Vec::with_capacity(
+                usize::from(headers_len > 0) * FRAME_HEADER_LEN
+                    + headers_len
+                    + data_frames * FRAME_HEADER_LEN
+                    + send_len
+                    + trailers_len,
+            );
+            if headers_len > 0 {
+                let headers_end_stream = pending.body.is_empty() && pending.trailers.is_none();
                 push_frame_header(
                     &mut out,
-                    FRAME_DATA,
-                    if end_stream { FLAG_END_STREAM } else { 0 },
+                    FRAME_HEADERS,
+                    FLAG_END_HEADERS
+                        | if headers_end_stream {
+                            FLAG_END_STREAM
+                        } else {
+                            0
+                        },
                     stream_id,
-                    chunk.len(),
+                    headers_len,
                 );
-                out.extend_from_slice(chunk);
+                out.extend_from_slice(&pending.header_block);
+                pending.header_block.clear();
             }
+            if send_len > 0 {
+                let start = pending.body_offset;
+                let end = start + send_len;
+                for (chunk_index, chunk) in pending.body.as_slice()[start..end]
+                    .chunks(frame_cap)
+                    .enumerate()
+                {
+                    let final_data = chunk_index + 1 == data_frames && body_done;
+                    let end_stream = final_data && pending.trailers.is_none();
+                    push_frame_header(
+                        &mut out,
+                        FRAME_DATA,
+                        if end_stream { FLAG_END_STREAM } else { 0 },
+                        stream_id,
+                        chunk.len(),
+                    );
+                    out.extend_from_slice(chunk);
+                }
+                pending.body_offset = end;
+                self.send_window -= send_len_i32;
+                self.streams[idx].send_window -= send_len_i32;
+                self.streams[idx].response_bytes_sent += send_len;
+            }
+            if body_done {
+                if let Some(trailers) = pending.trailers.take() {
+                    push_frame_header(
+                        &mut out,
+                        FRAME_HEADERS,
+                        FLAG_END_HEADERS | FLAG_END_STREAM,
+                        stream_id,
+                        trailers.len(),
+                    );
+                    out.extend_from_slice(&trailers);
+                }
+            }
+            self.write_queue.push_back(out);
         }
-        if let Some(trailers) = trailers {
-            push_frame_header(
-                &mut out,
-                FRAME_HEADERS,
-                FLAG_END_HEADERS | FLAG_END_STREAM,
+
+        if body_done {
+            self.streams[idx].state = Http2StreamState::Closed;
+            self.close_stream_with_cleanup(
                 stream_id,
-                trailers.len(),
+                Http2CloseReason::EndStream,
+                effects,
+                CallError::TargetClosed,
             );
-            out.extend_from_slice(&trailers);
+        } else {
+            let side = if self.send_window <= 0 {
+                Http2FlowControlSide::ConnectionSend
+            } else {
+                Http2FlowControlSide::StreamSend
+            };
+            self.report.flow_control_blocked += 1;
+            self.emit_protocol_fact(
+                effects,
+                ProtocolFact::Http2FlowControlFull {
+                    connection: self.connection_fact_id(),
+                    stream: Http2StreamId::new(stream_id),
+                    side,
+                },
+            );
+            self.streams[idx].pending_response = Some(pending);
         }
-        self.write_queue.push_back(out);
-        self.streams[idx].state = Http2StreamState::Closed;
-        self.close_stream_with_cleanup(
-            stream_id,
-            Http2CloseReason::EndStream,
-            effects,
-            CallError::TargetClosed,
-        );
         Ok(())
     }
 
@@ -1765,19 +1760,12 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             let Some(idx) = self.find_stream(stream_id) else {
                 continue;
             };
-            let can_send = self
-                .streams
-                .get(idx)
-                .and_then(|s| s.pending_response.as_ref().map(|p| p.body.len() as i32))
-                .is_some_and(|len| len <= self.send_window && len <= self.streams[idx].send_window);
-            if can_send {
-                let pending = self.streams[idx]
-                    .pending_response
-                    .take()
-                    .expect("checked pending response");
+            if let Some(pending) = self.streams[idx].pending_response.take() {
                 self.send_pending_response(stream_id, pending, effects)?;
             }
-            self.flush_response_stream(stream_id)?;
+            if self.find_stream(stream_id).is_some() {
+                self.flush_response_stream(stream_id)?;
+            }
         }
         Ok(())
     }
@@ -1964,15 +1952,9 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             if self.streams[idx].response_pending_data.is_empty() {
                 return Ok(());
             }
-            if self.send_window <= 0 || self.streams[idx].send_window <= 0 {
-                self.report.flow_control_blocked += 1;
-                return Ok(());
-            }
             let allowed = self
-                .peer_max_frame_size
-                .min(self.send_window as usize)
-                .min(self.streams[idx].send_window as usize)
-                .min(self.streams[idx].response_pending_data.len());
+                .outbound_response_credit(idx, self.streams[idx].response_pending_data.len())?
+                .min(self.peer_max_frame_size);
             if allowed == 0 {
                 self.report.flow_control_blocked += 1;
                 return Ok(());
@@ -1986,10 +1968,29 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             push_frame_header(&mut framed, FRAME_DATA, 0, stream_id, allowed);
             framed.extend(self.streams[idx].response_pending_data.drain(..allowed));
             self.write_queue.push_back(framed);
-            self.send_window -= allowed as i32;
-            self.streams[idx].send_window -= allowed as i32;
+            let allowed_i32 =
+                i32::try_from(allowed).map_err(|_| Http2ProtocolError::FlowControl)?;
+            self.send_window -= allowed_i32;
+            self.streams[idx].send_window -= allowed_i32;
             self.streams[idx].response_bytes_sent += allowed;
         }
+    }
+
+    /// Returns the bytes a response may consume from both HTTP/2 send windows.
+    /// Buffered and source-streamed bodies share this conversion boundary so
+    /// neither path relies on a narrowing cast after checking elsewhere.
+    fn outbound_response_credit(
+        &self,
+        stream_index: usize,
+        remaining: usize,
+    ) -> Result<usize, Http2ProtocolError> {
+        let window = self.send_window.min(self.streams[stream_index].send_window);
+        if window <= 0 {
+            return Ok(0);
+        }
+        usize::try_from(window)
+            .map(|credit| credit.min(remaining))
+            .map_err(|_| Http2ProtocolError::FlowControl)
     }
 
     fn handle_request_body_next(

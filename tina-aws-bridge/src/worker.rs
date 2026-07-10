@@ -18,7 +18,7 @@ use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use tina::CallContext;
 use tina::prelude::*;
-use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, sleep};
+use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeError, sleep};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 #[cfg(feature = "tracing")]
@@ -137,9 +137,9 @@ pub enum InstallError {
     /// Invalid config.
     Config(S3ConfigError),
     /// Tokio runtime or AWS client construction failed.
-    Build(String),
+    Build(S3Error),
     /// Tina runtime registration failed.
-    Register(String),
+    Register(ThreadedRuntimeError),
 }
 
 impl std::fmt::Display for InstallError {
@@ -152,7 +152,15 @@ impl std::fmt::Display for InstallError {
     }
 }
 
-impl std::error::Error for InstallError {}
+impl std::error::Error for InstallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(source) => Some(source),
+            Self::Build(source) => Some(source),
+            Self::Register(source) => Some(source),
+        }
+    }
+}
 
 impl From<S3ConfigError> for InstallError {
     fn from(value: S3ConfigError) -> Self {
@@ -458,12 +466,11 @@ impl<S: Shard + Send + 'static> S3Worker<S> {
     {
         config.validate()?;
         let cap = config.mailbox_capacity;
-        let (worker, metrics) =
-            Self::new(config).map_err(|e| InstallError::Build(e.to_string()))?;
+        let (worker, metrics) = Self::new(config).map_err(InstallError::Build)?;
         let closer = worker.closer();
         let address = runtime
             .register_with_capacity::<_, Infallible>(worker, cap)
-            .map_err(|e| InstallError::Register(format!("{e:?}")))?;
+            .map_err(InstallError::Register)?;
         Ok(InstalledS3Bridge {
             address,
             closer,

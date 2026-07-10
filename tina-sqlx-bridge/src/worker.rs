@@ -538,7 +538,7 @@ impl<S: Shard + Send + 'static> PgWorker<S> {
             .worker_threads(2)
             .thread_name("tina-sqlx-bridge")
             .build()
-            .map_err(|e| InstallError::Runtime(format!("{e}")))?;
+            .map_err(InstallError::Runtime)?;
         let handle = tokio_rt.handle().clone();
         let pool = handle
             .block_on(async {
@@ -549,14 +549,14 @@ impl<S: Shard + Send + 'static> PgWorker<S> {
                     .await?;
                 Ok::<_, sqlx::Error>(main)
             })
-            .map_err(|e| InstallError::Pool(format!("{e}")))?;
+            .map_err(InstallError::Pool)?;
         let owned = OwnedRuntime(Some(tokio_rt));
         let cap = config.mailbox_capacity;
         let (worker, metrics) = Self::assemble(config, pool, handle, Some(owned));
         let closer = worker.closer();
         let address = runtime
             .register_with_capacity::<_, Infallible>(worker, cap)
-            .map_err(|e| InstallError::Register(format!("{e:?}")))?;
+            .map_err(InstallError::Register)?;
         Ok(InstalledPgBridge {
             address: address.callable(),
             closer,
@@ -612,7 +612,7 @@ impl<S: Shard + Send + 'static> PgWorker<S> {
         let closer = worker.closer();
         let address = runtime
             .register_with_capacity::<_, Infallible>(worker, cap)
-            .map_err(|e| InstallError::Register(format!("{e:?}")))?;
+            .map_err(InstallError::Register)?;
         Ok(InstalledPgBridge {
             address: address.callable(),
             closer,

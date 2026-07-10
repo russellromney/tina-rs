@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tina::{Address, Context, Effect, Isolate, Outbound, Shard, ShardId};
-use tina_codec::{FrameDecision, LengthDelimitedFramer, LengthPrefix, encode_into};
+use tina_codec::{DecodeStatus, LengthDelimitedFramer, LengthPrefix, decode_chunk, encode_into};
 use tina_runtime::{
     RuntimeCall, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerId, UnixReadReply,
     UnixStreamId, UnixWriteReply, unix_accept, unix_bind, unix_close_stream, unix_connect,
@@ -82,25 +82,19 @@ impl Isolate for KeyspaceServer {
                         Effect::Stop
                     }
                 } else {
-                    self.framer.feed(bytes);
                     let mut response_buf = Vec::new();
                     let mut shutdown = false;
-                    loop {
-                        match self.framer.next_frame() {
-                            FrameDecision::NeedMore => break,
-                            FrameDecision::Frame(frame) => {
-                                self.received_frames.lock().unwrap().push(frame.clone());
-                                // Echo back with `ack:` prefix.
-                                let mut payload = b"ack:".to_vec();
-                                payload.extend_from_slice(&frame);
-                                let _ = encode_into(LengthPrefix::U16, &payload, &mut response_buf);
-                            }
-                            FrameDecision::Malformed(_) | FrameDecision::Full => {
-                                *self.saw_full.lock().unwrap() = true;
-                                shutdown = true;
-                                break;
-                            }
-                        }
+                    let received_frames = &self.received_frames;
+                    let status = decode_chunk(&mut self.framer, &bytes, |frame| {
+                        received_frames.lock().unwrap().push(frame.clone());
+                        // Echo back with `ack:` prefix.
+                        let mut payload = b"ack:".to_vec();
+                        payload.extend_from_slice(&frame);
+                        let _ = encode_into(LengthPrefix::U16, &payload, &mut response_buf);
+                    });
+                    if matches!(status, DecodeStatus::Malformed(_) | DecodeStatus::Full) {
+                        *self.saw_full.lock().unwrap() = true;
+                        shutdown = true;
                     }
                     if shutdown {
                         if let Some(stream) = self.stream.take() {
@@ -316,5 +310,21 @@ pub fn bad_input_frame_too_large() -> SpecimenReport {
         frames: 0,
         ok: saw,
         note: format!("framer_rejected_oversize_frame={}", saw),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simulator_delivers_coalesced_maximum_frame_and_following_frame() {
+        let result = run_framed_keyspace(
+            PathBuf::from("/tmp/specimen_keyspace_coalesced.sock"),
+            &[b"abcd", b"x"],
+            4,
+        );
+        assert_eq!(result.server_frames, [b"abcd".to_vec(), b"x".to_vec()]);
+        assert!(!result.server_saw_full_or_malformed);
     }
 }

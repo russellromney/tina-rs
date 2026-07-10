@@ -287,6 +287,7 @@ enum SimulatedPendingOp {
     SendOwned {
         socket_id: i32,
         bytes: Vec<u8>,
+        start: usize,
         completion: usize,
         delay: Option<u64>,
     },
@@ -508,6 +509,7 @@ impl IOSocket for SimulatedSocket {
         c.inner_mut().prepare(Operation::Send(SendOp {
             fd: socket_id,
             buf: buf.clone(),
+            start: 0,
             flags: 0,
         }));
         self.state
@@ -548,6 +550,7 @@ impl IOSocket for SimulatedSocket {
         c.inner_mut().prepare(Operation::SendOwned(SendOp {
             fd: socket_id,
             buf: buf.clone(),
+            start: 0,
             flags: 0,
         }));
         self.state
@@ -557,6 +560,45 @@ impl IOSocket for SimulatedSocket {
             .push_back(SimulatedPendingOp::SendOwned {
                 socket_id,
                 bytes: buf,
+                start: 0,
+                completion: c as *mut SendOwnedCompletion as usize,
+                delay: None,
+            });
+        Ok(())
+    }
+
+    fn send_owned_from(
+        &self,
+        c: &mut SendOwnedCompletion,
+        buf: Vec<u8>,
+        start: usize,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
+        if start > buf.len() {
+            return Err((io::Error::from(io::ErrorKind::InvalidInput), buf));
+        }
+        let state = self.state.lock().expect("simulated io mutex");
+        let socket_id = *self.socket_id.lock().expect("socket id mutex");
+        let Some(socket) = state.sockets.get(&socket_id) else {
+            return Err((io::Error::from(io::ErrorKind::NotConnected), buf));
+        };
+        if socket.closed || !matches!(socket.kind, SimulatedSocketKind::Stream) {
+            return Err((io::Error::from(io::ErrorKind::InvalidInput), buf));
+        }
+        drop(state);
+        c.inner_mut().prepare(Operation::SendOwned(SendOp {
+            fd: socket_id,
+            buf: buf.clone(),
+            start,
+            flags: 0,
+        }));
+        self.state
+            .lock()
+            .expect("simulated io mutex")
+            .pending
+            .push_back(SimulatedPendingOp::SendOwned {
+                socket_id,
+                bytes: buf,
+                start,
                 completion: c as *mut SendOwnedCompletion as usize,
                 delay: None,
             });
@@ -849,9 +891,13 @@ impl SimulatedPendingOp {
                 Some(SimulatedReadyResult::Send(Ok(count)))
             }
             Self::SendOwned {
-                socket_id, bytes, ..
+                socket_id,
+                bytes,
+                start,
+                ..
             } => {
-                let max_count = state.config.max_send_chunk.unwrap_or(bytes.len());
+                let remaining = &bytes[*start..];
+                let max_count = state.config.max_send_chunk.unwrap_or(remaining.len());
                 let Some(stream) = state.sockets.get_mut(socket_id) else {
                     return Some(SimulatedReadyResult::SendOwned(Err((
                         io::Error::new(io::ErrorKind::NotConnected, "stream missing"),
@@ -864,7 +910,7 @@ impl SimulatedPendingOp {
                         std::mem::take(bytes),
                     ))));
                 }
-                let count = max_count.min(bytes.len());
+                let count = max_count.min(remaining.len());
                 if let Some(peer_stream_id) = stream.peer_stream_id {
                     let Some(peer) = state.sockets.get_mut(&peer_stream_id) else {
                         return Some(SimulatedReadyResult::SendOwned(Err((
@@ -878,9 +924,9 @@ impl SimulatedPendingOp {
                             std::mem::take(bytes),
                         ))));
                     }
-                    peer.inbound.extend(bytes[..count].iter().copied());
+                    peer.inbound.extend(remaining[..count].iter().copied());
                 } else {
-                    stream.peer_output.extend_from_slice(&bytes[..count]);
+                    stream.peer_output.extend_from_slice(&remaining[..count]);
                 }
                 Some(SimulatedReadyResult::SendOwned(Ok((
                     std::mem::take(bytes),

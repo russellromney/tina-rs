@@ -49,8 +49,9 @@ use std::time::{Duration, Instant};
 
 use betelgeuse::{
     AcceptCompletion, ConnectCompletion, FsyncCompletion, IO, IOFile, IOLoop, IOLoopHandle,
-    IOSocket, MkdirCompletion, OpenOptions, PReadCompletion, PWriteCompletion, RecvBufCompletion,
-    RecvCompletion, SendCompletion, SendOwnedCompletion, SizeCompletion, io_loop,
+    IOSocket, MkdirCompletion, OpenOptions, PReadCompletion, PWriteCompletion,
+    PWriteOwnedCompletion, RecvBufCompletion, RecvCompletion, SendCompletion, SendOwnedCompletion,
+    SizeCompletion, io_loop,
 };
 
 use crate::call::{
@@ -76,6 +77,10 @@ use storage::{StorageJob, StorageLane};
 use tcp::BetelgeuseTcp;
 use tls::TlsLane;
 use unix::UnixLane;
+
+fn deadline_after(now: Instant, timeout: Duration) -> Instant {
+    tina::Deadline::from_instant(now, timeout).instant()
+}
 
 const INITIAL_DRIVER_RESOURCE_CAPACITY: usize = 4;
 const INITIAL_DRIVER_PENDING_CAPACITY: usize = 8;
@@ -336,8 +341,12 @@ impl RuntimeDriver for BetelgeuseDriver {
                     });
                 }
                 let insertion_order = self.next_timer_ordinal;
-                self.next_timer_ordinal += 1;
-                self.timers.insert((now + after, insertion_order), call_id);
+                self.next_timer_ordinal = self
+                    .next_timer_ordinal
+                    .checked_add(1)
+                    .expect("timer insertion ordinal exhausted after 2^64 submissions");
+                self.timers
+                    .insert((deadline_after(now, after), insertion_order), call_id);
                 None
             }
             CallInput::SnapshotCommit {
@@ -478,6 +487,7 @@ impl RuntimeDriver for BetelgeuseDriver {
             | CallInput::UnixConnect { .. }
             | CallInput::UnixRead { .. }
             | CallInput::UnixWrite { .. }
+            | CallInput::UnixWriteOwned { .. }
             | CallInput::UnixListenerClose { .. }
             | CallInput::UnixStreamClose { .. } => self.unix.submit(call_id, request),
             other => self.tcp.submit(call_id, other),
@@ -637,7 +647,7 @@ impl BetelgeuseDriver {
         self.signals.push(SignalWaitEntry {
             call_id,
             name,
-            deadline: now + timeout,
+            deadline: deadline_after(now, timeout),
             cancelled: false,
         });
         None

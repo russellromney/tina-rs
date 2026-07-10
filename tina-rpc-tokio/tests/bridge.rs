@@ -11,8 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tina::{Address, Context, Effect, Isolate, Mailbox, Outbound, ShardId, TrySendError};
-use tina_rpc::{ClientMsg, ClientResult, ClientResultMsg, service};
-use tina_rpc_tokio::{BridgeClient, BridgeError, RetryDelay, RetryPolicy, call_with_retry};
+use tina_rpc::{ClientMsg, ClientRequest, ClientResult, ClientResultMsg, service};
+use tina_rpc_tokio::{
+    BridgeBuildError, BridgeClient, BridgeError, RetryDelay, RetryPolicy, call_with_retry,
+};
 use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig};
 
 #[derive(Debug, Default, Clone)]
@@ -238,9 +240,58 @@ fn register_stub(
         .expect("register stub")
 }
 
+fn assert_send<T: Send>(_: T) {}
+
+fn assert_bridge_call_future_is_send<S>(bridge: &BridgeClient<S>)
+where
+    S: tina::Shard + Send + 'static,
+{
+    assert_send(bridge.call(
+        |correlator, reply_to| {
+            Ok(ClientRequest {
+                service: "compile-check".into(),
+                method: "send-future".into(),
+                payload: Vec::new(),
+                deadline: Duration::from_secs(1),
+                correlator,
+                reply_to,
+            })
+        },
+        |bytes| Ok(bytes.len()),
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[test]
+fn construction_validation_is_fallible_and_call_future_is_send() {
+    let runtime = build_runtime();
+    let stub = register_stub(&runtime, StubBehavior::Echo);
+
+    assert!(matches!(
+        BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 0, 1),
+        Err(BridgeBuildError::ZeroMaxInFlight)
+    ));
+    assert!(matches!(
+        BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 2, 1),
+        Err(BridgeBuildError::ClientCapacityTooSmall {
+            bridge_max_in_flight: 2,
+            client_max_in_flight: 1,
+        })
+    ));
+    assert!(matches!(
+        BridgeClient::<SpecimenShard>::new(Arc::clone(&runtime), stub, 1, usize::MAX),
+        Err(BridgeBuildError::ShimCapacityOverflow {
+            bridge_max_in_flight: 1,
+            client_max_in_flight: usize::MAX,
+        })
+    ));
+
+    let bridge = BridgeClient::<SpecimenShard>::new(runtime, stub, 1, 1).expect("valid bridge");
+    assert_bridge_call_future_is_send(&bridge);
+}
 
 #[tokio::test]
 async fn typed_call_round_trips_through_bridge_and_macro() {

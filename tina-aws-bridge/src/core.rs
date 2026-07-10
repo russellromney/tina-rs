@@ -38,7 +38,7 @@ pub(crate) fn await_drain<K>(
 where
     K: FnOnce() -> Vec<(&'static str, u64)>,
 {
-    let deadline = Instant::now() + timeout;
+    let deadline = tina::Deadline::from_instant(Instant::now(), timeout).instant();
     loop {
         let remaining = in_flight.load(Ordering::Relaxed);
         if remaining == 0 {
@@ -70,6 +70,14 @@ mod tests {
         assert!(result.drained);
         assert_eq!(result.in_flight_remaining, 0);
         assert!(result.in_flight_kinds.is_empty());
+    }
+
+    #[test]
+    fn await_drain_accepts_maximum_timeout() {
+        let in_flight = AtomicU64::new(0);
+        let result = await_drain(&in_flight, Vec::new, Duration::MAX);
+        assert!(result.drained);
+        assert_eq!(result.in_flight_remaining, 0);
     }
 
     #[test]

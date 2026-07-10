@@ -1537,6 +1537,7 @@ fn call_error_tag(error: CallError) -> u8 {
         // Appended after the existing tags; never renumber.
         CallError::TlsAlpnMismatch => 28,
         CallError::TimerFull => 29,
+        CallError::InvariantViolation => 30,
     }
 }
 

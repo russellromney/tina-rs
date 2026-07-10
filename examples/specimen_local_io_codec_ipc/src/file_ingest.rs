@@ -1,16 +1,14 @@
 //! Bounded file streaming using the simulator's file rails and
 //! `tina_runtime::FileReadChunks`.
 
-use std::cell::RefCell;
 use std::convert::Infallible;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use tina::{Context, Effect, Isolate, Outbound, Shard, ShardId};
 use tina_runtime::{
     CallError, FileId, FileLoopEnd, FileLoopReport, FileLoopStep, FileOpenOptions, FileReadChunks,
-    FileReadReply, FileWriteReply, RuntimeCall, file_close, file_open,
+    FileReadReply, FileWriteAll, FileWriteOwnedReply, RuntimeCall, file_close, file_open,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -112,6 +110,7 @@ pub struct IngestRunReport {
 pub fn run_ingest(path: PathBuf, payload: Vec<u8>, chunk: usize, cap: u64) -> IngestRunReport {
     let mut config = SimulatorConfig::default();
     config.tcp.pending_completion_capacity = 64;
+    config.storage.file_write_cap = Some(1);
     let mut sim = Simulator::new(IngestShard, config);
     // Pre-load the file by directly seeding the simulator's path-backed
     // file storage. This sidesteps having a writer isolate for the
@@ -143,21 +142,19 @@ pub fn run_ingest(path: PathBuf, payload: Vec<u8>, chunk: usize, cap: u64) -> In
 /// the normal file rails too — this helper just keeps the specimen
 /// self-contained.
 fn seed_file(sim: &mut Simulator<IngestShard>, path: &std::path::Path, bytes: Vec<u8>) {
-    use tina_runtime::file_write_at;
-
     #[derive(Debug)]
     enum SeederMsg {
         Start,
         Opened(Result<FileId, CallError>),
-        Wrote(Result<usize, CallError>),
+        Wrote(FileWriteOwnedReply),
         Closed,
     }
 
     struct Seeder {
         path: PathBuf,
-        bytes: Rc<RefCell<Vec<u8>>>,
+        bytes: Option<Vec<u8>>,
         file: Option<FileId>,
-        offset: u64,
+        helper: Option<FileWriteAll>,
     }
 
     impl Isolate for Seeder {
@@ -183,33 +180,34 @@ fn seed_file(sim: &mut Simulator<IngestShard>, path: &std::path::Path, bytes: Ve
                 .then(SeederMsg::Opened),
                 SeederMsg::Opened(Ok(file)) => {
                     self.file = Some(file);
-                    let payload = self.bytes.borrow().clone();
+                    let payload = self.bytes.take().expect("seed payload available");
                     if payload.is_empty() {
                         file_close(file).then(|_| SeederMsg::Closed)
                     } else {
-                        file_write_at(file, payload, self.offset).then(SeederMsg::Wrote)
+                        let mut helper = FileWriteAll::new(file, 0, payload);
+                        let effect = helper
+                            .next_effect(SeederMsg::Wrote)
+                            .expect("non-empty seed payload has a write effect");
+                        self.helper = Some(helper);
+                        effect
                     }
                 }
                 SeederMsg::Opened(Err(_)) => Effect::Stop,
-                SeederMsg::Wrote(Ok(count)) => {
-                    let mut bytes = self.bytes.borrow_mut();
-                    if count >= bytes.len() {
-                        bytes.clear();
-                    } else {
-                        let _ = bytes.drain(..count);
-                    }
-                    self.offset += count as u64;
-                    if bytes.is_empty() {
-                        let file = self.file.take().expect("file open");
-                        file_close(file).then(|_| SeederMsg::Closed)
-                    } else {
-                        let payload = bytes.clone();
-                        drop(bytes);
-                        file_write_at(self.file.expect("file open"), payload, self.offset)
-                            .then(SeederMsg::Wrote)
+                SeederMsg::Wrote(reply) => {
+                    let helper = self.helper.as_mut().expect("write helper armed");
+                    match helper.advance::<Self, _, _>(reply, SeederMsg::Wrote) {
+                        FileLoopStep::Pending(effect) => effect,
+                        FileLoopStep::Ended(report) if report.end == FileLoopEnd::Done => {
+                            self.helper = None;
+                            let file = self.file.take().expect("file open");
+                            file_close(file).then(|_| SeederMsg::Closed)
+                        }
+                        FileLoopStep::Ended(_) => Effect::Stop,
+                        FileLoopStep::Done((), _) => {
+                            unreachable!("write-all has no payload result")
+                        }
                     }
                 }
-                SeederMsg::Wrote(Err(_)) => Effect::Stop,
                 SeederMsg::Closed => Effect::Stop,
             }
         }
@@ -217,9 +215,9 @@ fn seed_file(sim: &mut Simulator<IngestShard>, path: &std::path::Path, bytes: Ve
 
     let seeder = Seeder {
         path: path.to_path_buf(),
-        bytes: Rc::new(RefCell::new(bytes)),
+        bytes: Some(bytes),
         file: None,
-        offset: 0,
+        helper: None,
     };
     let addr = sim.register(seeder);
     sim.try_send(addr, SeederMsg::Start).unwrap();
@@ -285,7 +283,7 @@ enum CopyMsg {
     SrcOpened(Result<FileId, CallError>),
     DstOpened(Result<FileId, CallError>),
     Read(FileReadReply),
-    Wrote(FileWriteReply),
+    Wrote(FileWriteOwnedReply),
     DstReadBack(FileReadReply),
     Closed,
 }
@@ -308,7 +306,7 @@ struct CopyPump {
 impl CopyPump {
     fn drive(&mut self) -> Effect<Self> {
         let next = {
-            let pump = self.pump.as_ref().expect("pump armed");
+            let pump = self.pump.as_mut().expect("pump armed");
             pump.next_effect(CopyMsg::Read, CopyMsg::Wrote)
                 .map(Ok)
                 .unwrap_or_else(|| Err(pump.report(FileLoopEnd::CapReached)))
@@ -426,6 +424,7 @@ pub fn run_copy(payload: Vec<u8>, chunk: usize, cap: u64) -> CopyRun {
     let dst_path = PathBuf::from("/tmp/specimen_file_copy_dst.dat");
     let mut config = SimulatorConfig::default();
     config.tcp.pending_completion_capacity = 64;
+    config.storage.file_write_cap = Some(1);
     let mut sim = Simulator::new(IngestShard, config);
     seed_file(&mut sim, &src_path, payload);
 

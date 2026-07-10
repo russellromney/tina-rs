@@ -503,6 +503,7 @@ impl From<PgType> for PgValue {
 /// statement per query and rejects multi-statement bodies with
 /// [`PgError::Sqlx`]. Use one statement per request.
 #[derive(Debug, Clone)]
+#[must_use = "Postgres requests must be submitted or retained after adding parameters"]
 pub enum PgRequest {
     /// Run one row-less statement. Reply carries `rows_affected`.
     Execute {
@@ -560,6 +561,7 @@ pub enum PgRequest {
 /// shapes mirror [`PgRequest`] minus `Transaction` — nested
 /// transactions are rejected at admission.
 #[derive(Debug, Clone)]
+#[must_use = "transaction steps must be retained after adding parameters"]
 pub enum PgStep {
     /// Run one row-less statement.
     Execute {
@@ -1066,6 +1068,7 @@ impl std::error::Error for PgConfigError {}
 /// so existing config files parse, but it does not build a sidecar or send DB
 /// cancels.
 #[derive(Debug, Clone)]
+#[must_use = "cancel configuration changes must be retained"]
 pub struct PgCancelConfig {
     /// Sidecar pool size. Tiny by default — cancel calls are short
     /// and rare.
@@ -1110,6 +1113,7 @@ impl Default for PgCancelConfig {
 /// pool. Ignored when the bridge is given a caller-supplied
 /// `sqlx::PgPool`.
 #[derive(Debug, Clone)]
+#[must_use = "pool configuration changes must be retained"]
 pub struct PgPoolConfig {
     /// Postgres connection URL (`postgres://user:pass@host/db`).
     pub url: String,
@@ -1164,6 +1168,7 @@ impl PgPoolConfig {
 /// `PoolAcquireTimeout` from SQLx, even though both mean "no work
 /// happened."
 #[derive(Debug, Clone)]
+#[must_use = "Postgres configuration changes must be retained or installed"]
 pub struct PgConfig {
     /// SQLx pool settings. `None` means the worker must be installed
     /// with a caller-supplied `sqlx::PgPool` via
@@ -1378,11 +1383,11 @@ pub enum InstallError {
     MissingPoolConfig,
     /// Building the SQLx `PgPool` failed (URL parse, TLS setup,
     /// initial connect failure depending on pool options).
-    Pool(String),
+    Pool(sqlx::Error),
     /// Building the worker's owned Tokio runtime failed.
-    Runtime(String),
+    Runtime(std::io::Error),
     /// Tina runtime registration failed.
-    Register(String),
+    Register(tina_runtime::ThreadedRuntimeError),
 }
 
 impl std::fmt::Display for InstallError {
@@ -1392,14 +1397,24 @@ impl std::fmt::Display for InstallError {
             Self::MissingPoolConfig => f.write_str(
                 "pg bridge install: PgConfig.pool is None; use install_with_pool or set with_pool",
             ),
-            Self::Pool(msg) => write!(f, "pg bridge install: pool: {msg}"),
-            Self::Runtime(msg) => write!(f, "pg bridge install: tokio runtime: {msg}"),
-            Self::Register(msg) => write!(f, "pg bridge install: register: {msg}"),
+            Self::Pool(source) => write!(f, "pg bridge install: pool: {source}"),
+            Self::Runtime(source) => write!(f, "pg bridge install: tokio runtime: {source}"),
+            Self::Register(source) => write!(f, "pg bridge install: register: {source}"),
         }
     }
 }
 
-impl std::error::Error for InstallError {}
+impl std::error::Error for InstallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(source) => Some(source),
+            Self::MissingPoolConfig => None,
+            Self::Pool(source) => Some(source),
+            Self::Runtime(source) => Some(source),
+            Self::Register(source) => Some(source),
+        }
+    }
+}
 
 impl From<PgConfigError> for InstallError {
     fn from(e: PgConfigError) -> Self {

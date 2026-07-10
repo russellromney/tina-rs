@@ -105,7 +105,8 @@ where
     /// `Instant` anchor that pairs with `virtual_now` to give the
     /// simulator a same-shape "now" as the live runtime's `Clock`.
     /// Stamped once at construction (from `Instant::now()`) and never
-    /// mutated; handlers see `virtual_anchor + virtual_now`.
+    /// mutated; handlers see `virtual_anchor + virtual_now`, saturated through
+    /// [`tina::Deadline`] when virtual time exceeds `Instant`'s range.
     ///
     /// **Determinism scope.** Within a single simulator run the anchor
     /// is stable, so every `Context::now()` and every `Deadline` built

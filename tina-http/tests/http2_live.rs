@@ -359,6 +359,10 @@ struct MixedResponseService {
     source: Address<tina_http::ResponseChunkMsg, tina_http::ResponseChunkReply>,
 }
 
+struct BufferedResponseService {
+    body: Arc<[u8]>,
+}
+
 struct RecordingResponseSource {
     chunks: std::vec::IntoIter<Vec<u8>>,
     repeat: Option<Vec<u8>>,
@@ -501,6 +505,39 @@ impl MixedResponseService {
     }
 }
 
+impl Isolate for BufferedResponseService {
+    tina::isolate_types! {
+        message: HttpRequest,
+        reply: HttpResponse,
+        send: tina::Outbound<std::convert::Infallible>,
+        spawn: std::convert::Infallible,
+        io: std::convert::Infallible,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        _request: HttpRequest,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        reply(HttpResponse::with_shared_body(
+            http::StatusCode::OK,
+            Arc::clone(&self.body),
+        ))
+    }
+
+    fn handle_call(
+        &mut self,
+        _request: HttpRequest,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        call.reply(HttpResponse::with_shared_body(
+            http::StatusCode::OK,
+            Arc::clone(&self.body),
+        ))
+    }
+}
+
 #[test]
 fn http2_h2c_unary_request_response() {
     let harness = Http2Harness::start(Http2ServerConfig::default());
@@ -515,6 +552,101 @@ fn http2_h2c_unary_request_response() {
     );
 
     assert_eq!(read_response_body(&mut stream, 1), b"0");
+    harness.shutdown();
+}
+
+#[test]
+fn buffered_response_larger_than_default_window_advances_as_peer_credits_bytes() {
+    const BODY_LEN: usize = 256 * 1024;
+
+    let body: Arc<[u8]> = (0..BODY_LEN)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>()
+        .into();
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let service = runtime
+        .register_with_capacity::<BufferedResponseService, std::convert::Infallible>(
+            BufferedResponseService {
+                body: Arc::clone(&body),
+            },
+            16,
+        )
+        .expect("register buffered response service");
+    let harness = Http2Harness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &request_headers("GET", "/large"),
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut received = Vec::with_capacity(BODY_LEN);
+    let mut saw_headers = false;
+    let mut data_frames = 0;
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "buffered response stalled at {}/{} bytes",
+            received.len(),
+            BODY_LEN
+        );
+        let frame = match read_frame_result(&mut stream) {
+            Ok(frame) => frame,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(error) => panic!("read response frame: {error}"),
+        };
+        if frame.stream_id != 1 {
+            continue;
+        }
+        match frame.ty {
+            FRAME_HEADERS => {
+                saw_headers = true;
+                assert_eq!(
+                    frame.flags & FLAG_END_STREAM,
+                    0,
+                    "non-empty response must not end on HEADERS"
+                );
+            }
+            FRAME_DATA => {
+                assert!(saw_headers, "response HEADERS must precede DATA");
+                assert!(
+                    frame.payload.len() <= 16 * 1024,
+                    "DATA must respect the peer's default frame size"
+                );
+                data_frames += 1;
+                received.extend_from_slice(&frame.payload);
+
+                // Return exactly the credit consumed, and only after the
+                // bytes are visible to the user. Before the first DATA frame
+                // the peer sends no speculative WINDOW_UPDATE at all.
+                let credit = u32::try_from(frame.payload.len()).expect("frame length fits u32");
+                write_window_update(&mut stream, 0, credit);
+                write_window_update(&mut stream, 1, credit);
+
+                if frame.flags & FLAG_END_STREAM != 0 {
+                    break;
+                }
+            }
+            FRAME_RST_STREAM => panic!("large buffered response reset: {frame:?}"),
+            FRAME_GOAWAY => panic!("large buffered response closed connection: {frame:?}"),
+            other => panic!("unexpected response frame {other}: {frame:?}"),
+        }
+    }
+
+    assert!(data_frames > 4, "response must span multiple credit rounds");
+    assert_eq!(received.as_slice(), body.as_ref());
     harness.shutdown();
 }
 
@@ -1124,6 +1256,10 @@ fn http2_settings_initial_window_shrink_blocks_until_window_update() {
     stream
         .set_read_timeout(Some(Duration::from_millis(150)))
         .expect("short read timeout");
+    let headers = read_frame(&mut stream);
+    assert_eq!(headers.ty, FRAME_HEADERS);
+    assert_eq!(headers.stream_id, 1);
+    assert_eq!(headers.flags & FLAG_END_STREAM, 0);
     assert!(
         read_frame_result(&mut stream).is_err(),
         "shrunk peer stream window should block outbound response DATA"
@@ -1156,6 +1292,10 @@ fn http2_settings_initial_window_increase_unblocks_pending_response() {
     stream
         .set_read_timeout(Some(Duration::from_millis(150)))
         .expect("short read timeout");
+    let headers = read_frame(&mut stream);
+    assert_eq!(headers.ty, FRAME_HEADERS);
+    assert_eq!(headers.stream_id, 1);
+    assert_eq!(headers.flags & FLAG_END_STREAM, 0);
     assert!(
         read_frame_result(&mut stream).is_err(),
         "zero peer stream window should park outbound response DATA"
@@ -1709,13 +1849,30 @@ fn http2_window_update_unblocks_bounded_pending_response() {
     stream
         .set_read_timeout(Some(Duration::from_millis(200)))
         .expect("short read timeout");
+    let mut received = Vec::new();
     loop {
         match read_frame_result(&mut stream) {
             Ok(frame) if frame.ty == FRAME_WINDOW_UPDATE => {}
-            Ok(frame) => panic!("response should be flow-control blocked before update: {frame:?}"),
+            Ok(frame) if frame.ty == FRAME_HEADERS && frame.stream_id == 1 => {
+                assert_eq!(frame.flags & FLAG_END_STREAM, 0);
+            }
+            Ok(frame) if frame.ty == FRAME_DATA && frame.stream_id == 1 => {
+                assert_eq!(
+                    frame.flags & FLAG_END_STREAM,
+                    0,
+                    "the initial window cannot finish a 70,000-byte body"
+                );
+                received.extend_from_slice(&frame.payload);
+            }
+            Ok(frame) => panic!("unexpected frame before flow-control update: {frame:?}"),
             Err(_) => break,
         }
     }
+    assert_eq!(
+        received.len(),
+        65_535,
+        "server should make all initial credit visible before parking"
+    );
 
     write_window_update(&mut stream, 0, 100_000);
     write_window_update(&mut stream, 1, 100_000);
@@ -1723,7 +1880,23 @@ fn http2_window_update_unblocks_bounded_pending_response() {
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("restore read timeout");
 
-    assert_eq!(read_response_body(&mut stream, 1), body);
+    loop {
+        let frame = read_frame(&mut stream);
+        if frame.stream_id != 1 {
+            continue;
+        }
+        match frame.ty {
+            FRAME_DATA => {
+                received.extend_from_slice(&frame.payload);
+                if frame.flags & FLAG_END_STREAM != 0 {
+                    break;
+                }
+            }
+            FRAME_RST_STREAM => panic!("pending response reset: {frame:?}"),
+            other => panic!("unexpected frame after flow-control update: {other}: {frame:?}"),
+        }
+    }
+    assert_eq!(received, body);
     harness.shutdown();
 }
 
