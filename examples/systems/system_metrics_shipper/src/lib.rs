@@ -17,7 +17,7 @@ use std::thread;
 use std::time::Duration;
 
 use tina::time::{RecurringCatchUp, RecurringTick, RecurringTickDecision, RecurringTickToken};
-use tina::{CallContext, RequestContext, prelude::*, reply_to};
+use tina::{RequestContext, prelude::*, reply_to};
 use tina_runtime::lifecycle::{
     CloseAdmission, Health, Lifecycle, ResourceCloseReport, ResourceKind, ServiceShutdownReport,
     ServiceTopology, ShutdownChoreography, ShutdownStep, StepOutcome, TopologyComponent,
@@ -163,13 +163,10 @@ pub enum FlushKind {
     Drain,
 }
 
+/// Fire-and-forget facts the shipper accepts: timer ticks and flush
+/// completions. Neither carries caller authority.
 #[derive(Debug)]
-pub enum ShipperMsg {
-    Submit {
-        event: Event,
-    },
-    Stats,
-    Stop,
+pub enum ShipperEvent {
     Tick {
         token: RecurringTickToken,
     },
@@ -180,6 +177,17 @@ pub enum ShipperMsg {
         outcome: CallOutcome<SinkReply>,
     },
 }
+
+/// Caller-authority requests the host can ask the shipper.
+#[derive(Debug)]
+pub enum ShipperRequest {
+    Submit { event: Event },
+    Stats,
+    Stop,
+}
+
+/// Split-service envelope for [`Shipper`].
+pub type ShipperMsg = tina::ServiceMessage<ShipperEvent, ShipperRequest>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShipperReply {
@@ -242,35 +250,34 @@ struct Shipper {
     stats: ShipperStats,
 }
 
-#[tina_runtime::isolate(message = ShipperMsg, reply = ShipperReply)]
+#[tina_runtime::isolate(event = ShipperEvent, request = ShipperRequest, reply = ShipperReply)]
 impl Shipper {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: ShipperMsg,
+        event: ShipperEvent,
         ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         let now = ctx.now();
-        match msg {
-            ShipperMsg::Tick { token } => self.on_tick(token),
-            ShipperMsg::FlushDone {
+        match event {
+            ShipperEvent::Tick { token } => self.on_tick(token),
+            ShipperEvent::FlushDone {
                 kind,
                 count,
                 permit,
                 outcome,
             } => self.on_flush_done(kind, count, permit, outcome, now),
-            // Call-only shapes get dropped here. The host always calls them.
-            ShipperMsg::Submit { .. } | ShipperMsg::Stats | ShipperMsg::Stop => noop(),
         }
     }
 
-    fn handle_call(&mut self, msg: ShipperMsg, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            ShipperMsg::Submit { event } => self.on_submit(event, call),
-            ShipperMsg::Stats => call.reply(ShipperReply::Stats(self.snapshot())),
-            ShipperMsg::Stop => self.on_stop(call),
-            ShipperMsg::Tick { .. } | ShipperMsg::FlushDone { .. } => {
-                call.reject(tina::CallRejectedReason::UnsupportedMessage)
-            }
+    fn handle_request(
+        &mut self,
+        request: ShipperRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            ShipperRequest::Submit { event } => self.on_submit(event, call),
+            ShipperRequest::Stats => call.reply(ShipperReply::Stats(self.snapshot())),
+            ShipperRequest::Stop => self.on_stop(call),
         }
     }
 }
@@ -298,7 +305,7 @@ impl Shipper {
         }
     }
 
-    fn on_submit(&mut self, event: Event, call: CallContext<'_, Self>) -> Effect<Self> {
+    fn on_submit(&mut self, event: Event, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
         let now = call.now();
         if !self.drain.is_open() {
             let _ = self.drain.admit();
@@ -323,10 +330,7 @@ impl Shipper {
         // tick makes any in-flight Tick continuation visibly stale via
         // `flush_tick.validate()`.
         if self.buffer.len() >= self.batch_size && self.flush_gate.is_idle() {
-            return Effect::Batch(vec![
-                call.reply(ShipperReply::Accepted),
-                self.start_flush(FlushKind::Size),
-            ]);
+            return call.reply_and(ShipperReply::Accepted, vec![self.start_flush(FlushKind::Size)]);
         }
 
         // Time-based flush: arm the recurring tick the first time the buffer
@@ -336,13 +340,14 @@ impl Shipper {
             && self.flush_tick.next_due().is_none()
             && !self.buffer.is_empty()
         {
-            return Effect::Batch(vec![call.reply(ShipperReply::Accepted), self.arm_tick(now)]);
+            return call.reply_and(ShipperReply::Accepted, vec![self.arm_tick(now)]);
         }
         call.reply(ShipperReply::Accepted)
     }
 
-    fn on_stop(&mut self, call: CallContext<'_, Self>) -> Effect<Self> {
+    fn on_stop(&mut self, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
         if !self.drain.is_open() {
+            // Double-stop is a real policy reject, not a wrong-lane message.
             return call.reject(tina::CallRejectedReason::UnsupportedMessage);
         }
         self.drain.begin();
@@ -356,12 +361,14 @@ impl Shipper {
                 drained_batches: self.drained_batches,
             });
         }
-        self.pending_stop = Some(call.into_request_context());
-        if self.flush_gate.is_idle() {
-            self.start_flush(FlushKind::Drain)
-        } else {
-            noop()
-        }
+        call.capture(|req| {
+            self.pending_stop = Some(req);
+            if self.flush_gate.is_idle() {
+                self.start_flush(FlushKind::Drain)
+            } else {
+                noop()
+            }
+        })
     }
 
     fn on_tick(&mut self, token: RecurringTickToken) -> Effect<Self> {
@@ -452,11 +459,13 @@ impl Shipper {
             SinkRequest::Flush { batch },
             self.flush_timeout,
         )
-        .then(move |outcome| ShipperMsg::FlushDone {
-            kind,
-            count,
-            permit,
-            outcome,
+        .then(move |outcome| {
+            ShipperMsg::Event(ShipperEvent::FlushDone {
+                kind,
+                count,
+                permit,
+                outcome,
+            })
         })
     }
 
@@ -465,7 +474,7 @@ impl Shipper {
         self.stats.ticks_armed += 1;
         match decision {
             RecurringTickDecision::Sleep { delay, token, .. } => {
-                sleep(delay).then(move |_| ShipperMsg::Tick { token })
+                sleep(delay).then(move |_| ShipperMsg::Event(ShipperEvent::Tick { token }))
             }
             RecurringTickDecision::Skip(report) => {
                 // Skip means whole periods were missed since this isolate
@@ -692,7 +701,7 @@ pub fn run_shutdown(config: &RunConfig) -> anyhow::Result<ShutdownReport> {
     let t_drain = std::time::Instant::now();
     let stop_outcome = world.runtime.call_blocking(
         world.shipper,
-        ShipperMsg::Stop,
+        ShipperMsg::Request(ShipperRequest::Stop),
         Duration::from_millis(config.stop_timeout_ms),
     )?;
     let (flushed_on_drain, drained_batches, drain_clean) = match stop_outcome {
@@ -731,7 +740,7 @@ pub fn run_shutdown(config: &RunConfig) -> anyhow::Result<ShutdownReport> {
 
     // Invariant after Stop: the shipper must refuse new admission with
     // Stopping. This is an assertion, not a shutdown phase — the act of
-    // closing ingress already happened inside `ShipperMsg::Stop` which
+    // closing ingress already happened inside `ShipperRequest::Stop` which
     // flipped `DrainState::begin()`. Recording it as a choreography
     // step would (correctly) flag an ordering violation since
     // StopIngress sits before DrainInFlight; the invariant check still
@@ -739,12 +748,12 @@ pub fn run_shutdown(config: &RunConfig) -> anyhow::Result<ShutdownReport> {
     // ordered choreography.
     let stopping = world.runtime.call_blocking(
         world.shipper,
-        ShipperMsg::Submit {
+        ShipperMsg::Request(ShipperRequest::Submit {
             event: Event {
                 key: "after-stop".into(),
                 value: 0,
             },
-        },
+        }),
         Duration::from_millis(config.call_timeout_ms),
     )?;
     anyhow::ensure!(
@@ -963,11 +972,14 @@ impl World {
             .map_err(|e| anyhow::anyhow!("register sink: {e:?}"))?
             .requests;
         let shipper = runtime
-            .register_with_capacity::<_, Infallible>(
+            .register_split_service::<Shipper, ShipperEvent, ShipperRequest, Infallible>(
                 Shipper::new(sink, config),
                 config.shipper_mailbox,
             )
-            .map_err(|e| anyhow::anyhow!("register shipper: {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("register shipper: {e:?}"))?
+            .requests
+            .address()
+            .address();
         // Cloneable shutdown handle: lets the host drive runtime
         // teardown without `Arc::try_unwrap(runtime)` once the burst
         // threads have joined.
@@ -993,12 +1005,12 @@ impl World {
             for i in 0..events {
                 outcomes.push(self.runtime.call_blocking(
                     self.shipper,
-                    ShipperMsg::Submit {
+                    ShipperMsg::Request(ShipperRequest::Submit {
                         event: Event {
                             key: format!("k{i}"),
                             value: i as i64,
                         },
-                    },
+                    }),
                     self.call_timeout,
                 )?);
             }
@@ -1023,8 +1035,11 @@ impl World {
                         key: format!("k{i}"),
                         value: i as i64,
                     };
-                    let outcome =
-                        rt.call_blocking(shipper, ShipperMsg::Submit { event }, timeout)?;
+                    let outcome = rt.call_blocking(
+                        shipper,
+                        ShipperMsg::Request(ShipperRequest::Submit { event }),
+                        timeout,
+                    )?;
                     bucket.lock().expect("outcomes lock").push(outcome);
                 }
                 Ok(())
@@ -1046,7 +1061,11 @@ impl World {
     fn shipper_stats(&self) -> anyhow::Result<ShipperStats> {
         match self
             .runtime
-            .call_blocking(self.shipper, ShipperMsg::Stats, self.call_timeout)?
+            .call_blocking(
+                self.shipper,
+                ShipperMsg::Request(ShipperRequest::Stats),
+                self.call_timeout,
+            )?
         {
             CallOutcome::Replied(ShipperReply::Stats(stats)) => Ok(stats),
             other => anyhow::bail!("expected Stats reply, got {other:?}"),
@@ -1092,7 +1111,11 @@ impl World {
     fn stop_and_shutdown(self) -> anyhow::Result<bool> {
         let outcome =
             self.runtime
-                .call_blocking(self.shipper, ShipperMsg::Stop, self.stop_timeout)?;
+                .call_blocking(
+                    self.shipper,
+                    ShipperMsg::Request(ShipperRequest::Stop),
+                    self.stop_timeout,
+                )?;
         let clean = matches!(outcome, CallOutcome::Replied(ShipperReply::Stopped { .. }));
         self.shutdown()?;
         Ok(clean)

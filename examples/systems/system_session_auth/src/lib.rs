@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tina::{CallContext, prelude::*};
+use tina::prelude::*;
 use tina_runtime::sharded::ShardPlacement;
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, ThreadedMultiShardRuntime, sleep_then,
@@ -129,10 +129,19 @@ pub struct BucketStats {
     pub high_water: u64,
 }
 
+/// Fire-and-forget facts a bucket accepts: bootstrap and the recurring
+/// sweep tick. Neither carries caller authority.
 #[derive(Debug)]
-pub enum SessionAuthMsg {
+pub enum SessionAuthEvent {
     /// One-shot kick from the host to start the recurring sweep timer.
     Bootstrap,
+    /// Internal sweep tick. Reschedules itself.
+    Sweep,
+}
+
+/// Caller-authority requests the host can ask a bucket.
+#[derive(Debug)]
+pub enum SessionAuthRequest {
     /// Host-supplied token; the bucket records it and replies with the
     /// admission result. The host is responsible for routing this call
     /// to the shard the token hashes to.
@@ -147,9 +156,10 @@ pub enum SessionAuthMsg {
         token: SessionToken,
     },
     Stats,
-    /// Internal sweep tick. Reschedules itself.
-    Sweep,
 }
+
+/// Split-service envelope for [`SessionBucket`].
+pub type SessionAuthMsg = tina::ServiceMessage<SessionAuthEvent, SessionAuthRequest>;
 
 #[derive(Debug)]
 struct SessionRow {
@@ -166,32 +176,34 @@ struct SessionBucket {
     stats: BucketStats,
 }
 
-#[tina_runtime::isolate(message = SessionAuthMsg, reply = SessionAuthReply, shard = AuthShard)]
+#[tina_runtime::isolate(
+    event = SessionAuthEvent,
+    request = SessionAuthRequest,
+    reply = SessionAuthReply,
+    shard = AuthShard
+)]
 impl SessionBucket {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: SessionAuthMsg,
+        event: SessionAuthEvent,
         _ctx: &mut Context<'_, AuthShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            SessionAuthMsg::Bootstrap => self.start_sweep(),
-            SessionAuthMsg::Sweep => self.sweep(),
-            SessionAuthMsg::Login { .. }
-            | SessionAuthMsg::Touch { .. }
-            | SessionAuthMsg::Logout { .. }
-            | SessionAuthMsg::Stats => noop(),
+        match event {
+            SessionAuthEvent::Bootstrap => self.start_sweep(),
+            SessionAuthEvent::Sweep => self.sweep(),
         }
     }
 
-    fn handle_call(&mut self, msg: SessionAuthMsg, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            SessionAuthMsg::Login { user_id, token } => self.login(user_id, token, call),
-            SessionAuthMsg::Touch { token } => self.touch(token, call),
-            SessionAuthMsg::Logout { token } => self.logout(token, call),
-            SessionAuthMsg::Stats => call.reply(SessionAuthReply::Stats(self.snapshot())),
-            SessionAuthMsg::Bootstrap | SessionAuthMsg::Sweep => {
-                call.reject(tina::CallRejectedReason::UnsupportedMessage)
-            }
+    fn handle_request(
+        &mut self,
+        request: SessionAuthRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            SessionAuthRequest::Login { user_id, token } => self.login(user_id, token, call),
+            SessionAuthRequest::Touch { token } => self.touch(token, call),
+            SessionAuthRequest::Logout { token } => self.logout(token, call),
+            SessionAuthRequest::Stats => call.reply(SessionAuthReply::Stats(self.snapshot())),
         }
     }
 }
@@ -217,7 +229,7 @@ impl SessionBucket {
     fn schedule_sweep(&self) -> Effect<Self> {
         sleep_then(
             Duration::from_millis(self.config.sweep_interval_ms),
-            SessionAuthMsg::Sweep,
+            SessionAuthMsg::Event(SessionAuthEvent::Sweep),
         )
     }
 
@@ -225,8 +237,8 @@ impl SessionBucket {
         &mut self,
         user_id: String,
         token: SessionToken,
-        call: CallContext<'_, Self>,
-    ) -> Effect<Self> {
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
         if self.rows.len() >= self.config.max_sessions_per_shard {
             self.stats.full_rejects += 1;
             return call.reply(SessionAuthReply::Full);
@@ -246,7 +258,11 @@ impl SessionBucket {
         call.reply(SessionAuthReply::Admitted { token })
     }
 
-    fn touch(&mut self, token: SessionToken, call: CallContext<'_, Self>) -> Effect<Self> {
+    fn touch(
+        &mut self,
+        token: SessionToken,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
         match self.rows.get_mut(&token) {
             Some(row) => {
                 row.last_touched_at = Instant::now();
@@ -260,7 +276,11 @@ impl SessionBucket {
         }
     }
 
-    fn logout(&mut self, token: SessionToken, call: CallContext<'_, Self>) -> Effect<Self> {
+    fn logout(
+        &mut self,
+        token: SessionToken,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
         if self.rows.remove(&token).is_some() {
             self.stats.logged_out += 1;
             self.stats.active = self.rows.len() as u64;
@@ -338,7 +358,7 @@ impl AuthWorld {
                     *shard_id,
                     SessionBucket::new(config),
                     config.session_mailbox,
-                    SessionAuthMsg::Bootstrap,
+                    SessionAuthMsg::Event(SessionAuthEvent::Bootstrap),
                 )
                 .map_err(|e| anyhow::anyhow!("register on shard {}: {e:?}", shard_id.get()))?;
             addrs_by_shard.insert(*shard_id, addr);
@@ -368,10 +388,10 @@ impl AuthWorld {
         let addr = self.addr_for(&token);
         match self.runtime.call_blocking(
             addr,
-            SessionAuthMsg::Login {
+            SessionAuthMsg::Request(SessionAuthRequest::Login {
                 user_id,
                 token: token.clone(),
-            },
+            }),
             self.timeout,
         )? {
             CallOutcome::Replied(r) => Ok(r),
@@ -381,10 +401,11 @@ impl AuthWorld {
 
     fn touch(&self, token: SessionToken) -> anyhow::Result<SessionAuthReply> {
         let addr = self.addr_for(&token);
-        match self
-            .runtime
-            .call_blocking(addr, SessionAuthMsg::Touch { token }, self.timeout)?
-        {
+        match self.runtime.call_blocking(
+            addr,
+            SessionAuthMsg::Request(SessionAuthRequest::Touch { token }),
+            self.timeout,
+        )? {
             CallOutcome::Replied(r) => Ok(r),
             other => anyhow::bail!("touch outcome: {other:?}"),
         }
@@ -392,10 +413,11 @@ impl AuthWorld {
 
     fn logout(&self, token: SessionToken) -> anyhow::Result<SessionAuthReply> {
         let addr = self.addr_for(&token);
-        match self
-            .runtime
-            .call_blocking(addr, SessionAuthMsg::Logout { token }, self.timeout)?
-        {
+        match self.runtime.call_blocking(
+            addr,
+            SessionAuthMsg::Request(SessionAuthRequest::Logout { token }),
+            self.timeout,
+        )? {
             CallOutcome::Replied(r) => Ok(r),
             other => anyhow::bail!("logout outcome: {other:?}"),
         }
@@ -417,10 +439,11 @@ impl AuthWorld {
         };
         for (idx, shard_id) in self.shard_ids.iter().enumerate() {
             let addr = self.addrs_by_shard[shard_id];
-            match self
-                .runtime
-                .call_blocking(addr, SessionAuthMsg::Stats, self.timeout)?
-            {
+            match self.runtime.call_blocking(
+                addr,
+                SessionAuthMsg::Request(SessionAuthRequest::Stats),
+                self.timeout,
+            )? {
                 CallOutcome::Replied(SessionAuthReply::Stats(s)) => {
                     combined.active += s.active as usize;
                     combined.admitted += s.admitted;

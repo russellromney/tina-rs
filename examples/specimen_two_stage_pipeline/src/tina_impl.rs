@@ -2,7 +2,9 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, call};
+use tina_runtime::{
+    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, call, call_request,
+};
 
 use crate::{REQUESTS, Report, Stage, classify};
 
@@ -126,8 +128,14 @@ pub enum PipelineReply {
     Failed,
 }
 
-enum PipelineMsg {
+/// Caller-authority request: the only thing an outside caller can ask.
+#[derive(Debug)]
+enum PipelineRequest {
     Submit(usize),
+}
+
+/// Internal event: one stage's continuation, never caller authority.
+enum PipelineEvent {
     Stage(PipelineFlow),
 }
 
@@ -142,6 +150,8 @@ struct Pipeline {
 // crate used to hand-roll as `PipelineMsg::{Parsed,Validated,Executed}` plus
 // a `qid`-keyed `PendingReplies` table. The caller's `RequestContext` now
 // threads through `req` directly, so the qid indirection is gone too.
+// Continuations land as `ServiceMessage::Event(PipelineEvent::Stage(...))`
+// so the split-service form can drop the hand-written reject arm.
 tina::flow! {
     flow PipelineFlow for Pipeline {
         reply PipelineReply;
@@ -151,7 +161,9 @@ tina::flow! {
                 CallOutcome::Replied(ParseReply::Ok(v)) => {
                     call(self.validate, ValidateInput(v), STAGE_TIMEOUT)
                         .then_with_request(req, move |req, outcome| {
-                            PipelineMsg::Stage(PipelineFlow::Validated(req, outcome))
+                            tina::ServiceMessage::Event(PipelineEvent::Stage(
+                                PipelineFlow::Validated(req, outcome),
+                            ))
                         })
                 }
                 CallOutcome::Replied(ParseReply::Failed) => {
@@ -166,7 +178,9 @@ tina::flow! {
                 CallOutcome::Replied(ValidateReply::Ok(v)) => {
                     call(self.execute, ExecuteInput(v), STAGE_TIMEOUT)
                         .then_with_request(req, move |req, outcome| {
-                            PipelineMsg::Stage(PipelineFlow::Executed(req, outcome))
+                            tina::ServiceMessage::Event(PipelineEvent::Stage(
+                                PipelineFlow::Executed(req, outcome),
+                            ))
                         })
                 }
                 CallOutcome::Replied(ValidateReply::Failed) => {
@@ -185,27 +199,52 @@ tina::flow! {
     }
 }
 
-#[tina_runtime::isolate(message = PipelineMsg, reply = PipelineReply)]
+// `flow!` does not derive `Debug`; print the outcome, skip `req`.
+impl std::fmt::Debug for PipelineFlow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PipelineFlow::Parsed(_, outcome) => f.debug_tuple("Parsed").field(outcome).finish(),
+            PipelineFlow::Validated(_, outcome) => {
+                f.debug_tuple("Validated").field(outcome).finish()
+            }
+            PipelineFlow::Executed(_, outcome) => f.debug_tuple("Executed").field(outcome).finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for PipelineEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PipelineEvent::Stage(flow) => f.debug_tuple("Stage").field(flow).finish(),
+        }
+    }
+}
+
+#[tina_runtime::isolate(event = PipelineEvent, request = PipelineRequest, reply = PipelineReply)]
 impl Pipeline {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: PipelineMsg,
+        event: PipelineEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            PipelineMsg::Submit(_) => noop(),
-            PipelineMsg::Stage(flow) => self.handle_pipeline_flow(flow),
+        match event {
+            PipelineEvent::Stage(flow) => self.handle_pipeline_flow(flow),
         }
     }
 
-    fn handle_call(&mut self, msg: PipelineMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            PipelineMsg::Submit(input) => call_ctx
+    fn handle_request(
+        &mut self,
+        request: PipelineRequest,
+        req_call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            PipelineRequest::Submit(input) => req_call
                 .defer(call(self.parse, ParseInput(input), STAGE_TIMEOUT))
                 .reply(move |req, outcome| {
-                    PipelineMsg::Stage(PipelineFlow::Parsed(req, outcome))
+                    tina::ServiceMessage::Event(PipelineEvent::Stage(PipelineFlow::Parsed(
+                        req, outcome,
+                    )))
                 }),
-            PipelineMsg::Stage(_) => call_ctx.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }
@@ -227,7 +266,7 @@ enum DriverMsg {
 }
 
 struct Driver {
-    pipeline: Address<PipelineMsg, PipelineReply>,
+    pipeline: tina::ServiceRequestAddress<PipelineEvent, PipelineRequest, PipelineReply>,
     remaining: usize,
     outcome: DriverOutcome,
 }
@@ -244,7 +283,7 @@ impl Driver {
                 let pipeline = self.pipeline;
                 let calls: Vec<_> = (0..REQUESTS)
                     .map(|i| {
-                        call(pipeline, PipelineMsg::Submit(i), STAGE_TIMEOUT)
+                        call_request(pipeline, PipelineRequest::Submit(i), STAGE_TIMEOUT)
                             .then(DriverMsg::Returned)
                     })
                     .collect();
@@ -285,7 +324,7 @@ pub fn run() -> anyhow::Result<Report> {
         .register_with_capacity::<_, Infallible>(ExecuteStage, 32)
         .map_err(|e| anyhow::anyhow!("register execute: {e:?}"))?;
     let pipeline = runtime
-        .register_with_capacity::<_, Infallible>(
+        .register_split_service::<Pipeline, PipelineEvent, PipelineRequest, Infallible>(
             Pipeline {
                 parse,
                 validate,
@@ -293,7 +332,8 @@ pub fn run() -> anyhow::Result<Report> {
             },
             64,
         )
-        .map_err(|e| anyhow::anyhow!("register pipeline: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("register pipeline: {e:?}"))?
+        .requests;
     let driver = runtime
         .register_with_capacity::<_, Infallible>(
             Driver {

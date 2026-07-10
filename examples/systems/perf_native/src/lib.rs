@@ -16,7 +16,6 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::routing::get;
-use tina::CallRejectedReason;
 use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::prelude::*;
 use tina_http::{
@@ -384,11 +383,20 @@ impl Ping {
     }
 }
 
+/// Caller-authority request: the only thing an outside caller can ask.
 #[derive(Debug)]
-enum ChainMsg {
+enum ChainRequest {
     Run,
+}
+
+/// Internal event: ping continuation, never caller authority.
+#[derive(Debug)]
+enum ChainEvent {
     PingReturned(RequestContext<ChainReply>, CallOutcome<PingReply>),
 }
+
+/// Split-service envelope for [`ChainService`].
+type ChainMsg = tina::ServiceMessage<ChainEvent, ChainRequest>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChainReply {
@@ -400,28 +408,32 @@ struct ChainService {
     ping: Address<PingMsg, PingReply>,
 }
 
-#[tina_runtime::isolate(message = ChainMsg, reply = ChainReply)]
+#[tina_runtime::isolate(event = ChainEvent, request = ChainRequest, reply = ChainReply)]
 impl ChainService {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: ChainMsg,
+        event: ChainEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            ChainMsg::Run => noop(),
-            ChainMsg::PingReturned(request, CallOutcome::Replied(PingReply::Pong)) => {
+        match event {
+            ChainEvent::PingReturned(request, CallOutcome::Replied(PingReply::Pong)) => {
                 reply_to(request, ChainReply::Done)
             }
-            ChainMsg::PingReturned(request, _) => reply_to(request, ChainReply::Done),
+            ChainEvent::PingReturned(request, _) => reply_to(request, ChainReply::Done),
         }
     }
 
-    fn handle_call(&mut self, msg: ChainMsg, call_ctx: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            ChainMsg::Run => call_ctx
+    fn handle_request(
+        &mut self,
+        request: ChainRequest,
+        call_ctx: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            ChainRequest::Run => call_ctx
                 .defer(call(self.ping, PingMsg::Ping, CALL_TIMEOUT))
-                .reply(ChainMsg::PingReturned),
-            ChainMsg::PingReturned(_, _) => call_ctx.reject(CallRejectedReason::UnsupportedMessage),
+                .reply(|req, outcome| {
+                    ChainMsg::Event(ChainEvent::PingReturned(req, outcome))
+                }),
         }
     }
 }
@@ -681,10 +693,20 @@ fn tina_service_call_chain_row() -> anyhow::Result<PerfReport> {
         .register_with_capacity::<_, Infallible>(Ping, CAPACITY)
         .map_err(|e| anyhow::anyhow!("register tina chain ping: {e:?}"))?;
     let chain = runtime
-        .register_with_capacity::<_, Infallible>(ChainService { ping }, CAPACITY)
-        .map_err(|e| anyhow::anyhow!("register tina chain service: {e:?}"))?;
+        .register_split_service::<ChainService, ChainEvent, ChainRequest, Infallible>(
+            ChainService { ping },
+            CAPACITY,
+        )
+        .map_err(|e| anyhow::anyhow!("register tina chain service: {e:?}"))?
+        .requests
+        .address()
+        .address();
     assert_eq!(
-        runtime.call_blocking(chain, ChainMsg::Run, CALL_TIMEOUT)?,
+        runtime.call_blocking(
+            chain,
+            ChainMsg::Request(ChainRequest::Run),
+            CALL_TIMEOUT
+        )?,
         CallOutcome::Replied(ChainReply::Done),
     );
 
@@ -695,7 +717,11 @@ fn tina_service_call_chain_row() -> anyhow::Result<PerfReport> {
             stop: LoadStop::ops(OPS),
             label: "tina_service_call_chain",
         },
-        move |_| match rt.call_blocking(chain, ChainMsg::Run, CALL_TIMEOUT) {
+        move |_| match rt.call_blocking(
+            chain,
+            ChainMsg::Request(ChainRequest::Run),
+            CALL_TIMEOUT,
+        ) {
             Ok(CallOutcome::Replied(ChainReply::Done)) => OpOutcome::Ok,
             Ok(CallOutcome::Full) => OpOutcome::Err { kind: "full" },
             Ok(CallOutcome::Timeout) => OpOutcome::Timeout,

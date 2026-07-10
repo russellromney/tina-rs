@@ -23,11 +23,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tina::capacity::CapacityMode;
-use tina::{CallContext, prelude::*};
+use tina::prelude::*;
 use tina_runtime::{
     BoundedEventSink, CallOutcome, CapacitySummary, DefaultThreadedMailboxFactory, DropPolicy,
-    GuardedPendingReplies, ServiceHandle, ServicePressureReport, ServicePressureSurface,
-    SharedCapacityScope, SharedLease, SharedScopeFull, SleepReply, ThreadedRuntime,
+    GuardedPendingReplies, ServicePressureReport, ServicePressureSurface, SharedCapacityScope,
+    SharedLease, SharedScopeFull, SleepReply, SplitServiceHandle, ThreadedRuntime,
     format_assertion_failure, sleep,
 };
 
@@ -85,10 +85,19 @@ pub struct SlowEvent {
     pub took_ms: u64,
 }
 
-pub enum SoakMsg {
+/// Caller-authority request: the only thing an outside caller can ask.
+#[derive(Debug)]
+pub enum SoakRequest {
     Request { worker_id: usize, request_id: usize },
+}
+
+/// Internal event: flow continuation, never caller authority.
+pub enum SoakEvent {
     Flow(SoakFlow),
 }
+
+/// Split-service envelope for [`Soak`].
+pub type SoakMsg = tina::ServiceMessage<SoakEvent, SoakRequest>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SoakReply {
@@ -132,7 +141,9 @@ struct Soak {
 // steps. Neither step carries a `RequestContext` in the message, so each
 // uses `-> raw SleepReply` instead of the call-shaped `-> T` arrow: the
 // field is `SleepReply` verbatim (no `CallOutcome` wrap), and the body has
-// no `req` to thread.
+// no `req` to thread. Continuations land as
+// `ServiceMessage::Event(SoakEvent::Flow(...))` so the split-service form
+// can drop the hand-written reject arm.
 tina::flow! {
     pub flow SoakFlow for Soak {
         reply SoakReply;
@@ -151,26 +162,28 @@ tina::flow! {
     }
 }
 
-#[tina_runtime::isolate(message = SoakMsg, reply = SoakReply)]
+#[tina_runtime::isolate(event = SoakEvent, request = SoakRequest, reply = SoakReply)]
 impl Soak {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: SoakMsg,
+        event: SoakEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            SoakMsg::Request { .. } => noop(),
-            SoakMsg::Flow(flow) => self.handle_soak_flow(flow),
+        match event {
+            SoakEvent::Flow(flow) => self.handle_soak_flow(flow),
         }
     }
 
-    fn handle_call(&mut self, msg: SoakMsg, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            SoakMsg::Request {
+    fn handle_request(
+        &mut self,
+        request: SoakRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            SoakRequest::Request {
                 worker_id,
                 request_id,
             } => self.dispatch(worker_id, request_id, call),
-            _ => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }
@@ -211,8 +224,8 @@ impl Soak {
         &mut self,
         worker_id: usize,
         request_id: usize,
-        call: CallContext<'_, Self>,
-    ) -> Effect<Self> {
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
         let http_lease = match self.http_scope.try_admit(1) {
             Ok(lease) => lease,
             Err(SharedScopeFull { current, max, .. }) => {
@@ -220,31 +233,36 @@ impl Soak {
             }
         };
         let qid = self.next_qid;
-        let next_qid = qid + 1;
-        match self.pending.park_call_guarded(qid, call, http_lease) {
-            Ok(_ticket) => {
-                self.next_qid = next_qid;
-                let started_ms = self.now_ms();
-                let fake = self.fake_http;
-                sleep(fake).then(move |result| {
-                    SoakMsg::Flow(SoakFlow::HttpReleased(
-                        qid, worker_id, request_id, started_ms, result,
-                    ))
-                })
+        call.capture(|request| {
+            match self
+                .pending
+                .insert_deferred_guarded(qid, request.into_deferred(), http_lease)
+            {
+                Ok(_ticket) => {
+                    self.next_qid = qid + 1;
+                    let started_ms = self.now_ms();
+                    let fake = self.fake_http;
+                    sleep(fake).then(move |result| {
+                        tina::ServiceMessage::Event(SoakEvent::Flow(SoakFlow::HttpReleased(
+                            qid, worker_id, request_id, started_ms, result,
+                        )))
+                    })
+                }
+                Err(tina_runtime::GuardedInsertError::Full { reply, .. }) => {
+                    let cap = self.pending.capacity();
+                    reply_to::<Self>(
+                        reply,
+                        SoakReply::PendingFull {
+                            current: cap,
+                            max: cap,
+                        },
+                    )
+                }
+                Err(tina_runtime::GuardedInsertError::DuplicateKey { reply, .. }) => {
+                    reply_to::<Self>(reply, SoakReply::PendingDuplicate)
+                }
             }
-            Err(tina_runtime::GuardedParkCallError::Full { call, .. }) => {
-                let cap = self.pending.capacity();
-                call.reply(SoakReply::PendingFull {
-                    current: cap,
-                    max: cap,
-                })
-            }
-            Err(tina_runtime::GuardedParkCallError::DuplicateKey { call, .. })
-            | Err(tina_runtime::GuardedParkCallError::NoCaller { call, .. })
-            | Err(tina_runtime::GuardedParkCallError::CrossShardUnsupported { call, .. }) => {
-                call.reply(SoakReply::PendingDuplicate)
-            }
-        }
+        })
     }
 
     fn http_released(
@@ -275,9 +293,9 @@ impl Soak {
             .expect("re-admission after take cannot fail");
         let fake = self.fake_db;
         sleep(fake).then(move |result| {
-            SoakMsg::Flow(SoakFlow::DbReleased(
+            tina::ServiceMessage::Event(SoakEvent::Flow(SoakFlow::DbReleased(
                 qid, worker_id, request_id, started_ms, result,
-            ))
+            )))
         })
     }
 
@@ -314,8 +332,11 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     let http_scope = soak.http_scope.clone();
     let db_scope = soak.db_scope.clone();
     let events = soak.events.clone();
-    let svc: ServiceHandle<SoakMsg, SoakReply> = runtime
-        .register_service::<_, Infallible>(soak, config.gateway_mailbox)
+    let svc: SplitServiceHandle<SoakEvent, SoakRequest, SoakReply> = runtime
+        .register_split_service::<Soak, SoakEvent, SoakRequest, Infallible>(
+            soak,
+            config.gateway_mailbox,
+        )
         .map_err(|e| anyhow::anyhow!("register soak gateway: {e:?}"))?;
 
     let timeout = Duration::from_millis(config.call_timeout_ms);
@@ -328,17 +349,17 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         let rt = Arc::clone(&runtime);
         let gate = Arc::clone(&barrier);
         let out = Arc::clone(&outcomes);
-        let addr = svc.call;
+        let addr = svc.requests.address();
         let per = config.requests_per_worker;
         threads.push(thread::spawn(move || {
             gate.wait();
             for request_id in 0..per {
                 let r = rt.call_blocking_typed(
                     addr,
-                    SoakMsg::Request {
+                    SoakMsg::Request(SoakRequest::Request {
                         worker_id,
                         request_id,
-                    },
+                    }),
                     timeout,
                 );
                 out.lock().expect("outcomes").push(r);

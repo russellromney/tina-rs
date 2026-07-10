@@ -64,13 +64,23 @@ pub struct Report {
 
 // --- Worker: holds the slot, replies after a sleep ------------------------
 
+/// Caller-authority request: the only thing an outside caller can ask.
+#[derive(Debug)]
+enum WorkerRequest {
+    Run,
+}
+
+/// Internal event: sleep finished for a call in flight.
 #[derive(Debug)]
 #[allow(dead_code)] // `SleepReply` payload is part of the runtime
                     // contract; only the variant tag matters in this
                     // specimen.
-enum WorkerMsg {
+enum WorkerEvent {
     Wake(SleepReply),
 }
+
+/// Split-service envelope for [`Worker`].
+type WorkerMsg = tina::ServiceMessage<WorkerEvent, WorkerRequest>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkerReply;
@@ -80,15 +90,15 @@ struct Worker {
     held: Option<DeferredReply<WorkerReply>>,
 }
 
-#[tina_runtime::isolate(message = WorkerMsg, reply = WorkerReply)]
+#[tina_runtime::isolate(event = WorkerEvent, request = WorkerRequest, reply = WorkerReply)]
 impl Worker {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: WorkerMsg,
+        event: WorkerEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            WorkerMsg::Wake(_) => {
+        match event {
+            WorkerEvent::Wake(_) => {
                 if let Some(slot) = self.held.take() {
                     tina::reply_to(slot, WorkerReply)
                 } else {
@@ -98,10 +108,15 @@ impl Worker {
         }
     }
 
-    fn handle_call(&mut self, _msg: WorkerMsg, call: CallContext<'_, Self>) -> Effect<Self> {
-        let slot = call.into_request_context().into_deferred();
-        self.held = Some(slot);
-        sleep(self.work).then(WorkerMsg::Wake)
+    fn handle_request(
+        &mut self,
+        _request: WorkerRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        call.capture(move |req| {
+            self.held = Some(req.into_deferred());
+            sleep(self.work).then(|reply| tina::ServiceMessage::Event(WorkerEvent::Wake(reply)))
+        })
     }
 }
 
@@ -179,7 +194,7 @@ impl Driver {
         let mut effects = Vec::with_capacity(self.workers.len());
         for worker in &self.workers {
             let (effect, handle) =
-                call_cancelable(*worker, WorkerMsg::Wake(Ok(())), CALL_TIMEOUT)
+                call_cancelable(*worker, WorkerMsg::Request(WorkerRequest::Run), CALL_TIMEOUT)
                     .then(DriverMsg::Returned);
             // Scope is sole canceller for these rails; the worker-return
             // continuation still delivers `Returned` normally for any
