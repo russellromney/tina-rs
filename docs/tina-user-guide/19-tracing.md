@@ -125,6 +125,28 @@ Hot-path rules:
 `TraceRetention::Off` + observer = stream-only mode: in-memory trace
 stays empty, every event flows through the hook.
 
+## Retention
+
+The in-memory trace is bounded, like everything else. Three modes:
+
+- `Bounded(n)` — keep the most recent `n` events, count the rest in
+  `trace_dropped`. This is the live default (`ThreadedRuntimeConfig`,
+  `LocalSystemConfig`), sized at `DEFAULT_LIVE_TRACE_RETENTION` (16,384).
+  A long-running service does not grow trace memory with uptime;
+  shutdown reports and last-N debugging still get a deep tail.
+- `Full` — keep every event. Replay, simulation, and tests that assert
+  on the whole trace set this explicitly. Unbounded, so not a live default.
+- `Off` — drop events after assigning ids (see stream-only above).
+
+Set `Full` yourself when you need the complete trace:
+
+```rust
+ThreadedRuntimeConfig {
+    trace_retention: TraceRetention::Full,
+    ..Default::default()
+}
+```
+
 ## Fairness Reports
 
 `tina_runtime::FairnessReport::from_events(...)` is a trace reader. It

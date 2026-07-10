@@ -90,7 +90,9 @@ pub struct ThreadedRuntimeConfig {
     /// Setup-time reserves for runtime-owned metadata.
     pub preallocation: PreallocationConfig,
 
-    /// Trace retention for the worker-owned runtime.
+    /// Trace retention for the worker-owned runtime. Defaults to a bounded
+    /// ring ([`DEFAULT_LIVE_TRACE_RETENTION`](crate::DEFAULT_LIVE_TRACE_RETENTION));
+    /// set [`TraceRetention::Full`] for replay/debug that needs every event.
     pub trace_retention: TraceRetention,
 
     /// How long a fully idle worker (no runtime-owned work pending) may park
@@ -151,7 +153,9 @@ impl Default for ThreadedRuntimeConfig {
             signal_capacity: driver::DEFAULT_SIGNAL_CAPACITY,
             configured_core: None,
             preallocation: PreallocationConfig::default(),
-            trace_retention: TraceRetention::Full,
+            // Live worker: bounded ring so trace does not grow with uptime.
+            // Replay/sim/tests set `TraceRetention::Full` explicitly.
+            trace_retention: TraceRetention::Bounded(crate::DEFAULT_LIVE_TRACE_RETENTION),
             idle_wait: Duration::from_millis(1),
             // Single-shard workers use this only as a cap when some pending
             // work cannot wake the Betelgeuse park directly. Multi-shard keeps

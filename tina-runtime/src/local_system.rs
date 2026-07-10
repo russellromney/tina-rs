@@ -63,7 +63,9 @@ pub struct LocalSystemConfig {
     pub configured_core: Option<usize>,
     /// Setup-time reserves for runtime-owned metadata.
     pub preallocation: PreallocationConfig,
-    /// Trace retention for worker-owned runtimes.
+    /// Trace retention for worker-owned runtimes. Defaults to a bounded ring
+    /// ([`DEFAULT_LIVE_TRACE_RETENTION`](crate::DEFAULT_LIVE_TRACE_RETENTION));
+    /// set [`TraceRetention::Full`] for replay/debug that needs every event.
     pub trace_retention: TraceRetention,
     /// How long an idle worker may park before checking runtime-owned work.
     pub idle_wait: Duration,
@@ -89,7 +91,9 @@ impl Default for LocalSystemConfig {
             signal_capacity: driver::DEFAULT_SIGNAL_CAPACITY,
             configured_core: None,
             preallocation: PreallocationConfig::default(),
-            trace_retention: TraceRetention::Full,
+            // Live worker: bounded ring so trace does not grow with uptime.
+            // Replay/sim/tests set `TraceRetention::Full` explicitly.
+            trace_retention: TraceRetention::Bounded(crate::DEFAULT_LIVE_TRACE_RETENTION),
             idle_wait: Duration::from_millis(1),
             shutdown_lane_drain_timeout: DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT,
         }

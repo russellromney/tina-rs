@@ -587,11 +587,24 @@ impl Default for PreallocationConfig {
     }
 }
 
+/// Default trace ring for live runtime owners.
+///
+/// Live workers ([`ThreadedRuntimeConfig`], [`LocalSystemConfig`]) keep the most recent
+/// this-many runtime events, so a long-running service does not grow memory with
+/// uptime. Generous on purpose: shutdown reports and last-N debugging keep a
+/// deep tail, and `trace_dropped` still reports what fell off. A `RuntimeEvent`
+/// is a few dozen bytes, so this ring costs well under a megabyte. Replay and
+/// simulation want every event instead — set [`TraceRetention::Full`]
+/// explicitly there.
+pub const DEFAULT_LIVE_TRACE_RETENTION: usize = 16_384;
+
 /// Runtime trace retention policy.
 ///
-/// Tests usually want [`Full`](Self::Full) so replay artifacts keep every
-/// event. Live services can use [`Bounded`](Self::Bounded) or [`Off`](Self::Off)
-/// so observability does not become another hidden unbounded queue.
+/// Live runtime owners default to [`Bounded`](Self::Bounded) with
+/// [`DEFAULT_LIVE_TRACE_RETENTION`] so the trace stays bounded with uptime.
+/// Replay/simulation/tests that need every event set [`Full`](Self::Full)
+/// explicitly. [`Off`](Self::Off) drops events after assigning their ids, for
+/// when even a tail is unwanted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceRetention {
     /// Keep every runtime event.
