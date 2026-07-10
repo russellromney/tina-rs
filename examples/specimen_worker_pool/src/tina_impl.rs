@@ -116,14 +116,14 @@ impl Frontend {
                 let qid = self.next_qid;
                 self.next_qid += 1;
                 match self.pending.park_request(qid, call) {
-                    Ok(ticket) => {
+                    Ok((_ticket, permit)) => {
                         let worker = self.workers[self.next_worker];
                         self.next_worker = (self.next_worker + 1) % self.workers.len();
                         let dispatch_effect = call_request(worker, WorkerRequest::Do(payload), CALL_TIMEOUT)
                             .then(move |outcome| {
                                 tina::ServiceMessage::Event(FrontendEvent::WorkerDone(qid, outcome))
                             });
-                        request_effect_after_park(&ticket, dispatch_effect)
+                        request_effect_after_park(permit, dispatch_effect)
                     }
                     Err(ParkError::Full { call, .. }) => call.reply(FrontendReply::Full),
                     Err(ParkError::DuplicateKey { call, .. }) => call.reply(FrontendReply::Full),

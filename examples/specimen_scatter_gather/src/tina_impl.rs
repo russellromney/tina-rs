@@ -133,7 +133,7 @@ impl Coordinator {
                 let qid = self.next_qid;
                 self.next_qid += 1;
                 match self.pending.park_request(qid, call) {
-                    Ok(ticket) => {
+                    Ok((_ticket, permit)) => {
                         self.partials.push(PartialQuery {
                             qid,
                             sum: 0,
@@ -155,7 +155,7 @@ impl Coordinator {
                                 ))
                             })
                             .collect();
-                        request_effect_after_park(&ticket, Effect::Batch(calls))
+                        request_effect_after_park(permit, Effect::Batch(calls))
                     }
                     // Pending box full: reply Full to the caller
                     // without capturing. The caller observes a typed

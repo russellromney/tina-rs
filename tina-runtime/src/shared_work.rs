@@ -255,20 +255,21 @@ where
 
     /// Park the current request-call caller under `key`.
     ///
-    /// Returns a [`SharedWorkTicket`] on success. Returns
+    /// Returns a [`SharedWorkTicket`] and the request turn's one-use effect
+    /// permit on success. Returns
     /// [`SharedWorkError::Full`] or [`SharedWorkError::KeyFull`] with
     /// caller authority returned unchanged when admission cannot happen.
     pub fn wait<'a, I>(
         &mut self,
         key: K,
         call: RequestCall<'a, I>,
-    ) -> Result<SharedWorkTicket<K>, SharedWorkError<'a, K, I>>
+    ) -> Result<(SharedWorkTicket<K>, tina::RequestEffectPermit<'a, I>), SharedWorkError<'a, K, I>>
     where
         I: Isolate<Reply = R>,
         R: 'static,
     {
         match self.inner.park(key, call) {
-            Ok(inner) => Ok(SharedWorkTicket { inner }),
+            Ok((inner, permit)) => Ok((SharedWorkTicket { inner }, permit)),
             Err(WaitError::Full { key, call }) => Err(SharedWorkError::Full { key, call }),
             Err(WaitError::KeyFull { key, call }) => Err(SharedWorkError::KeyFull { key, call }),
         }
@@ -396,17 +397,17 @@ where
 /// Build a request-lane effect after caller authority has been consumed
 /// by [`SharedWork::wait`] or [`SharedWork::wait_call`].
 ///
-/// The ticket is a proof that admission happened. Its fields are private
-/// to the crate, so user code cannot manufacture a `RequestEffect` from
-/// plain `noop()` without first parking the caller.
-pub fn request_effect_after_shared_wait<I, K>(
-    _ticket: &SharedWorkTicket<K>,
+/// The one-use permit is minted only after admission captures a real caller.
+/// The separate [`SharedWorkTicket`] remains available for later waiter
+/// routing.
+pub fn request_effect_after_shared_wait<I>(
+    permit: tina::RequestEffectPermit<'_, I>,
     effect: tina::Effect<I>,
 ) -> tina::RequestEffect<I>
 where
     I: tina::Isolate,
 {
-    crate::call::request_effect_from_consumed_effect(effect)
+    permit.apply(effect)
 }
 
 #[cfg(test)]

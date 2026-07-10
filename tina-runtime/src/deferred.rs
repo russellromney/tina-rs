@@ -936,9 +936,11 @@ where
 {
     /// Park the current request-call caller under `key`.
     ///
-    /// On success returns a [`ParkTicket`] that must be carried into the
-    /// continuation message. On failure, the original [`RequestCall`] is
-    /// returned alongside the key so the handler can answer immediately.
+    /// On success returns a [`ParkTicket`] and the request turn's one-use
+    /// effect permit. The ticket may be carried into a continuation message;
+    /// the permit must be consumed on this turn. On failure, the original
+    /// [`RequestCall`] is returned alongside the key so the handler can answer
+    /// immediately.
     ///
     /// `RequestCall` is the split-service request shape and guarantees
     /// caller authority is present on this turn. Park admission is
@@ -976,7 +978,7 @@ where
         &mut self,
         key: K,
         call: RequestCall<'a, I>,
-    ) -> Result<ParkTicket<K>, ParkError<'a, K, I>>
+    ) -> Result<(ParkTicket<K>, tina::RequestEffectPermit<'a, I>), ParkError<'a, K, I>>
     where
         I: tina::Isolate<Reply = R>,
         R: 'static,
@@ -996,8 +998,8 @@ where
             return Err(ParkError::Full { key, call });
         }
 
-        let req = Self::extract_request_context(call);
-        Ok(self.store_request_context(key, req))
+        let (req, permit) = call.into_request_context_with_permit();
+        Ok((self.store_request_context(key, req), permit))
     }
 
     /// Park the current call-context caller under `key`.
@@ -1118,39 +1120,20 @@ where
     }
 }
 
-impl<K, R> PendingReplies<K, R> {
-    /// Internal helper that pulls the request context out of a
-    /// `RequestCall` without forcing the user to settle the caller now.
-    ///
-    /// Cross-shard `RequestCall` would surface as a panic here; in
-    /// practice the split-service request path is local-only on
-    /// the request handler turn, so the conversion always succeeds.
-    fn extract_request_context<I>(call: RequestCall<'_, I>) -> RequestContext<I::Reply>
-    where
-        I: tina::Isolate,
-        I::Reply: 'static,
-    {
-        call.into_call_context().into_request_context()
-    }
-}
-
 /// Build a `RequestEffect<I>` from an `Effect<I>` after caller authority
 /// has been consumed by a bounded helper such as
 /// [`PendingReplies::park_request`].
 ///
-/// The ticket reference is taken purely as a type-level witness that
-/// admission already happened: a caller cannot conjure one without going
-/// through `park_request` (or one of its siblings), so this helper does
-/// not open a hole in the safety rails. The ticket itself is borrowed,
-/// not consumed.
-pub fn request_effect_after_park<I, K>(
-    _ticket: &ParkTicket<K>,
+/// The one-use permit is minted only after admission captures a real caller.
+/// The separate [`ParkTicket`] remains available for later slot routing.
+pub fn request_effect_after_park<I>(
+    permit: tina::RequestEffectPermit<'_, I>,
     effect: tina::Effect<I>,
 ) -> tina::RequestEffect<I>
 where
     I: tina::Isolate,
 {
-    crate::call::request_effect_from_consumed_effect(effect)
+    permit.apply(effect)
 }
 
 #[cfg(test)]

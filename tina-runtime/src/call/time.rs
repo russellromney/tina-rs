@@ -152,20 +152,21 @@ where
     }
 }
 
-impl<T, Q, E> RequestDeferredTypedCall<T, Q, E>
+impl<'request, T, I, E> RequestDeferredTypedCall<'request, T, I, E>
 where
     T: 'static,
-    Q: 'static,
+    I: tina::Isolate,
+    I::Reply: 'static,
     E: 'static,
 {
     /// Builds a request effect whose continuation carries caller authority.
-    pub fn reply<I, F, M>(self, translator: F) -> tina::RequestEffect<I>
+    pub fn reply<F, M>(self, translator: F) -> tina::RequestEffect<I>
     where
-        I: tina::Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
-        F: FnOnce(tina::RequestContext<Q>, Result<T, E>) -> M + 'static,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
+        F: FnOnce(tina::RequestContext<I::Reply>, Result<T, E>) -> M + 'static,
         M: 'static,
     {
-        crate::call::request_effect_from_consumed_effect(self.inner.reply(translator))
+        self.permit.apply(self.inner.reply(translator))
     }
 }
 
@@ -193,11 +194,22 @@ where
     I: tina::Isolate,
     I::Reply: 'static,
 {
-    type RequestDeferred = RequestDeferredTypedCall<T, I::Reply, E>;
+    type RequestDeferred<'request>
+        = RequestDeferredTypedCall<'request, T, I, E>
+    where
+        I: 'request;
 
-    fn defer_request_through(self, call: tina::RequestCall<'_, I>) -> Self::RequestDeferred {
+    fn defer_request_through<'request>(
+        self,
+        call: tina::RequestCall<'request, I>,
+    ) -> Self::RequestDeferred<'request> {
+        let (request, permit) = call.into_request_context_with_permit();
         RequestDeferredTypedCall {
-            inner: <Self as tina::DeferThrough<I>>::defer_through(self, call.into_call_context()),
+            inner: DeferredTypedCall {
+                inner: self,
+                request,
+            },
+            permit,
         }
     }
 }
@@ -374,9 +386,15 @@ where
     I: tina::Isolate,
     I::Reply: 'static,
 {
-    type RequestDeferred = RequestDeferredTypedCall<(), I::Reply>;
+    type RequestDeferred<'request>
+        = RequestDeferredTypedCall<'request, (), I>
+    where
+        I: 'request;
 
-    fn defer_request_through(self, call: tina::RequestCall<'_, I>) -> Self::RequestDeferred {
+    fn defer_request_through<'request>(
+        self,
+        call: tina::RequestCall<'request, I>,
+    ) -> Self::RequestDeferred<'request> {
         <TypedCall<()> as tina::RequestDeferThrough<I>>::defer_request_through(self.inner, call)
     }
 }

@@ -712,6 +712,7 @@ where
     pub(crate) marker: PhantomData<fn(Outbound) -> Outbound>,
 }
 
+#[allow(unsafe_code)]
 impl<I, S, Msg, Outbound> ErasedHandler<S> for HandlerAdapter<I, Outbound>
 where
     I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
@@ -740,7 +741,8 @@ where
         let effect = {
             let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id).with_now(now);
             if let Some(caller) = caller {
-                ctx = ctx.with_caller(caller);
+                // SAFETY: simulator dispatch allocated this caller for this delivery.
+                ctx = unsafe { ctx.with_caller(caller) };
             }
             self.isolate.handle(*message, &mut ctx)
         };
@@ -761,10 +763,15 @@ where
         });
 
         let effect = {
-            let ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id)
-                .with_now(now)
-                .with_caller(caller);
-            self.isolate.handle_call(*message, CallContext::new(ctx))
+            let call = unsafe {
+                // SAFETY: simulator dispatch allocated this caller for this delivery.
+                CallContext::new(
+                    Context::<_, I::Reply>::new_typed(shard, isolate_id)
+                        .with_now(now)
+                        .with_caller(caller),
+                )
+            };
+            self.isolate.handle_call(*message, call)
         };
 
         erase_effect::<I, S, Msg, Outbound>(effect)

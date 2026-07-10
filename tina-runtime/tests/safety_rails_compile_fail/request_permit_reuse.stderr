@@ -1,0 +1,9 @@
+error[E0382]: use of moved value: `permit`
+  --> tests/safety_rails_compile_fail/request_permit_reuse.rs:16:19
+   |
+14 | fn reuse(permit: tina::RequestEffectPermit<'_, Demo>) {
+   |          ------ move occurs because `permit` has type `RequestEffectPermit<'_, Demo>`, which does not implement the `Copy` trait
+15 |     let _first = permit.apply(tina::noop());
+   |                  ------ value moved here
+16 |     let _second = permit.apply(tina::noop());
+   |                   ^^^^^^ value used here after move

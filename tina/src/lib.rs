@@ -442,38 +442,6 @@ pub mod runtime_internal {
     pub fn call_handle_inner_into_shared(inner: CallHandleInner) -> Arc<CallHandleShared> {
         inner.shared
     }
-
-    /// Build a request-lane effect after caller authority has already been
-    /// consumed.
-    ///
-    /// Runtime-side adapters use this after they have consumed a `RequestCall`
-    /// into a `RequestContext`. It re-wraps an arbitrary [`crate::Effect`] into
-    /// a [`crate::RequestEffect`], so it can manufacture the "caller answered"
-    /// witness from a `noop()` — the exact bad state the split-service
-    /// must-answer rail forbids.
-    ///
-    /// It is `unsafe` for that reason, not for memory safety: it is the one
-    /// hole through the must-answer rail, so calling it is an explicit,
-    /// `unsafe`-gated, reviewable opt-out that `#![forbid(unsafe_code)]` app
-    /// crates reject outright. Ordinary code answers the caller through
-    /// [`crate::RequestCall`] / [`crate::RequestContext`] instead.
-    ///
-    /// # Safety
-    ///
-    /// The caller must already have consumed the `RequestCall` authority for
-    /// this request (e.g. via `RequestContext`), so that `effect` genuinely
-    /// represents answering — or deliberately not answering — that one caller.
-    /// Manufacturing a `RequestEffect` without consuming the authority breaks
-    /// the "every call settles exactly once" invariant.
-    #[allow(unsafe_code)]
-    pub unsafe fn request_effect_from_consumed_effect<I>(
-        effect: crate::Effect<I>,
-    ) -> crate::RequestEffect<I>
-    where
-        I: crate::Isolate,
-    {
-        crate::RequestEffect::from_consumed_effect(effect)
-    }
 }
 
 /// Common imports for ordinary Tina application code.
@@ -483,8 +451,8 @@ pub mod prelude {
         ChildRef, Context, CrossShardRestartableChildDefinition, Deadline, DeferCancelableThrough,
         DeferThrough, DeferredReply, Effect, Isolate, IsolateId, Outbound, PendingCallSet,
         PendingCallSetInsertError, RequestCall, RequestContext, RequestDeferCancelableThrough,
-        RequestDeferThrough, RequestEffect, RestartableChildDefinition, Shard, ShardId,
-        SingleShard, SpawnObservedError, batch, fail, isolate, isolate_types, noop, reply,
+        RequestDeferThrough, RequestEffect, RequestEffectPermit, RestartableChildDefinition, Shard,
+        ShardId, SingleShard, SpawnObservedError, batch, fail, isolate, isolate_types, noop, reply,
         reply_to, restart_children, send, spawn, spawn_observed, stop, stop_children, stop_with,
         time::{
             Backoff, BackoffDelay, RecurringCatchUp, RecurringTick, RecurringTickDecision,

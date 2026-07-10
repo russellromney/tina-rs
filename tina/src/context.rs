@@ -19,7 +19,8 @@ use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::{
-    Address, AddressGeneration, Effect, Isolate, IsolateId, Outbound, RequestEffect, Shard, ShardId,
+    Address, AddressGeneration, Effect, Isolate, IsolateId, Outbound, RequestEffect,
+    RequestEffectPermit, Shard, ShardId,
 };
 
 /// Per-handler context provided by the runtime.
@@ -86,8 +87,15 @@ where
     /// Used by runtime crates so handlers can capture the caller as a
     /// request context via [`take_request_context`](Self::take_request_context).
     /// Ordinary application code does not call this.
+    ///
+    /// # Safety
+    ///
+    /// `caller` must have been allocated by the runtime dispatching this
+    /// exact context. Attaching a synthetic or unrelated registry would mint
+    /// request authority that the active runtime cannot observe.
     #[doc(hidden)]
-    pub fn with_caller(mut self, caller: MessageCaller) -> Self {
+    #[allow(unsafe_code)]
+    pub unsafe fn with_caller(mut self, caller: MessageCaller) -> Self {
         self.caller = Some(caller);
         self
     }
@@ -268,21 +276,24 @@ where
 
     /// Replies to the caller now.
     pub fn reply(self, value: I::Reply) -> RequestEffect<I> {
-        RequestEffect::from_consumed_effect(self.inner.reply(value))
+        let permit = self.inner.into_request_effect_permit();
+        permit.apply(Effect::Reply(value))
     }
 
     /// Replies to the caller now and executes additional explicit effects
     /// afterwards.
     pub fn reply_and(self, value: I::Reply, mut effects: Vec<Effect<I>>) -> RequestEffect<I> {
+        let permit = self.inner.into_request_effect_permit();
         let mut batch = Vec::with_capacity(effects.len() + 1);
-        batch.push(self.inner.reply(value));
+        batch.push(Effect::Reply(value));
         batch.append(&mut effects);
-        RequestEffect::from_consumed_effect(Effect::Batch(batch))
+        permit.apply(Effect::Batch(batch))
     }
 
     /// Rejects the caller now.
     pub fn reject(self, reason: CallRejectedReason) -> RequestEffect<I> {
-        RequestEffect::from_consumed_effect(self.inner.reject(reason))
+        let permit = self.inner.into_request_effect_permit();
+        permit.apply(Effect::Reject(reason))
     }
 
     /// Captures caller authority into a [`RequestContext`] and lets the
@@ -296,7 +307,8 @@ where
         I::Reply: 'static,
         F: FnOnce(RequestContext<I::Reply>) -> Effect<I>,
     {
-        RequestEffect::from_consumed_effect(build(self.inner.into_request_context()))
+        let (request, permit) = self.into_request_context_with_permit();
+        permit.apply(build(request))
     }
 
     /// Fallible variant of [`capture`](Self::capture).
@@ -311,13 +323,33 @@ where
         F: FnOnce(RequestContext<I::Reply>) -> Effect<I>,
     {
         match self.inner.try_into_request_context() {
-            Ok(req) => Ok(RequestEffect::from_consumed_effect(build(req))),
+            Ok(req) => Ok(RequestEffectPermit::new().apply(build(req))),
             Err((ctx, err)) => Err((RequestCall { inner: ctx }, err)),
         }
     }
 
+    /// Promotes this caller into a request context and its one-use effect
+    /// permit.
+    ///
+    /// This is the runtime-adapter primitive behind request deferral. The
+    /// returned values are intentionally separate: the request context may be
+    /// stored until completion while the permit is consumed immediately to
+    /// authorize the continuation effect returned from this handler turn.
+    #[doc(hidden)]
+    pub fn into_request_context_with_permit(
+        self,
+    ) -> (RequestContext<I::Reply>, RequestEffectPermit<'a, I>)
+    where
+        I::Reply: 'static,
+    {
+        (
+            self.inner.into_request_context(),
+            RequestEffectPermit::new(),
+        )
+    }
+
     /// Defers this caller reply through one visible runtime-owned work item.
-    pub fn defer<W>(self, work: W) -> W::RequestDeferred
+    pub fn defer<W>(self, work: W) -> W::RequestDeferred<'a>
     where
         W: RequestDeferThrough<I>,
         I::Reply: 'static,
@@ -326,7 +358,7 @@ where
     }
 
     /// Defers this caller reply through cancelable runtime-owned work.
-    pub fn defer_cancelable<W>(self, work: W) -> W::RequestDeferredCancelable
+    pub fn defer_cancelable<W>(self, work: W) -> W::RequestDeferredCancelable<'a>
     where
         W: RequestDeferCancelableThrough<I>,
         I::Reply: 'static,
@@ -357,9 +389,23 @@ impl<'a, I> CallContext<'a, I>
 where
     I: Isolate,
 {
+    fn into_request_effect_permit(mut self) -> RequestEffectPermit<'a, I> {
+        self.ctx
+            .caller
+            .take()
+            .expect("RequestCall always carries caller authority");
+        RequestEffectPermit::new()
+    }
+
     /// Runtime-only constructor.
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must be the context created by runtime dispatch for the call
+    /// currently being delivered.
     #[doc(hidden)]
-    pub fn new(ctx: Context<'a, I::Shard, I::Reply>) -> Self {
+    #[allow(unsafe_code)]
+    pub unsafe fn new(ctx: Context<'a, I::Shard, I::Reply>) -> Self {
         Self {
             ctx,
             _isolate: PhantomData,
@@ -502,10 +548,15 @@ where
     I: Isolate,
 {
     /// Builder returned after request authority has been captured.
-    type RequestDeferred;
+    type RequestDeferred<'request>
+    where
+        I: 'request;
 
     /// Consumes request authority and prepares deferred work.
-    fn defer_request_through(self, call: RequestCall<'_, I>) -> Self::RequestDeferred;
+    fn defer_request_through<'request>(
+        self,
+        call: RequestCall<'request, I>,
+    ) -> Self::RequestDeferred<'request>;
 }
 
 /// Runtime-provided support for [`CallContext::defer_cancelable`].
@@ -535,13 +586,15 @@ where
     I: Isolate,
 {
     /// Builder returned after request authority has been captured.
-    type RequestDeferredCancelable;
+    type RequestDeferredCancelable<'request>
+    where
+        I: 'request;
 
     /// Consumes request authority and prepares cancelable deferred work.
-    fn defer_cancelable_request_through(
+    fn defer_cancelable_request_through<'request>(
         self,
-        call: RequestCall<'_, I>,
-    ) -> Self::RequestDeferredCancelable;
+        call: RequestCall<'request, I>,
+    ) -> Self::RequestDeferredCancelable<'request>;
 }
 
 /// Runtime-level reason a call was rejected without an application reply.

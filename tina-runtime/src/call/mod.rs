@@ -93,25 +93,6 @@ use std::time::Duration;
 
 use tina::{Address, AddressGeneration, CallHandleShared, CancelOutcome, IsolateId, ShardId};
 
-/// Safe in-runtime wrapper over tina's `unsafe` must-answer-rail escape hatch.
-///
-/// Every runtime adapter that re-wraps a finished effect into a
-/// `RequestEffect` routes through here so the `unsafe` is discharged once,
-/// centrally. The hole stays `unsafe` to foreign app crates (which cannot name
-/// this `pub(crate)` wrapper); they would have to call the `unsafe`
-/// `tina::runtime_internal` form, which the must-answer rail forbids outside an
-/// explicit `unsafe` block.
-#[allow(unsafe_code)]
-pub(crate) fn request_effect_from_consumed_effect<I: tina::Isolate>(
-    effect: tina::Effect<I>,
-) -> tina::RequestEffect<I> {
-    // SAFETY: every caller that reaches this wrapper has already consumed the
-    // matching `RequestCall` authority (via `RequestContext`) before producing
-    // `effect`, so the manufactured `RequestEffect` settles exactly that one
-    // caller — the precondition tina's escape hatch documents.
-    unsafe { tina::runtime_internal::request_effect_from_consumed_effect(effect) }
-}
-
 type ErasedReply = Box<dyn Any>;
 type ErasedCallOutcome = CallOutcome<ErasedReply>;
 type IsolateCallTranslator<M> = Box<dyn FnOnce(ErasedCallOutcome) -> M>;
@@ -1410,8 +1391,9 @@ pub struct DeferredObservedSend<T, Q> {
 
 /// Request-effect wrapper for [`DeferredObservedSend`].
 #[doc(hidden)]
-pub struct RequestDeferredObservedSend<T, Q> {
-    inner: DeferredObservedSend<T, Q>,
+pub struct RequestDeferredObservedSend<'request, T, I: tina::Isolate> {
+    inner: DeferredObservedSend<T, I::Reply>,
+    permit: tina::RequestEffectPermit<'request, I>,
 }
 
 /// Prepared isolate-call helper returned by [`call`].
@@ -1432,8 +1414,9 @@ pub struct DeferredIsolateCall<T, R, Q> {
 
 /// Request-effect wrapper for [`DeferredIsolateCall`].
 #[doc(hidden)]
-pub struct RequestDeferredIsolateCall<T, R, Q> {
-    inner: DeferredIsolateCall<T, R, Q>,
+pub struct RequestDeferredIsolateCall<'request, T, R, I: tina::Isolate> {
+    inner: DeferredIsolateCall<T, R, I::Reply>,
+    permit: tina::RequestEffectPermit<'request, I>,
 }
 
 /// Prepared typed runtime-call continuation after caller authority was
@@ -1446,8 +1429,9 @@ pub struct DeferredTypedCall<T, Q, E = CallError> {
 
 /// Request-effect wrapper for [`DeferredTypedCall`].
 #[doc(hidden)]
-pub struct RequestDeferredTypedCall<T, Q, E = CallError> {
-    inner: DeferredTypedCall<T, Q, E>,
+pub struct RequestDeferredTypedCall<'request, T, I: tina::Isolate, E = CallError> {
+    inner: DeferredTypedCall<T, I::Reply, E>,
+    permit: tina::RequestEffectPermit<'request, I>,
 }
 
 impl<T> ObservedSend<T>
@@ -1552,19 +1536,20 @@ where
     }
 }
 
-impl<T, Q> RequestDeferredObservedSend<T, Q>
+impl<'request, T, I> RequestDeferredObservedSend<'request, T, I>
 where
     T: Send + 'static,
-    Q: 'static,
+    I: tina::Isolate,
+    I::Reply: 'static,
 {
     /// Builds a request effect whose continuation carries caller authority.
-    pub fn reply<I, F, M>(self, translator: F) -> tina::RequestEffect<I>
+    pub fn reply<F, M>(self, translator: F) -> tina::RequestEffect<I>
     where
-        I: tina::Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
-        F: FnOnce(tina::RequestContext<Q>, SendOutcome) -> M + 'static,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
+        F: FnOnce(tina::RequestContext<I::Reply>, SendOutcome) -> M + 'static,
         M: 'static,
     {
-        crate::call::request_effect_from_consumed_effect(self.inner.reply(translator))
+        self.permit.apply(self.inner.reply(translator))
     }
 }
 
@@ -1590,11 +1575,22 @@ where
     I: tina::Isolate,
     I::Reply: 'static,
 {
-    type RequestDeferred = RequestDeferredObservedSend<T, I::Reply>;
+    type RequestDeferred<'request>
+        = RequestDeferredObservedSend<'request, T, I>
+    where
+        I: 'request;
 
-    fn defer_request_through(self, call: tina::RequestCall<'_, I>) -> Self::RequestDeferred {
+    fn defer_request_through<'request>(
+        self,
+        call: tina::RequestCall<'request, I>,
+    ) -> Self::RequestDeferred<'request> {
+        let (request, permit) = call.into_request_context_with_permit();
         RequestDeferredObservedSend {
-            inner: <Self as tina::DeferThrough<I>>::defer_through(self, call.into_call_context()),
+            inner: DeferredObservedSend {
+                inner: self,
+                request,
+            },
+            permit,
         }
     }
 }
@@ -1721,20 +1717,21 @@ where
     }
 }
 
-impl<T, R, Q> RequestDeferredIsolateCall<T, R, Q>
+impl<'request, T, R, I> RequestDeferredIsolateCall<'request, T, R, I>
 where
     T: Send + 'static,
     R: 'static,
-    Q: 'static,
+    I: tina::Isolate,
+    I::Reply: 'static,
 {
     /// Builds a request effect whose continuation carries caller authority.
-    pub fn reply<I, F, M>(self, translator: F) -> tina::RequestEffect<I>
+    pub fn reply<F, M>(self, translator: F) -> tina::RequestEffect<I>
     where
-        I: tina::Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
-        F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> M + 'static,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
+        F: FnOnce(tina::RequestContext<I::Reply>, CallOutcome<R>) -> M + 'static,
         M: 'static,
     {
-        crate::call::request_effect_from_consumed_effect(self.inner.reply(translator))
+        self.permit.apply(self.inner.reply(translator))
     }
 }
 
@@ -1762,11 +1759,22 @@ where
     I: tina::Isolate,
     I::Reply: 'static,
 {
-    type RequestDeferred = RequestDeferredIsolateCall<T, R, I::Reply>;
+    type RequestDeferred<'request>
+        = RequestDeferredIsolateCall<'request, T, R, I>
+    where
+        I: 'request;
 
-    fn defer_request_through(self, call: tina::RequestCall<'_, I>) -> Self::RequestDeferred {
+    fn defer_request_through<'request>(
+        self,
+        call: tina::RequestCall<'request, I>,
+    ) -> Self::RequestDeferred<'request> {
+        let (request, permit) = call.into_request_context_with_permit();
         RequestDeferredIsolateCall {
-            inner: <Self as tina::DeferThrough<I>>::defer_through(self, call.into_call_context()),
+            inner: DeferredIsolateCall {
+                inner: self,
+                request,
+            },
+            permit,
         }
     }
 }

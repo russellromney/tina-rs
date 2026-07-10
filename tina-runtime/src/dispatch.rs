@@ -3442,6 +3442,7 @@ where
     pub(crate) marker: PhantomData<fn(Outbound) -> Outbound>,
 }
 
+#[allow(unsafe_code)]
 impl<I, S, F, Outbound> ErasedHandler<S, F> for HandlerAdapter<I, Outbound>
 where
     I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
@@ -3474,7 +3475,8 @@ where
                 .with_current_generation(generation)
                 .with_now(now);
             if let Some(caller) = caller {
-                ctx = ctx.with_caller(caller);
+                // SAFETY: dispatch allocated this caller for this delivery.
+                ctx = unsafe { ctx.with_caller(caller) };
             }
             self.isolate.handle(*message, &mut ctx)
         };
@@ -3496,11 +3498,16 @@ where
         });
 
         let effect = {
-            let ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id)
-                .with_current_generation(generation)
-                .with_now(now)
-                .with_caller(caller);
-            self.isolate.handle_call(*message, CallContext::new(ctx))
+            let call = unsafe {
+                // SAFETY: dispatch allocated this caller for this delivery.
+                CallContext::new(
+                    Context::<_, I::Reply>::new_typed(shard, isolate_id)
+                        .with_current_generation(generation)
+                        .with_now(now)
+                        .with_caller(caller),
+                )
+            };
+            self.isolate.handle_call(*message, call)
         };
 
         erase_effect::<I, S, F, Outbound>(effect)
@@ -3515,6 +3522,7 @@ where
     pub(crate) marker: PhantomData<fn(Outbound) -> Outbound>,
 }
 
+#[allow(unsafe_code)]
 impl<I, S, F, Outbound> ErasedHandler<S, F> for SendableHandlerAdapter<I, Outbound>
 where
     I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
@@ -3547,7 +3555,8 @@ where
                 .with_current_generation(generation)
                 .with_now(now);
             if let Some(caller) = caller {
-                ctx = ctx.with_caller(caller);
+                // SAFETY: dispatch allocated this caller for this delivery.
+                ctx = unsafe { ctx.with_caller(caller) };
             }
             self.isolate.handle(*message, &mut ctx)
         };
@@ -3569,11 +3578,16 @@ where
         });
 
         let effect = {
-            let ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id)
-                .with_current_generation(generation)
-                .with_now(now)
-                .with_caller(caller);
-            self.isolate.handle_call(*message, CallContext::new(ctx))
+            let call = unsafe {
+                // SAFETY: dispatch allocated this caller for this delivery.
+                CallContext::new(
+                    Context::<_, I::Reply>::new_typed(shard, isolate_id)
+                        .with_current_generation(generation)
+                        .with_now(now)
+                        .with_caller(caller),
+                )
+            };
+            self.isolate.handle_call(*message, call)
         };
 
         erase_effect_sendable::<I, S, F, Outbound>(effect)

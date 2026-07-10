@@ -31,7 +31,13 @@ fn diagnostic_phrases_are_pinned() {
     cases.compile_fail("tests/safety_rails_compile_fail/split_request_double_consume.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/split_request_forged_effect.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/split_request_early_return.rs");
-    cases.compile_fail("tests/safety_rails_compile_fail/runtime_internal_forge_needs_unsafe.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/request_permit_fake_caller.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/request_call_fake_context.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/request_permit_forged.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/request_permit_clone.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/request_permit_reuse.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/request_permit_cross_isolate.rs");
+    cases.compile_fail("tests/safety_rails_compile_fail/request_permit_escape_turn.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/split_private_internal_event.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/split_request_on_event_lane.rs");
     cases.compile_fail("tests/safety_rails_compile_fail/split_event_on_request_lane.rs");

@@ -35,8 +35,9 @@ pub struct DeferredCancelableCall<T, R, Q> {
 
 /// Request-effect wrapper for [`DeferredCancelableCall`].
 #[doc(hidden)]
-pub struct RequestDeferredCancelableCall<T, R, Q> {
-    inner: DeferredCancelableCall<T, R, Q>,
+pub struct RequestDeferredCancelableCall<'request, T, R, I: tina::Isolate> {
+    inner: DeferredCancelableCall<T, R, I::Reply>,
+    permit: tina::RequestEffectPermit<'request, I>,
 }
 
 /// Visible pending caller obligation for cancelable deferred work.
@@ -113,6 +114,43 @@ pub enum PendingCancelableInsertError<K, Q, R> {
         /// Rejected token. Recover caller authority from this value.
         token: PendingCancelableCall<K, Q, R>,
     },
+}
+
+/// Request-lane admission failure with caller authority and its one-use
+/// request-effect permit returned together.
+#[derive(Debug)]
+pub enum RequestPendingCancelableInsertError<'request, K, R, I>
+where
+    I: tina::Isolate,
+{
+    /// The set is at its configured capacity.
+    Full {
+        /// Rejected token. Recover caller authority from this value.
+        token: PendingCancelableCall<K, I::Reply, R>,
+        /// Permit for constructing the request handler's terminal effect.
+        permit: tina::RequestEffectPermit<'request, I>,
+    },
+    /// A pending call is already stored under this key.
+    DuplicateKey {
+        /// Rejected token. Recover caller authority from this value.
+        token: PendingCancelableCall<K, I::Reply, R>,
+        /// Permit for constructing the request handler's terminal effect.
+        permit: tina::RequestEffectPermit<'request, I>,
+    },
+}
+
+impl<'request, K: 'static, R: 'static, I> RequestPendingCancelableInsertError<'request, K, R, I>
+where
+    I: tina::Isolate,
+    I::Reply: 'static,
+{
+    /// Replies to the rejected caller and consumes the returned permit.
+    pub fn reply(self, value: I::Reply) -> tina::RequestEffect<I> {
+        let (token, permit) = match self {
+            Self::Full { token, permit } | Self::DuplicateKey { token, permit } => (token, permit),
+        };
+        permit.apply(tina::reply_to(token.into_request_context(), value))
+    }
 }
 
 /// Reasons [`PendingCancelableCallSet::remove`] may not find an exact entry.
@@ -434,51 +472,64 @@ where
     }
 }
 
-impl<T, R, Q> RequestDeferredCancelableCall<T, R, Q>
+impl<'request, T, R, I> RequestDeferredCancelableCall<'request, T, R, I>
 where
     T: Send + 'static,
     R: 'static,
-    Q: 'static,
+    I: tina::Isolate,
+    I::Reply: 'static,
 {
     /// Builds the worker-return continuation and the pending token.
     ///
     /// Prefer [`Self::try_admit`] so the child effect is returned only after
     /// bounded pending storage accepts the token.
-    pub fn reply<I, F, M, K>(
+    pub fn reply<F, M, K>(
         self,
         key: K,
         translator: F,
-    ) -> (PendingCancelableCall<K, Q, R>, tina::RequestEffect<I>)
+    ) -> (
+        PendingCancelableCall<K, I::Reply, R>,
+        tina::RequestEffect<I>,
+    )
     where
-        I: tina::Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(K, PendingCancelableTicket, CallOutcome<R>) -> M + 'static,
         K: Clone + 'static,
         M: 'static,
     {
         let (token, effect) = self.inner.reply(key, translator);
-        (
-            token,
-            crate::call::request_effect_from_consumed_effect(effect),
-        )
+        (token, self.permit.apply(effect))
     }
 
     /// Admits the pending token into bounded storage and returns the child
     /// request effect only after admission succeeds.
-    pub fn try_admit<I, F, M, K>(
+    pub fn try_admit<F, M, K>(
         self,
-        pending: &mut PendingCancelableCallSet<K, Q, R>,
+        pending: &mut PendingCancelableCallSet<K, I::Reply, R>,
         key: K,
         translator: F,
-    ) -> Result<tina::RequestEffect<I>, PendingCancelableInsertError<K, Q, R>>
+    ) -> Result<tina::RequestEffect<I>, RequestPendingCancelableInsertError<'request, K, R, I>>
     where
-        I: tina::Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(K, PendingCancelableTicket, CallOutcome<R>) -> M + 'static,
         K: Clone + PartialEq + 'static,
         M: 'static,
     {
-        self.inner
-            .try_admit(pending, key, translator)
-            .map(crate::call::request_effect_from_consumed_effect)
+        match self.inner.try_admit(pending, key, translator) {
+            Ok(effect) => Ok(self.permit.apply(effect)),
+            Err(PendingCancelableInsertError::Full { token }) => {
+                Err(RequestPendingCancelableInsertError::Full {
+                    token,
+                    permit: self.permit,
+                })
+            }
+            Err(PendingCancelableInsertError::DuplicateKey { token }) => {
+                Err(RequestPendingCancelableInsertError::DuplicateKey {
+                    token,
+                    permit: self.permit,
+                })
+            }
+        }
     }
 }
 
@@ -506,17 +557,22 @@ where
     I: tina::Isolate,
     I::Reply: 'static,
 {
-    type RequestDeferredCancelable = RequestDeferredCancelableCall<T, R, I::Reply>;
+    type RequestDeferredCancelable<'request>
+        = RequestDeferredCancelableCall<'request, T, R, I>
+    where
+        I: 'request;
 
-    fn defer_cancelable_request_through(
+    fn defer_cancelable_request_through<'request>(
         self,
-        call: tina::RequestCall<'_, I>,
-    ) -> Self::RequestDeferredCancelable {
+        call: tina::RequestCall<'request, I>,
+    ) -> Self::RequestDeferredCancelable<'request> {
+        let (request, permit) = call.into_request_context_with_permit();
         RequestDeferredCancelableCall {
-            inner: <Self as tina::DeferCancelableThrough<I>>::defer_cancelable_through(
-                self,
-                call.into_call_context(),
-            ),
+            inner: DeferredCancelableCall {
+                inner: self,
+                request,
+            },
+            permit,
         }
     }
 }
