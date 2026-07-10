@@ -448,21 +448,25 @@ jobs:
         run: sccache --show-stats || true
 
   # Packaging-readiness smoke check (crates.io 0.1.0 prep): guards against
-  # regressing back to an unpublishable crate graph, e.g. a new internal
-  # `path`-only dependency with no `version =`, or a crate losing its
-  # description/license/repository. `cargo package --no-verify` builds
-  # nothing (the `test`/`clippy` jobs already cover that); it only proves
-  # each manifest is packageable. Deliberately NOT part of the required-check
-  # critical path: `main` has no branch protection today, and this only
-  # covers the three crates that can package with zero prerequisites
-  # (tina-macros, tina-rpc-macros, tina-codec -- no internal deps). Every
-  # other workspace crate either depends on the vendor-betelgeuse path
-  # dependency (no published version to fall back to -- the open Betelgeuse
-  # question) or depends on another workspace crate that isn't live on
-  # crates.io yet, which is expected pre-first-publish and not something this
-  # job can pass until the real, ordered `cargo publish` sequence has run.
+  # regressing back to an unpublishable crate graph. Two layers (see the
+  # Makefile `verify-packaging` target):
+  #  - `cargo package --no-verify` on the three crates that can package today
+  #    (tina-macros, tina-rpc-macros, tina-codec -- no internal deps): proves
+  #    each manifest packages and fails outright on a versionless `path`-only
+  #    internal dep. Builds nothing (the `test`/`clippy` jobs cover that).
+  #  - `packaging_metadata_guard.sh`: backstops what `cargo package` misses --
+  #    a crate LOSING its description/license/repository (cargo only warns,
+  #    exit 0), and a versionless path dep in a crate that can't package at
+  #    all. Asserts both across every workspace crate.
+  # Deliberately NOT part of the required-check critical path: `main` has no
+  # branch protection today. Every workspace crate beyond the three above
+  # either depends on the vendor-betelgeuse path dependency (no published
+  # version to fall back to -- the open Betelgeuse question) or on another
+  # workspace crate not yet live on crates.io, which is expected
+  # pre-first-publish and cannot pass `cargo package` until the real, ordered
+  # `cargo publish` sequence has run.
   packaging:
-    name: packaging check (cargo package --no-verify)
+    name: packaging check (cargo package + metadata guard)
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
