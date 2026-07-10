@@ -16,8 +16,8 @@ use std::{
 
 use betelgeuse::{
     AcceptCompletion, ConnectCompletion, FsyncCompletion, IO, IOLoop, IOLoopHandle,
-    MkdirCompletion, OpenOptions, PReadCompletion, PWriteCompletion, RecvCompletion,
-    SendCompletion, SizeCompletion, io_loop,
+    MkdirCompletion, OpenOptions, PReadCompletion, PWriteCompletion, PWriteOwnedCompletion,
+    RecvCompletion, SendCompletion, SendOwnedCompletion, SizeCompletion, io_loop,
 };
 use tempfile::TempDir;
 
@@ -176,6 +176,66 @@ io_test! {
             io_loop.step()?;
         }
         assert_eq!(&c.take_result().unwrap()?, b"xyz");
+        Ok(())
+    }
+}
+
+io_test! {
+    fn owned_pwrite_preserves_allocation_and_empty_writes_are_noops(io_loop) -> io::Result<()> {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("owned-offset.bin");
+        let file = io_loop.io().open(&path, rw_create_truncate())?;
+
+        let bytes = b"skip-payload".to_vec();
+        let allocation = bytes.as_ptr();
+        let mut owned = PWriteOwnedCompletion::new();
+        file.pwrite_owned_from(&mut owned, bytes, 5, 2)
+            .map_err(|(error, _bytes)| error)?;
+        while !owned.has_result() {
+            io_loop.step()?;
+        }
+        let (bytes, count) = owned.take_result().unwrap().map_err(|(error, _)| error)?;
+        assert_eq!(bytes.as_ptr(), allocation);
+        assert_eq!(count, 7);
+
+        let mut raw_empty = PWriteCompletion::new();
+        file.pwrite(&mut raw_empty, Vec::new(), u64::MAX)?;
+        assert_eq!(raw_empty.take_result().unwrap()?, 0);
+
+        let empty = Vec::with_capacity(8);
+        let allocation = empty.as_ptr();
+        let mut owned_empty = PWriteOwnedCompletion::new();
+        file.pwrite_owned(&mut owned_empty, empty, u64::MAX)
+            .map_err(|(error, _bytes)| error)?;
+        let (empty, count) = owned_empty
+            .take_result()
+            .unwrap()
+            .map_err(|(error, _)| error)?;
+        assert_eq!(empty.as_ptr(), allocation);
+        assert_eq!(count, 0);
+
+        let mut rejected = PWriteOwnedCompletion::new();
+        let rejected_bytes = b"returned".to_vec();
+        let (error, rejected_bytes) = file
+            .pwrite_owned(&mut rejected, rejected_bytes, u64::MAX)
+            .expect_err("non-empty unrepresentable range must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(rejected_bytes, b"returned");
+        assert!(rejected.is_idle());
+
+        let mut size = SizeCompletion::new();
+        file.size(&mut size)?;
+        while !size.has_result() {
+            io_loop.step()?;
+        }
+        assert_eq!(size.take_result().unwrap()?, 9);
+
+        let mut read = PReadCompletion::new();
+        file.pread(&mut read, 7, 2)?;
+        while !read.has_result() {
+            io_loop.step()?;
+        }
+        assert_eq!(read.take_result().unwrap()?, b"payload");
         Ok(())
     }
 }
@@ -438,12 +498,22 @@ io_test! {
         connect_c.take_result().unwrap()?;
 
         // Client -> server.
-        let mut send_c = SendCompletion::new();
-        client.send(&mut send_c, b"ping".to_vec())?;
+        let bytes = b"ping".to_vec();
+        let allocation = bytes.as_ptr();
+        let mut send_c = SendOwnedCompletion::new();
+        client
+            .send_owned(&mut send_c, bytes)
+            .map_err(|(error, _bytes)| error)?;
         while !send_c.has_result() {
             io_loop.step()?;
         }
-        assert_eq!(send_c.take_result().unwrap()?, 4);
+        let (bytes, count) = send_c
+            .take_result()
+            .unwrap()
+            .map_err(|(error, _bytes)| error)?;
+        assert_eq!(bytes.as_ptr(), allocation);
+        assert_eq!(bytes, b"ping");
+        assert_eq!(count, 4);
 
         let mut recv_c = RecvCompletion::new();
         accepted.recv(&mut recv_c, 32)?;

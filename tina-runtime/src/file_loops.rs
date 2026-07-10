@@ -157,8 +157,20 @@ impl FileReadChunks {
                 self.high_water_chunk = self.high_water_chunk.max(bytes.len());
                 let room = self.max_total - self.buffer.len() as u64;
                 let take = (bytes.len() as u64).min(room) as usize;
+                let Ok(take_u64) = u64::try_from(take) else {
+                    let report = self
+                        .terminal_report(FileLoopEnd::Error, Some(CallError::InvariantViolation));
+                    let payload = std::mem::take(&mut self.buffer);
+                    return FileLoopStep::Done(payload, report);
+                };
+                let Some(next_offset) = self.offset.checked_add(take_u64) else {
+                    let report = self
+                        .terminal_report(FileLoopEnd::Error, Some(CallError::InvariantViolation));
+                    let payload = std::mem::take(&mut self.buffer);
+                    return FileLoopStep::Done(payload, report);
+                };
                 self.buffer.extend_from_slice(&bytes[..take]);
-                self.offset += take as u64;
+                self.offset = next_offset;
                 if self.buffer.len() as u64 >= self.max_total {
                     let report = self.terminal_report(FileLoopEnd::CapReached, None);
                     let payload = std::mem::take(&mut self.buffer);
@@ -306,9 +318,30 @@ impl FileWriteAll {
                         self.terminal_report(FileLoopEnd::StuckWrite, Some(CallError::Io)),
                     );
                 }
+                let Ok(progress) = u64::try_from(reply.written) else {
+                    self.buffer = Some(reply.bytes);
+                    return FileLoopStep::Ended(
+                        self.terminal_report(
+                            FileLoopEnd::Error,
+                            Some(CallError::InvariantViolation),
+                        ),
+                    );
+                };
+                let (Some(next_written), Some(next_offset)) = (
+                    self.written.checked_add(progress),
+                    self.offset.checked_add(progress),
+                ) else {
+                    self.buffer = Some(reply.bytes);
+                    return FileLoopStep::Ended(
+                        self.terminal_report(
+                            FileLoopEnd::Error,
+                            Some(CallError::InvariantViolation),
+                        ),
+                    );
+                };
                 self.cursor += reply.written;
-                self.written += reply.written as u64;
-                self.offset += reply.written as u64;
+                self.written = next_written;
+                self.offset = next_offset;
                 if self.cursor == reply.bytes.len() {
                     self.buffer = Some(reply.bytes);
                     let report = self.terminal_report(FileLoopEnd::Done, None);
@@ -595,8 +628,19 @@ impl FileCopyBounded {
                 let room = self.max_total - self.transferred;
                 let take = (bytes.len() as u64).min(room) as usize;
                 bytes.truncate(take);
-                self.src_offset += take as u64;
-                self.pending_write_offset = self.dst_offset + self.transferred;
+                let Ok(take_u64) = u64::try_from(take) else {
+                    return Err(self
+                        .terminal_report(FileLoopEnd::Error, Some(CallError::InvariantViolation)));
+                };
+                let (Some(next_src_offset), Some(pending_write_offset)) = (
+                    self.src_offset.checked_add(take_u64),
+                    self.dst_offset.checked_add(self.transferred),
+                ) else {
+                    return Err(self
+                        .terminal_report(FileLoopEnd::Error, Some(CallError::InvariantViolation)));
+                };
+                self.src_offset = next_src_offset;
+                self.pending_write_offset = pending_write_offset;
                 self.in_flight = Some(bytes);
                 self.in_flight_len = take;
                 self.in_flight_cursor = 0;
@@ -635,9 +679,22 @@ impl FileCopyBounded {
                     self.in_flight = Some(reply.bytes);
                     return Err(self.terminal_report(FileLoopEnd::StuckWrite, Some(CallError::Io)));
                 }
+                let Ok(progress) = u64::try_from(reply.written) else {
+                    self.in_flight = Some(reply.bytes);
+                    return Err(self
+                        .terminal_report(FileLoopEnd::Error, Some(CallError::InvariantViolation)));
+                };
+                let (Some(next_transferred), Some(next_write_offset)) = (
+                    self.transferred.checked_add(progress),
+                    self.pending_write_offset.checked_add(progress),
+                ) else {
+                    self.in_flight = Some(reply.bytes);
+                    return Err(self
+                        .terminal_report(FileLoopEnd::Error, Some(CallError::InvariantViolation)));
+                };
                 self.in_flight_cursor += reply.written;
-                self.transferred += reply.written as u64;
-                self.pending_write_offset += reply.written as u64;
+                self.transferred = next_transferred;
+                self.pending_write_offset = next_write_offset;
                 if self.in_flight_cursor == reply.bytes.len() {
                     self.in_flight = None;
                     self.in_flight_len = 0;
@@ -669,7 +726,7 @@ impl FileCopyBounded {
         FileLoopReport {
             end,
             bytes_transferred: self.transferred,
-            final_offset: self.dst_offset + self.transferred,
+            final_offset: self.pending_write_offset,
             error: None,
             high_water_chunk: self.high_water_chunk,
             cap: self.max_total,
@@ -680,7 +737,7 @@ impl FileCopyBounded {
         FileLoopReport {
             end,
             bytes_transferred: self.transferred,
-            final_offset: self.dst_offset + self.transferred,
+            final_offset: self.pending_write_offset,
             error,
             high_water_chunk: self.high_water_chunk,
             cap: self.max_total,
@@ -951,6 +1008,23 @@ mod tests {
     }
 
     #[test]
+    fn write_all_reports_offset_overflow_without_advancing() {
+        let mut helper = FileWriteAll::new(file(1), u64::MAX, b"x".to_vec());
+        let step: FileLoopStep<DummyIsolate, ()> = helper.advance(wrote(b"x", 1), Msg::Wrote);
+        match step {
+            FileLoopStep::Ended(report) => {
+                assert_eq!(report.end, FileLoopEnd::Error);
+                assert_eq!(report.error, Some(CallError::InvariantViolation));
+                assert_eq!(report.bytes_transferred, 0);
+                assert_eq!(report.final_offset, u64::MAX);
+            }
+            other => panic!("unexpected step: {other:?}"),
+        }
+        assert_eq!(helper.written(), 0);
+        assert_eq!(helper.offset(), u64::MAX);
+    }
+
+    #[test]
     fn write_all_rejects_a_changed_owned_buffer_length() {
         let mut helper = FileWriteAll::new(file(1), 0, b"hello".to_vec());
         let step: FileLoopStep<DummyIsolate, ()> = helper.advance(wrote(b"hel", 3), Msg::Wrote);
@@ -1001,6 +1075,19 @@ mod tests {
             }
             Ok(_) => panic!("expected EOF report"),
         }
+    }
+
+    #[test]
+    fn copy_bounded_reports_destination_offset_overflow() {
+        let mut pump = FileCopyBounded::new(file(1), file(2), 0, u64::MAX, 4, 4);
+        assert_eq!(pump.record_read(Ok(b"x".to_vec())).unwrap(), CopyLeg::Write);
+        let report = pump
+            .record_write(wrote(b"x", 1))
+            .expect_err("destination offset must not wrap");
+        assert_eq!(report.end, FileLoopEnd::Error);
+        assert_eq!(report.error, Some(CallError::InvariantViolation));
+        assert_eq!(report.bytes_transferred, 0);
+        assert_eq!(report.final_offset, u64::MAX);
     }
 
     #[test]

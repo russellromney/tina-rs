@@ -359,8 +359,14 @@ struct MixedResponseService {
     source: Address<tina_http::ResponseChunkMsg, tina_http::ResponseChunkReply>,
 }
 
+struct DualStreamingResponseService {
+    first: Address<tina_http::ResponseChunkMsg, tina_http::ResponseChunkReply>,
+    second: Address<tina_http::ResponseChunkMsg, tina_http::ResponseChunkReply>,
+}
+
 struct BufferedResponseService {
     body: Arc<[u8]>,
+    grpc_trailers: bool,
 }
 
 struct RecordingResponseSource {
@@ -505,6 +511,44 @@ impl MixedResponseService {
     }
 }
 
+impl Isolate for DualStreamingResponseService {
+    tina::isolate_types! {
+        message: HttpRequest,
+        reply: HttpResponse,
+        send: tina::Outbound<std::convert::Infallible>,
+        spawn: std::convert::Infallible,
+        io: std::convert::Infallible,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        request: HttpRequest,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        reply(self.response_for(&request))
+    }
+
+    fn handle_call(
+        &mut self,
+        request: HttpRequest,
+        call: tina::CallContext<'_, Self>,
+    ) -> Effect<Self> {
+        call.reply(self.response_for(&request))
+    }
+}
+
+impl DualStreamingResponseService {
+    fn response_for(&self, request: &HttpRequest) -> HttpResponse {
+        let source = if request.path == "/first" {
+            self.first
+        } else {
+            self.second
+        };
+        HttpResponse::stream_chunked(http::StatusCode::OK, source)
+    }
+}
+
 impl Isolate for BufferedResponseService {
     tina::isolate_types! {
         message: HttpRequest,
@@ -520,10 +564,7 @@ impl Isolate for BufferedResponseService {
         _request: HttpRequest,
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
-        reply(HttpResponse::with_shared_body(
-            http::StatusCode::OK,
-            Arc::clone(&self.body),
-        ))
+        reply(self.response())
     }
 
     fn handle_call(
@@ -531,10 +572,20 @@ impl Isolate for BufferedResponseService {
         _request: HttpRequest,
         call: tina::CallContext<'_, Self>,
     ) -> Effect<Self> {
-        call.reply(HttpResponse::with_shared_body(
-            http::StatusCode::OK,
-            Arc::clone(&self.body),
-        ))
+        call.reply(self.response())
+    }
+}
+
+impl BufferedResponseService {
+    fn response(&self) -> HttpResponse {
+        let mut response =
+            HttpResponse::with_shared_body(http::StatusCode::OK, Arc::clone(&self.body));
+        if self.grpc_trailers {
+            response
+                .headers
+                .insert("grpc-status", http::HeaderValue::from_static("0"));
+        }
+        response
     }
 }
 
@@ -576,6 +627,7 @@ fn buffered_response_larger_than_default_window_advances_as_peer_credits_bytes()
         .register_with_capacity::<BufferedResponseService, std::convert::Infallible>(
             BufferedResponseService {
                 body: Arc::clone(&body),
+                grpc_trailers: false,
             },
             16,
         )
@@ -647,6 +699,225 @@ fn buffered_response_larger_than_default_window_advances_as_peer_credits_bytes()
 
     assert!(data_frames > 4, "response must span multiple credit rounds");
     assert_eq!(received.as_slice(), body.as_ref());
+    harness.shutdown();
+}
+
+#[test]
+fn concurrent_large_buffered_responses_share_each_connection_credit_round() {
+    const BODY_LEN: usize = 128 * 1024;
+    const QUANTUM: usize = 16 * 1024;
+
+    let body: Arc<[u8]> = vec![b'x'; BODY_LEN].into();
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let service = runtime
+        .register_with_capacity::<BufferedResponseService, std::convert::Infallible>(
+            BufferedResponseService {
+                body: Arc::clone(&body),
+                grpc_trailers: true,
+            },
+            16,
+        )
+        .expect("register buffered response service");
+    let harness = Http2Harness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    for stream_id in [1, 3] {
+        write_frame(
+            &mut stream,
+            FRAME_HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            stream_id,
+            &request_headers("GET", "/large"),
+        );
+    }
+
+    let mut saw_head = [false; 2];
+    let mut bodies = [Vec::new(), Vec::new()];
+    let mut initial_data = 0;
+    while !saw_head.iter().all(|seen| *seen) || initial_data < 65_535 {
+        let frame = read_frame(&mut stream);
+        let slot = match frame.stream_id {
+            1 => 0,
+            3 => 1,
+            _ => continue,
+        };
+        match frame.ty {
+            FRAME_HEADERS => saw_head[slot] = true,
+            FRAME_DATA => {
+                initial_data += frame.payload.len();
+                bodies[slot].extend_from_slice(&frame.payload);
+            }
+            FRAME_RST_STREAM => panic!("large response reset: {frame:?}"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        initial_data, 65_535,
+        "initial connection credit must be exhausted"
+    );
+
+    // Both responses are now ready and blocked on connection credit. A single
+    // grant of two frame quanta must advance both streams, not let the lower id
+    // consume the whole update.
+    write_window_update(&mut stream, 1, u32::try_from(QUANTUM * 2).unwrap());
+    write_window_update(&mut stream, 3, u32::try_from(QUANTUM * 2).unwrap());
+    write_window_update(&mut stream, 0, u32::try_from(QUANTUM * 2).unwrap());
+    let mut credited_streams = Vec::new();
+    while credited_streams.len() < 2 {
+        let frame = read_frame(&mut stream);
+        if frame.ty == FRAME_DATA && matches!(frame.stream_id, 1 | 3) {
+            credited_streams.push(frame.stream_id);
+            let slot = usize::from(frame.stream_id == 3);
+            bodies[slot].extend_from_slice(&frame.payload);
+            let credit = u32::try_from(frame.payload.len()).unwrap();
+            write_window_update(&mut stream, 0, credit);
+            write_window_update(&mut stream, frame.stream_id, credit);
+        }
+    }
+    credited_streams.sort_unstable();
+    assert_eq!(credited_streams, [1, 3]);
+
+    let mut terminal_trailers = [false; 2];
+    while !terminal_trailers.iter().all(|done| *done) {
+        let frame = read_frame(&mut stream);
+        let slot = match frame.stream_id {
+            1 => 0,
+            3 => 1,
+            _ => continue,
+        };
+        match frame.ty {
+            FRAME_DATA => {
+                bodies[slot].extend_from_slice(&frame.payload);
+                let credit = u32::try_from(frame.payload.len()).unwrap();
+                write_window_update(&mut stream, 0, credit);
+                write_window_update(&mut stream, frame.stream_id, credit);
+            }
+            FRAME_HEADERS if frame.flags & FLAG_END_STREAM != 0 => {
+                terminal_trailers[slot] = true;
+            }
+            FRAME_RST_STREAM => panic!("large response reset: {frame:?}"),
+            _ => {}
+        }
+    }
+    assert_eq!(bodies[0].as_slice(), body.as_ref());
+    assert_eq!(bodies[1].as_slice(), body.as_ref());
+    harness.shutdown();
+}
+
+#[test]
+fn concurrent_large_streaming_responses_share_each_connection_credit_round() {
+    const BODY_LEN: usize = 128 * 1024;
+    const QUANTUM: usize = 16 * 1024;
+
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 64,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let first =
+        IterBodySource::<TestShard>::register(&runtime, vec![vec![b'a'; BODY_LEN]].into_iter(), 16)
+            .expect("register first source");
+    let second =
+        IterBodySource::<TestShard>::register(&runtime, vec![vec![b'b'; BODY_LEN]].into_iter(), 16)
+            .expect("register second source");
+    let service = runtime
+        .register_with_capacity::<DualStreamingResponseService, std::convert::Infallible>(
+            DualStreamingResponseService { first, second },
+            16,
+        )
+        .expect("register streaming response service");
+    let harness = Http2Harness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let mut stream = connect_h2(harness.addr);
+
+    for (stream_id, path) in [(1, "/first"), (3, "/second")] {
+        write_frame(
+            &mut stream,
+            FRAME_HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            stream_id,
+            &request_headers("GET", path),
+        );
+    }
+
+    let mut saw_head = [false; 2];
+    let mut bodies = [Vec::new(), Vec::new()];
+    let mut initial_data = 0;
+    while !saw_head.iter().all(|seen| *seen) || initial_data < 65_535 {
+        let frame = read_frame(&mut stream);
+        let slot = match frame.stream_id {
+            1 => 0,
+            3 => 1,
+            _ => continue,
+        };
+        match frame.ty {
+            FRAME_HEADERS => saw_head[slot] = true,
+            FRAME_DATA => {
+                initial_data += frame.payload.len();
+                bodies[slot].extend_from_slice(&frame.payload);
+            }
+            FRAME_RST_STREAM => panic!("streaming response reset: {frame:?}"),
+            _ => {}
+        }
+    }
+
+    for stream_id in [1, 3] {
+        write_window_update(&mut stream, stream_id, u32::try_from(QUANTUM * 2).unwrap());
+    }
+    write_window_update(&mut stream, 0, u32::try_from(QUANTUM * 2).unwrap());
+    let mut credited_streams = Vec::new();
+    while credited_streams.len() < 2 {
+        let frame = read_frame(&mut stream);
+        if frame.ty == FRAME_DATA && matches!(frame.stream_id, 1 | 3) {
+            credited_streams.push(frame.stream_id);
+            let slot = usize::from(frame.stream_id == 3);
+            bodies[slot].extend_from_slice(&frame.payload);
+            let credit = u32::try_from(frame.payload.len()).unwrap();
+            write_window_update(&mut stream, 0, credit);
+            write_window_update(&mut stream, frame.stream_id, credit);
+        }
+    }
+    credited_streams.sort_unstable();
+    assert_eq!(credited_streams, [1, 3]);
+
+    let mut terminal = [false; 2];
+    while !terminal.iter().all(|done| *done) {
+        let frame = read_frame(&mut stream);
+        let slot = match frame.stream_id {
+            1 => 0,
+            3 => 1,
+            _ => continue,
+        };
+        match frame.ty {
+            FRAME_DATA => {
+                bodies[slot].extend_from_slice(&frame.payload);
+                if !frame.payload.is_empty() {
+                    let credit = u32::try_from(frame.payload.len()).unwrap();
+                    write_window_update(&mut stream, 0, credit);
+                    write_window_update(&mut stream, frame.stream_id, credit);
+                }
+                if frame.flags & FLAG_END_STREAM != 0 {
+                    terminal[slot] = true;
+                }
+            }
+            FRAME_HEADERS if frame.flags & FLAG_END_STREAM != 0 => terminal[slot] = true,
+            FRAME_RST_STREAM => panic!("streaming response reset: {frame:?}"),
+            _ => {}
+        }
+    }
+    assert_eq!(bodies[0], vec![b'a'; BODY_LEN]);
+    assert_eq!(bodies[1], vec![b'b'; BODY_LEN]);
     harness.shutdown();
 }
 

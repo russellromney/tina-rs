@@ -320,6 +320,42 @@ jobs:
   # revisit promoting it to a scheduled job once we see how often examples
   # actually break.
 
+  # The local-I/O specimen and custom-codec extension are a small per-PR gate:
+  # together they exercise the promoted UnixWriteAll user path and codec/IPC
+  # examples changed by runtime rail work. They are excluded workspaces, so
+  # the root `make test` job cannot cover them.
+  promoted-io-examples:
+    name: promoted I/O examples (Unix + codec)
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up mold linker
+        uses: rui314/setup-mold@v1
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo + target (per example workspace)
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+          workspaces: |
+            examples/specimen_local_io_codec_ipc -> target
+            examples/extensions/tina-extension-custom-codec -> target
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Test and lint promoted I/O examples
+        run: |
+          cargo test --manifest-path examples/specimen_local_io_codec_ipc/Cargo.toml --tests
+          cargo clippy --manifest-path examples/specimen_local_io_codec_ipc/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path examples/extensions/tina-extension-custom-codec/Cargo.toml --tests
+          cargo clippy --manifest-path examples/extensions/tina-extension-custom-codec/Cargo.toml --all-targets -- -D warnings
+
   # Two systems examples ARE a per-PR gate, unlike the sweep above: they are
   # the two examples the root README and docs point new users at first
   # (`system_copied_service_path` is the copied-path skeleton; `mini_saas_api`

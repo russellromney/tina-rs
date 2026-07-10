@@ -49,7 +49,7 @@ pub struct SimulatorConfig {
     /// Scripted process configuration for this run.
     pub process: ScriptedProcessConfig,
 
-    /// Scripted simulator-only storage faults for persistence recovery tests.
+    /// Deterministic simulator storage limits and persistence fault injection.
     pub storage: ScriptedStorageFaultConfig,
 
     /// Default per-stream caps for Unix-domain rails in the simulator.
@@ -563,14 +563,22 @@ pub enum ScriptedProcessResult {
     KillUncertain,
 }
 
-/// Simulator-only deterministic storage fault configuration.
+/// Simulator-only deterministic storage limits and fault configuration.
 ///
 /// These faults mutate the simulator durable image or completion result. They
 /// are not claims about native filesystem crash behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ScriptedStorageFaultConfig {
     /// Maximum bytes accepted by one simulated file write.
     pub file_write_cap: Option<usize>,
+
+    /// Maximum length of one simulated file, in bytes.
+    ///
+    /// A write whose non-empty range would end past this boundary fails with
+    /// [`tina_runtime::CallError::StorageFull`] without changing the durable
+    /// image. Empty positional writes remain no-ops at every offset. The
+    /// default is 64 MiB per file.
+    pub max_file_bytes: u64,
 
     /// Fail the selected storage operation when it is a journal append.
     pub fail_journal_append_at: Option<u64>,
@@ -590,6 +598,20 @@ pub struct ScriptedStorageFaultConfig {
     /// `CommitUncertain` to model a completed rename with unproven final
     /// durability.
     pub commit_uncertain_snapshot_at: Option<u64>,
+}
+
+impl Default for ScriptedStorageFaultConfig {
+    fn default() -> Self {
+        Self {
+            file_write_cap: None,
+            max_file_bytes: 64 * 1024 * 1024,
+            fail_journal_append_at: None,
+            fail_snapshot_commit_at: None,
+            truncate_journal_tail_at: None,
+            corrupt_journal_record_at: None,
+            commit_uncertain_snapshot_at: None,
+        }
+    }
 }
 
 impl Default for ScriptedTcpConfig {

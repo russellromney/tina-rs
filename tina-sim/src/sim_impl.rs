@@ -59,6 +59,53 @@ use crate::deferred;
 use crate::dst::*;
 use crate::internals::*;
 
+fn simulated_file_write_range(
+    offset: u64,
+    count: usize,
+    max_file_bytes: u64,
+) -> Result<std::ops::Range<usize>, CallError> {
+    if count == 0 {
+        return Ok(0..0);
+    }
+
+    let count = u64::try_from(count).map_err(|_| CallError::StorageFull)?;
+    let end = offset
+        .checked_add(count)
+        .filter(|end| *end <= max_file_bytes)
+        .ok_or(CallError::StorageFull)?;
+    let start = usize::try_from(offset).map_err(|_| CallError::StorageFull)?;
+    let end = usize::try_from(end).map_err(|_| CallError::StorageFull)?;
+    Ok(start..end)
+}
+
+fn completion_failure_preserving_owned(result: CallOutput, error: CallError) -> CallOutput {
+    match result {
+        CallOutput::TcpReadBuf { buffer, .. } | CallOutput::TcpReadBufFailed { buffer, .. } => {
+            CallOutput::TcpReadBufFailed { buffer, error }
+        }
+        CallOutput::TcpWroteOwned { bytes, .. }
+        | CallOutput::TcpWroteOwnedClose { bytes, .. }
+        | CallOutput::TcpWroteOwnedFailed { bytes, .. } => {
+            CallOutput::TcpWroteOwnedFailed { bytes, error }
+        }
+        CallOutput::TlsReadBuf { buffer, .. } | CallOutput::TlsReadBufFailed { buffer, .. } => {
+            CallOutput::TlsReadBufFailed { buffer, error }
+        }
+        CallOutput::TlsWroteOwned { bytes, .. } | CallOutput::TlsWroteOwnedFailed { bytes, .. } => {
+            CallOutput::TlsWroteOwnedFailed { bytes, error }
+        }
+        CallOutput::FileWroteOwned { bytes, .. }
+        | CallOutput::FileWroteOwnedFailed { bytes, .. } => {
+            CallOutput::FileWroteOwnedFailed { bytes, error }
+        }
+        CallOutput::UnixWroteOwned { bytes, .. }
+        | CallOutput::UnixWroteOwnedFailed { bytes, .. } => {
+            CallOutput::UnixWroteOwnedFailed { bytes, error }
+        }
+        _ => CallOutput::Failed(error),
+    }
+}
+
 impl<S> Simulator<S>
 where
     S: Shard,
@@ -3239,7 +3286,14 @@ where
             self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
             return;
         }
-        let start = offset as usize;
+        let Ok(start) = usize::try_from(offset) else {
+            self.schedule_tcp_completion(
+                call_id,
+                TcpResourceKey::FileRead(file),
+                CallOutput::FileRead { bytes: Vec::new() },
+            );
+            return;
+        };
         let bytes = self
             .file_storage
             .get(&self.files[index].path)
@@ -3276,20 +3330,26 @@ where
             self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
             return;
         }
-        let path = self.files[index].path.clone();
-        let start = offset as usize;
         let count = bytes
             .len()
             .min(self.config.storage.file_write_cap.unwrap_or(usize::MAX));
-        let end = start.saturating_add(count);
+        let range =
+            match simulated_file_write_range(offset, count, self.config.storage.max_file_bytes) {
+                Ok(range) => range,
+                Err(error) => {
+                    self.deliver_completion(call_id, CallOutput::Failed(error));
+                    return;
+                }
+            };
+        let path = self.files[index].path.clone();
         let storage = self
             .file_storage
             .get_mut(&path)
             .unwrap_or_else(|| panic!("open file has no simulated storage"));
-        if storage.len() < end {
-            storage.resize(end, 0);
+        if storage.len() < range.end {
+            storage.resize(range.end, 0);
         }
-        storage[start..end].copy_from_slice(&bytes[..count]);
+        storage[range].copy_from_slice(&bytes[..count]);
         self.schedule_tcp_completion(
             call_id,
             TcpResourceKey::FileWrite(file),
@@ -3348,16 +3408,25 @@ where
         }
         let count = (bytes.len() - buffer_start)
             .min(self.config.storage.file_write_cap.unwrap_or(usize::MAX));
-        let file_start = offset as usize;
-        let end = file_start.saturating_add(count);
+        let range =
+            match simulated_file_write_range(offset, count, self.config.storage.max_file_bytes) {
+                Ok(range) => range,
+                Err(error) => {
+                    self.deliver_completion(
+                        call_id,
+                        CallOutput::FileWroteOwnedFailed { bytes, error },
+                    );
+                    return;
+                }
+            };
         let storage = self
             .file_storage
             .get_mut(&path)
             .unwrap_or_else(|| panic!("open file has no simulated storage"));
-        if storage.len() < end {
-            storage.resize(end, 0);
+        if storage.len() < range.end {
+            storage.resize(range.end, 0);
         }
-        storage[file_start..end].copy_from_slice(&bytes[buffer_start..buffer_start + count]);
+        storage[range].copy_from_slice(&bytes[buffer_start..buffer_start + count]);
         self.schedule_tcp_completion(
             call_id,
             TcpResourceKey::FileWrite(file),
@@ -3566,8 +3635,13 @@ where
             bytes,
             last_journal_index,
         };
-        self.file_storage
-            .insert(path, tina_runtime::persistence::encode_snapshot(&snapshot));
+        let encoded = tina_runtime::persistence::encode_snapshot(&snapshot);
+        if simulated_file_write_range(0, encoded.len(), self.config.storage.max_file_bytes).is_err()
+        {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::StorageFull));
+            return;
+        }
+        self.file_storage.insert(path, encoded);
         if self.config.storage.commit_uncertain_snapshot_at == Some(storage_ordinal) {
             self.deliver_completion(call_id, CallOutput::Failed(CallError::CommitUncertain));
             return;
@@ -3627,10 +3701,26 @@ where
             index: record_index,
             bytes,
         };
+        let encoded = tina_runtime::persistence::encode_journal_record(&record);
+        let existing_len = self.file_storage.get(&path).map_or(0, Vec::len);
+        let Ok(existing_len) = u64::try_from(existing_len) else {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::StorageFull));
+            return;
+        };
+        if simulated_file_write_range(
+            existing_len,
+            encoded.len(),
+            self.config.storage.max_file_bytes,
+        )
+        .is_err()
+        {
+            self.deliver_completion(call_id, CallOutput::Failed(CallError::StorageFull));
+            return;
+        }
         self.file_storage
             .entry(path.clone())
             .or_default()
-            .extend(tina_runtime::persistence::encode_journal_record(&record));
+            .extend(encoded);
         if self.config.storage.truncate_journal_tail_at == Some(storage_ordinal) {
             if let Some(stored) = self.file_storage.get_mut(&path) {
                 stored.pop();
@@ -3837,6 +3927,7 @@ where
             let take = state.inbound.len().min(max_len);
             let bytes: Vec<u8> = state.inbound.drain(..take).collect();
             self.schedule_tcp_completion(call_id, resource, CallOutput::UnixRead { bytes });
+            self.wake_pending_unix_write_for_peer(stream);
             return;
         }
         if state.peer_closed {
@@ -3889,9 +3980,12 @@ where
         let room = peer.inbound_capacity.saturating_sub(peer.inbound.len());
         let allowed = room.min(write_cap).min(bytes.len());
         if allowed == 0 && !bytes.is_empty() {
-            // Peer inbound buffer is full. Surface zero-progress so the
-            // user state machine sees pressure instead of dropping bytes.
-            self.schedule_tcp_completion(call_id, resource, CallOutput::UnixWrote { count: 0 });
+            self.pending_unix_writes.push(PendingUnixWrite {
+                call_id,
+                stream,
+                peer: peer_id,
+                buffer: PendingUnixWriteBuffer::Raw(bytes),
+            });
             return;
         }
         peer.inbound.extend(bytes[..allowed].iter().copied());
@@ -3990,6 +4084,15 @@ where
         }
         let room = peer.inbound_capacity.saturating_sub(peer.inbound.len());
         let count = room.min(write_cap).min(bytes.len() - start);
+        if count == 0 && start < bytes.len() {
+            self.pending_unix_writes.push(PendingUnixWrite {
+                call_id,
+                stream,
+                peer: peer_id,
+                buffer: PendingUnixWriteBuffer::Owned { bytes, start },
+            });
+            return;
+        }
         peer.inbound
             .extend(bytes[start..start + count].iter().copied());
         // Match the borrowed write rail: bytes becoming available must wake a
@@ -4014,6 +4117,89 @@ where
             resource,
             CallOutput::UnixWroteOwned { bytes, count },
         );
+    }
+
+    fn wake_pending_unix_write_for_peer(&mut self, peer_id: UnixStreamId) {
+        let Some(pending_index) = self
+            .pending_unix_writes
+            .iter()
+            .position(|pending| pending.peer == peer_id)
+        else {
+            return;
+        };
+        let Some(peer_index) = self.unix_stream_index(peer_id) else {
+            self.fail_pending_unix_writes_to_peer(peer_id, CallError::Io);
+            return;
+        };
+        let peer_room = self.unix_streams[peer_index]
+            .inbound_capacity
+            .saturating_sub(self.unix_streams[peer_index].inbound.len());
+        if peer_room == 0 {
+            return;
+        }
+
+        let stream = self.pending_unix_writes[pending_index].stream;
+        let Some(stream_index) = self.unix_stream_index(stream) else {
+            let pending = self.pending_unix_writes.remove(pending_index);
+            self.complete_failed_pending_unix_write(pending, CallError::InvalidResource);
+            return;
+        };
+        let allowed = peer_room.min(self.unix_streams[stream_index].write_cap);
+        if allowed == 0 {
+            return;
+        }
+        let pending = self.pending_unix_writes.remove(pending_index);
+        match pending.buffer {
+            PendingUnixWriteBuffer::Raw(bytes) => {
+                let count = allowed.min(bytes.len());
+                self.unix_streams[peer_index]
+                    .inbound
+                    .extend(bytes[..count].iter().copied());
+                self.schedule_tcp_completion(
+                    pending.call_id,
+                    TcpResourceKey::UnixStreamWrite(pending.stream),
+                    CallOutput::UnixWrote { count },
+                );
+            }
+            PendingUnixWriteBuffer::Owned { bytes, start } => {
+                let count = allowed.min(bytes.len() - start);
+                self.unix_streams[peer_index]
+                    .inbound
+                    .extend(bytes[start..start + count].iter().copied());
+                self.schedule_tcp_completion(
+                    pending.call_id,
+                    TcpResourceKey::UnixStreamWrite(pending.stream),
+                    CallOutput::UnixWroteOwned { bytes, count },
+                );
+            }
+        }
+    }
+
+    fn complete_failed_pending_unix_write(&mut self, pending: PendingUnixWrite, error: CallError) {
+        let output = match pending.buffer {
+            PendingUnixWriteBuffer::Raw(_) => CallOutput::Failed(error),
+            PendingUnixWriteBuffer::Owned { bytes, .. } => {
+                CallOutput::UnixWroteOwnedFailed { bytes, error }
+            }
+        };
+        self.schedule_tcp_completion(
+            pending.call_id,
+            TcpResourceKey::UnixStreamWrite(pending.stream),
+            output,
+        );
+    }
+
+    fn fail_pending_unix_writes_to_peer(&mut self, peer: UnixStreamId, error: CallError) {
+        let mut retained = Vec::with_capacity(self.pending_unix_writes.len());
+        let pending = std::mem::take(&mut self.pending_unix_writes);
+        for write in pending {
+            if write.peer == peer {
+                self.complete_failed_pending_unix_write(write, error);
+            } else {
+                retained.push(write);
+            }
+        }
+        self.pending_unix_writes = retained;
     }
 
     pub(crate) fn handle_unix_listener_close(&mut self, call_id: CallId, listener: UnixListenerId) {
@@ -4048,6 +4234,7 @@ where
         // Cancel pending reads/writes on this stream.
         self.cancel_backend_calls_for_resource(TcpResourceKey::UnixStreamRead(stream));
         self.cancel_backend_calls_for_resource(TcpResourceKey::UnixStreamWrite(stream));
+        self.fail_pending_unix_writes_to_peer(stream, CallError::Io);
         let peer_id = self.unix_streams[index].peer;
         self.unix_streams[index].closed = true;
         if let Some(peer_id) = peer_id {
@@ -4131,7 +4318,11 @@ where
                 .pending_unix_reads
                 .iter()
                 .any(|pending| pending.stream == stream),
-            TcpResourceKey::UnixConnect(_) | TcpResourceKey::UnixStreamWrite(_) => false,
+            TcpResourceKey::UnixStreamWrite(stream) => self
+                .pending_unix_writes
+                .iter()
+                .any(|pending| pending.stream == stream),
+            TcpResourceKey::UnixConnect(_) => false,
         };
         queued_accept
             || self
@@ -4185,7 +4376,10 @@ where
             })
             .count();
         if pending_non_udp >= self.config.tcp.pending_completion_capacity {
-            self.deliver_completion(call_id, CallOutput::Failed(CallError::Io));
+            self.deliver_completion(
+                call_id,
+                completion_failure_preserving_owned(result, CallError::Io),
+            );
             return;
         }
 
@@ -4293,7 +4487,7 @@ where
                 ready_at_step: self.step_ordinal + 1,
                 insertion_order,
                 resource,
-                result: CallOutput::Failed(CallError::TlsFull),
+                result: completion_failure_preserving_owned(result, CallError::TlsFull),
             });
             return;
         }
@@ -6106,6 +6300,17 @@ where
                     })
                     .map(|pending| pending.call_id),
             )
+            .chain(
+                self.pending_unix_writes
+                    .iter()
+                    .filter(|pending| {
+                        matches!(
+                            resource,
+                            TcpResourceKey::UnixStreamWrite(s) if s == pending.stream
+                        )
+                    })
+                    .map(|pending| pending.call_id),
+            )
             .collect();
 
         for call_id in cancelled_call_ids {
@@ -6119,6 +6324,8 @@ where
             self.pending_unix_accepts
                 .retain(|pending| pending.call_id != call_id);
             self.pending_unix_reads
+                .retain(|pending| pending.call_id != call_id);
+            self.pending_unix_writes
                 .retain(|pending| pending.call_id != call_id);
 
             // Drop simulator call state too, or quiescence never arrives.
@@ -6170,6 +6377,8 @@ where
         self.pending_unix_connects
             .retain(|pending| pending.call_id != call_id);
         self.pending_unix_reads
+            .retain(|pending| pending.call_id != call_id);
+        self.pending_unix_writes
             .retain(|pending| pending.call_id != call_id);
         self.tls_streams
             .retain(|stream| stream.pending_connect_call != Some(call_id));

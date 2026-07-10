@@ -82,10 +82,10 @@ struct RunResult {
     closed_stream_facts: usize,
 }
 
-fn run_pass(seed: u64, continue_with_credit: bool) -> RunResult {
+fn run_pass(seed: u64, continue_with_credit: bool, concurrent: bool) -> RunResult {
     let bind_addr: SocketAddr = "127.0.0.1:19090".parse().unwrap();
     let peer_addr: SocketAddr = "10.0.0.1:59090".parse().unwrap();
-    let inbound_chunks = scripted_peer_input(continue_with_credit);
+    let inbound_chunks = scripted_peer_input(continue_with_credit, concurrent);
     let first_read_len = inbound_chunks[0].len();
     let config = SimulatorConfig {
         seed,
@@ -103,7 +103,7 @@ fn run_pass(seed: u64, continue_with_credit: bool) -> RunResult {
                     read_chunk_cap: Some(first_read_len),
                     // Force the server's write retry path while DATA is paced.
                     write_cap: 2 * 1024,
-                    output_capacity: BODY_LEN + 16 * 1024,
+                    output_capacity: BODY_LEN * usize::from(concurrent) + BODY_LEN + 16 * 1024,
                 }],
             }],
         },
@@ -179,7 +179,7 @@ fn drive_steps(sim: &mut Simulator<SimShard>, budget: usize) {
     }
 }
 
-fn scripted_peer_input(continue_with_credit: bool) -> Vec<Vec<u8>> {
+fn scripted_peer_input(continue_with_credit: bool, concurrent: bool) -> Vec<Vec<u8>> {
     let mut handshake_and_request = Vec::new();
     handshake_and_request.extend_from_slice(CLIENT_PREFACE);
     push_frame(&mut handshake_and_request, FRAME_SETTINGS, 0, 0, &[]);
@@ -190,6 +190,15 @@ fn scripted_peer_input(continue_with_credit: bool) -> Vec<Vec<u8>> {
         1,
         &request_headers(),
     );
+    if concurrent {
+        push_frame(
+            &mut handshake_and_request,
+            FRAME_HEADERS,
+            FLAG_END_HEADERS | FLAG_END_STREAM,
+            3,
+            &request_headers(),
+        );
+    }
 
     let remaining_credit = u32::try_from(BODY_LEN - 65_535).expect("test body delta fits u32");
     let mut credit = Vec::new();
@@ -200,6 +209,15 @@ fn scripted_peer_input(continue_with_credit: bool) -> Vec<Vec<u8>> {
         0,
         &remaining_credit.to_be_bytes(),
     );
+    if concurrent {
+        push_frame(
+            &mut credit,
+            FRAME_WINDOW_UPDATE,
+            0,
+            3,
+            &remaining_credit.to_be_bytes(),
+        );
+    }
     push_frame(
         &mut credit,
         FRAME_WINDOW_UPDATE,
@@ -294,8 +312,8 @@ fn response_data(output: &[u8]) -> (Vec<u8>, usize) {
 
 #[test]
 fn buffered_response_pressure_is_deterministic_and_bounded_to_initial_credit() {
-    let first = run_pass(0xB0D1_5EED, false);
-    let replay = run_pass(0xB0D1_5EED, false);
+    let first = run_pass(0xB0D1_5EED, false, false);
+    let replay = run_pass(0xB0D1_5EED, false, false);
 
     assert_eq!(first.trace_hash, replay.trace_hash);
     assert_eq!(first.trace_len, replay.trace_len);
@@ -321,8 +339,8 @@ fn buffered_response_pressure_is_deterministic_and_bounded_to_initial_credit() {
 
 #[test]
 fn credited_buffered_response_is_deterministic_under_short_writes() {
-    let first = run_pass(0xC0ED_17ED, true);
-    let replay = run_pass(0xC0ED_17ED, true);
+    let first = run_pass(0xC0ED_17ED, true, false);
+    let replay = run_pass(0xC0ED_17ED, true, false);
 
     assert_eq!(first.trace_hash, replay.trace_hash);
     assert_eq!(first.trace_len, replay.trace_len);
@@ -335,4 +353,45 @@ fn credited_buffered_response_is_deterministic_under_short_writes() {
     let (body, terminal_frames) = response_data(&first.peer_output);
     assert_eq!(body, expected_body());
     assert_eq!(terminal_frames, 1, "exactly one DATA frame ends the stream");
+}
+
+fn data_streams_after_initial_credit(output: &[u8]) -> Vec<u32> {
+    let mut cursor = 0;
+    let mut data_bytes = 0;
+    let mut credited_streams = Vec::new();
+    while cursor + 9 <= output.len() {
+        let len = (usize::from(output[cursor]) << 16)
+            | (usize::from(output[cursor + 1]) << 8)
+            | usize::from(output[cursor + 2]);
+        let end = cursor + 9 + len;
+        assert!(end <= output.len(), "peer output ends mid-frame");
+        let ty = output[cursor + 3];
+        let stream_id =
+            u32::from_be_bytes(output[cursor + 5..cursor + 9].try_into().unwrap()) & 0x7fff_ffff;
+        if ty == FRAME_DATA && matches!(stream_id, 1 | 3) {
+            if data_bytes >= 65_535 && credited_streams.len() < 2 {
+                credited_streams.push(stream_id);
+            }
+            data_bytes += len;
+        }
+        cursor = end;
+    }
+    credited_streams
+}
+
+#[test]
+fn concurrent_buffered_responses_share_credited_quanta_deterministically() {
+    let first = run_pass(0xFA17_5EED, true, true);
+    let replay = run_pass(0xFA17_5EED, true, true);
+
+    assert_eq!(first.trace_hash, replay.trace_hash);
+    assert_eq!(first.trace_len, replay.trace_len);
+    assert_eq!(first.peer_output, replay.peer_output);
+    let mut streams = data_streams_after_initial_credit(&first.peer_output);
+    streams.sort_unstable();
+    assert_eq!(
+        streams,
+        [1, 3],
+        "one connection WINDOW_UPDATE must advance both ready responses"
+    );
 }

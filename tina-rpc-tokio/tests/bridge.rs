@@ -18,10 +18,11 @@ use tina_rpc_tokio::{
 use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig};
 
 #[derive(Debug, Default, Clone)]
-struct SpecimenShard;
+struct SpecimenShard(Cell<u8>);
 
 impl tina::Shard for SpecimenShard {
     fn id(&self) -> ShardId {
+        let _ = self.0.get();
         ShardId::new(95)
     }
 }
@@ -220,7 +221,7 @@ impl Isolate for ClientStub {
 
 fn build_runtime() -> Arc<ThreadedRuntime<SpecimenShard, EFactory>> {
     Arc::new(ThreadedRuntime::with_config(
-        SpecimenShard,
+        SpecimenShard::default(),
         EFactory,
         ThreadedRuntimeConfig {
             command_capacity: 32,

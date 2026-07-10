@@ -2,8 +2,9 @@
 //!
 //! There is one concrete completion type per operation kind:
 //! [`AcceptCompletion`], [`ConnectCompletion`], [`RecvCompletion`], [`RecvBufCompletion`],
-//! [`SendCompletion`], [`SendOwnedCompletion`], [`PReadCompletion`], [`PWriteCompletion`], [`FsyncCompletion`],
-//! [`SizeCompletion`], [`MkdirCompletion`]. Each is a thin wrapper around
+//! [`SendCompletion`], [`SendOwnedCompletion`], [`PReadCompletion`], [`PWriteCompletion`],
+//! [`PWriteOwnedCompletion`], [`FsyncCompletion`], [`SizeCompletion`], [`MkdirCompletion`].
+//! Each is a thin wrapper around
 //! [`CompletionInner`] (the shared state machine and operation slot) and
 //! carries its own typed result.
 //!
@@ -157,6 +158,10 @@ define_completion!(
 
 define_completion!(
     /// Completion slot for a positional file write that returns the buffer.
+    ///
+    /// The complete allocation is returned on success and failure. Success
+    /// reports only the bytes accepted by that one positional write, so callers
+    /// must advance both their buffer cursor and file offset after a short write.
     pub struct PWriteOwnedCompletion => Result<(Vec<u8>, usize), (io::Error, Vec<u8>)>
 );
 

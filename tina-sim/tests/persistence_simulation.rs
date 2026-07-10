@@ -255,6 +255,38 @@ fn journal_path() -> PathBuf {
 }
 
 #[test]
+fn simulator_storage_limit_rejects_persistence_without_mutating_durable_image() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut sim = Simulator::new(
+        SimShard,
+        SimulatorConfig {
+            storage: ScriptedStorageFaultConfig {
+                max_file_bytes: 1,
+                ..ScriptedStorageFaultConfig::default()
+            },
+            ..SimulatorConfig::default()
+        },
+    );
+    let address = sim.register_with_mailbox_capacity::<PersistService, PersistMsg, PersistMsg>(
+        PersistService::new(snapshot_path(), journal_path(), Arc::clone(&observed)),
+        16,
+    );
+
+    sim.try_send(address, PersistMsg::Mutate("too-large".to_owned()))
+        .unwrap();
+    sim.run_until_quiescent();
+    sim.try_send(address, PersistMsg::CommitSnapshot).unwrap();
+    sim.run_until_quiescent();
+
+    assert_eq!(
+        observed.lock().expect("observed mutex").as_slice(),
+        &["append-error:StorageFull", "snapshot-error:StorageFull"]
+    );
+    assert!(sim.durable_image().files().is_empty());
+    InvariantSuite::standard().assert(sim.trace());
+}
+
+#[test]
 fn simulator_replays_durable_recovery_from_durable_image() {
     let observed = Arc::new(Mutex::new(Vec::new()));
     let mut sim = Simulator::new(SimShard, SimulatorConfig::default());

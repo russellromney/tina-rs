@@ -12,19 +12,20 @@ use tina::{
 };
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallInput, CallKind, CallOutput, FileId,
-    FileOpenOptions, ListenerId, LoopStep, PathKind, ProcessRunResult, RuntimeCall, RuntimeEvent,
-    RuntimeEventKind, StreamId, TcpWriteAll, TcpWriteOwnedReply, TlsListenerId, TlsStreamId,
-    UdpSocketId, WriteOwnedError, dns_lookup, file_close, file_create, file_write, mkdir,
-    path_metadata, process_run, read_dir, remove_file, rename_replace, signal_wait, sync_parent,
-    tls_accept, tls_bind, tls_close, tls_close_listener, tls_connect, tls_read, tls_write,
-    udp_bind, udp_close_socket, udp_recv_from, udp_send_to,
+    FileOpenOptions, FileWriteOwnedReply, ListenerId, LoopStep, PathKind, ProcessRunResult,
+    RuntimeCall, RuntimeEvent, RuntimeEventKind, StreamId, TcpWriteAll, TcpWriteOwnedReply,
+    TlsListenerId, TlsStreamId, UdpSocketId, WriteOwnedError, dns_lookup, file_close, file_create,
+    file_size, file_write, file_write_at, file_write_at_owned, mkdir, path_metadata, process_run,
+    read_dir, remove_file, rename_replace, signal_wait, sync_parent, tls_accept, tls_bind,
+    tls_close, tls_close_listener, tls_connect, tls_read, tls_write, udp_bind, udp_close_socket,
+    udp_recv_from, udp_send_to,
 };
 use tina_sim::{
     Checker, CheckerDecision, FaultConfig, ObservedPeerOutput, ReplayArtifact, ScriptedDnsConfig,
     ScriptedDnsLookupConfig, ScriptedDnsResult, ScriptedListenerConfig, ScriptedPeerConfig,
     ScriptedProcessConfig, ScriptedProcessResult, ScriptedProcessRunConfig, ScriptedSignalConfig,
-    ScriptedSignalEventConfig, ScriptedSignalResult, ScriptedTcpConfig, ScriptedTlsConfig,
-    ScriptedTlsConnectConfig, ScriptedTlsConnectResult, ScriptedTlsReadResult,
+    ScriptedSignalEventConfig, ScriptedSignalResult, ScriptedStorageFaultConfig, ScriptedTcpConfig,
+    ScriptedTlsConfig, ScriptedTlsConnectConfig, ScriptedTlsConnectResult, ScriptedTlsReadResult,
     ScriptedTlsWriteResult, ScriptedUdpConfig, ScriptedUdpDatagramConfig, ScriptedUdpSocketConfig,
     Simulator, SimulatorConfig, TcpCompletionFaultMode,
     dst::{DstRun, History, InvariantSuite, ShrinkConfig, assert_replays, delete_shrink},
@@ -214,6 +215,151 @@ struct FileClient {
     file: Option<FileId>,
     size: Option<u64>,
     observed: FileObserved,
+}
+
+#[derive(Debug, Clone)]
+enum FileBoundaryMsg {
+    Start { dir: PathBuf, path: PathBuf },
+    DirectoryMade(Result<(), CallError>, PathBuf),
+    Opened(Result<FileId, CallError>),
+    Seeded(Result<usize, CallError>),
+    RawEmpty(Result<usize, CallError>),
+    OwnedEmpty(FileWriteOwnedReply),
+    SizeAfterEmpty(Result<u64, CallError>),
+    WroteBoundary(Result<usize, CallError>),
+    RawPastCap(Result<usize, CallError>),
+    RawHostileOffset(Result<usize, CallError>),
+    OwnedHostileOffset(FileWriteOwnedReply),
+    FinalSize(Result<u64, CallError>),
+    Closed(Result<(), CallError>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileBoundaryObservation {
+    Seeded(Result<usize, CallError>),
+    RawEmpty(Result<usize, CallError>),
+    OwnedEmpty(Result<(Vec<u8>, usize), (CallError, Vec<u8>)>),
+    SizeAfterEmpty(Result<u64, CallError>),
+    WroteBoundary(Result<usize, CallError>),
+    RawPastCap(Result<usize, CallError>),
+    RawHostileOffset(Result<usize, CallError>),
+    OwnedHostileOffset(Result<(Vec<u8>, usize), (CallError, Vec<u8>)>),
+    FinalSize(Result<u64, CallError>),
+}
+
+#[derive(Debug)]
+struct FileBoundaryClient {
+    file: Option<FileId>,
+    observed: Arc<Mutex<Vec<FileBoundaryObservation>>>,
+}
+
+fn observe_owned(reply: FileWriteOwnedReply) -> Result<(Vec<u8>, usize), (CallError, Vec<u8>)> {
+    match reply {
+        Ok(reply) => Ok((reply.bytes, reply.written)),
+        Err(error) => Err((error.error, error.bytes)),
+    }
+}
+
+impl Isolate for FileBoundaryClient {
+    type Message = FileBoundaryMsg;
+    type Reply = ();
+    type Send = Outbound<Infallible>;
+    type Spawn = Infallible;
+    type SpawnObserved = Infallible;
+    type Io = RuntimeCall<FileBoundaryMsg>;
+    type Fact = Infallible;
+    type Shard = TestShard;
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            FileBoundaryMsg::Start { dir, path } => {
+                mkdir(dir, 0o755).then(move |result| FileBoundaryMsg::DirectoryMade(result, path))
+            }
+            FileBoundaryMsg::DirectoryMade(Ok(()), path) => {
+                file_create(path).then(FileBoundaryMsg::Opened)
+            }
+            FileBoundaryMsg::Opened(Ok(file)) => {
+                self.file = Some(file);
+                file_write_at(file, b"seed".to_vec(), 0).then(FileBoundaryMsg::Seeded)
+            }
+            FileBoundaryMsg::Seeded(result) => {
+                self.observed
+                    .lock()
+                    .expect("boundary observations")
+                    .push(FileBoundaryObservation::Seeded(result));
+                file_write_at(self.file.expect("opened"), Vec::new(), u64::MAX)
+                    .then(FileBoundaryMsg::RawEmpty)
+            }
+            FileBoundaryMsg::RawEmpty(result) => {
+                self.observed
+                    .lock()
+                    .expect("boundary observations")
+                    .push(FileBoundaryObservation::RawEmpty(result));
+                file_write_at_owned(self.file.expect("opened"), Vec::new(), u64::MAX)
+                    .then(FileBoundaryMsg::OwnedEmpty)
+            }
+            FileBoundaryMsg::OwnedEmpty(reply) => {
+                self.observed
+                    .lock()
+                    .expect("boundary observations")
+                    .push(FileBoundaryObservation::OwnedEmpty(observe_owned(reply)));
+                file_size(self.file.expect("opened")).then(FileBoundaryMsg::SizeAfterEmpty)
+            }
+            FileBoundaryMsg::SizeAfterEmpty(result) => {
+                self.observed
+                    .lock()
+                    .expect("boundary observations")
+                    .push(FileBoundaryObservation::SizeAfterEmpty(result));
+                file_write_at(self.file.expect("opened"), b"xy".to_vec(), 6)
+                    .then(FileBoundaryMsg::WroteBoundary)
+            }
+            FileBoundaryMsg::WroteBoundary(result) => {
+                self.observed
+                    .lock()
+                    .expect("boundary observations")
+                    .push(FileBoundaryObservation::WroteBoundary(result));
+                file_write_at(self.file.expect("opened"), b"x".to_vec(), 8)
+                    .then(FileBoundaryMsg::RawPastCap)
+            }
+            FileBoundaryMsg::RawPastCap(result) => {
+                self.observed
+                    .lock()
+                    .expect("boundary observations")
+                    .push(FileBoundaryObservation::RawPastCap(result));
+                file_write_at(self.file.expect("opened"), b"x".to_vec(), u64::MAX)
+                    .then(FileBoundaryMsg::RawHostileOffset)
+            }
+            FileBoundaryMsg::RawHostileOffset(result) => {
+                self.observed
+                    .lock()
+                    .expect("boundary observations")
+                    .push(FileBoundaryObservation::RawHostileOffset(result));
+                file_write_at_owned(self.file.expect("opened"), b"owned".to_vec(), u64::MAX)
+                    .then(FileBoundaryMsg::OwnedHostileOffset)
+            }
+            FileBoundaryMsg::OwnedHostileOffset(reply) => {
+                self.observed.lock().expect("boundary observations").push(
+                    FileBoundaryObservation::OwnedHostileOffset(observe_owned(reply)),
+                );
+                file_size(self.file.expect("opened")).then(FileBoundaryMsg::FinalSize)
+            }
+            FileBoundaryMsg::FinalSize(result) => {
+                self.observed
+                    .lock()
+                    .expect("boundary observations")
+                    .push(FileBoundaryObservation::FinalSize(result));
+                file_close(self.file.expect("opened")).then(FileBoundaryMsg::Closed)
+            }
+            FileBoundaryMsg::Closed(Ok(())) => Effect::Stop,
+            FileBoundaryMsg::DirectoryMade(Err(_), _)
+            | FileBoundaryMsg::Opened(Err(_))
+            | FileBoundaryMsg::Closed(Err(_)) => Effect::Stop,
+        }
+    }
 }
 
 impl Isolate for FileClient {
@@ -3368,6 +3514,69 @@ fn simulated_file_client_writes_syncs_reads_and_closes() {
     assert_eq!(count_call_completed(sim.trace(), CallKind::FileSize), 1);
     assert_eq!(count_call_completed(sim.trace(), CallKind::FileReadAt), 1);
     assert_eq!(count_call_completed(sim.trace(), CallKind::FileClose), 1);
+}
+
+fn run_file_boundary_scenario() -> (Vec<FileBoundaryObservation>, ReplayArtifact) {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let mut sim = Simulator::new(
+        TestShard,
+        SimulatorConfig {
+            storage: ScriptedStorageFaultConfig {
+                max_file_bytes: 8,
+                ..ScriptedStorageFaultConfig::default()
+            },
+            ..SimulatorConfig::default()
+        },
+    );
+    let client = sim.register(FileBoundaryClient {
+        file: None,
+        observed: Arc::clone(&observed),
+    });
+    sim.try_send(
+        client,
+        FileBoundaryMsg::Start {
+            dir: PathBuf::from("/tmp/tina-sim-boundary"),
+            path: PathBuf::from("/tmp/tina-sim-boundary/file.bin"),
+        },
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+    let observations = observed.lock().expect("boundary observations").clone();
+    (observations, sim.replay_artifact())
+}
+
+#[test]
+fn simulated_positional_writes_enforce_bounds_preserve_buffers_and_replay() {
+    let (observed, artifact) = run_file_boundary_scenario();
+
+    assert_eq!(
+        observed,
+        vec![
+            FileBoundaryObservation::Seeded(Ok(4)),
+            FileBoundaryObservation::RawEmpty(Ok(0)),
+            FileBoundaryObservation::OwnedEmpty(Ok((Vec::new(), 0))),
+            FileBoundaryObservation::SizeAfterEmpty(Ok(4)),
+            FileBoundaryObservation::WroteBoundary(Ok(2)),
+            FileBoundaryObservation::RawPastCap(Err(CallError::StorageFull)),
+            FileBoundaryObservation::RawHostileOffset(Err(CallError::StorageFull)),
+            FileBoundaryObservation::OwnedHostileOffset(Err((
+                CallError::StorageFull,
+                b"owned".to_vec(),
+            ))),
+            FileBoundaryObservation::FinalSize(Ok(8)),
+        ]
+    );
+    assert_eq!(
+        artifact
+            .durable_image()
+            .get("/tmp/tina-sim-boundary/file.bin"),
+        Some(&b"seed\0\0xy"[..])
+    );
+
+    let (replayed_observed, replayed_artifact) = run_file_boundary_scenario();
+    assert_eq!(replayed_observed, observed);
+    assert_eq!(replayed_artifact, artifact);
+    InvariantSuite::standard().assert(artifact.event_record());
 }
 
 #[test]

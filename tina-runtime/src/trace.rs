@@ -2283,6 +2283,23 @@ mod stable_hash_tests {
     }
 
     #[test]
+    fn invariant_violation_call_error_tag_and_event_hash_are_stable() {
+        assert_eq!(call_error_tag(CallError::InvariantViolation), 30);
+        let event = RuntimeEvent::new(
+            EventId::new(11),
+            Some(CauseId::new(EventId::new(7))),
+            ShardId::new(2),
+            IsolateId::new(5),
+            RuntimeEventKind::CallFailed {
+                call_id: CallId::new(13),
+                call_kind: CallKind::UnixWrite,
+                reason: CallError::InvariantViolation,
+            },
+        );
+        assert_eq!(event.stable_hash(), 0xc45645ee45d71e4f);
+    }
+
+    #[test]
     fn fact_observed_event_tag_is_thirty_six() {
         // The kind body of `FactObserved` starts with the literal tag byte 36.
         let event = RuntimeEvent::new(

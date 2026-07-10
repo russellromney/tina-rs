@@ -73,7 +73,8 @@ pub struct Http2Limits {
     /// Bounded outbound write-buffer queue length per connection.
     ///
     /// A queued buffer may contain one control frame, one streaming DATA frame,
-    /// or one coalesced buffered response (HEADERS + DATA frames + trailers).
+    /// or one buffered-response quantum (HEADERS + at most one DATA frame,
+    /// plus trailers when that frame completes the response).
     /// Buffered response bytes are still bounded by
     /// [`Http2Limits::max_response_body_bytes`].
     pub connection_outbound_queue_capacity: usize,
@@ -314,6 +315,7 @@ struct ActiveStream {
     response_source: Option<tina::Address<ResponseChunkMsg, ResponseChunkReply>>,
     response_trailers: Option<Vec<u8>>,
     response_pending_data: Vec<u8>,
+    response_pending_end: Option<PendingStreamEnd>,
     response_bytes_sent: usize,
     response_pull_in_flight: bool,
     response_pull_handle: Option<tina::CallHandle<ResponseChunkReply>>,
@@ -370,6 +372,17 @@ struct PendingResponse {
     trailers: Option<Vec<u8>>,
 }
 
+#[derive(Debug)]
+enum PendingStreamEnd {
+    Eof {
+        trailers: Option<Vec<u8>>,
+    },
+    GrpcStatus {
+        trailers: Vec<u8>,
+        status: tina_runtime::GrpcStatusCode,
+    },
+}
+
 impl PendingResponse {
     fn remaining_body(&self) -> &[u8] {
         &self.body.as_slice()[self.body_offset..]
@@ -391,6 +404,7 @@ impl ActiveStream {
             response_source: None,
             response_trailers: None,
             response_pending_data: Vec::new(),
+            response_pending_end: None,
             response_bytes_sent: 0,
             response_pull_in_flight: false,
             response_pull_handle: None,
@@ -479,6 +493,10 @@ pub struct Http2Connection<S: Shard, M: Http2ServiceMessage = HttpRequest> {
     send_window: i32,
     peer_initial_stream_window: i32,
     peer_max_frame_size: usize,
+    /// Stream most recently given a DATA-frame quantum. Stream ids are
+    /// monotonically increasing, so this remains a stable round-robin cursor
+    /// even when closed streams are removed with `swap_remove`.
+    response_flush_cursor: Option<u32>,
     reset_churn: u32,
     goaway: bool,
     closing_after_write: bool,
@@ -516,6 +534,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             send_window: DEFAULT_WINDOW,
             peer_initial_stream_window: DEFAULT_WINDOW,
             peer_max_frame_size: limits.max_frame_size,
+            response_flush_cursor: None,
             reset_churn: 0,
             goaway: false,
             closing_after_write: false,
@@ -1609,7 +1628,14 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         pending: PendingResponse,
         effects: &mut Vec<Effect<Self>>,
     ) -> Result<(), Http2ProtocolError> {
-        self.send_pending_response(stream_id, pending, effects)
+        let idx = self
+            .find_stream(stream_id)
+            .ok_or(Http2ProtocolError::StreamClosed)?;
+        if self.streams[idx].pending_response.is_some() {
+            return Err(Http2ProtocolError::StreamClosed);
+        }
+        self.streams[idx].pending_response = Some(pending);
+        self.flush_pending_responses(effects)
     }
 
     fn send_pending_response(
@@ -1623,10 +1649,15 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             .find_stream(stream_id)
             .ok_or(Http2ProtocolError::StreamClosed)?;
         let mut pending = pending;
-        let send_len = self.outbound_response_credit(idx, pending.remaining_body().len())?;
+        // One peer-sized DATA frame is this stream's scheduling quantum. The
+        // connection scheduler rotates between all ready streams before this
+        // stream may consume another quantum.
+        let send_len = self
+            .outbound_response_credit(idx, pending.remaining_body().len())?
+            .min(frame_cap);
         let send_len_i32 = i32::try_from(send_len).map_err(|_| Http2ProtocolError::FlowControl)?;
         let headers_len = pending.header_block.len();
-        let data_frames = send_len.div_ceil(frame_cap);
+        let data_frames = usize::from(send_len > 0);
         let body_done = pending.body_offset + send_len == pending.body.len();
         let trailers_len = if body_done {
             pending
@@ -1711,20 +1742,25 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                 CallError::TargetClosed,
             );
         } else {
-            let side = if self.send_window <= 0 {
-                Http2FlowControlSide::ConnectionSend
-            } else {
-                Http2FlowControlSide::StreamSend
-            };
-            self.report.flow_control_blocked += 1;
-            self.emit_protocol_fact(
-                effects,
-                ProtocolFact::Http2FlowControlFull {
-                    connection: self.connection_fact_id(),
-                    stream: Http2StreamId::new(stream_id),
-                    side,
-                },
-            );
+            // A response larger than one scheduling quantum remains pending
+            // even when both flow-control windows still have credit. Report a
+            // flow-control stall only when a window actually reached zero.
+            if self.send_window <= 0 || self.streams[idx].send_window <= 0 {
+                let side = if self.send_window <= 0 {
+                    Http2FlowControlSide::ConnectionSend
+                } else {
+                    Http2FlowControlSide::StreamSend
+                };
+                self.report.flow_control_blocked += 1;
+                self.emit_protocol_fact(
+                    effects,
+                    ProtocolFact::Http2FlowControlFull {
+                        connection: self.connection_fact_id(),
+                        stream: Http2StreamId::new(stream_id),
+                        side,
+                    },
+                );
+            }
             self.streams[idx].pending_response = Some(pending);
         }
         Ok(())
@@ -1755,16 +1791,41 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         &mut self,
         effects: &mut Vec<Effect<Self>>,
     ) -> Result<(), Http2ProtocolError> {
-        let ids: Vec<u32> = self.streams.iter().map(|s| s.id).collect();
+        let mut ids: Vec<u32> = self
+            .streams
+            .iter()
+            .filter(|stream| {
+                stream.pending_response.is_some()
+                    || !stream.response_pending_data.is_empty()
+                    || stream.response_pending_end.is_some()
+            })
+            .map(|stream| stream.id)
+            .collect();
+        ids.sort_unstable();
+        if let Some(cursor) = self.response_flush_cursor {
+            let start = ids.partition_point(|stream_id| *stream_id <= cursor);
+            ids.rotate_left(start);
+        }
         for stream_id in ids {
+            // HEADERS and trailers are not flow controlled, so a zero DATA
+            // window must not prevent a pending response from making protocol
+            // progress. The per-stream flushers handle zero DATA credit.
+            if self.write_queue.len() >= self.limits.connection_outbound_queue_capacity {
+                break;
+            }
             let Some(idx) = self.find_stream(stream_id) else {
                 continue;
             };
+            let send_window_before = self.send_window;
             if let Some(pending) = self.streams[idx].pending_response.take() {
                 self.send_pending_response(stream_id, pending, effects)?;
             }
             if self.find_stream(stream_id).is_some() {
                 self.flush_response_stream(stream_id)?;
+            }
+            self.flush_response_end(stream_id, effects)?;
+            if self.send_window < send_window_before {
+                self.response_flush_cursor = Some(stream_id);
             }
         }
         Ok(())
@@ -1847,19 +1908,14 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                         *remaining -= bytes.len();
                     }
                 }
-                if self.flush_response_stream(stream_id).is_err() {
+                let mut effects = Vec::new();
+                if self.flush_pending_responses(&mut effects).is_err() {
                     self.report.flow_control_blocked += 1;
                 }
-                let mut effects = Vec::new();
                 if self.pending_write.is_empty() && !self.write_queue.is_empty() {
                     effects.push(self.write_more());
                 }
-                if self
-                    .find_stream(stream_id)
-                    .is_some_and(|idx| self.streams[idx].response_pending_data.is_empty())
-                {
-                    effects.push(self.pull_response_chunk_effect(stream_id));
-                }
+                self.push_ready_response_pulls(&mut effects);
                 batch(effects)
             }
             CallOutcome::Replied(ResponseChunkReply::Eof) => {
@@ -1886,44 +1942,35 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
                 let trailers = self
                     .find_stream(stream_id)
                     .and_then(|idx| self.streams[idx].response_trailers.take());
-                if let Some(trailers) = trailers {
-                    let _ = self.enqueue_frame(headers_frame(stream_id, true, trailers));
-                } else {
-                    let _ = self.enqueue_frame(data_frame(stream_id, true, Vec::new()));
-                }
                 if let Some(idx) = self.find_stream(stream_id) {
-                    self.streams[idx].state = Http2StreamState::Closed;
+                    self.streams[idx].response_pending_end =
+                        Some(PendingStreamEnd::Eof { trailers });
                 }
                 let mut effects = Vec::new();
-                self.close_stream_with_cleanup(
-                    stream_id,
-                    Http2CloseReason::EndStream,
-                    &mut effects,
-                    CallError::TargetClosed,
-                );
-                effects.push(self.maybe_write_effect());
+                if self.flush_pending_responses(&mut effects).is_err() {
+                    self.report.protocol_errors += 1;
+                }
+                if self.pending_write.is_empty() && !self.write_queue.is_empty() {
+                    effects.push(self.write_more());
+                }
                 batch(effects)
             }
             CallOutcome::Replied(ResponseChunkReply::GrpcStatus(status)) => {
                 let grpc_status_code = crate::grpc::classify_grpc_status_code(&status);
                 let trailers = crate::grpc::grpc_status_trailers_block(status);
-                let _ = self.enqueue_frame(headers_frame(stream_id, true, trailers));
                 if let Some(idx) = self.find_stream(stream_id) {
-                    self.streams[idx].state = Http2StreamState::Closed;
+                    self.streams[idx].response_pending_end = Some(PendingStreamEnd::GrpcStatus {
+                        trailers,
+                        status: grpc_status_code,
+                    });
                 }
-                let status_fact = tina::fact::<Self>(ProtocolFact::GrpcFinalStatusSent {
-                    connection: self.connection_fact_id(),
-                    stream: tina_runtime::GrpcStreamId::new(stream_id as u64),
-                    status: grpc_status_code,
-                });
-                let mut effects = vec![status_fact];
-                self.close_stream_with_cleanup(
-                    stream_id,
-                    Http2CloseReason::EndStream,
-                    &mut effects,
-                    CallError::TargetClosed,
-                );
-                effects.push(self.maybe_write_effect());
+                let mut effects = Vec::new();
+                if self.flush_pending_responses(&mut effects).is_err() {
+                    self.report.protocol_errors += 1;
+                }
+                if self.pending_write.is_empty() && !self.write_queue.is_empty() {
+                    effects.push(self.write_more());
+                }
                 batch(effects)
             }
             CallOutcome::Full
@@ -1945,35 +1992,80 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
     }
 
     fn flush_response_stream(&mut self, stream_id: u32) -> Result<(), Http2ProtocolError> {
-        loop {
-            let idx = self
-                .find_stream(stream_id)
-                .ok_or(Http2ProtocolError::StreamClosed)?;
-            if self.streams[idx].response_pending_data.is_empty() {
-                return Ok(());
-            }
-            let allowed = self
-                .outbound_response_credit(idx, self.streams[idx].response_pending_data.len())?
-                .min(self.peer_max_frame_size);
-            if allowed == 0 {
-                self.report.flow_control_blocked += 1;
-                return Ok(());
-            }
-            // Frame the next streamed chunk directly: header bytes, then drain
-            // the consumed prefix of the pending buffer straight into the
-            // framed `Vec`. The body is copied once (the drain) instead of once
-            // into a `chunk` `Vec` and again in `Frame::encode`.
-            self.ensure_outbound_slots(1)?;
-            let mut framed = Vec::with_capacity(FRAME_HEADER_LEN + allowed);
-            push_frame_header(&mut framed, FRAME_DATA, 0, stream_id, allowed);
-            framed.extend(self.streams[idx].response_pending_data.drain(..allowed));
-            self.write_queue.push_back(framed);
-            let allowed_i32 =
-                i32::try_from(allowed).map_err(|_| Http2ProtocolError::FlowControl)?;
-            self.send_window -= allowed_i32;
-            self.streams[idx].send_window -= allowed_i32;
-            self.streams[idx].response_bytes_sent += allowed;
+        let idx = self
+            .find_stream(stream_id)
+            .ok_or(Http2ProtocolError::StreamClosed)?;
+        if self.streams[idx].response_pending_data.is_empty() {
+            return Ok(());
         }
+        let allowed = self
+            .outbound_response_credit(idx, self.streams[idx].response_pending_data.len())?
+            .min(self.peer_max_frame_size);
+        if allowed == 0 {
+            self.report.flow_control_blocked += 1;
+            return Ok(());
+        }
+        // Frame one scheduling quantum directly: header bytes, then drain the
+        // consumed prefix of the pending buffer straight into the framed Vec.
+        self.ensure_outbound_slots(1)?;
+        let mut framed = Vec::with_capacity(FRAME_HEADER_LEN + allowed);
+        push_frame_header(&mut framed, FRAME_DATA, 0, stream_id, allowed);
+        framed.extend(self.streams[idx].response_pending_data.drain(..allowed));
+        self.write_queue.push_back(framed);
+        let allowed_i32 = i32::try_from(allowed).map_err(|_| Http2ProtocolError::FlowControl)?;
+        self.send_window -= allowed_i32;
+        self.streams[idx].send_window -= allowed_i32;
+        self.streams[idx].response_bytes_sent += allowed;
+        Ok(())
+    }
+
+    fn flush_response_end(
+        &mut self,
+        stream_id: u32,
+        effects: &mut Vec<Effect<Self>>,
+    ) -> Result<(), Http2ProtocolError> {
+        let Some(idx) = self.find_stream(stream_id) else {
+            return Ok(());
+        };
+        if !self.streams[idx].response_pending_data.is_empty()
+            || self.streams[idx].response_pending_end.is_none()
+            || self.write_queue.len() >= self.limits.connection_outbound_queue_capacity
+        {
+            return Ok(());
+        }
+        let terminal = self.streams[idx]
+            .response_pending_end
+            .take()
+            .expect("terminal response checked above");
+        let (frame, grpc_status) = match terminal {
+            PendingStreamEnd::Eof {
+                trailers: Some(trailers),
+            } => (headers_frame(stream_id, true, trailers), None),
+            PendingStreamEnd::Eof { trailers: None } => {
+                (data_frame(stream_id, true, Vec::new()), None)
+            }
+            PendingStreamEnd::GrpcStatus { trailers, status } => {
+                (headers_frame(stream_id, true, trailers), Some(status))
+            }
+        };
+        self.enqueue_frame(frame)?;
+        if let Some(status) = grpc_status {
+            effects.push(tina::fact::<Self>(ProtocolFact::GrpcFinalStatusSent {
+                connection: self.connection_fact_id(),
+                stream: tina_runtime::GrpcStreamId::new(stream_id as u64),
+                status,
+            }));
+        }
+        if let Some(idx) = self.find_stream(stream_id) {
+            self.streams[idx].state = Http2StreamState::Closed;
+        }
+        self.close_stream_with_cleanup(
+            stream_id,
+            Http2CloseReason::EndStream,
+            effects,
+            CallError::TargetClosed,
+        );
+        Ok(())
     }
 
     /// Returns the bytes a response may consume from both HTTP/2 send windows.
@@ -2270,6 +2362,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             .filter(|stream| {
                 stream.response_source.is_some()
                     && stream.response_pending_data.is_empty()
+                    && stream.response_pending_end.is_none()
                     && !stream.response_pull_in_flight
             })
             .map(|stream| stream.id)
@@ -2304,6 +2397,7 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         if self.flush_pending_responses(&mut effects).is_err() {
             self.report.protocol_errors += 1;
         }
+        self.push_ready_response_pulls(&mut effects);
         if !self.write_queue.is_empty() {
             effects.push(self.write_more());
         }
@@ -2635,6 +2729,12 @@ mod tests {
             DEFAULT_WINDOW,
             false,
         ));
+        let stream = conn.find_stream(1).expect("stream exists");
+        conn.streams[stream].response_source = Some(Address::new_with_generation(
+            ShardId::new(9001),
+            IsolateId::new(2),
+            tina::AddressGeneration::new(0),
+        ));
         let _ = conn.handle_stream_chunk(
             1,
             CallOutcome::Replied(ResponseChunkReply::Chunk(b"abc".to_vec())),
@@ -2656,7 +2756,154 @@ mod tests {
                 .is_some_and(|idx| conn.streams[idx].response_pending_data.is_empty()),
             "write drain should retry and drain parked streamed response DATA"
         );
+        assert!(
+            conn.find_stream(1)
+                .is_some_and(|idx| conn.streams[idx].response_pull_in_flight),
+            "draining the parked chunk should pull the next source chunk"
+        );
         assert!(conn.write_in_flight, "retry should arm a TCP write");
+    }
+
+    fn queued_frame_stream_id(bytes: &[u8]) -> u32 {
+        u32::from_be_bytes(bytes[5..9].try_into().expect("frame stream id")) & 0x7fff_ffff
+    }
+
+    fn pending_body(bytes: usize) -> PendingResponse {
+        PendingResponse {
+            header_block: Vec::new(),
+            body: ResponseBytes::Owned(vec![b'x'; bytes]),
+            body_offset: 0,
+            trailers: None,
+        }
+    }
+
+    #[test]
+    fn outbound_data_scheduler_rotates_between_buffered_and_streamed_responses() {
+        let mut conn = unit_connection();
+        let quantum = conn.peer_max_frame_size;
+        conn.push_stream(ActiveStream::new(
+            1,
+            HeaderBlock::default(),
+            DEFAULT_WINDOW,
+            DEFAULT_WINDOW,
+            false,
+        ));
+        conn.push_stream(ActiveStream::new(
+            3,
+            HeaderBlock::default(),
+            DEFAULT_WINDOW,
+            DEFAULT_WINDOW,
+            false,
+        ));
+        let first = conn.find_stream(1).unwrap();
+        conn.streams[first].pending_response = Some(pending_body(quantum * 3));
+        let second = conn.find_stream(3).unwrap();
+        conn.streams[second].response_pending_data = vec![b'y'; quantum * 3];
+        conn.send_window = i32::try_from(quantum * 2).unwrap();
+
+        conn.flush_pending_responses(&mut Vec::new()).unwrap();
+
+        assert_eq!(conn.write_queue.len(), 2);
+        assert_eq!(queued_frame_stream_id(&conn.write_queue[0]), 1);
+        assert_eq!(queued_frame_stream_id(&conn.write_queue[1]), 3);
+        assert_eq!(
+            conn.streams[conn.find_stream(1).unwrap()].response_bytes_sent,
+            quantum
+        );
+        assert_eq!(
+            conn.streams[conn.find_stream(3).unwrap()].response_bytes_sent,
+            quantum
+        );
+
+        // With only one frame of new connection credit, rotation resumes after
+        // stream 3, so stream 1 receives this quantum. The following grant
+        // resumes at stream 3 instead of letting stream 1 monopolize updates.
+        conn.send_window = i32::try_from(quantum).unwrap();
+        conn.flush_pending_responses(&mut Vec::new()).unwrap();
+        assert_eq!(queued_frame_stream_id(conn.write_queue.back().unwrap()), 1);
+        conn.send_window = i32::try_from(quantum).unwrap();
+        conn.flush_pending_responses(&mut Vec::new()).unwrap();
+        assert_eq!(queued_frame_stream_id(conn.write_queue.back().unwrap()), 3);
+    }
+
+    #[test]
+    fn scheduler_yield_is_not_reported_as_flow_control_exhaustion() {
+        let mut conn = unit_connection();
+        let quantum = conn.peer_max_frame_size;
+        conn.push_stream(ActiveStream::new(
+            1,
+            HeaderBlock::default(),
+            DEFAULT_WINDOW,
+            DEFAULT_WINDOW,
+            false,
+        ));
+        let stream = conn.find_stream(1).unwrap();
+        conn.streams[stream].pending_response = Some(pending_body(quantum * 2));
+
+        conn.flush_pending_responses(&mut Vec::new()).unwrap();
+
+        assert_eq!(conn.report.flow_control_blocked, 0);
+        assert!(conn.streams[stream].pending_response.is_some());
+        assert!(conn.send_window > 0);
+        assert!(conn.streams[stream].send_window > 0);
+    }
+
+    #[test]
+    fn zero_data_window_does_not_block_response_headers() {
+        let mut conn = unit_connection();
+        conn.push_stream(ActiveStream::new(
+            1,
+            HeaderBlock::default(),
+            DEFAULT_WINDOW,
+            DEFAULT_WINDOW,
+            false,
+        ));
+        let stream = conn.find_stream(1).unwrap();
+        conn.streams[stream].pending_response = Some(PendingResponse {
+            header_block: vec![0x88],
+            body: ResponseBytes::Owned(b"body".to_vec()),
+            body_offset: 0,
+            trailers: None,
+        });
+        conn.send_window = 0;
+
+        conn.flush_pending_responses(&mut Vec::new()).unwrap();
+
+        assert_eq!(conn.write_queue.len(), 1);
+        assert_eq!(conn.write_queue[0][3], FRAME_HEADERS);
+        assert!(conn.streams[stream].pending_response.is_some());
+        assert_eq!(conn.report.flow_control_blocked, 1);
+    }
+
+    #[test]
+    fn streaming_end_waits_for_outbound_queue_capacity_before_closing() {
+        let mut conn = unit_connection();
+        conn.limits.connection_outbound_queue_capacity = 1;
+        conn.write_queue.push_back(vec![0; FRAME_HEADER_LEN]);
+        conn.push_stream(ActiveStream::new(
+            1,
+            HeaderBlock::default(),
+            DEFAULT_WINDOW,
+            DEFAULT_WINDOW,
+            false,
+        ));
+        let stream = conn.find_stream(1).unwrap();
+        conn.streams[stream].response_trailers = Some(vec![0x88]);
+
+        let _ = conn.handle_stream_chunk(1, CallOutcome::Replied(ResponseChunkReply::Eof));
+
+        let stream = conn
+            .find_stream(1)
+            .expect("stream must stay open until END_STREAM is queued");
+        assert!(conn.streams[stream].response_pending_end.is_some());
+
+        conn.write_queue.clear();
+        conn.flush_pending_responses(&mut Vec::new()).unwrap();
+
+        assert!(conn.find_stream(1).is_none());
+        assert_eq!(conn.write_queue.len(), 1);
+        assert_eq!(conn.write_queue[0][3], FRAME_HEADERS);
+        assert_ne!(conn.write_queue[0][4] & FLAG_END_STREAM, 0);
     }
 
     #[test]

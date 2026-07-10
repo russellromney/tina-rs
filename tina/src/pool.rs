@@ -608,7 +608,7 @@ pub enum ReleaseFailure {
 
 /// Capability-based internals exposed for runtime pool implementations.
 ///
-/// [`PoolAuthority`] owns a process-unique [`PoolId`]. Its constructor does
+/// [`runtime_internal::PoolAuthority`] owns a process-unique [`PoolId`]. Its constructor does
 /// not accept caller-provided identity, so even code that can name this module
 /// cannot forge a lease that passes a different pool's identity check. A pool
 /// implementation keeps its authority private and uses it to mint the

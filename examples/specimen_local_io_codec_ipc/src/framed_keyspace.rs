@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex};
 use tina::{Address, Context, Effect, Isolate, Outbound, Shard, ShardId};
 use tina_codec::{DecodeStatus, LengthDelimitedFramer, LengthPrefix, decode_chunk, encode_into};
 use tina_runtime::{
-    RuntimeCall, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerId, UnixReadReply,
-    UnixStreamId, UnixWriteReply, unix_accept, unix_bind, unix_close_stream, unix_connect,
-    unix_read, unix_write,
+    LoopStep, RuntimeCall, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerId,
+    UnixReadReply, UnixStreamId, UnixWriteAll, UnixWriteOwnedReply, unix_accept, unix_bind,
+    unix_close_stream, unix_connect, unix_read,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -32,7 +32,7 @@ enum ServerMsg {
     Bound(UnixBindReply),
     Accepted(UnixAcceptReply),
     Read(UnixReadReply),
-    Wrote(UnixWriteReply),
+    Wrote(UnixWriteOwnedReply),
     Done,
 }
 
@@ -41,7 +41,7 @@ struct KeyspaceServer {
     listener: Option<UnixListenerId>,
     stream: Option<UnixStreamId>,
     framer: LengthDelimitedFramer,
-    write_pending: Vec<u8>,
+    write_all: Option<UnixWriteAll>,
     /// Echo store: tracks the bytes the server received frame-by-frame.
     received_frames: Arc<Mutex<Vec<Vec<u8>>>>,
     saw_full: Arc<Mutex<bool>>,
@@ -105,24 +105,28 @@ impl Isolate for KeyspaceServer {
                     if response_buf.is_empty() {
                         unix_read(self.stream.expect("stream"), 64).then(ServerMsg::Read)
                     } else {
-                        self.write_pending = response_buf.clone();
-                        unix_write(self.stream.expect("stream"), response_buf)
-                            .then(ServerMsg::Wrote)
+                        let mut write_all =
+                            UnixWriteAll::new(self.stream.expect("stream"), response_buf);
+                        let effect = write_all
+                            .next_effect(ServerMsg::Wrote)
+                            .expect("response buffer is non-empty");
+                        self.write_all = Some(write_all);
+                        effect
                     }
                 }
             }
             ServerMsg::Read(Err(_)) => Effect::Stop,
-            ServerMsg::Wrote(Ok(count)) => {
-                let drained = count.min(self.write_pending.len());
-                self.write_pending.drain(..drained);
-                if self.write_pending.is_empty() {
-                    unix_read(self.stream.expect("stream"), 64).then(ServerMsg::Read)
-                } else {
-                    let pending = self.write_pending.clone();
-                    unix_write(self.stream.expect("stream"), pending).then(ServerMsg::Wrote)
+            ServerMsg::Wrote(reply) => {
+                let write_all = self.write_all.as_mut().expect("write helper armed");
+                match write_all.advance::<Self, _, _>(reply, ServerMsg::Wrote) {
+                    LoopStep::Pending(effect) => effect,
+                    LoopStep::Done(_) => {
+                        self.write_all = None;
+                        unix_read(self.stream.expect("stream"), 64).then(ServerMsg::Read)
+                    }
+                    LoopStep::Failed(_) => Effect::Stop,
                 }
             }
-            ServerMsg::Wrote(Err(_)) => Effect::Stop,
             ServerMsg::Done => Effect::Stop,
         }
     }
@@ -132,7 +136,7 @@ impl Isolate for KeyspaceServer {
 enum ClientMsg {
     Start,
     Connected(UnixConnectReply),
-    Wrote(UnixWriteReply),
+    Wrote(UnixWriteOwnedReply),
     Read(UnixReadReply),
     Done,
 }
@@ -141,7 +145,7 @@ struct KeyspaceClient {
     path: PathBuf,
     stream: Option<UnixStreamId>,
     outbound: Vec<u8>,
-    write_pending: Vec<u8>,
+    write_all: Option<UnixWriteAll>,
     received: Arc<Mutex<Vec<u8>>>,
 }
 
@@ -164,29 +168,37 @@ impl Isolate for KeyspaceClient {
             ClientMsg::Start => unix_connect(self.path.clone()).then(ClientMsg::Connected),
             ClientMsg::Connected(Ok(stream)) => {
                 self.stream = Some(stream);
-                self.write_pending = std::mem::take(&mut self.outbound);
-                let bytes = self.write_pending.clone();
-                unix_write(stream, bytes).then(ClientMsg::Wrote)
+                let bytes = std::mem::take(&mut self.outbound);
+                if bytes.is_empty() {
+                    self.stream = None;
+                    return unix_close_stream(stream).then(|_| ClientMsg::Done);
+                }
+                let mut write_all = UnixWriteAll::new(stream, bytes);
+                let effect = write_all
+                    .next_effect(ClientMsg::Wrote)
+                    .expect("non-empty client payload has a write step");
+                self.write_all = Some(write_all);
+                effect
             }
             ClientMsg::Connected(Err(_)) => Effect::Stop,
-            ClientMsg::Wrote(Ok(count)) => {
-                let drained = count.min(self.write_pending.len());
-                self.write_pending.drain(..drained);
-                if self.write_pending.is_empty() {
-                    // Drive a single read for the first batch of
-                    // responses, then close. Closing after one read
-                    // keeps the smoke from deadlocking on a second
-                    // unwakeable read; the server sees EOF and exits
-                    // cleanly, and the test asserts on
-                    // `server_frames` (which the server populates
-                    // synchronously per parsed frame).
-                    unix_read(self.stream.expect("stream"), 256).then(ClientMsg::Read)
-                } else {
-                    let pending = self.write_pending.clone();
-                    unix_write(self.stream.expect("stream"), pending).then(ClientMsg::Wrote)
+            ClientMsg::Wrote(reply) => {
+                let write_all = self.write_all.as_mut().expect("write helper armed");
+                match write_all.advance::<Self, _, _>(reply, ClientMsg::Wrote) {
+                    LoopStep::Pending(effect) => effect,
+                    LoopStep::Done(_) => {
+                        self.write_all = None;
+                        // Drive a single read for the first batch of
+                        // responses, then close. Closing after one read
+                        // keeps the smoke from deadlocking on a second
+                        // unwakeable read; the server sees EOF and exits
+                        // cleanly, and the test asserts on
+                        // `server_frames` (which the server populates
+                        // synchronously per parsed frame).
+                        unix_read(self.stream.expect("stream"), 256).then(ClientMsg::Read)
+                    }
+                    LoopStep::Failed(_) => Effect::Stop,
                 }
             }
-            ClientMsg::Wrote(Err(_)) => Effect::Stop,
             ClientMsg::Read(Ok(bytes)) => {
                 if !bytes.is_empty() {
                     self.received.lock().unwrap().extend_from_slice(&bytes);
@@ -220,7 +232,7 @@ pub fn run_framed_keyspace(path: PathBuf, frames: &[&[u8]], max_body_len: usize)
         listener: None,
         stream: None,
         framer: LengthDelimitedFramer::new(LengthPrefix::U16, max_body_len),
-        write_pending: Vec::new(),
+        write_all: None,
         received_frames: Arc::clone(&received_frames),
         saw_full: Arc::clone(&saw_full),
     };
@@ -233,7 +245,7 @@ pub fn run_framed_keyspace(path: PathBuf, frames: &[&[u8]], max_body_len: usize)
         path,
         stream: None,
         outbound,
-        write_pending: Vec::new(),
+        write_all: None,
         received: Arc::clone(&client_received),
     };
     let client_addr: Address<ClientMsg, ()> = sim.register(client);
@@ -286,7 +298,7 @@ pub fn bad_input_frame_too_large() -> SpecimenReport {
         listener: None,
         stream: None,
         framer: LengthDelimitedFramer::new(LengthPrefix::U16, 16),
-        write_pending: Vec::new(),
+        write_all: None,
         received_frames: Arc::clone(&received_frames),
         saw_full: Arc::clone(&saw_full),
     };
@@ -295,7 +307,7 @@ pub fn bad_input_frame_too_large() -> SpecimenReport {
         path,
         stream: None,
         outbound: frames[0].to_vec(),
-        write_pending: Vec::new(),
+        write_all: None,
         received: Arc::clone(&client_received),
     };
     let client_addr: Address<ClientMsg, ()> = sim.register(client);
@@ -326,5 +338,13 @@ mod tests {
         );
         assert_eq!(result.server_frames, [b"abcd".to_vec(), b"x".to_vec()]);
         assert!(!result.server_saw_full_or_malformed);
+    }
+
+    #[test]
+    fn empty_frame_batch_does_not_arm_an_empty_write() {
+        let result =
+            run_framed_keyspace(PathBuf::from("/tmp/specimen_keyspace_empty.sock"), &[], 4);
+        assert!(result.server_frames.is_empty());
+        assert!(result.client_bytes.is_empty());
     }
 }

@@ -476,6 +476,24 @@ pub(crate) struct PendingUnixRead {
     pub(crate) max_len: usize,
 }
 
+/// Buffer retained for a Unix write parked on full peer inbound capacity.
+#[derive(Debug)]
+pub(crate) enum PendingUnixWriteBuffer {
+    Raw(Vec<u8>),
+    Owned { bytes: Vec<u8>, start: usize },
+}
+
+/// Park record for a Unix write waiting for its peer to drain inbound bytes.
+/// The per-stream write resource lane permits at most one such record for a
+/// source stream.
+#[derive(Debug)]
+pub(crate) struct PendingUnixWrite {
+    pub(crate) call_id: CallId,
+    pub(crate) stream: tina_runtime::UnixStreamId,
+    pub(crate) peer: tina_runtime::UnixStreamId,
+    pub(crate) buffer: PendingUnixWriteBuffer,
+}
+
 #[derive(Debug)]
 pub(crate) struct FileState {
     pub(crate) id: tina_runtime::FileId,
