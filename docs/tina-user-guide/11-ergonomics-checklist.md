@@ -1,15 +1,13 @@
 # Ergonomics Checklist
 
-Phases 047, 048, 052, and 058 retired most of the hand-rolled
-boilerplate that early Specimen examples carried. This page lists the
-primitives you should reach for when writing a new Tina program,
-example, or test.
+This page lists the primitives to reach for when writing a new Tina program or
+test. It describes the current public shape, not the history that produced it.
 
 If you're reading older code that does not use these, treat that as
 debt rather than precedent.
 
-This page is the "use this, not that" checklist for new code. Live paper cuts
-belong in `examples/FINDINGS.md` or a focused design note, not in the user guide.
+This is the "use this, not that" checklist for new code. The R&D specimen
+corpus and its findings ledger remain development inputs, not user docs.
 
 ## Use this, not that
 
@@ -148,28 +146,34 @@ re-executed.
 Do not invent ad-hoc `armed_tick: Option<u64>` token state in every
 batcher.
 
-### Isolate-local in-flight permits
+### Isolate-local concurrency limits
 
-Use `tina_runtime::LocalPermitGate` for "this isolate admitted local work
+Use `tina_runtime::ConcurrencyLimit` for "this isolate admitted local work
 that has not settled yet":
 
 ```rust
-match self.gate.try_admit() {
-    Ok(permit) => call_ctx.defer(work).reply(move |req, result|
+match self.limit.try_admit() {
+    AdmissionDecision::Admitted(permit) => call_ctx.defer(work).reply(move |req, result|
         Msg::Done { permit, req, result }),
-    Err(full) => call_ctx.reply(Reply::Busy(full.report())),
+    AdmissionDecision::Full(report) => call_ctx.reply(Reply::Busy(report)),
+    other => call_ctx.reply(Reply::Unavailable(
+        other.report().expect("non-admitted decisions carry a report").clone(),
+    )),
 }
 ```
 
-The permit is move-only; release it via `gate.release(permit)` (records a
-completion) or `gate.retire(permit)` (records an explicit abandon). Stale
-or unknown release returns `LocalPermitReleaseError::StaleOrUnknown`.
-`Drop` does not silently release: the gate stays charged for the slot
-and the process-wide `tina_runtime::dropped_permit_count()` increments.
+The `ConcurrencyPermit` is move-only; release it via `limit.release(permit)`
+or explicitly abandon it via `limit.retire(permit)`. Permits carry a
+process-unique gate identity, so releasing one against a different
+`ConcurrencyLimit` returns `ConcurrencyReleaseError::WrongGate` without
+changing either limit.
 
 Do not invent per-service `in_flight: usize` plus `cap: usize` shapes.
 A pool is something else: it leases a resource across handlers and has
-waiter semantics. `LocalPermitGate` is not that.
+waiter semantics. `ConcurrencyLimit` is admission policy, not a pool.
+
+`LocalPermitGate` is the lower-level mechanism beneath this policy. Do not use
+it as the default application-facing API.
 
 ### Drain state
 
@@ -1041,25 +1045,15 @@ continuations," not just incoming. Common diagnoses live in
 `CallCompletionRejected { MailboxFull }` and `SendRejected { Full }`
 trace events.
 
-### Examples
-
-Use examples as specimens: readable `tokio_impl.rs` and
-`tina_impl.rs`, smoke tests only, README discussion. Exact invariants
-live in crate tests.
-
 ## When in doubt
 
-- Read [`examples/specimen_rpc/src/tina_impl.rs`](../../examples/specimen_rpc/src/tina_impl.rs)
-  as a current-shape reference.
-- Read [`examples/FINDINGS.md`](../../examples/FINDINGS.md) for the
-  history of why these primitives exist.
-- Read the per-comparison `README.md` for any specimen-specific
-  notes.
+- Start with [`tina-runtime/examples/hello_world.rs`](../../tina-runtime/examples/hello_world.rs).
+- Use the focused chapter linked from the checklist entry.
+- Treat repository-root specimens as R&D evidence, not stable templates.
 
 ## Adding to this checklist
 
-If a new ergonomics primitive lands, add a "Use this, not that"
-entry here, link the deep-dive doc if there is one, and remove or mark the
-matching paper cut in `examples/FINDINGS.md` or the matching design note.
+If a new ergonomics primitive lands, add a "Use this, not that" entry here and
+link the deep-dive doc if there is one.
 
 Keep entries one paragraph. Detail goes in the deep-dive doc.

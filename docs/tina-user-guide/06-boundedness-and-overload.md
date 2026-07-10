@@ -366,8 +366,8 @@ use tina_runtime::{
 
 Three policies, one decision shape:
 
-- `ConcurrencyLimit` — fixed-cap local concurrency. Thin wrapper over
-  `LocalPermitGate`. Returns a move-only `Permit`.
+- `ConcurrencyLimit` — fixed-cap local concurrency. Returns a move-only,
+  gate-identified `ConcurrencyPermit`.
 - `KeyedLimit<K>` — fixed-cap per-key concurrency. Move-only
   `KeyedPermit<K>`. Per-key storage is a `Vec<Option<...>>`; nothing
   grows.
@@ -402,12 +402,12 @@ Rules the layer keeps:
   `summary.any_full()` stays honest for admission surfaces.
 - **Fixed-capacity per-key storage.** No growing `HashMap`. A new key
   finds a free slot or sees `Full(report)` — never silent eviction.
-- **Move-only proofs.** `Permit` / `KeyedPermit` cannot be released
+- **Move-only proofs.** `ConcurrencyPermit` / `KeyedPermit` cannot be released
   twice. The compile-fail tests prove it.
 
-`examples/systems/system_tenant_rate_limiter` is the copied path: one
-gateway, one `RateLimit<TenantId>`, hot/cold tenants, and a
-`retry_after` that is byte-identical across runs.
+`examples/systems/system_tenant_rate_limiter` is the R&D proof: one gateway,
+one `RateLimit<TenantId>`, hot/cold tenants, and a `retry_after` that is
+byte-identical across runs.
 
 ## Shared Weighted Budgets
 

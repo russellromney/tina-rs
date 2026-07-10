@@ -17,8 +17,7 @@
 #   - tina-codec / tina-rpc / tina-rpc-macros / tina-macros / tina-tracing carry
 #     no shared-memory primitive at all (verified by the same grep).
 #   - Bridges (tokio/tower/reqwest/sqlite/sqlx/aws/rpc-tokio) are the explicitly
-#     different trusted-edge boundary where Tina meets SDK queues/threads
-#     (`.intent/SYSTEM.md` bridge posture).
+#     different trusted-edge boundary where Tina meets SDK queues/threads.
 #   - tina-proof-harness uses atomics but is test/proof tooling, not the shipped
 #     semantic core (like examples and tests). Add it to CORE_SRC in the guard if
 #     that ever changes.

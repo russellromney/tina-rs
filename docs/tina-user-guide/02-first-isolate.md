@@ -35,13 +35,17 @@ Make the isolate.
 ```rust
 #[tina::isolate(message = CounterMsg, reply = u64, shard = AppShard)]
 impl Counter {
-    fn handle(&mut self, msg: CounterMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: CounterMsg,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CounterMsg::Add(n) => {
                 self.value += n;
                 noop()
             }
-            CounterMsg::Read => reply(self.value),
+            CounterMsg::Read => noop(),
         }
     }
 }
@@ -51,14 +55,13 @@ That is the core.
 
 `Add` mutates owned state.
 
-`Read` replies.
+`Read` is reserved for the call handler in the complete program below. An
+event handler cannot assume that a fire-and-forget message has a caller.
 
 No task. No async trait. No shared state.
 
-This first sketch replies straight from `handle` to show the shape. A
-fire-and-forget send has no caller to answer, though, so in the runnable
-program at the end of the chapter `Read` replies from `handle_call` — where a
-blocking `call` carries a caller. Same split, spelled out below.
+The runnable program at the end of the chapter replies from `handle_call`,
+where a blocking call carries caller authority.
 
 ## Effect Types
 

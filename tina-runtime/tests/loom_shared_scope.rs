@@ -5,7 +5,7 @@
 //! `SharedCapacityScope` is public, `Clone`, and `Arc`-backed, so the type
 //! can cross threads even though the intended pattern is shard-local. That
 //! makes its reserve/release CAS loops part of the verified shared-memory
-//! race surface (`.intent/SYSTEM.md` "Shared-memory race surface"). These
+//! race surface inventoried in `.intent/race-surface-allowlist.txt`. These
 //! models let loom permute every legal interleaving of two contending
 //! admitters/releasers — at weight 1 and at weights > 1 — and check the safety
 //! invariants the std stress test can only sample:

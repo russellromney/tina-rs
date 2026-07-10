@@ -63,7 +63,7 @@ outbound full counters, high-water counts, close flags, and lifecycle state.
 There is no hidden reconnect or unbounded background stream: inbound reads are
 armed by a caller's `Receive` pull, except for the initial handshake.
 
-## Copy Path
+## R&D Reference
 
 The production-shaped specimen is:
 
@@ -71,11 +71,11 @@ The production-shaped specimen is:
 cargo test --manifest-path examples/specimen_websocket_room/Cargo.toml
 ```
 
-Copy from `examples/specimen_websocket_room/src/lib.rs` when you need a
-small multi-client room with bounded member storage, Origin/auth/subprotocol
-admission, send outcomes, slow-peer policy, stale-handle proof, app-level
-shutdown, health/readiness endpoints, report endpoint, browser `ws://` and
-`wss://` smoke page, and fill-close-refill capacity proof.
+The specimen exercises a small multi-client room with bounded member storage,
+Origin/auth/subprotocol admission, send outcomes, slow-peer policy,
+stale-handle proof, app-level shutdown, health/readiness endpoints, a report
+endpoint, browser `ws://` and `wss://` smoke paths, and fill-close-refill
+capacity proof. Treat it as implementation evidence, not a stable template.
 
 ## Upgrade
 

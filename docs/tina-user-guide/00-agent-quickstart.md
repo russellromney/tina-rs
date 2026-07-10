@@ -27,10 +27,10 @@ use tina::prelude::*;
 use tina_runtime::{call, sleep, tcp_read, tcp_write, CallError, CallOutcome};
 ```
 
-The effect constructors (`noop`, `reply`, `send`, `stop`, `batch`, `spawn`)
-come with `tina::prelude::*`; the runtime calls (`call`, `sleep`, `tcp_*`)
-come from `tina_runtime`. Names move sometimes. The shape matters more than
-the exact path.
+The effect constructors (`noop`, `send`, `stop`, `batch`, `spawn`) come with
+`tina::prelude::*`; the runtime calls (`call`, `sleep`, `tcp_*`) come from
+`tina_runtime`. Replies consume caller authority through `CallContext`,
+`RequestCall`, or a captured `RequestContext`.
 
 ## First Shape To Reach For
 
@@ -55,27 +55,23 @@ impl Worker {
 }
 ```
 
-## First Service To Copy
+## First Program To Run
 
-For an HTTP service with state, DB work, outbound HTTP, readiness, shutdown,
-capacity, and a live-replay fact, copy:
+Start with the complete program used by the root README:
 
 ```text
-examples/systems/mini_saas_api
+tina-runtime/examples/hello_world.rs
 ```
 
 Run it from the repo root:
 
 ```sh
-cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml
-cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- smoke
-cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- pressure
+cargo run --locked -p tina-runtime --example hello_world
 ```
 
-The route to study first is `POST /items/{id}/notify`: it starts from
-`call_ctx.defer(...).reply(...)`, does SQLite work, acquires a native keepalive
-pool lease, calls an upstream HTTP service, releases the lease, and only then
-replies to the original HTTP caller.
+The repository-root `examples/` tree is an R&D specimen corpus. Consult it when
+investigating a specific service shape, but do not treat every specimen as a
+blessed user template.
 
 ## Request Reply Shape
 
@@ -86,11 +82,17 @@ call(worker, WorkerMsg::Run(job), Duration::from_millis(50))
     .then(ClientMsg::WorkerReturned)
 ```
 
-Worker:
+Worker call handler:
 
 ```rust
-match msg {
-    WorkerMsg::Run(job) => reply(self.run(job)),
+fn handle_call(
+    &mut self,
+    msg: WorkerMsg,
+    call: CallContext<'_, Self>,
+) -> Effect<Self> {
+    match msg {
+        WorkerMsg::Run(job) => call.reply(self.run(job)),
+    }
 }
 ```
 
@@ -131,12 +133,13 @@ Save it as a `ReplayCase` in `tina_sim::dst`. The case is plain
 Rust data: name, seed, full `SimulatorConfig`, declared mailbox
 capacities, history, pinned event count, pinned `stable_trace_hash`.
 
-Then write one `#[test]` calling `assert_replay_case(&case(),
-run_case)`. Same seed, same story. Saved seed, saved bug.
+Then write one `#[test]` calling `assert_replay_case(&case(), run_case)`.
+Replay identity includes the simulator version, complete config, initial state,
+and materialized history. The seed affects only perturbation axes enabled in
+the config; changing a seed with every axis disabled normally changes nothing.
 
 Sweep seeds with `sweep_seeds`. Shrink the failing history with
 `shrink_replay_case`. Both helpers return pasteable output.
 
-Do not roll a per-test `Report` struct or hand-rolled fingerprint
-comparison. See the [Simulation And DST](08-simulation-and-dst.md)
-chapter and `examples/specimen_replay_dst` for the copyable shape.
+Do not use an event count or trace hash as the only business assertion. See the
+[Simulation And DST](08-simulation-and-dst.md) chapter for the full workflow.

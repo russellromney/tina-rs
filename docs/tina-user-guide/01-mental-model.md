@@ -72,7 +72,18 @@ fn handle(&mut self, msg: Msg, ctx: &mut Context<'_, AppShard>) -> Effect<Self> 
     match msg {
         Msg::A => noop(),
         Msg::B => send(self.other, OtherMsg::B),
-        Msg::C => reply(42),
+        Msg::C => stop(),
+    }
+}
+```
+
+Calls use a call handler so caller authority is visible:
+
+```rust
+fn handle_call(&mut self, msg: Msg, call: CallContext<'_, Self>) -> Effect<Self> {
+    match msg {
+        Msg::Read => call.reply(self.value),
+        _ => call.reject(CallRejectedReason::UnsupportedMessage),
     }
 }
 ```

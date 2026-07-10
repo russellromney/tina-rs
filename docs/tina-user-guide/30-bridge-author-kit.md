@@ -201,7 +201,7 @@ When you write the next bridge, prove these in one hermetic test file:
 ## Worked example
 
 The reqwest bridge is the smallest end-to-end copy of this kit. Read
-[`tina-reqwest-bridge/README.md`](../../tina-reqwest-bridge/README.md)
+[`tina-reqwest-bridge` crate documentation](../../tina-reqwest-bridge/src/lib.rs)
 for the non-AWS shape, then [`tina-aws-bridge`](../../tina-aws-bridge/)
 for the multi-service AWS shape.
 

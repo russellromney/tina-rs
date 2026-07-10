@@ -2,8 +2,11 @@
 
 Start here:
 
-- [Agent Quickstart](tina-user-guide/00-agent-quickstart.md)
+- [First Isolate](tina-user-guide/02-first-isolate.md) — the smallest complete
+  program and the core handler/runtime loop
 - [Tina User Guide](tina-user-guide/README.md)
+- [Agent Quickstart](tina-user-guide/00-agent-quickstart.md) — a compact
+  implementation checklist for coding agents and experienced contributors
 - [Core And Batteries](tina-user-guide/23-core-and-batteries.md) — where the
   Tina core ends and the blessed batteries begin
 - [Battery Authoring Checklist](tina-user-guide/24-battery-authoring.md) —
@@ -15,9 +18,8 @@ Start here:
 - [Resource Owner Matrix](resource-owner-matrix.md) — who owns the
   close/drain/force/report path for each long-lived resource kind
 
-The guide is intentionally practical and grug-first. It is for humans and LLM
-sessions that need to build with Tina without rediscovering the model by
-digging through examples.
+The guide is practical and model-first. It explains the current public shape
+without requiring readers to reverse-engineer the R&D specimen corpus.
 
 The docs explain the current user-facing shape for isolates, effects, runtime
 calls, request/reply continuations, service topology, boundedness, supervision,

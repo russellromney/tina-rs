@@ -7,11 +7,13 @@ Common effects:
 ```rust
 noop()
 send(addr, msg)
-reply(value)
 stop()
 batch(vec![effect_a, effect_b])
 spawn(child_definition)
 ```
+
+Reply effects consume visible caller authority: use `call.reply(value)` for
+the current call or `reply_to(request, value)` for a captured deferred request.
 
 Runtime effects are for time, network, storage, process, DNS, TLS, and signals.
 

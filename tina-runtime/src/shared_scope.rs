@@ -49,8 +49,8 @@ use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 // loom model (`tests/loom_shared_scope.rs`) can explore every legal
 // interleaving of the lock-free reserve/release CAS loops. The shipped
 // build keeps the std types; only this module swaps, because it is the
-// only cross-thread CAS surface in the runtime crate. See
-// `.intent/SYSTEM.md` "Shared-memory race surface".
+// only cross-thread CAS surface in the runtime crate. The reviewed surface and
+// loom-model location are inventoried in `.intent/race-surface-allowlist.txt`.
 #[cfg(feature = "loom")]
 mod sync {
     pub(crate) use loom::sync::Arc;
