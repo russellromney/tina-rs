@@ -181,23 +181,30 @@ verify-guards: loom race-surface-guard rail-inventory-guard
 # (plus a per-platform `clippy`) as parallel jobs instead of this target.
 verify: verify-static clippy test verify-guards
 
-# Packaging-readiness smoke check: `cargo package` fails outright if any
-# workspace crate has a `path`-only internal dependency (no `version =`) or
-# missing publish metadata (description/license/repository) -- see the
-# crates.io 0.1.0 packaging-readiness work. --no-verify skips the build (that's
-# already covered by `test`/`clippy`); this only proves the manifest packages.
+# Packaging-readiness smoke check for the crates.io 0.1.0 prep. Two parts:
 #
-# Only the crates below can run this today: any crate that depends on
-# tina-runtime (directly or transitively) pulls in the vendored
-# ../vendor-betelgeuse path dependency, which has no published version to
-# fall back to, so `cargo package` on it fails with "no matching package"
-# regardless of manifest correctness (tracked as the open Betelgeuse
-# question). And even among these, a crate that depends on another workspace
-# crate can only pass once that dependency is actually live on crates.io at
-# the required version -- that's inherent to first-time interdependent
-# releases, not a bug here. tina-macros, tina-rpc-macros, and tina-codec have
-# zero internal dependencies, so they package cleanly with no prerequisite.
+# 1. `cargo package --no-verify` on the crates that can package today. This
+#    proves the manifest packages AND fails outright on a versionless
+#    `path`-only internal dependency ("all dependencies must have a version
+#    requirement specified when packaging"). --no-verify skips the build
+#    (already covered by `test`/`clippy`). Only these three run: any crate
+#    that depends on tina-runtime (directly or transitively) pulls in the
+#    vendored ../vendor-betelgeuse path dependency, which has no published
+#    version to fall back to, so `cargo package` on it fails regardless of
+#    manifest correctness (the open Betelgeuse question). And even among
+#    publishable crates, one that depends on another workspace crate can only
+#    pass once that dependency is live on crates.io -- inherent to first-time
+#    interdependent releases. tina-macros, tina-rpc-macros, and tina-codec
+#    have zero internal dependencies, so they package with no prerequisite.
+#
+# 2. `packaging_metadata_guard.sh` backstops the two things `cargo package`
+#    does NOT catch: a missing description/license/repository (cargo only
+#    WARNS, exit 0) and a versionless path dep in a crate that can't package
+#    at all (never reached by part 1). It asserts both across every workspace
+#    crate. Without it, a crate could lose its publish metadata and this job
+#    would stay green.
 verify-packaging:
 	cargo package --allow-dirty --no-verify -p tina-macros
 	cargo package --allow-dirty --no-verify -p tina-rpc-macros
 	cargo package --allow-dirty --no-verify -p tina-codec
+	bash scripts/packaging_metadata_guard.sh
