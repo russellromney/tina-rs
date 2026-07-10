@@ -50,7 +50,7 @@ fn main() {
 
     let rejected = match runtime.try_send(worker, Job::Run(3)) {
         Err(TrySendError::Full(job)) => {
-            println!("mailbox full; retaining {job:?}");
+            println!("send {job:?} -> Full({job:?}); caller retains the job");
             job
         }
         other => panic!("expected typed Full, got {other:?}"),

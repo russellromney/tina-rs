@@ -38,7 +38,7 @@ frees capacity, the same job can be retried. Once the worker stops, later sends
 return typed `Closed`.
 
 ```text
-mailbox full; retaining Run(3)
+send Run(3) -> Full(Run(3)); caller retains the job
 processed job=1
 processed job=2
 processed job=3
@@ -91,7 +91,7 @@ fn main() {
 
     let rejected = match runtime.try_send(worker, Job::Run(3)) {
         Err(TrySendError::Full(job)) => {
-            println!("mailbox full; retaining {job:?}");
+            println!("send {job:?} -> Full({job:?}); caller retains the job");
             job
         }
         other => panic!("expected typed Full, got {other:?}"),
