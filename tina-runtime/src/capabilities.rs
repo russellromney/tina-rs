@@ -2,8 +2,8 @@
 //! must, must-not, may, or doesn't claim to provide.
 
 use crate::driver::{
-    DEFAULT_DNS_LANE_CAPACITY, DEFAULT_PROCESS_LANE_CAPACITY, DEFAULT_SIGNAL_CAPACITY,
-    DEFAULT_TLS_LANE_CAPACITY,
+    DEFAULT_DNS_LANE_CAPACITY, DEFAULT_DRIVER_TIMER_CAPACITY, DEFAULT_PROCESS_LANE_CAPACITY,
+    DEFAULT_SIGNAL_CAPACITY, DEFAULT_TLS_LANE_CAPACITY,
 };
 use crate::persistence::{LOCAL_PERSISTENCE_SUPPORT, PersistenceSupportLevel};
 
@@ -255,6 +255,7 @@ impl RuntimeCapabilities {
             DEFAULT_TLS_LANE_CAPACITY,
             DEFAULT_PROCESS_LANE_CAPACITY,
             DEFAULT_SIGNAL_CAPACITY,
+            DEFAULT_DRIVER_TIMER_CAPACITY,
         )
     }
 
@@ -265,6 +266,7 @@ impl RuntimeCapabilities {
         tls_lane_capacity: usize,
         process_lane_capacity: usize,
         signal_capacity: usize,
+        timer_capacity: usize,
     ) -> Self {
         Self {
             timers: ResourceCapability::new(
@@ -272,7 +274,7 @@ impl RuntimeCapabilities {
                 ResourceExecutionShape::Inline,
                 CancellationSupport::CancelableBeforeStart,
                 ShutdownSupport::Canceled,
-                None,
+                Some(timer_capacity),
             ),
             tcp: ResourceCapability::new(
                 ResourceSupport::Supported,

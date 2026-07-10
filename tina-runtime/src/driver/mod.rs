@@ -28,6 +28,7 @@
 //!   shutdown was clean.
 //!
 use std::alloc::Global;
+use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::path::PathBuf;
@@ -76,7 +77,6 @@ use tcp::BetelgeuseTcp;
 use tls::TlsLane;
 use unix::UnixLane;
 
-const INITIAL_DRIVER_TIMER_CAPACITY: usize = 8;
 const INITIAL_DRIVER_RESOURCE_CAPACITY: usize = 4;
 const INITIAL_DRIVER_PENDING_CAPACITY: usize = 8;
 pub(crate) const DEFAULT_STORAGE_LANE_CAPACITY: usize = 64;
@@ -84,6 +84,16 @@ pub(crate) const DEFAULT_DNS_LANE_CAPACITY: usize = 16;
 pub(crate) const DEFAULT_TLS_LANE_CAPACITY: usize = 64;
 pub(crate) const DEFAULT_PROCESS_LANE_CAPACITY: usize = 16;
 pub(crate) const DEFAULT_SIGNAL_CAPACITY: usize = 64;
+/// Generous default cap on concurrently armed runtime timers per shard. Timer
+/// admission is bounded so a runaway isolate cannot grow the timer lane without
+/// limit; a full lane refuses the arm with [`CallError::TimerFull`] instead.
+/// Generous enough that healthy workloads never see it.
+pub(crate) const DEFAULT_DRIVER_TIMER_CAPACITY: usize = 262_144;
+/// Max due timers a single `advance` harvests into the completion carry before
+/// yielding the shard. A synchronized batch larger than this fires across
+/// several ticks (deterministic order preserved) rather than monopolising one
+/// advance. Generous so a normal warm turn drains all its due timers at once.
+pub(crate) const DEFAULT_TIMER_HARVEST_BUDGET: usize = 1_024;
 
 /// Runtime-owned substrate driver.
 ///
@@ -219,18 +229,29 @@ pub(crate) struct BetelgeuseDriver {
     unix: UnixLane,
     signals: Vec<SignalWaitEntry>,
     signal_capacity: usize,
-    timers: Vec<TimerEntry>,
+    /// Pending timers keyed by `(deadline, insertion_order)` so the earliest
+    /// due timer is `first_key_value` in O(log n) — no linear scan. The
+    /// `insertion_order` tie-break preserves the exact same-deadline pop order
+    /// the old linear `min_by(deadline, insertion_order)` scan produced: equal
+    /// deadlines fire in submission (FIFO) order. Newly armed timers always
+    /// have `deadline >= now` and a strictly larger `insertion_order`, so they
+    /// can never sort ahead of an already-due timer — which is why budgeted
+    /// harvesting yields byte-identical delivery order to the old all-at-once
+    /// harvest.
+    timers: BTreeMap<TimerKey, CallId>,
     next_timer_ordinal: u64,
+    /// Bounded admission: refuse a new arm once this many timers are pending.
+    timer_capacity: usize,
+    /// Bounded per-advance harvest work (see [`DEFAULT_TIMER_HARVEST_BUDGET`]).
+    timer_harvest_budget: usize,
     os_signals: OsSignalDispatcher,
 }
 
-/// One pending timer tracked by the driver.
-#[derive(Debug)]
-struct TimerEntry {
-    call_id: CallId,
-    deadline: Instant,
-    insertion_order: u64,
-}
+/// Ordered timer key: earliest `deadline` first, then earliest
+/// `insertion_order` (submission FIFO) for equal deadlines. `Instant` and `u64`
+/// are both `Ord`, and `insertion_order` is a per-driver monotonic counter, so
+/// every key is unique and totally ordered.
+type TimerKey = (Instant, u64);
 
 /// One completion the driver produced during [`RuntimeDriver::advance`].
 #[derive(Debug)]
@@ -262,8 +283,10 @@ impl BetelgeuseDriver {
                 DEFAULT_SIGNAL_CAPACITY.min(INITIAL_DRIVER_PENDING_CAPACITY),
             ),
             signal_capacity: DEFAULT_SIGNAL_CAPACITY,
-            timers: Vec::with_capacity(INITIAL_DRIVER_TIMER_CAPACITY),
+            timers: BTreeMap::new(),
             next_timer_ordinal: 0,
+            timer_capacity: DEFAULT_DRIVER_TIMER_CAPACITY,
+            timer_harvest_budget: DEFAULT_TIMER_HARVEST_BUDGET,
             os_signals: OsSignalDispatcher::install(),
         }
     }
@@ -275,6 +298,7 @@ impl BetelgeuseDriver {
         tls_lane_capacity: usize,
         process_lane_capacity: usize,
         signal_capacity: usize,
+        timer_capacity: usize,
     ) -> Self {
         Self {
             tls: TlsLane::new(tls_lane_capacity, io_loop.clone()),
@@ -285,8 +309,10 @@ impl BetelgeuseDriver {
             process: ProcessLane::new(process_lane_capacity),
             signals: Vec::with_capacity(signal_capacity.min(INITIAL_DRIVER_PENDING_CAPACITY)),
             signal_capacity,
-            timers: Vec::with_capacity(INITIAL_DRIVER_TIMER_CAPACITY),
+            timers: BTreeMap::new(),
             next_timer_ordinal: 0,
+            timer_capacity,
+            timer_harvest_budget: DEFAULT_TIMER_HARVEST_BUDGET,
             os_signals: OsSignalDispatcher::install(),
         }
     }
@@ -301,13 +327,17 @@ impl RuntimeDriver for BetelgeuseDriver {
     ) -> Option<DriverCompletion> {
         match request {
             CallInput::Sleep { after } => {
+                // Bounded admission: a full timer lane refuses the arm with a
+                // typed overload outcome rather than growing without bound.
+                if self.timers.len() >= self.timer_capacity {
+                    return Some(DriverCompletion {
+                        call_id,
+                        result: CallOutput::Failed(CallError::TimerFull),
+                    });
+                }
                 let insertion_order = self.next_timer_ordinal;
                 self.next_timer_ordinal += 1;
-                self.timers.push(TimerEntry {
-                    call_id,
-                    deadline: now + after,
-                    insertion_order,
-                });
+                self.timers.insert((now + after, insertion_order), call_id);
                 None
             }
             CallInput::SnapshotCommit {
@@ -514,7 +544,7 @@ impl RuntimeDriver for BetelgeuseDriver {
 
     fn cancel(&mut self, call_id: CallId) -> bool {
         let before = self.timers.len();
-        self.timers.retain(|entry| entry.call_id != call_id);
+        self.timers.retain(|_, entry| *entry != call_id);
         let signal_before = self.signals.len();
         self.signals.retain(|entry| entry.call_id != call_id);
         before != self.timers.len()
@@ -650,23 +680,27 @@ impl BetelgeuseDriver {
     }
 
     fn harvest_timers(&mut self, now: Instant, completed: &mut Vec<DriverCompletion>) {
-        while let Some(index) = self
-            .timers
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.deadline <= now)
-            .min_by(|(_, left), (_, right)| {
-                left.deadline
-                    .cmp(&right.deadline)
-                    .then_with(|| left.insertion_order.cmp(&right.insertion_order))
-            })
-            .map(|(index, _)| index)
-        {
-            let entry = self.timers.remove(index);
+        // Fire due timers in `(deadline, insertion_order)` order, at most
+        // `timer_harvest_budget` per advance. The map is ordered, so the front
+        // entry is always the globally-earliest due timer; a synchronized batch
+        // larger than the budget simply fires its tail on the next advance.
+        // Delivery order is byte-identical to the old all-at-once harvest: a
+        // timer armed after this batch has `deadline >= now` and a larger
+        // `insertion_order`, so it can never sort ahead of an already-due timer.
+        let mut fired = 0;
+        while fired < self.timer_harvest_budget {
+            let Some((&key, &call_id)) = self.timers.first_key_value() else {
+                break;
+            };
+            if key.0 > now {
+                break;
+            }
+            self.timers.remove(&key);
             completed.push(DriverCompletion {
-                call_id: entry.call_id,
+                call_id,
                 result: CallOutput::TimerFired,
             });
+            fired += 1;
         }
     }
 }
@@ -1174,6 +1208,139 @@ mod tests {
         assert_eq!(report.owned_resource_count(), 0);
         assert_eq!(report.worker_held_resource_count(), 0);
         assert_eq!(report.pending_driver_call_count(), 1);
+    }
+
+    // Runs a full budgeted harvest of `n` synchronized (equal-deadline) timers
+    // with harvest budget `budget`, returning the call-id sequence fired across
+    // all ticks plus the per-tick counts.
+    fn drain_synchronized_batch(n: u64, budget: usize) -> (Vec<u64>, Vec<usize>) {
+        let io_loop = io_loop(Global).expect("init io loop");
+        let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+        driver.timer_harvest_budget = budget;
+        let now = Instant::now();
+        for i in 0..n {
+            assert!(
+                driver
+                    .submit(
+                        CallId::new(i),
+                        CallInput::Sleep {
+                            after: Duration::ZERO
+                        },
+                        now
+                    )
+                    .is_none(),
+                "arming a timer under capacity must not complete inline"
+            );
+        }
+        let harvest_at = now + Duration::from_millis(1);
+        let mut fired = Vec::new();
+        let mut per_tick = Vec::new();
+        let mut ticks = 0u64;
+        while !driver.timers.is_empty() {
+            let mut completed = Vec::new();
+            driver.harvest_timers(harvest_at, &mut completed);
+            per_tick.push(completed.len());
+            for completion in &completed {
+                assert!(matches!(completion.result, CallOutput::TimerFired));
+                fired.push(completion.call_id.get());
+            }
+            ticks += 1;
+            assert!(ticks <= n + 1, "harvest made no progress");
+        }
+        (fired, per_tick)
+    }
+
+    #[test]
+    fn synchronized_timer_batch_harvests_within_budget_and_all_fire_in_order() {
+        let n = 30u64;
+        let budget = 4usize;
+        let (fired, per_tick) = drain_synchronized_batch(n, budget);
+
+        // Every tick honours the budget, and non-final ticks fill it. This is
+        // the load-bearing budget assertion: revert to an unbudgeted harvest
+        // (fire all due at once) and a single tick fires all 30 -> fails here.
+        assert!(
+            per_tick.iter().all(|&count| count <= budget),
+            "a tick exceeded the harvest budget: {per_tick:?}"
+        );
+        assert!(
+            per_tick.len() > 1,
+            "budget did not spread the synchronized batch across ticks: {per_tick:?}"
+        );
+        if let Some((_last, leading)) = per_tick.split_last() {
+            assert!(
+                leading.iter().all(|&count| count == budget),
+                "a non-final tick did not fill the budget: {per_tick:?}"
+            );
+        }
+
+        // All timers eventually fire, in submission (FIFO) order because their
+        // deadlines are equal.
+        let expected: Vec<u64> = (0..n).collect();
+        assert_eq!(fired, expected, "not every timer fired, or order changed");
+
+        // Same config -> identical sequence on a second independent run.
+        let (fired_again, _) = drain_synchronized_batch(n, budget);
+        assert_eq!(fired, fired_again, "harvest order was not deterministic");
+    }
+
+    #[test]
+    fn timer_harvest_order_is_deadline_then_insertion_fifo() {
+        // Load-bearing tie-break test: preserves the exact same-deadline order
+        // of the old linear `min_by(deadline, insertion_order)` scan. A plain
+        // BinaryHeap (no insertion tie-break) or a reversed tie-break reorders
+        // the equal-deadline pairs and fails here.
+        let io_loop = io_loop(Global).expect("init io loop");
+        let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+        driver.timer_harvest_budget = usize::MAX;
+        let now = Instant::now();
+        let early = Duration::ZERO;
+        let late = Duration::from_millis(1);
+        // Submission order deliberately differs from harvest order and mixes
+        // deadlines: id 10 (late), 11 (early), 12 (early), 13 (late).
+        driver.submit(CallId::new(10), CallInput::Sleep { after: late }, now);
+        driver.submit(CallId::new(11), CallInput::Sleep { after: early }, now);
+        driver.submit(CallId::new(12), CallInput::Sleep { after: early }, now);
+        driver.submit(CallId::new(13), CallInput::Sleep { after: late }, now);
+        let mut completed = Vec::new();
+        driver.harvest_timers(now + late, &mut completed);
+        let order: Vec<u64> = completed.iter().map(|c| c.call_id.get()).collect();
+        // Earlier deadline first (11 then 12), then the later deadline in
+        // submission order (10 then 13).
+        assert_eq!(order, vec![11, 12, 10, 13]);
+    }
+
+    #[test]
+    fn timer_capacity_exceeded_returns_timer_full_not_growth() {
+        let io_loop = io_loop(Global).expect("init io loop");
+        let mut driver = BetelgeuseDriver::with_io_loop(io_loop);
+        driver.timer_capacity = 3;
+        let now = Instant::now();
+        let after = Duration::from_secs(60);
+        for i in 0..3 {
+            assert!(
+                driver
+                    .submit(CallId::new(i), CallInput::Sleep { after }, now)
+                    .is_none(),
+                "arming under capacity must not complete inline"
+            );
+        }
+        // The fourth arm exceeds the cap. Load-bearing: revert the capacity
+        // guard and this returns None while `timers.len()` grows to 4.
+        let completion = driver
+            .submit(CallId::new(99), CallInput::Sleep { after }, now)
+            .expect("a full timer lane refuses the arm inline");
+        assert_eq!(completion.call_id, CallId::new(99));
+        assert!(
+            matches!(completion.result, CallOutput::Failed(CallError::TimerFull)),
+            "expected TimerFull, got {:?}",
+            completion.result
+        );
+        assert_eq!(
+            driver.timers.len(),
+            3,
+            "a refused arm must not grow the lane"
+        );
     }
 
     #[test]

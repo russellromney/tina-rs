@@ -54,6 +54,10 @@ pub struct LocalSystemConfig {
     pub process_lane_capacity: usize,
     /// Capacity of runtime-owned signal waits.
     pub signal_capacity: usize,
+    /// Max concurrently armed runtime timers per shard. A full timer lane
+    /// refuses new sleeps with [`crate::CallError::TimerFull`] instead of
+    /// growing without bound.
+    pub timer_capacity: usize,
     /// OS CPU id to hard-pin shard workers to. `Some(n)` pins on platforms that
     /// can (Linux), reports [`crate::AffinityStatus::Unsupported`] elsewhere,
     /// and [`crate::AffinityStatus::Failed`] for a core outside the process's
@@ -87,6 +91,7 @@ impl Default for LocalSystemConfig {
             tls_lane_capacity: driver::DEFAULT_TLS_LANE_CAPACITY,
             process_lane_capacity: driver::DEFAULT_PROCESS_LANE_CAPACITY,
             signal_capacity: driver::DEFAULT_SIGNAL_CAPACITY,
+            timer_capacity: driver::DEFAULT_DRIVER_TIMER_CAPACITY,
             configured_core: None,
             preallocation: PreallocationConfig::default(),
             trace_retention: TraceRetention::Full,
@@ -123,6 +128,9 @@ impl LocalSystemConfig {
         if self.signal_capacity == 0 {
             return Err(LocalSystemConfigError::ZeroSignalCapacity);
         }
+        if self.timer_capacity == 0 {
+            return Err(LocalSystemConfigError::ZeroTimerCapacity);
+        }
         Ok(())
     }
 
@@ -136,6 +144,7 @@ impl LocalSystemConfig {
             tls_lane_capacity: self.tls_lane_capacity,
             process_lane_capacity: self.process_lane_capacity,
             signal_capacity: self.signal_capacity,
+            timer_capacity: self.timer_capacity,
             configured_core: self.configured_core,
             preallocation: self.preallocation,
             trace_retention: self.trace_retention,
@@ -167,6 +176,8 @@ pub enum LocalSystemConfigError {
     ZeroProcessLaneCapacity,
     /// Signal capacity must be greater than zero.
     ZeroSignalCapacity,
+    /// Timer capacity must be greater than zero.
+    ZeroTimerCapacity,
 }
 
 pub(crate) type ThreadedCommandFn<S, F> = Box<dyn FnOnce(&mut Runtime<S, F>) + Send>;

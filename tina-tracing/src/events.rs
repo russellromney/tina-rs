@@ -865,6 +865,7 @@ pub fn call_error_name(error: CallError) -> &'static str {
         CallError::ProcessFull => "ProcessFull",
         CallError::ProcessClosed => "ProcessClosed",
         CallError::KillUncertain => "KillUncertain",
+        CallError::TimerFull => "TimerFull",
         CallError::Rejected(CallRejectedReason::ReplyAbandoned) => "Rejected.ReplyAbandoned",
         CallError::Rejected(CallRejectedReason::HandlerPanicked) => "Rejected.HandlerPanicked",
         CallError::Rejected(CallRejectedReason::UnsupportedMessage) => {

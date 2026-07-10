@@ -153,6 +153,9 @@ where
         if config.signal_capacity == 0 {
             panic!("ThreadedMultiShardRuntime requires signal capacity > 0");
         }
+        if config.timer_capacity == 0 {
+            panic!("ThreadedMultiShardRuntime requires timer capacity > 0");
+        }
         if config.shard_pair_capacity == 0 {
             panic!("ThreadedMultiShardRuntime requires shard-pair capacity > 0");
         }
@@ -296,6 +299,7 @@ where
                                 worker_config.tls_lane_capacity,
                                 worker_config.process_lane_capacity,
                                 worker_config.signal_capacity,
+                                worker_config.timer_capacity,
                             )),
                             worker_config.preallocation,
                         );
@@ -661,6 +665,7 @@ where
             config.tls_lane_capacity,
             config.process_lane_capacity,
             config.signal_capacity,
+            config.timer_capacity,
         )
     }
 
