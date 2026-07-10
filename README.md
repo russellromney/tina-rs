@@ -24,104 +24,115 @@ The repository contains:
 > the pinned nightly toolchain in `rust-toolchain.toml`; 32-bit targets and
 > Windows are not currently tested or supported.
 
-## Run The Smallest Program
+## Bounded By Construction
 
 Clone the repository and run:
 
 ```sh
-cargo run --locked -p tina-runtime --example hello_world
+cargo run --locked -p tina-runtime --example bounded_mailbox
 ```
 
-It prints:
+This worker has room for two queued jobs. A third send returns typed `Full`
+with the undelivered job still owned by the caller. After one runtime step
+frees capacity, the same job can be retried. Once the worker stops, later sends
+return typed `Closed`.
 
 ```text
-counter total = 5
+mailbox full; retaining Run(3)
+processed job=1
+processed job=2
+processed job=3
+mailbox closed
 ```
 
 The complete program is below. Its checked-in source is
-[`tina-runtime/examples/hello_world.rs`](tina-runtime/examples/hello_world.rs),
+[`tina-runtime/examples/bounded_mailbox.rs`](tina-runtime/examples/bounded_mailbox.rs),
 which normal all-target workspace checks compile.
 
 ```rust
 use std::convert::Infallible;
-use std::time::Duration;
 
 use tina::prelude::*;
-use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime};
+use tina::TrySendError;
+use tina_runtime::{DefaultMailboxFactory, Runtime};
 
-#[derive(Debug, Default)]
-struct Counter {
-    value: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Job {
+    Run(u64),
+    Stop,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum CounterMsg {
-    Add(u64),
-    Read,
-}
+#[derive(Debug)]
+struct Worker;
 
-#[tina::isolate(message = CounterMsg, reply = u64)]
-impl Counter {
+#[tina::isolate(message = Job)]
+impl Worker {
     fn handle(
         &mut self,
-        msg: CounterMsg,
+        job: Job,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            CounterMsg::Add(n) => {
-                self.value += n;
+        match job {
+            Job::Run(id) => {
+                println!("processed job={id}");
                 noop()
             }
-            CounterMsg::Read => noop(),
-        }
-    }
-
-    fn handle_call(&mut self, msg: CounterMsg, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            CounterMsg::Read => call.reply(self.value),
-            CounterMsg::Add(n) => {
-                self.value += n;
-                call.reply(self.value)
-            }
+            Job::Stop => stop(),
         }
     }
 }
 
 fn main() {
-    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let mut runtime = Runtime::new(SingleShard, DefaultMailboxFactory);
+    let worker = runtime.register_with_capacity::<Worker, Infallible>(Worker, 2);
 
-    let counter = runtime
-        .register_with_capacity::<Counter, Infallible>(Counter::default(), 16)
-        .expect("register counter");
+    runtime.try_send(worker, Job::Run(1)).expect("job 1 fits");
+    runtime.try_send(worker, Job::Run(2)).expect("job 2 fits");
 
+    let rejected = match runtime.try_send(worker, Job::Run(3)) {
+        Err(TrySendError::Full(job)) => {
+            println!("mailbox full; retaining {job:?}");
+            job
+        }
+        other => panic!("expected typed Full, got {other:?}"),
+    };
+
+    assert_eq!(runtime.step(), 1);
     runtime
-        .try_send(counter, CounterMsg::Add(2))
-        .expect("send add");
-    runtime
-        .try_send(counter, CounterMsg::Add(3))
-        .expect("send add");
+        .try_send(worker, rejected)
+        .expect("retry fits after one step");
 
-    match runtime.call_blocking(counter, CounterMsg::Read, Duration::from_secs(1)) {
-        Ok(CallOutcome::Replied(total)) => println!("counter total = {total}"),
-        other => println!("unexpected outcome: {other:?}"),
+    while runtime.step() > 0 {}
+
+    runtime.try_send(worker, Job::Stop).expect("stop fits");
+    assert_eq!(runtime.step(), 1);
+
+    match runtime.try_send(worker, Job::Run(4)) {
+        Err(TrySendError::Closed(Job::Run(4))) => println!("mailbox closed"),
+        other => panic!("expected typed Closed, got {other:?}"),
     }
-
-    runtime.shutdown().expect("clean shutdown");
 }
 ```
 
-The important shape is small:
+The important facts are visible at the call site:
 
-1. An isolate owns ordinary Rust state.
-2. `handle` processes fire-and-forget messages.
-3. `handle_call` consumes caller authority by replying, rejecting, or
-   deferring the request.
-4. Every handler returns one effect; it does not `.await`.
-5. Registration chooses a mailbox capacity.
-6. The runtime is shut down explicitly.
+1. Capacity is chosen when the isolate is registered.
+2. Admission never silently grows a queue.
+3. `Full` and `Closed` are typed outcomes.
+4. A refused send returns ownership of the message, so retry policy remains
+   with the caller.
+5. The explicit-step runtime makes the pressure transition deterministic.
 
-Continue with the [First Isolate](docs/tina-user-guide/02-first-isolate.md)
-chapter and the [user-guide index](docs/tina-user-guide/README.md).
+For the smallest complete live program, run:
+
+```sh
+cargo run --locked -p tina-runtime --example hello_world
+```
+
+It demonstrates owned state, fire-and-forget messages, a typed blocking call,
+and clean threaded-runtime shutdown. Continue with the
+[First Isolate](docs/tina-user-guide/02-first-isolate.md) chapter and the
+[user-guide index](docs/tina-user-guide/README.md).
 
 ## Programming Model
 
@@ -212,7 +223,8 @@ The repository pins its Rust toolchain. Common checks are:
 
 | Command | Purpose |
 |---|---|
-| `cargo run --locked -p tina-runtime --example hello_world` | Run the smallest live program. |
+| `cargo run --locked -p tina-runtime --example bounded_mailbox` | Run the boundedness example from this README. |
+| `cargo run --locked -p tina-runtime --example hello_world` | Run the smallest threaded live program. |
 | `make check` | Type-check the workspace. |
 | `make test` | Run nextest plus workspace doctests. |
 | `make clippy` | Lint all workspace targets with warnings denied. |
