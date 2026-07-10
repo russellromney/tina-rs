@@ -7,12 +7,15 @@ a completion-based I/O library (no runtime, no executor, no hidden tasks).
 
 - Project: penberg/betelgeuse (Pekka Enberg)
 - License: MIT OR Apache-2.0 (see `LICENSE.md`)
-- Upstream has no tagged releases. Our copy tracks upstream tip around
-  **May 2026** (it carries the recent `connect` op and the
-  `ConnectionStep::Keep -> Continue` rename).
-- Exact upstream commit hash for the vendor point is **not recorded** in this
-  tree (historical vendor predates this marker). Treat the upstream URL above as
-  the canonical source; diff against it before any re-vendor.
+- Upstream has no tagged releases.
+- **Vendored upstream commit: `6d1f13767afe0a331933a4abbd5afe3bbbe1ed5a`**
+  ("Add tina-rs to README.md (#9)", upstream tip at the 2026-07-09 re-vendor).
+- The original vendor point (never recorded at the time) was reconstructed as
+  `97f4f40a768dc3c5a2f9d41b5e7fb6a9b80008a2` ("Add connect operation to
+  IOSocket (#8)", 2026-05-02) by diffing candidate upstream trees against this
+  directory until the residual equaled exactly the tina patch set below.
+- Not vendored: upstream `.github/` and `.gitignore`. Everything else tracks
+  upstream verbatim plus the patches below. `VENDOR.md` is tina-local.
 
 ## Why a fork, not a dependency
 
@@ -21,34 +24,51 @@ is deliberate upstream — a TigerBeetle-style step loop). Tina needs a small se
 of substrate features upstream does not provide, so we vendor and patch rather
 than pin a moving git dependency.
 
-## tina-local patch families (already present before Phase 151)
+## tina-local patch families
 
+One re-apply commit per family in the 2026-07-09 re-vendor series; diff this
+directory against the upstream commit above to regenerate any of them.
+
+- **Simulated I/O backend** — `io::simulated` implements the substrate traits
+  for TCP with no kernel calls (scriptable completion delay, partial writes).
+  tina-runtime substrate tests and tina-sim parity suites run on it.
+- **Connect raw-sockaddr rework** — `ConnectOp` carries a prepared
+  `sockaddr_storage` + length (not a `SocketAddr`) so one op serves internet
+  and Unix connects. Darwin drops upstream's EALREADY/getsockopt-EINTR retry
+  states: EINPROGRESS/WouldBlock parks on kqueue, SO_ERROR decides.
 - **Unix sockets on the substrate** — `bind_unix` / `connect_unix`, accepted
   streams as ordinary stream sockets (#207, retires bypass-Betelgeuse lanes).
+  Backends own the socket-file lifecycle (stale-inode clear, unlink on close).
 - **Native hot-path buffer reuse** — `recv_buf` / `send_owned` caller-owned
-  buffer round-trips (#217).
+  buffer round-trips, buffer returned on error paths too (#217).
 - **Completion release hooks** — `pending_completion_count` /
   `cancel_pending_completions` for runtime-driven shutdown without leaving
-  backend-owned raw pointers.
-- **Parallel substrate support** — cloned `IOLoopHandle` lanes (TCP/TLS/Unix
-  share one loop).
-- **`F_FULLFSYNC`** on Darwin file sync (durability).
+  backend-owned raw pointers (darwin watched-registry, linux AsyncCancel).
+- **`F_FULLFSYNC`** on Darwin file sync (durability; ENOTSUP falls back to
+  fsync).
 - **Honest socket address introspection** — `local_addr` / `peer_addr`.
+- **Lint/feature hygiene** — drop unused nightly features, satisfy the
+  workspace's clippy -D warnings gate.
 
-## Phase 157 explicit-step I/O purity
+Parallel substrate lanes (cloned `IOLoopHandle` sharing one loop) need no
+patch: upstream's `IOLoopHandle` already derives `Clone`; tina merely uses it.
 
-Phase 151 briefly added a readiness-driven worker park to this fork. Phase 157
-removed that experiment and restored Betelgeuse's explicit completion loop:
-`IOLoop::step()` is the only progress primitive, and it never sleeps.
+## Explicit-step I/O purity
 
-Linux socket ops again always use `MSG_DONTWAIT` for `recv`, `recv_buf`, `send`,
-and `send_owned`; send paths continue to include `MSG_NOSIGNAL`. Threaded Tina
-workers observe I/O completion by explicitly stepping and using their bounded
-idle re-poll policy.
+An earlier experiment added a readiness-driven worker park to this fork; it
+was removed and the fork is poll/step-pure: `IOLoop::step()` is the only
+progress primitive, and it never sleeps. Keep it that way — no waker, park,
+or readiness side-channel may return in a re-vendor or patch.
+
+Linux socket ops always use `MSG_DONTWAIT` for `recv`, `recv_buf`, `send`,
+and `send_owned`; send paths include `MSG_NOSIGNAL`. Threaded Tina workers
+observe I/O completion by explicitly stepping and using their bounded idle
+re-poll policy.
 
 ## Re-vendoring
 
 Do not re-vendor to upstream tip unless a specific upstream change is required.
-If one is, make the re-vendor its own isolated commit (prove the workspace
-builds and tests pass) **before** layering tina-local patches back on, and
-update the upstream commit reference above.
+If one is, follow the 2026-07-09 series shape: one isolated commit bringing
+this directory to verbatim upstream tip (it will not build — say so in the
+message), then one commit per patch family re-applied, then update the
+upstream commit hash above and prove the workspace green.
