@@ -247,7 +247,7 @@ pub use parse::{
     encode_request, encode_response, parse_request_head, parse_response_head,
 };
 pub use pool::{HttpConnectionPool, HttpPoolMsg};
-pub use request_builder::RequestBuilder;
+pub use request_builder::{RequestBuilder, RequestHeaderError};
 pub use router::{RouteHandler, Router, StatefulHandler, StatefulRouter};
 pub use scope::{
     ScopedRailRejected, cancel_response_source, scoped_grpc_unary, scoped_operation,

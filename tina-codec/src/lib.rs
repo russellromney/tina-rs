@@ -16,10 +16,10 @@
 //!   length prefix followed by an opaque payload, with an explicit
 //!   maximum frame body length.
 //!
-//! Both follow the same shape: push bytes in with
-//! [`LineFramer::feed`] / [`LengthDelimitedFramer::feed`]; pull frames
-//! out one at a time with [`LineFramer::next_frame`] /
-//! [`LengthDelimitedFramer::next_frame`]. Each pull returns a
+//! Both follow the same shape: drive complete transport chunks through
+//! [`decode_chunk`], or use the lower-level consuming
+//! [`LineFramer::feed`] / [`LengthDelimitedFramer::feed`] methods and pull
+//! frames one at a time. Each pull returns a
 //! [`FrameDecision`]:
 //!
 //! - [`FrameDecision::NeedMore`] — keep reading from the rail.
@@ -50,25 +50,12 @@
 //!
 //! impl Connection {
 //!     fn on_bytes(&mut self, bytes: Vec<u8>) {
-//!         self.framer.feed(bytes);
-//!         loop {
-//!             match self.framer.next_frame() {
-//!                 FrameDecision::NeedMore => break,
-//!                 FrameDecision::Frame(line) => {
-//!                     // hand `line` to application logic
-//!                     let _ = line;
-//!                 }
-//!                 FrameDecision::Malformed(reason) => {
-//!                     // close the connection and tag the trace
-//!                     let _ = reason;
-//!                     break;
-//!                 }
-//!                 FrameDecision::Full => {
-//!                     // line longer than cap; tear connection down
-//!                     break;
-//!                 }
-//!             }
-//!         }
+//!         let status = tina_codec::decode_chunk(&mut self.framer, &bytes, |line| {
+//!             // hand `line` to application logic
+//!             let _ = line;
+//!         });
+//!         // Malformed / Full mean tear the connection down.
+//!         let _ = status;
 //!     }
 //! }
 //! ```
@@ -128,6 +115,18 @@ impl<F, M> FrameDecision<F, M> {
     }
 }
 
+/// Terminal status after [`decode_chunk`] consumes a transport chunk.
+#[must_use = "Malformed and Full require the caller to close or reject the stream"]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodeStatus<M> {
+    /// Every supplied byte was consumed and the codec needs more input.
+    NeedMore,
+    /// The stream became unrecoverably malformed.
+    Malformed(M),
+    /// The current frame exceeded its configured bound.
+    Full,
+}
+
 mod sealed {
     pub trait Sealed {}
     impl Sealed for super::LineFramer {}
@@ -152,8 +151,9 @@ pub trait Framer: sealed::Sealed {
     /// The typed reason a stream is unrecoverably malformed.
     type Malformed;
 
-    /// Push received bytes into the framer.
-    fn feed(&mut self, bytes: &[u8]);
+    /// Pushes bytes into the current frame and returns bytes consumed.
+    #[must_use]
+    fn feed(&mut self, bytes: &[u8]) -> usize;
 
     /// Try to extract the next complete frame.
     fn next_frame(&mut self) -> FrameDecision<Self::Frame, Self::Malformed>;
@@ -163,8 +163,8 @@ impl Framer for LineFramer {
     type Frame = Vec<u8>;
     type Malformed = MalformedLineReason;
 
-    fn feed(&mut self, bytes: &[u8]) {
-        LineFramer::feed(self, bytes);
+    fn feed(&mut self, bytes: &[u8]) -> usize {
+        LineFramer::feed(self, bytes)
     }
 
     fn next_frame(&mut self) -> FrameDecision<Self::Frame, Self::Malformed> {
@@ -176,8 +176,8 @@ impl Framer for LengthDelimitedFramer {
     type Frame = Vec<u8>;
     type Malformed = MalformedLengthReason;
 
-    fn feed(&mut self, bytes: &[u8]) {
-        LengthDelimitedFramer::feed(self, bytes);
+    fn feed(&mut self, bytes: &[u8]) -> usize {
+        LengthDelimitedFramer::feed(self, bytes)
     }
 
     fn next_frame(&mut self) -> FrameDecision<Self::Frame, Self::Malformed> {
@@ -217,15 +217,8 @@ impl Framer for LengthDelimitedFramer {
 /// use tina_codec::{FrameDecision, SyncCodec};
 ///
 /// fn drain_all<C: SyncCodec>(codec: &mut C, bytes: &[u8]) -> usize {
-///     codec.feed(bytes);
 ///     let mut frames = 0;
-///     loop {
-///         match codec.next_frame() {
-///             FrameDecision::Frame(_) => frames += 1,
-///             // NeedMore / Malformed / Full all stop this drain.
-///             _ => break,
-///         }
-///     }
+///     let _ = tina_codec::decode_chunk(codec, bytes, |_| frames += 1);
 ///     frames
 /// }
 ///
@@ -238,9 +231,11 @@ pub trait SyncCodec {
     /// The typed reason a stream is unrecoverably malformed.
     type Malformed;
 
-    /// Push received bytes into the codec. Must not block, allocate
-    /// unboundedly, or perform I/O.
-    fn feed(&mut self, bytes: &[u8]);
+    /// Pushes bytes into the current frame and returns bytes consumed.
+    /// Must not block, allocate unboundedly, or perform I/O. A nonterminal
+    /// codec must consume at least one byte when passed non-empty input.
+    #[must_use]
+    fn feed(&mut self, bytes: &[u8]) -> usize;
 
     /// Try to extract the next complete frame. Returns
     /// [`FrameDecision::Full`] instead of growing past the configured
@@ -252,8 +247,8 @@ impl SyncCodec for LineFramer {
     type Frame = Vec<u8>;
     type Malformed = MalformedLineReason;
 
-    fn feed(&mut self, bytes: &[u8]) {
-        LineFramer::feed(self, bytes);
+    fn feed(&mut self, bytes: &[u8]) -> usize {
+        LineFramer::feed(self, bytes)
     }
 
     fn next_frame(&mut self) -> FrameDecision<Self::Frame, Self::Malformed> {
@@ -265,12 +260,50 @@ impl SyncCodec for LengthDelimitedFramer {
     type Frame = Vec<u8>;
     type Malformed = MalformedLengthReason;
 
-    fn feed(&mut self, bytes: &[u8]) {
-        LengthDelimitedFramer::feed(self, bytes);
+    fn feed(&mut self, bytes: &[u8]) -> usize {
+        LengthDelimitedFramer::feed(self, bytes)
     }
 
     fn next_frame(&mut self) -> FrameDecision<Self::Frame, Self::Malformed> {
         LengthDelimitedFramer::next_frame(self)
+    }
+}
+
+/// Consumes one complete transport chunk while emitting frames incrementally.
+///
+/// The driver alternates [`SyncCodec::next_frame`] and [`SyncCodec::feed`], so
+/// a codec only needs to retain one incomplete frame. This makes decoding
+/// invariant to socket-read partitioning without introducing an unbounded
+/// internal queue for coalesced frames.
+///
+/// # Panics
+///
+/// Panics if a custom codec reports `NeedMore` but consumes zero bytes from
+/// non-empty input, or reports consuming more bytes than it received.
+pub fn decode_chunk<C, F>(
+    codec: &mut C,
+    mut bytes: &[u8],
+    mut on_frame: F,
+) -> DecodeStatus<C::Malformed>
+where
+    C: SyncCodec + ?Sized,
+    F: FnMut(C::Frame),
+{
+    loop {
+        match codec.next_frame() {
+            FrameDecision::Frame(frame) => on_frame(frame),
+            FrameDecision::Malformed(reason) => return DecodeStatus::Malformed(reason),
+            FrameDecision::Full => return DecodeStatus::Full,
+            FrameDecision::NeedMore if bytes.is_empty() => return DecodeStatus::NeedMore,
+            FrameDecision::NeedMore => {
+                let consumed = codec.feed(bytes);
+                assert!(
+                    consumed > 0 && consumed <= bytes.len(),
+                    "SyncCodec::feed must consume 1..=input.len() bytes after NeedMore"
+                );
+                bytes = &bytes[consumed..];
+            }
+        }
     }
 }
 
@@ -302,23 +335,24 @@ mod sync_codec_tests {
         type Frame = Vec<u8>;
         type Malformed = ();
 
-        fn feed(&mut self, bytes: &[u8]) {
+        fn feed(&mut self, bytes: &[u8]) -> usize {
             if self.full {
-                return;
+                return 0;
             }
-            for byte in bytes {
-                self.buf.push(*byte);
-                let unframed = self
-                    .buf
-                    .iter()
-                    .rev()
-                    .take_while(|seen| **seen != self.delim)
-                    .count();
-                if unframed > self.cap {
-                    self.full = true;
-                    return;
-                }
+            if self.buf.last() == Some(&self.delim) {
+                return 0;
             }
+            let room = self.cap.saturating_add(1).saturating_sub(self.buf.len());
+            let through_delimiter = bytes
+                .iter()
+                .position(|byte| *byte == self.delim)
+                .map_or(bytes.len(), |index| index + 1);
+            let consumed = room.min(through_delimiter);
+            self.buf.extend_from_slice(&bytes[..consumed]);
+            if consumed == room && self.buf.last() != Some(&self.delim) {
+                self.full = true;
+            }
+            consumed
         }
 
         fn next_frame(&mut self) -> FrameDecision<Self::Frame, Self::Malformed> {
@@ -339,15 +373,14 @@ mod sync_codec_tests {
         codec: &mut C,
         bytes: &[u8],
     ) -> Vec<FrameDecision<Vec<u8>, C::Malformed>> {
-        codec.feed(bytes);
         let mut out = Vec::new();
-        loop {
-            let d = codec.next_frame();
-            let stop = !d.is_frame();
-            out.push(d);
-            if stop {
-                break;
-            }
+        let status = decode_chunk(codec, bytes, |frame| {
+            out.push(FrameDecision::Frame(frame));
+        });
+        match status {
+            DecodeStatus::NeedMore => out.push(FrameDecision::NeedMore),
+            DecodeStatus::Malformed(reason) => out.push(FrameDecision::Malformed(reason)),
+            DecodeStatus::Full => out.push(FrameDecision::Full),
         }
         out
     }
@@ -385,11 +418,52 @@ mod sync_codec_tests {
     #[test]
     fn external_codec_accepts_delimiter_before_later_overflow() {
         let mut codec = ByteSplitCodec::new(b'|', 4);
-        codec.feed(b"ok|abcdef");
-        assert!(matches!(
-            codec.next_frame(),
-            FrameDecision::Frame(ref f) if f == b"ok"
-        ));
-        assert!(matches!(codec.next_frame(), FrameDecision::Full));
+        let out = drain(&mut codec, b"ok|abcdef");
+        assert!(matches!(out[0], FrameDecision::Frame(ref f) if f == b"ok"));
+        assert!(matches!(out[1], FrameDecision::Full));
+    }
+
+    fn assert_every_partition<C, Make>(bytes: &[u8], make_codec: Make, expected: &[Vec<u8>])
+    where
+        C: SyncCodec<Frame = Vec<u8>>,
+        C::Malformed: std::fmt::Debug + PartialEq,
+        Make: Fn() -> C,
+    {
+        let boundary_count = bytes.len().saturating_sub(1);
+        for mask in 0usize..(1usize << boundary_count) {
+            let mut codec = make_codec();
+            let mut frames = Vec::new();
+            let mut start = 0;
+            for boundary in 0..boundary_count {
+                if mask & (1 << boundary) != 0 {
+                    let status = decode_chunk(&mut codec, &bytes[start..=boundary], |frame| {
+                        frames.push(frame);
+                    });
+                    assert_eq!(status, DecodeStatus::NeedMore, "partition mask {mask:#x}");
+                    start = boundary + 1;
+                }
+            }
+            let status = decode_chunk(&mut codec, &bytes[start..], |frame| frames.push(frame));
+            assert_eq!(status, DecodeStatus::NeedMore, "partition mask {mask:#x}");
+            assert_eq!(frames, expected, "partition mask {mask:#x}");
+        }
+    }
+
+    #[test]
+    fn line_frames_are_invariant_across_every_partition_and_coalescing() {
+        assert_every_partition::<LineFramer, _>(
+            b"abcd\nx\n",
+            || LineFramer::new(4),
+            &[b"abcd".to_vec(), b"x".to_vec()],
+        );
+    }
+
+    #[test]
+    fn length_frames_are_invariant_across_every_partition_and_coalescing() {
+        assert_every_partition::<LengthDelimitedFramer, _>(
+            &[4, b'a', b'b', b'c', b'd', 1, b'x'],
+            || LengthDelimitedFramer::new(LengthPrefix::U8, 4),
+            &[b"abcd".to_vec(), b"x".to_vec()],
+        );
     }
 }

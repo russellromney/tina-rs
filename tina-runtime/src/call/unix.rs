@@ -15,7 +15,10 @@
 
 use std::path::PathBuf;
 
-use super::{CallInput, CallOutput, TypedCall, UnixListenerId, UnixStreamId};
+use super::{
+    CallInput, CallOutput, TypedCall, UnixListenerId, UnixStreamId, WriteOwnedError,
+    WriteOwnedReply,
+};
 
 /// Returns a typed Unix bind helper.
 pub fn unix_bind(path: impl Into<PathBuf>) -> TypedCall<(UnixListenerId, PathBuf)> {
@@ -54,6 +57,36 @@ pub fn unix_write(stream: UnixStreamId, bytes: Vec<u8>) -> TypedCall<usize> {
     TypedCall::new(
         CallInput::UnixWrite { stream, bytes },
         CallOutput::into_unix_wrote,
+    )
+}
+
+/// Returns a Unix write helper that gives the bytes back.
+pub fn unix_write_owned(
+    stream: UnixStreamId,
+    bytes: Vec<u8>,
+) -> TypedCall<WriteOwnedReply, WriteOwnedError> {
+    TypedCall::new(
+        CallInput::UnixWriteOwned {
+            stream,
+            bytes,
+            start: 0,
+        },
+        CallOutput::into_unix_wrote_owned,
+    )
+}
+
+pub(crate) fn unix_write_owned_from(
+    stream: UnixStreamId,
+    bytes: Vec<u8>,
+    start: usize,
+) -> TypedCall<WriteOwnedReply, WriteOwnedError> {
+    TypedCall::new(
+        CallInput::UnixWriteOwned {
+            stream,
+            bytes,
+            start,
+        },
+        CallOutput::into_unix_wrote_owned,
     )
 }
 

@@ -295,7 +295,8 @@ impl Client {
                     Err(CallError::TargetClosed) => push(&self.events, "closed"),
                     Err(CallError::Timeout) => push(&self.events, "timeout"),
                     Err(
-                        CallError::InvalidResource
+                        CallError::InvariantViolation
+                        | CallError::InvalidResource
                         | CallError::NotFound
                         | CallError::Io
                         | CallError::Unsupported

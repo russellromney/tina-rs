@@ -8,7 +8,8 @@
 use tina::Isolate;
 
 use crate::call::{
-    CallError, RuntimeCall, UnixReadReply, UnixStreamId, UnixWriteReply, unix_read, unix_write,
+    CallError, RuntimeCall, UnixReadReply, UnixStreamId, UnixWriteOwnedReply, unix_read,
+    unix_write_owned_from,
 };
 use crate::tcp_loops::LoopStep;
 
@@ -17,60 +18,82 @@ use crate::tcp_loops::LoopStep;
 #[derive(Debug)]
 pub struct UnixWriteAll {
     stream: UnixStreamId,
-    pending: Vec<u8>,
+    buffer: Option<Vec<u8>>,
     written: usize,
+    total: usize,
 }
 
 impl UnixWriteAll {
     /// Builds a write-all helper.
     pub fn new(stream: UnixStreamId, bytes: Vec<u8>) -> Self {
+        let total = bytes.len();
         Self {
             stream,
-            pending: bytes,
+            buffer: Some(bytes),
             written: 0,
+            total,
         }
     }
 
     /// Returns the effect that issues the next `unix_write`. Returns `None` if
     /// the loop has nothing left to send.
-    pub fn next_effect<I, M, F>(&self, on_progress: F) -> Option<tina::Effect<I>>
+    pub fn next_effect<I, M, F>(&mut self, on_progress: F) -> Option<tina::Effect<I>>
     where
         I: Isolate<Message = M, Io = RuntimeCall<M>>,
-        F: FnOnce(UnixWriteReply) -> M + Send + 'static,
+        F: FnOnce(UnixWriteOwnedReply) -> M + Send + 'static,
         M: 'static,
     {
-        if self.pending.is_empty() {
-            None
-        } else {
-            Some(unix_write(self.stream, self.pending.clone()).then(on_progress))
+        if self.written >= self.total {
+            return None;
         }
+        let bytes = self.buffer.take()?;
+        Some(unix_write_owned_from(self.stream, bytes, self.written).then(on_progress))
     }
 
     /// Records progress from a `unix_write` reply.
     ///
     /// `Ok(0)` with non-empty pending data is a stuck stream. Surface it as
     /// `Failed(CallError::Io)` instead of re-issuing the same write forever.
-    pub fn advance<I, M, F>(&mut self, reply: UnixWriteReply, on_progress: F) -> LoopStep<I, usize>
+    pub fn advance<I, M, F>(
+        &mut self,
+        reply: UnixWriteOwnedReply,
+        on_progress: F,
+    ) -> LoopStep<I, usize>
     where
         I: Isolate<Message = M, Io = RuntimeCall<M>>,
-        F: FnOnce(UnixWriteReply) -> M + Send + 'static,
+        F: FnOnce(UnixWriteOwnedReply) -> M + Send + 'static,
         M: 'static,
     {
         match reply {
-            Ok(0) if !self.pending.is_empty() => LoopStep::Failed(CallError::Io),
-            Ok(count) => {
-                let drained = count.min(self.pending.len());
-                self.pending.drain(..drained);
-                self.written += drained;
-                if self.pending.is_empty() {
+            Ok(reply) => {
+                if reply.bytes.len() != self.total {
+                    self.buffer = Some(reply.bytes);
+                    return LoopStep::Failed(CallError::InvariantViolation);
+                }
+                let remaining = reply.bytes.len().saturating_sub(self.written);
+                if reply.written > remaining {
+                    self.buffer = Some(reply.bytes);
+                    return LoopStep::Failed(CallError::InvariantViolation);
+                }
+                if reply.written == 0 && remaining > 0 {
+                    self.buffer = Some(reply.bytes);
+                    return LoopStep::Failed(CallError::Io);
+                }
+                self.written += reply.written;
+                if self.written == reply.bytes.len() {
+                    self.buffer = Some(reply.bytes);
                     LoopStep::Done(self.written)
                 } else {
                     LoopStep::Pending(
-                        unix_write(self.stream, self.pending.clone()).then(on_progress),
+                        unix_write_owned_from(self.stream, reply.bytes, self.written)
+                            .then(on_progress),
                     )
                 }
             }
-            Err(error) => LoopStep::Failed(error),
+            Err(error) => {
+                self.buffer = Some(error.bytes);
+                LoopStep::Failed(error.error)
+            }
         }
     }
 
@@ -81,7 +104,7 @@ impl UnixWriteAll {
 
     /// Bytes still pending.
     pub fn remaining(&self) -> usize {
-        self.pending.len()
+        self.total.saturating_sub(self.written)
     }
 }
 
@@ -192,29 +215,73 @@ mod tests {
     #[derive(Debug)]
     enum Msg {
         Read(UnixReadReply),
-        Wrote(UnixWriteReply),
+        Wrote(UnixWriteOwnedReply),
     }
 
     fn stream(id: u64) -> UnixStreamId {
         UnixStreamId::new(id)
     }
 
+    fn wrote(bytes: &[u8], written: usize) -> UnixWriteOwnedReply {
+        Ok(crate::call::WriteOwnedReply {
+            bytes: bytes.to_vec(),
+            written,
+        })
+    }
+
     #[test]
     fn write_all_handles_partial_writes() {
         let mut helper = UnixWriteAll::new(stream(1), b"abcdef".to_vec());
-        let step: LoopStep<DummyIsolate, usize> = helper.advance(Ok(2), Msg::Wrote);
+        let step: LoopStep<DummyIsolate, usize> = helper.advance(wrote(b"abcdef", 2), Msg::Wrote);
         assert!(matches!(step, LoopStep::Pending(_)));
         assert_eq!(helper.written(), 2);
         assert_eq!(helper.remaining(), 4);
-        let step: LoopStep<DummyIsolate, usize> = helper.advance(Ok(4), Msg::Wrote);
+        let step: LoopStep<DummyIsolate, usize> = helper.advance(wrote(b"abcdef", 4), Msg::Wrote);
         assert!(matches!(step, LoopStep::Done(6)));
+    }
+
+    #[test]
+    fn write_all_keeps_the_owned_allocation() {
+        let mut helper = UnixWriteAll::new(stream(1), b"abcdef".to_vec());
+        let bytes = helper.buffer.take().expect("buffer stored");
+        let allocation = bytes.as_ptr();
+        let step: LoopStep<DummyIsolate, usize> = helper.advance(
+            Ok(crate::call::WriteOwnedReply { bytes, written: 6 }),
+            Msg::Wrote,
+        );
+        assert!(matches!(step, LoopStep::Done(6)));
+        assert_eq!(
+            helper.buffer.as_ref().expect("buffer returned").as_ptr(),
+            allocation
+        );
     }
 
     #[test]
     fn write_all_rejects_zero_progress() {
         let mut helper = UnixWriteAll::new(stream(1), b"abc".to_vec());
-        let step: LoopStep<DummyIsolate, usize> = helper.advance(Ok(0), Msg::Wrote);
+        let step: LoopStep<DummyIsolate, usize> = helper.advance(wrote(b"abc", 0), Msg::Wrote);
         assert!(matches!(step, LoopStep::Failed(CallError::Io)));
+    }
+
+    #[test]
+    fn write_all_rejects_impossible_completion_count() {
+        let mut helper = UnixWriteAll::new(stream(1), b"abc".to_vec());
+        let step: LoopStep<DummyIsolate, usize> = helper.advance(wrote(b"abc", 4), Msg::Wrote);
+        assert!(matches!(
+            step,
+            LoopStep::Failed(CallError::InvariantViolation)
+        ));
+    }
+
+    #[test]
+    fn write_all_rejects_a_changed_owned_buffer_length() {
+        let mut helper = UnixWriteAll::new(stream(1), b"abcdef".to_vec());
+        let step: LoopStep<DummyIsolate, usize> = helper.advance(wrote(b"abc", 3), Msg::Wrote);
+        assert!(matches!(
+            step,
+            LoopStep::Failed(CallError::InvariantViolation)
+        ));
+        assert_eq!(helper.remaining(), 6);
     }
 
     #[test]

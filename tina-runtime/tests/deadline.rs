@@ -13,7 +13,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina_runtime::{DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, sleep};
+use tina_runtime::{
+    CallError, CallOutcome, DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, dns_lookup,
+    sleep,
+};
 
 #[derive(Debug, Default, Clone, Copy)]
 struct Report {
@@ -173,4 +176,141 @@ fn deadline_saturates_on_overflow_instead_of_expiring_now() {
         deadline.remaining_or_zero(now) > Duration::from_secs(60 * 60 * 24 * 365 * 50),
         "saturated deadline should report at least 50 years remaining",
     );
+}
+
+#[derive(Debug)]
+enum MaxSleepMsg {
+    Park,
+    Probe,
+    UnexpectedWake(SleepReply),
+}
+
+#[derive(Debug, Default)]
+struct MaxSleepProbe;
+
+#[tina_runtime::isolate(message = MaxSleepMsg)]
+impl MaxSleepProbe {
+    fn handle(
+        &mut self,
+        msg: MaxSleepMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            MaxSleepMsg::Park => sleep(Duration::MAX).then(MaxSleepMsg::UnexpectedWake),
+            MaxSleepMsg::Probe => stop_with(true),
+            MaxSleepMsg::UnexpectedWake(result) => {
+                assert!(result.is_ok(), "maximum-duration timer was cancelled early");
+                stop_with(false)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum MaxDnsMsg {
+    Resolve,
+    Done(Result<Vec<std::net::SocketAddr>, CallError>),
+}
+
+#[derive(Debug, Default)]
+struct MaxDnsProbe;
+
+#[tina_runtime::isolate(message = MaxDnsMsg)]
+impl MaxDnsProbe {
+    fn handle(
+        &mut self,
+        msg: MaxDnsMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            MaxDnsMsg::Resolve => dns_lookup("localhost", 80, Duration::MAX).then(MaxDnsMsg::Done),
+            MaxDnsMsg::Done(result) => stop_with(result.is_ok()),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum MaxHostCallMsg {
+    Echo(u32),
+}
+
+#[derive(Debug, Default)]
+struct MaxHostCallProbe;
+
+#[tina_runtime::isolate(message = MaxHostCallMsg, reply = u32)]
+impl MaxHostCallProbe {
+    fn handle(
+        &mut self,
+        _msg: MaxHostCallMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        noop()
+    }
+
+    fn handle_call(&mut self, msg: MaxHostCallMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            MaxHostCallMsg::Echo(value) => call.reply(value),
+        }
+    }
+}
+
+/// User-facing regression: maximum configured waits are accepted at the
+/// runtime effect boundary. A parked maximum-duration timer must not panic the
+/// shard or prevent an ordinary mailbox message from making progress, and DNS
+/// must complete normally under the same timeout.
+#[test]
+fn maximum_effect_timeouts_do_not_panic_or_stall_the_live_runtime() {
+    let runtime = Arc::new(ThreadedRuntime::new(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+    ));
+
+    let sleeper = runtime
+        .register_with_capacity::<_, Infallible>(MaxSleepProbe, 4)
+        .expect("register max-duration sleeper");
+    let sleep_result = runtime
+        .observe_result::<bool, _, _>(sleeper)
+        .expect("observe sleeper");
+    runtime
+        .try_send(sleeper, MaxSleepMsg::Park)
+        .expect("park max-duration sleeper");
+    runtime
+        .try_send(sleeper, MaxSleepMsg::Probe)
+        .expect("probe parked sleeper");
+    assert!(
+        sleep_result
+            .wait(Duration::MAX)
+            .expect("runtime remains responsive beside max-duration timer")
+    );
+
+    let dns = runtime
+        .register_with_capacity::<_, Infallible>(MaxDnsProbe, 4)
+        .expect("register max-duration DNS probe");
+    let dns_result = runtime
+        .observe_result::<bool, _, _>(dns)
+        .expect("observe DNS probe");
+    runtime
+        .try_send(dns, MaxDnsMsg::Resolve)
+        .expect("start max-duration DNS lookup");
+    assert!(
+        dns_result
+            .wait(Duration::MAX)
+            .expect("DNS completes with max timeout")
+    );
+
+    let echo = runtime
+        .register_with_capacity::<_, Infallible>(MaxHostCallProbe, 4)
+        .expect("register maximum-timeout host-call probe");
+    assert!(matches!(
+        runtime
+            .call_blocking(echo, MaxHostCallMsg::Echo(42), Duration::MAX)
+            .expect("host call accepts maximum timeout"),
+        CallOutcome::Replied(42)
+    ));
+
+    if let Ok(runtime) = Arc::try_unwrap(runtime) {
+        runtime
+            .shutdown()
+            .expect("shutdown after max-duration calls");
+    }
 }

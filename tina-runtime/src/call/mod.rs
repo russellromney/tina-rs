@@ -1164,8 +1164,26 @@ impl CallOutput {
     pub fn into_file_wrote(self) -> Result<usize, CallError> {
         match self {
             Self::FileWrote { count } => Ok(count),
+            Self::FileWroteOwned { count, .. } => Ok(count),
+            Self::FileWroteOwnedFailed { error, .. } => Err(error),
             Self::Failed(error) => Err(error),
             other => Self::panic_wrong_shape("FileWrote", &other),
+        }
+    }
+
+    /// Extracts a positional file write and its caller-owned buffer.
+    pub fn into_file_wrote_owned(self) -> Result<WriteOwnedReply, WriteOwnedError> {
+        match self {
+            Self::FileWroteOwned { bytes, count } => Ok(WriteOwnedReply {
+                bytes,
+                written: count,
+            }),
+            Self::FileWroteOwnedFailed { bytes, error } => Err(WriteOwnedError { error, bytes }),
+            Self::Failed(error) => Err(WriteOwnedError {
+                error,
+                bytes: Vec::new(),
+            }),
+            other => Self::panic_wrong_shape("FileWroteOwned", &other),
         }
     }
 
@@ -1290,8 +1308,26 @@ impl CallOutput {
     pub fn into_unix_wrote(self) -> Result<usize, CallError> {
         match self {
             Self::UnixWrote { count } => Ok(count),
+            Self::UnixWroteOwned { count, .. } => Ok(count),
+            Self::UnixWroteOwnedFailed { error, .. } => Err(error),
             Self::Failed(error) => Err(error),
             other => Self::panic_wrong_shape("UnixWrote", &other),
+        }
+    }
+
+    /// Extracts a Unix write and its caller-owned buffer.
+    pub fn into_unix_wrote_owned(self) -> Result<WriteOwnedReply, WriteOwnedError> {
+        match self {
+            Self::UnixWroteOwned { bytes, count } => Ok(WriteOwnedReply {
+                bytes,
+                written: count,
+            }),
+            Self::UnixWroteOwnedFailed { bytes, error } => Err(WriteOwnedError { error, bytes }),
+            Self::Failed(error) => Err(WriteOwnedError {
+                error,
+                bytes: Vec::new(),
+            }),
+            other => Self::panic_wrong_shape("UnixWroteOwned", &other),
         }
     }
 
@@ -1927,6 +1963,9 @@ pub type FileReadReply = CallReply<Vec<u8>>;
 /// Reply delivered by [`file_write`] / [`file_write_at`].
 pub type FileWriteReply = CallReply<usize>;
 
+/// Reply delivered by [`file_write_at_owned`].
+pub type FileWriteOwnedReply = Result<WriteOwnedReply, WriteOwnedError>;
+
 /// Reply delivered by [`file_fsync`].
 pub type FileFsyncReply = CallReply<()>;
 
@@ -1968,6 +2007,9 @@ pub type UnixReadReply = CallReply<Vec<u8>>;
 
 /// Reply delivered by [`unix_write`].
 pub type UnixWriteReply = CallReply<usize>;
+
+/// Reply delivered by [`unix_write_owned`].
+pub type UnixWriteOwnedReply = Result<WriteOwnedReply, WriteOwnedError>;
 
 /// Reply delivered by [`unix_close_listener`].
 pub type UnixListenerCloseReply = CallReply<()>;

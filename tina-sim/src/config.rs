@@ -569,6 +569,9 @@ pub enum ScriptedProcessResult {
 /// are not claims about native filesystem crash behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ScriptedStorageFaultConfig {
+    /// Maximum bytes accepted by one simulated file write.
+    pub file_write_cap: Option<usize>,
+
     /// Fail the selected storage operation when it is a journal append.
     pub fail_journal_append_at: Option<u64>,
 

@@ -1158,7 +1158,8 @@ where
         }
     }
 
-    let shutdown_deadline = Instant::now() + config.shutdown_lane_drain_timeout;
+    let shutdown_deadline =
+        tina::Deadline::from_instant(Instant::now(), config.shutdown_lane_drain_timeout).instant();
     let shutdown_result = runtime.cancel_in_flight_calls_for_shutdown(shutdown_deadline);
     shard_metrics.set_resource_counts(runtime.resource_report());
     shard_metrics.set_trace_dropped(runtime.trace_dropped());

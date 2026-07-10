@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::error::Error as _;
 use std::net::SocketAddr;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -16,9 +17,9 @@ use hyper_util::rt::TokioIo;
 use tina::prelude::*;
 use tina::{CallContext, RequestContext, reply_to};
 use tina_aws_bridge::{
-    InstalledS3Bridge, S3Address, S3CallOutcome, S3Config, S3Credentials, S3DeleteObject, S3Error,
-    S3GetObject, S3HeadObject, S3Object, S3PutObject, S3Request, S3Response, S3Worker,
-    SdkRetryPolicy, send_s3,
+    InstallError, InstalledS3Bridge, S3Address, S3CallOutcome, S3Config, S3Credentials,
+    S3DeleteObject, S3Error, S3GetObject, S3HeadObject, S3Object, S3PutObject, S3Request,
+    S3Response, S3Worker, SdkRetryPolicy, send_s3,
 };
 use tina_runtime::{
     DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig,
@@ -911,6 +912,27 @@ fn config_validation_rejects_zero_caps() {
             .validate()
             .unwrap_err(),
         tina_aws_bridge::S3ConfigError::ZeroPollInterval
+    );
+}
+
+#[test]
+fn install_errors_keep_typed_build_and_registration_sources() {
+    let build = InstallError::Build(S3Error::Internal("client build failed".into()));
+    assert!(
+        build
+            .source()
+            .and_then(|source| source.downcast_ref::<S3Error>())
+            .is_some(),
+        "AWS worker build classification must remain inspectable"
+    );
+
+    let register = InstallError::Register(tina_runtime::ThreadedRuntimeError::WorkerStopped);
+    assert!(
+        register
+            .source()
+            .and_then(|source| source.downcast_ref::<tina_runtime::ThreadedRuntimeError>())
+            .is_some(),
+        "runtime registration failure must remain inspectable"
     );
 }
 

@@ -156,6 +156,11 @@ define_completion!(
 );
 
 define_completion!(
+    /// Completion slot for a positional file write that returns the buffer.
+    pub struct PWriteOwnedCompletion => Result<(Vec<u8>, usize), (io::Error, Vec<u8>)>
+);
+
+define_completion!(
     /// Completion slot for an `fsync(2)` operation.
     pub struct FsyncCompletion => io::Result<()>
 );
@@ -291,6 +296,8 @@ pub enum Operation {
     PRead(PReadOp),
     /// Write bytes to a file at a fixed offset.
     PWrite(PWriteOp),
+    /// Write bytes to a file at a fixed offset and return the buffer.
+    PWriteOwned(PWriteOp),
     /// Flush file data to stable storage.
     Fsync(FsyncOp),
     /// Read file size metadata.
@@ -323,6 +330,7 @@ pub struct RecvOp {
 pub struct SendOp {
     pub fd: RawFd,
     pub buf: Vec<u8>,
+    pub start: usize,
     pub flags: i32,
 }
 
@@ -337,6 +345,7 @@ pub struct PReadOp {
 pub struct PWriteOp {
     pub fd: RawFd,
     pub buf: Vec<u8>,
+    pub start: usize,
     pub offset: u64,
 }
 

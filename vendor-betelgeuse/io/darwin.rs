@@ -16,8 +16,8 @@ use log::trace;
 use crate::{
     AcceptCompletion, AcceptOp, CompletionInner, ConnectCompletion, ConnectOp, FsyncCompletion,
     FsyncOp, IO, IOFile, IOLoop, IOSocket, MkdirCompletion, MkdirOp, OpenOptions, Operation,
-    PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, RecvBufCompletion, RecvCompletion,
-    RecvOp, SendCompletion, SendOp, SendOwnedCompletion, SizeCompletion, SizeOp,
+    PReadCompletion, PReadOp, PWriteCompletion, PWriteOp, PWriteOwnedCompletion, RecvBufCompletion,
+    RecvCompletion, RecvOp, SendCompletion, SendOp, SendOwnedCompletion, SizeCompletion, SizeOp,
 };
 
 enum SocketKind {
@@ -261,6 +261,45 @@ impl IOFile for DarwinFile {
         inner.prepare(Operation::PWrite(PWriteOp {
             fd: self.fd.raw(),
             buf,
+            start: 0,
+            offset,
+        }));
+        queue(&self.state, inner);
+        Ok(())
+    }
+
+    fn pwrite_owned(
+        &self,
+        c: &mut PWriteOwnedCompletion,
+        buf: Vec<u8>,
+        offset: u64,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
+        let inner = c.inner_mut();
+        inner.prepare(Operation::PWriteOwned(PWriteOp {
+            fd: self.fd.raw(),
+            buf,
+            start: 0,
+            offset,
+        }));
+        queue(&self.state, inner);
+        Ok(())
+    }
+
+    fn pwrite_owned_from(
+        &self,
+        c: &mut PWriteOwnedCompletion,
+        buf: Vec<u8>,
+        start: usize,
+        offset: u64,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
+        if start > buf.len() {
+            return Err((io::Error::from(io::ErrorKind::InvalidInput), buf));
+        }
+        let inner = c.inner_mut();
+        inner.prepare(Operation::PWriteOwned(PWriteOp {
+            fd: self.fd.raw(),
+            buf,
+            start,
             offset,
         }));
         queue(&self.state, inner);
@@ -532,6 +571,7 @@ impl IOSocket for DarwinSocket {
         inner.prepare(Operation::Send(SendOp {
             fd,
             buf,
+            start: 0,
             flags: libc::MSG_DONTWAIT,
         }));
         queue(&self.state, inner);
@@ -572,6 +612,39 @@ impl IOSocket for DarwinSocket {
         inner.prepare(Operation::SendOwned(SendOp {
             fd,
             buf,
+            start: 0,
+            flags: libc::MSG_DONTWAIT,
+        }));
+        queue(&self.state, inner);
+        Ok(())
+    }
+
+    fn send_owned_from(
+        &self,
+        c: &mut SendOwnedCompletion,
+        buf: Vec<u8>,
+        start: usize,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
+        if start > buf.len() {
+            return Err((io::Error::from(io::ErrorKind::InvalidInput), buf));
+        }
+        let fd = match self.fd.borrow().as_ref() {
+            Some(fd) => fd.raw(),
+            None => {
+                return Err((
+                    io::Error::new(io::ErrorKind::NotConnected, "send called on closed socket"),
+                    buf,
+                ));
+            }
+        };
+        if !matches!(&*self.kind.borrow(), Some(SocketKind::Stream)) {
+            return Err((io::Error::from(io::ErrorKind::InvalidInput), buf));
+        }
+        let inner = c.inner_mut();
+        inner.prepare(Operation::SendOwned(SendOp {
+            fd,
+            buf,
+            start,
             flags: libc::MSG_DONTWAIT,
         }));
         queue(&self.state, inner);
@@ -842,6 +915,15 @@ fn fail_completion(c: &mut CompletionInner, err: io::Error) {
         },
         Operation::PRead(_) => unsafe { PReadCompletion::from_inner_mut(c) }.complete(Err(err)),
         Operation::PWrite(_) => unsafe { PWriteCompletion::from_inner_mut(c) }.complete(Err(err)),
+        Operation::PWriteOwned(_) => unsafe {
+            let buffer = {
+                let Operation::PWriteOwned(op) = c.operation_mut() else {
+                    unreachable!()
+                };
+                mem::take(&mut op.buf)
+            };
+            PWriteOwnedCompletion::from_inner_mut(c).complete(Err((err, buffer)));
+        },
         Operation::Fsync(_) => unsafe { FsyncCompletion::from_inner_mut(c) }.complete(Err(err)),
         Operation::Size(_) => unsafe { SizeCompletion::from_inner_mut(c) }.complete(Err(err)),
         Operation::Mkdir(_) => unsafe { MkdirCompletion::from_inner_mut(c) }.complete(Err(err)),
@@ -1018,8 +1100,8 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
                 let Operation::Send(op) = c.operation_mut() else {
                     unreachable!()
                 };
-                let rc =
-                    unsafe { libc::send(op.fd, op.buf.as_ptr().cast(), op.buf.len(), op.flags) };
+                let bytes = &op.buf[op.start..];
+                let rc = unsafe { libc::send(op.fd, bytes.as_ptr().cast(), bytes.len(), op.flags) };
                 if rc < 0 {
                     let err = io::Error::last_os_error();
                     if err.kind() == io::ErrorKind::WouldBlock {
@@ -1041,8 +1123,8 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
                 let Operation::SendOwned(op) = c.operation_mut() else {
                     unreachable!()
                 };
-                let rc =
-                    unsafe { libc::send(op.fd, op.buf.as_ptr().cast(), op.buf.len(), op.flags) };
+                let bytes = &op.buf[op.start..];
+                let rc = unsafe { libc::send(op.fd, bytes.as_ptr().cast(), bytes.len(), op.flags) };
                 if rc < 0 {
                     let err = io::Error::last_os_error();
                     if err.kind() == io::ErrorKind::WouldBlock {
@@ -1086,16 +1168,18 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
             unsafe { PReadCompletion::from_inner_mut(c) }.complete(result);
             PollResult::Done
         }
-        Operation::PWrite(_) => {
+        Operation::PWrite(_) | Operation::PWriteOwned(_) => {
+            let owned = matches!(c.operation(), Operation::PWriteOwned(_));
             let result = {
-                let Operation::PWrite(op) = c.operation_mut() else {
-                    unreachable!()
+                let op = match c.operation_mut() {
+                    Operation::PWrite(op) | Operation::PWriteOwned(op) => op,
+                    _ => unreachable!(),
                 };
                 let rc = unsafe {
                     libc::pwrite(
                         op.fd,
-                        op.buf.as_ptr().cast(),
-                        op.buf.len(),
+                        op.buf[op.start..].as_ptr().cast(),
+                        op.buf.len() - op.start,
                         op.offset as libc::off_t,
                     )
                 };
@@ -1109,7 +1193,19 @@ fn execute_completion(state: &Rc<RefCell<DarwinState>>, c: &mut CompletionInner)
                     Ok(rc as usize)
                 }
             };
-            unsafe { PWriteCompletion::from_inner_mut(c) }.complete(result);
+            if owned {
+                let buffer = match c.operation_mut() {
+                    Operation::PWriteOwned(op) => mem::take(&mut op.buf),
+                    _ => unreachable!(),
+                };
+                let result = match result {
+                    Ok(count) => Ok((buffer, count)),
+                    Err(error) => Err((error, buffer)),
+                };
+                unsafe { PWriteOwnedCompletion::from_inner_mut(c) }.complete(result);
+            } else {
+                unsafe { PWriteCompletion::from_inner_mut(c) }.complete(result);
+            }
             PollResult::Done
         }
         Operation::Fsync(_) => {

@@ -37,9 +37,7 @@
 
 use std::convert::Infallible;
 use std::marker::PhantomData;
-use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use tina::pool::{
@@ -55,16 +53,6 @@ use tina::{
 };
 
 use crate::call::RuntimeCall;
-
-fn mint_pool_id() -> PoolId {
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    let raw = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nz = NonZeroU64::new(raw).expect("pool id counter wrapped to zero");
-    // SAFETY: process-wide monotonic counter, used only here to
-    // identify a pool we're constructing in `WorkerPool::new`. The
-    // returned id is unique per pool instance for the process.
-    unsafe { pool_internal::pool_id_from_raw(nz) }
-}
 
 /// Messages handled by [`WorkerPool`]. `H` is the resource handle.
 pub enum WorkerPoolMsg<H>
@@ -219,7 +207,7 @@ where
     H: Send + Clone + 'static,
     S: Shard + 'static,
 {
-    pool_id: PoolId,
+    pool_authority: pool_internal::PoolAuthority,
     config: PoolConfig,
     lifetime: Option<ResourceLifetime>,
     // Per-slot timestamps, populated only when `lifetime` is set.
@@ -246,11 +234,16 @@ where
     H: Send + Clone + 'static,
     S: Shard + 'static,
 {
-    /// Build a pool over a fixed list of resource handles. Panics if
-    /// `resources` is empty or its length disagrees with `config.capacity`.
+    /// Build a pool over a fixed list of resource handles.
     ///
     /// No lifetime policy: `Maintain` is a no-op and resources are only
     /// retired by caller `Retire` or force-close.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `resources` is empty, its length disagrees with
+    /// `config.capacity`, or the resource/waiter counts exceed the `u32`
+    /// identifier space used by the pool protocol.
     pub fn new(config: PoolConfig, resources: Vec<H>) -> Self {
         Self::build(config, resources, None, None)
     }
@@ -259,8 +252,11 @@ where
     ///
     /// `now` stamps every resource's creation time. The owner drives
     /// retirement with `Maintain { now }` (typically off a Tina timer);
-    /// the pool never reads the wall clock itself. Panics under the
-    /// same conditions as [`WorkerPool::new`].
+    /// the pool never reads the wall clock itself.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`WorkerPool::new`].
     pub fn with_lifetime(
         config: PoolConfig,
         resources: Vec<H>,
@@ -287,14 +283,24 @@ where
             config.capacity,
             resources.len()
         );
+        assert!(
+            u32::try_from(config.capacity).is_ok(),
+            "WorkerPool capacity {} exceeds the u32 resource-id space",
+            config.capacity
+        );
+        assert!(
+            u32::try_from(config.max_waiters).is_ok(),
+            "WorkerPool max_waiters {} exceeds the u32 waiter-id space",
+            config.max_waiters
+        );
 
-        let pool_id = mint_pool_id();
+        let pool_authority = pool_internal::PoolAuthority::new();
         let cap = config.capacity;
         let max_waiters = config.max_waiters;
         let mut idle = std::collections::VecDeque::with_capacity(cap);
         let mut states = Vec::with_capacity(cap);
         for i in 0..cap {
-            idle.push_back(i as u32);
+            idle.push_back(u32::try_from(i).expect("capacity was validated against u32"));
             states.push(ResourceState::Idle { next_generation: 1 });
         }
         let mut waiter_slab = Vec::with_capacity(max_waiters);
@@ -303,7 +309,8 @@ where
             waiter_slab.push(None);
         }
         for idx in (0..max_waiters).rev() {
-            free_waiter_slots.push(idx as u32);
+            free_waiter_slots
+                .push(u32::try_from(idx).expect("max_waiters was validated against u32"));
         }
         let resources_opt: Vec<Option<H>> = resources.into_iter().map(Some).collect();
         // Resources start idle "now". Both timestamps anchor at build
@@ -311,7 +318,7 @@ where
         let created_at = vec![now; cap];
         let idle_since = vec![now; cap];
         Self {
-            pool_id,
+            pool_authority,
             config,
             lifetime,
             created_at,
@@ -332,7 +339,7 @@ where
 
     /// This pool's identity. Useful for diagnostic logging.
     pub fn pool_id(&self) -> PoolId {
-        self.pool_id
+        self.pool_authority.pool_id()
     }
 
     /// Snapshot the current pressure state.
@@ -493,20 +500,7 @@ where
             .and_then(|r| r.as_ref())
             .expect("resource present for non-retired slot")
             .clone();
-        // SAFETY: this is the pool implementation that owns
-        // `resource_id` under `self.pool_id`. The state-machine
-        // guarantees `generation` was just minted for this resource
-        // and is not duplicated against any outstanding lease — see
-        // the `Idle { next_generation }` arm above which transitions
-        // to `Leased { generation }` atomically with the lease mint.
-        unsafe {
-            pool_internal::lease_new(
-                self.pool_id,
-                pool_internal::resource_id_from_raw(resource_id),
-                generation,
-                handle,
-            )
-        }
+        self.pool_authority.lease(resource_id, generation, handle)
     }
 
     fn track_dispatch(
@@ -609,7 +603,7 @@ where
         let (lease_pool_id, lease_resource_id, lease_generation, _handle) =
             pool_internal::lease_into_parts(lease);
 
-        if lease_pool_id != self.pool_id {
+        if lease_pool_id != self.pool_authority.pool_id() {
             return reply(WorkerPoolReply::Release(ReleaseOutcome::StaleLease));
         }
         let raw_idx = lease_resource_id.get();
@@ -778,10 +772,7 @@ where
                         None
                     };
                     if let Some(reason) = reason {
-                        // SAFETY: idx < states.len(), so the raw resource
-                        // id is in range for this pool.
-                        let resource_id =
-                            unsafe { pool_internal::resource_id_from_raw(idx as u32) };
+                        let resource_id = self.pool_authority.resource_id(idx as u32);
                         self.retire_slot(idx as u32);
                         retired_any = true;
                         report.retired.push(RetiredResource {
@@ -801,8 +792,7 @@ where
                     if over_age {
                         // Reported old, never stolen. The caller still
                         // holds a valid lease.
-                        let resource_id =
-                            unsafe { pool_internal::resource_id_from_raw(idx as u32) };
+                        let resource_id = self.pool_authority.resource_id(idx as u32);
                         report.over_age_leased.push(resource_id);
                     }
                 }
@@ -1263,6 +1253,13 @@ mod tests {
             },
             vec![7],
         )
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    #[should_panic(expected = "exceeds the u32 waiter-id space")]
+    fn pool_rejects_waiter_capacity_that_cannot_be_represented() {
+        let _ = pool_with_waiters(u32::MAX as usize + 1);
     }
 
     #[test]

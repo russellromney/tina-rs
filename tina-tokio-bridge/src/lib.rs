@@ -122,6 +122,12 @@ use tokio::sync::oneshot;
 #[cfg(feature = "tracing")]
 use tracing::{Level, event};
 
+fn tokio_deadline(timeout: Duration) -> tokio::time::Instant {
+    tokio::time::Instant::from_std(
+        tina::Deadline::from_instant(std::time::Instant::now(), timeout).instant(),
+    )
+}
+
 /// `tracing` target for per-call events on the bridge.
 #[cfg(feature = "tracing")]
 const TRACE_TARGET_CALL: &str = "tina_tokio.bridge.call";
@@ -774,7 +780,8 @@ where
         &mut self,
         drain_timeout: Duration,
     ) -> Result<BridgeShutdownReport, BridgeShutdownError> {
-        let deadline = std::time::Instant::now() + drain_timeout;
+        let deadline =
+            tina::Deadline::from_instant(std::time::Instant::now(), drain_timeout).instant();
         loop {
             if self.pending_handles() == 0 {
                 break;
@@ -809,7 +816,9 @@ where
         &mut self,
         drain_timeout: Duration,
     ) -> Result<BridgeShutdownReport, BridgeShutdownError> {
-        let deadline = tokio::time::Instant::now() + drain_timeout;
+        let deadline = tokio::time::Instant::from_std(
+            tina::Deadline::from_instant(std::time::Instant::now(), drain_timeout).instant(),
+        );
         loop {
             if self.pending_handles() == 0 {
                 break;
@@ -993,8 +1002,8 @@ where
                 delay,
                 total_timeout,
             } => {
-                match tokio::time::timeout(
-                    total_timeout,
+                match tokio::time::timeout_at(
+                    tokio_deadline(total_timeout),
                     self.call_with_retry(message, max_retries, delay, per_attempt_timeout),
                 )
                 .await
@@ -1038,7 +1047,7 @@ where
             match self.call_once(message.clone(), per_attempt_timeout).await {
                 Err(BridgeError::Full) if remaining > 0 => {
                     remaining -= 1;
-                    tokio::time::sleep(delay).await;
+                    tokio::time::sleep_until(tokio_deadline(delay)).await;
                 }
                 outcome => return outcome,
             }
@@ -1115,7 +1124,7 @@ where
                 error
             })?;
 
-        let outcome = match tokio::time::timeout(timeout, async {
+        let outcome = match tokio::time::timeout_at(tokio_deadline(timeout), async {
             match observed_rx.await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => return BridgeWaitOutcome::ObservedError(error),

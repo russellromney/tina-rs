@@ -10,6 +10,7 @@
 //!     .build();
 //! ```
 
+use http::header::{InvalidHeaderName, InvalidHeaderValue};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Version};
 
 use crate::types::HttpRequest;
@@ -36,6 +37,7 @@ impl HttpRequest {
 /// Consumes itself on each call so chaining is one expression. Build with
 /// [`RequestBuilder::build`].
 #[derive(Debug)]
+#[must_use = "request builders must be built or chained to retain their changes"]
 pub struct RequestBuilder {
     method: Method,
     path: String,
@@ -70,16 +72,16 @@ impl RequestBuilder {
         self
     }
 
-    /// Appends a header, returning the builder unchanged on invalid input.
-    /// Useful when names/values come from untrusted sources.
-    pub fn try_header(mut self, name: &str, value: &str) -> Self {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(value),
-        ) {
-            self.headers.append(name, value);
-        }
-        self
+    /// Appends a header, returning a typed error for an invalid name or value.
+    /// Use this when either input comes from an untrusted source. The builder
+    /// is consumed on error, so callers cannot accidentally continue with a
+    /// request that silently omitted a security-relevant header.
+    pub fn try_header(mut self, name: &str, value: &str) -> Result<Self, RequestHeaderError> {
+        let name =
+            HeaderName::from_bytes(name.as_bytes()).map_err(RequestHeaderError::InvalidName)?;
+        let value = HeaderValue::from_str(value).map_err(RequestHeaderError::InvalidValue)?;
+        self.headers.append(name, value);
+        Ok(self)
     }
 
     /// Sets the body bytes. The encoder fills in `Content-Length`
@@ -109,6 +111,33 @@ impl RequestBuilder {
             version: self.version,
             headers: self.headers,
             body: crate::types::HttpRequestBody::Buffered(self.body),
+        }
+    }
+}
+
+/// Invalid input supplied to [`RequestBuilder::try_header`].
+#[derive(Debug)]
+pub enum RequestHeaderError {
+    /// The field name is not a valid HTTP header name.
+    InvalidName(InvalidHeaderName),
+    /// The field value contains bytes HTTP forbids in a header value.
+    InvalidValue(InvalidHeaderValue),
+}
+
+impl std::fmt::Display for RequestHeaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidName(_) => f.write_str("invalid HTTP header name"),
+            Self::InvalidValue(_) => f.write_str("invalid HTTP header value"),
+        }
+    }
+}
+
+impl std::error::Error for RequestHeaderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidName(source) => Some(source),
+            Self::InvalidValue(source) => Some(source),
         }
     }
 }
@@ -149,9 +178,11 @@ mod tests {
     }
 
     #[test]
-    fn try_header_swallows_invalid() {
+    fn try_header_distinguishes_invalid_value() {
         // \x7f is not a legal header value byte.
-        let req = HttpRequest::get("/").try_header("X-Bad", "\x7f").build();
-        assert!(req.headers.is_empty());
+        let error = HttpRequest::get("/")
+            .try_header("X-Bad", "\x7f")
+            .expect_err("invalid header value must be visible");
+        assert!(matches!(error, RequestHeaderError::InvalidValue(_)));
     }
 }

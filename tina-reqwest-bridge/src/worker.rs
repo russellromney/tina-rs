@@ -26,6 +26,19 @@ use crate::types::{
 
 type ReqwestResult = Result<ReqwestResponse, ReqwestError>;
 
+const REQWEST_TIMEOUT_CEILING: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 50);
+
+fn tokio_deadline(timeout: Duration) -> tokio::time::Instant {
+    tokio::time::Instant::from_std(tina::Deadline::from_instant(Instant::now(), timeout).instant())
+}
+
+// Reqwest's builder accepts a relative duration and constructs its deadline
+// later. Stay below Tina's 100-year saturation ceiling so that second addition
+// retains generous representational headroom.
+fn reqwest_timeout(timeout: Duration) -> Duration {
+    timeout.min(REQWEST_TIMEOUT_CEILING)
+}
+
 /// `tracing` target for per-call events.
 #[cfg(feature = "tracing")]
 const TRACE_TARGET_CALL: &str = "tina_reqwest.bridge.call";
@@ -168,7 +181,15 @@ impl std::fmt::Display for InstallError {
     }
 }
 
-impl std::error::Error for InstallError {}
+impl std::error::Error for InstallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(source) => Some(source),
+            Self::Build(source) => Some(source),
+            Self::Register(source) => Some(source),
+        }
+    }
+}
 
 impl From<ReqwestConfigError> for InstallError {
     fn from(e: ReqwestConfigError) -> Self {
@@ -450,7 +471,7 @@ impl<S: Shard + 'static> ReqwestWorker<S> {
         }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        let attempt_due_at = Instant::now() + retry_delay;
+        let attempt_due_at = tina::Deadline::from_instant(Instant::now(), retry_delay).instant();
         let retry_safe = method_is_retry_safe_by_default(&request.method);
         let method = request.method.as_str().to_string();
         self.in_flight.insert(
@@ -862,7 +883,7 @@ impl ReqwestCloser {
 }
 
 fn build_client(config: &ReqwestConfig) -> Result<Client, ReqwestError> {
-    let mut builder = Client::builder().timeout(config.default_timeout);
+    let mut builder = Client::builder().timeout(reqwest_timeout(config.default_timeout));
     builder = match config.redirect {
         RedirectPolicy::None => builder.redirect(reqwest::redirect::Policy::none()),
         RedirectPolicy::Limited(n) => {
@@ -894,7 +915,7 @@ fn build_reqwest_request(
         builder = builder.body(request.body.clone());
     }
     if let Some(timeout) = request.timeout {
-        builder = builder.timeout(timeout);
+        builder = builder.timeout(reqwest_timeout(timeout));
     }
     builder
         .build()
@@ -936,7 +957,7 @@ async fn execute(
             body: bytes,
         })
     };
-    match tokio::time::timeout(overall_timeout, send_future).await {
+    match tokio::time::timeout_at(tokio_deadline(overall_timeout), send_future).await {
         Ok(out) => out,
         Err(_) => Err(ReqwestError::Timeout),
     }
@@ -1053,5 +1074,47 @@ mod tests {
         assert!(method_is_retry_safe_by_default(&Method::DELETE));
         assert!(!method_is_retry_safe_by_default(&Method::POST));
         assert!(!method_is_retry_safe_by_default(&Method::PATCH));
+    }
+
+    #[test]
+    fn maximum_retry_delay_is_parked_instead_of_panicking() {
+        let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let client = Client::builder().build().expect("client");
+        let (mut worker, _) = ReqwestWorker::<SingleShard>::with_supplied_client(
+            ReqwestConfig::default(),
+            client,
+            tokio_runtime.handle().clone(),
+        )
+        .expect("worker");
+        let now = Instant::now();
+
+        let _poll = worker.schedule_retry(
+            ReqwestRequest::get("http://127.0.0.1:1/retry"),
+            None,
+            1,
+            Duration::MAX,
+            Duration::from_secs(1),
+        );
+
+        let slot = worker.in_flight.values().next().expect("parked retry slot");
+        let SlotKind::PendingRetry { attempt_due_at, .. } = &slot.kind else {
+            panic!("maximum retry delay should remain pending")
+        };
+        assert!(
+            *attempt_due_at > now + Duration::from_secs(60 * 60 * 24 * 365 * 50),
+            "maximum retry delay should saturate far into the future"
+        );
+    }
+
+    #[test]
+    fn reqwest_relative_timeout_keeps_headroom() {
+        assert_eq!(
+            reqwest_timeout(Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(reqwest_timeout(Duration::MAX), REQWEST_TIMEOUT_CEILING);
     }
 }

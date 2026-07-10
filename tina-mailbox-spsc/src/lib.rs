@@ -1,6 +1,7 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 #![deny(unsafe_op_in_unsafe_fn)]
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 //! Bounded single-producer/single-consumer mailbox for `tina-rs`.
 //!
@@ -173,7 +174,7 @@ impl<T> Mailbox<T> for SpscMailbox<T> {
         if tail.wrapping_sub(head) >= self.capacity {
             return Err(TrySendError::Full(message));
         }
-        // Safety: the producer claim guarantees exclusive write access among
+        // SAFETY: the producer claim guarantees exclusive write access among
         // producers, and the queue is known not to be full, so this slot is not
         // concurrently owned by the consumer.
         unsafe {
@@ -199,7 +200,7 @@ impl<T> Mailbox<T> for SpscMailbox<T> {
             return None;
         }
 
-        // Safety: the consumer claim guarantees exclusive read access among
+        // SAFETY: the consumer claim guarantees exclusive read access among
         // consumers, and `head != tail` means a producer has fully published a
         // value into this slot.
         let value = unsafe { self.slot(head).read() };
@@ -266,7 +267,7 @@ impl<T> Drop for SpscMailbox<T> {
         while cursor != tail {
             let index = cursor & self.slot_mask;
 
-            // Safety: drop runs with exclusive access to the mailbox, and the
+            // SAFETY: drop runs with exclusive access to the mailbox, and the
             // range `[head, tail)` contains only initialized elements that have
             // not yet been received.
             unsafe {
@@ -278,13 +279,13 @@ impl<T> Drop for SpscMailbox<T> {
     }
 }
 
-// Safety: the mailbox uses atomics for coordination, and the producer gate in
+// SAFETY: the mailbox uses atomics for coordination, and the producer gate in
 // `state` prevents overlapping producer access while still allowing one
 // producer and one consumer to operate concurrently. Sharing the mailbox across
 // threads is sound as long as stored messages are themselves `Send`.
 unsafe impl<T: Send> Send for SpscMailbox<T> {}
 
-// Safety: see the `Send` impl above. The mailbox panics on overlapping
+// SAFETY: see the `Send` impl above. The mailbox panics on overlapping
 // same-role access instead of permitting an unsound producer or consumer set.
 unsafe impl<T: Send> Sync for SpscMailbox<T> {}
 
@@ -300,41 +301,46 @@ impl<T> Slot<T> {
     }
 
     unsafe fn write(&self, value: T) {
-        // Safety: callers guarantee exclusive ownership of the slot for writes.
         #[cfg(feature = "loom")]
+        // SAFETY: callers guarantee exclusive ownership of the slot for writes.
         self.value.with_mut(|ptr| unsafe {
             (*ptr).write(value);
         });
 
         #[cfg(not(feature = "loom"))]
+        // SAFETY: callers guarantee exclusive ownership of the slot for writes.
         unsafe {
             (*self.value.get()).write(value);
         }
     }
 
     unsafe fn read(&self) -> T {
-        // Safety: callers guarantee the slot currently holds an initialized
-        // value that is being consumed exactly once.
         #[cfg(feature = "loom")]
         {
+            // SAFETY: callers guarantee the slot contains an initialized value
+            // that is being consumed exactly once.
             self.value.with(|ptr| unsafe { (*ptr).assume_init_read() })
         }
 
         #[cfg(not(feature = "loom"))]
+        // SAFETY: callers guarantee the slot contains an initialized value that
+        // is being consumed exactly once.
         unsafe {
             (*self.value.get()).assume_init_read()
         }
     }
 
     unsafe fn drop_in_place(&self) {
-        // Safety: callers guarantee the slot currently holds an initialized
-        // value that has not yet been moved out.
         #[cfg(feature = "loom")]
+        // SAFETY: callers guarantee the slot contains an initialized value that
+        // has not yet been moved out.
         self.value.with_mut(|ptr| unsafe {
             (*ptr).assume_init_drop();
         });
 
         #[cfg(not(feature = "loom"))]
+        // SAFETY: callers guarantee the slot contains an initialized value that
+        // has not yet been moved out.
         unsafe {
             (*self.value.get()).assume_init_drop();
         }

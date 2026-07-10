@@ -1394,7 +1394,7 @@ fn wait_keepalive_pool_drain<S>(
 where
     S: Shard + Send + 'static,
 {
-    let deadline = Instant::now() + timeout;
+    let deadline = tina::Deadline::from_instant(Instant::now(), timeout).instant();
     let mut last_leased = handles.connections.len();
 
     loop {

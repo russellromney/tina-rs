@@ -2,7 +2,10 @@
 
 use std::path::PathBuf;
 
-use super::{CallInput, CallOutput, FileId, FileOpenOptions, PathMetadata, TypedCall};
+use super::{
+    CallInput, CallOutput, FileId, FileOpenOptions, PathMetadata, TypedCall, WriteOwnedError,
+    WriteOwnedReply,
+};
 
 /// Returns a typed file-open helper.
 pub fn file_open(path: impl Into<PathBuf>, options: FileOpenOptions) -> TypedCall<FileId> {
@@ -43,6 +46,40 @@ pub fn file_write_at(file: FileId, bytes: Vec<u8>, offset: u64) -> TypedCall<usi
             offset,
         },
         CallOutput::into_file_wrote,
+    )
+}
+
+/// Returns a positional file-write helper that gives the bytes back.
+pub fn file_write_at_owned(
+    file: FileId,
+    bytes: Vec<u8>,
+    offset: u64,
+) -> TypedCall<WriteOwnedReply, WriteOwnedError> {
+    TypedCall::new(
+        CallInput::FileWriteAtOwned {
+            file,
+            bytes,
+            offset,
+            start: 0,
+        },
+        CallOutput::into_file_wrote_owned,
+    )
+}
+
+pub(crate) fn file_write_at_owned_from(
+    file: FileId,
+    bytes: Vec<u8>,
+    offset: u64,
+    start: usize,
+) -> TypedCall<WriteOwnedReply, WriteOwnedError> {
+    TypedCall::new(
+        CallInput::FileWriteAtOwned {
+            file,
+            bytes,
+            offset,
+            start,
+        },
+        CallOutput::into_file_wrote_owned,
     )
 }
 

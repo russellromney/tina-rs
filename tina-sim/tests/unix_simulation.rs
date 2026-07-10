@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use tina::{Context, Effect, Isolate, Outbound, Shard, ShardId};
 use tina_runtime::{
-    CallError, RuntimeCall, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixReadReply,
-    UnixStreamId, UnixWriteReply, sleep, unix_accept, unix_bind, unix_close_listener,
-    unix_close_stream, unix_connect, unix_read, unix_write,
+    CallError, LoopStep, RuntimeCall, UnixAcceptReply, UnixBindReply, UnixConnectReply,
+    UnixReadReply, UnixStreamId, UnixWriteAll, UnixWriteOwnedReply, sleep, unix_accept, unix_bind,
+    unix_close_listener, unix_close_stream, unix_connect, unix_read,
 };
-use tina_sim::{Simulator, SimulatorConfig};
+use tina_sim::{Simulator, SimulatorConfig, dst::InvariantSuite};
 
 #[derive(Debug, Default)]
 struct UnixShard;
@@ -45,7 +45,7 @@ enum EchoServerMsg {
     DelayDone(Result<(), CallError>),
     Accepted(UnixAcceptReply),
     Read(UnixReadReply),
-    Wrote(UnixWriteReply),
+    Wrote(UnixWriteOwnedReply),
     Done,
 }
 
@@ -54,7 +54,7 @@ struct EchoServer {
     accept_delay: Duration,
     listener: Option<tina_runtime::UnixListenerId>,
     stream: Option<UnixStreamId>,
-    pending: Vec<u8>,
+    write_all: Option<UnixWriteAll>,
 }
 
 impl Isolate for EchoServer {
@@ -94,23 +94,26 @@ impl Isolate for EchoServer {
                         None => Effect::Stop,
                     }
                 } else {
-                    self.pending = bytes;
-                    unix_write(self.stream.expect("stream"), self.pending.clone())
-                        .then(EchoServerMsg::Wrote)
+                    let mut write_all = UnixWriteAll::new(self.stream.expect("stream"), bytes);
+                    let effect = write_all
+                        .next_effect(EchoServerMsg::Wrote)
+                        .expect("echo payload is non-empty");
+                    self.write_all = Some(write_all);
+                    effect
                 }
             }
             EchoServerMsg::Read(Err(_)) => Effect::Stop,
-            EchoServerMsg::Wrote(Ok(count)) => {
-                let drained = count.min(self.pending.len());
-                self.pending.drain(..drained);
-                if self.pending.is_empty() {
-                    unix_read(self.stream.expect("stream"), 64).then(EchoServerMsg::Read)
-                } else {
-                    unix_write(self.stream.expect("stream"), self.pending.clone())
-                        .then(EchoServerMsg::Wrote)
+            EchoServerMsg::Wrote(reply) => {
+                let write_all = self.write_all.as_mut().expect("write helper armed");
+                match write_all.advance::<Self, _, _>(reply, EchoServerMsg::Wrote) {
+                    LoopStep::Pending(effect) => effect,
+                    LoopStep::Done(_) => {
+                        self.write_all = None;
+                        unix_read(self.stream.expect("stream"), 64).then(EchoServerMsg::Read)
+                    }
+                    LoopStep::Failed(_) => Effect::Stop,
                 }
             }
-            EchoServerMsg::Wrote(Err(_)) => Effect::Stop,
             EchoServerMsg::Done => Effect::Stop,
         }
     }
@@ -122,7 +125,7 @@ enum EchoClientMsg {
     Start,
     ConnectDelayDone(Result<(), CallError>),
     Connected(UnixConnectReply),
-    Wrote(UnixWriteReply),
+    Wrote(UnixWriteOwnedReply),
     Read(UnixReadReply),
     Done,
 }
@@ -131,7 +134,7 @@ struct EchoClient {
     path: PathBuf,
     connect_delay: Duration,
     stream: Option<UnixStreamId>,
-    pending: Vec<u8>,
+    write_all: Option<UnixWriteAll>,
     received: Arc<Mutex<Vec<u8>>>,
     connect_error: Arc<Mutex<Option<CallError>>>,
 }
@@ -158,31 +161,39 @@ impl Isolate for EchoClient {
             }
             EchoClientMsg::Connected(Ok(stream)) => {
                 self.stream = Some(stream);
-                self.pending = b"ping".to_vec();
-                unix_write(stream, self.pending.clone()).then(EchoClientMsg::Wrote)
+                let mut write_all = UnixWriteAll::new(stream, b"ping".to_vec());
+                let effect = write_all
+                    .next_effect(EchoClientMsg::Wrote)
+                    .expect("client payload is non-empty");
+                self.write_all = Some(write_all);
+                effect
             }
             EchoClientMsg::Connected(Err(error)) => {
                 *self.connect_error.lock().unwrap() = Some(error);
                 Effect::Stop
             }
-            EchoClientMsg::Wrote(Ok(count)) => {
-                let drained = count.min(self.pending.len());
-                self.pending.drain(..drained);
-                if self.pending.is_empty() {
-                    unix_read(self.stream.expect("stream"), 64).then(EchoClientMsg::Read)
-                } else {
-                    unix_write(self.stream.expect("stream"), self.pending.clone())
-                        .then(EchoClientMsg::Wrote)
+            EchoClientMsg::Wrote(reply) => {
+                let write_all = self.write_all.as_mut().expect("write helper armed");
+                match write_all.advance::<Self, _, _>(reply, EchoClientMsg::Wrote) {
+                    LoopStep::Pending(effect) => effect,
+                    LoopStep::Done(_) => {
+                        self.write_all = None;
+                        unix_read(self.stream.expect("stream"), 64).then(EchoClientMsg::Read)
+                    }
+                    LoopStep::Failed(_) => Effect::Stop,
                 }
             }
-            EchoClientMsg::Wrote(Err(_)) => Effect::Stop,
             EchoClientMsg::Read(Ok(bytes)) => {
                 if !bytes.is_empty() {
                     self.received.lock().unwrap().extend_from_slice(&bytes);
                 }
-                match self.stream.take() {
-                    Some(stream) => unix_close_stream(stream).then(|_| EchoClientMsg::Done),
-                    None => Effect::Stop,
+                if self.received.lock().unwrap().len() < 4 {
+                    unix_read(self.stream.expect("stream"), 64).then(EchoClientMsg::Read)
+                } else {
+                    match self.stream.take() {
+                        Some(stream) => unix_close_stream(stream).then(|_| EchoClientMsg::Done),
+                        None => Effect::Stop,
+                    }
                 }
             }
             EchoClientMsg::Read(Err(_)) => Effect::Stop,
@@ -193,7 +204,9 @@ impl Isolate for EchoClient {
 
 #[test]
 fn connect_parks_until_accept_then_pairs() {
-    let mut sim = Simulator::new(UnixShard, SimulatorConfig::default());
+    let mut config = SimulatorConfig::default();
+    config.unix.default_write_cap = 1;
+    let mut sim = Simulator::new(UnixShard, config);
     let received = Arc::new(Mutex::new(Vec::new()));
     let connect_error = Arc::new(Mutex::new(None));
 
@@ -204,13 +217,13 @@ fn connect_parks_until_accept_then_pairs() {
         accept_delay: Duration::from_millis(5),
         listener: None,
         stream: None,
-        pending: Vec::new(),
+        write_all: None,
     });
     let client = sim.register(EchoClient {
         path: sock("connect-parks"),
         connect_delay: Duration::from_millis(1),
         stream: None,
-        pending: Vec::new(),
+        write_all: None,
         received: Arc::clone(&received),
         connect_error: Arc::clone(&connect_error),
     });
@@ -220,6 +233,7 @@ fn connect_parks_until_accept_then_pairs() {
 
     assert_eq!(*connect_error.lock().unwrap(), None, "connect must succeed");
     assert_eq!(received.lock().unwrap().as_slice(), b"ping");
+    InvariantSuite::standard().assert(sim.trace());
 }
 
 // ---------------------------------------------------------------------------
@@ -474,7 +488,7 @@ fn listener_close_refuses_parked_connect() {
         path: sock("refuse"),
         connect_delay: Duration::from_millis(1),
         stream: None,
-        pending: Vec::new(),
+        write_all: None,
         received: Arc::clone(&received),
         connect_error: Arc::clone(&connect_error),
     });

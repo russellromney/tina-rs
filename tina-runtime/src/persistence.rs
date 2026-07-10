@@ -397,7 +397,8 @@ pub fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotImage, CallError> {
         return Err(CallError::CorruptRecord);
     }
     let last_journal_index = read_u64(bytes, 8).ok_or(CallError::CorruptRecord)?;
-    let payload_len = read_u64(bytes, 16).ok_or(CallError::CorruptRecord)? as usize;
+    let payload_len = usize::try_from(read_u64(bytes, 16).ok_or(CallError::CorruptRecord)?)
+        .map_err(|_| CallError::CorruptRecord)?;
     let expected_checksum = read_u64(bytes, 24).ok_or(CallError::CorruptRecord)?;
     let end = SNAPSHOT_HEADER_BYTES
         .checked_add(payload_len)
@@ -445,7 +446,8 @@ pub fn replay_journal_bytes(bytes: &[u8]) -> Result<JournalReplay, CallError> {
             return Err(CallError::CorruptRecord);
         }
         let index = read_u64(header, 8).ok_or(CallError::CorruptRecord)?;
-        let payload_len = read_u64(header, 16).ok_or(CallError::CorruptRecord)? as usize;
+        let payload_len = usize::try_from(read_u64(header, 16).ok_or(CallError::CorruptRecord)?)
+            .map_err(|_| CallError::CorruptRecord)?;
         let expected_checksum = read_u64(header, 24).ok_or(CallError::CorruptRecord)?;
         let payload_start = cursor + JOURNAL_HEADER_BYTES;
         let Some(payload_end) = payload_start.checked_add(payload_len) else {

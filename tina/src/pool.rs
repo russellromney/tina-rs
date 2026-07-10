@@ -606,79 +606,89 @@ pub enum ReleaseFailure {
     WrongReply,
 }
 
-/// Internals exposed for runtime crates.
+/// Capability-based internals exposed for runtime pool implementations.
 ///
-/// Cross-crate Rust does not have a clean private-but-visible
-/// boundary, so the lease and id constructors here are
-/// `unsafe fn`. The unsafety is not memory-related; it is the
-/// pool's *contract* invariant:
-///
-/// > Only the pool that owns a resource may mint a lease for it.
-///
-/// Calling [`runtime_internal::lease_new`] from outside the pool
-/// implementation lets
-/// application code forge a lease whose identity matches an
-/// outstanding one, release the duplicate, and produce resource
-/// aliasing — the pool will hand the same resource to a new waiter
-/// while the original lease is still live. That is a real
-/// correctness bug for resources that don't tolerate it (DB
-/// connections, files, sockets).
-///
-/// `tina-runtime`'s pool implementation is the only legitimate
-/// caller. It wraps each call in `unsafe { }` with a SAFETY comment
-/// pointing at the pool that minted the lease.
-#[allow(unsafe_code)]
+/// [`PoolAuthority`] owns a process-unique [`PoolId`]. Its constructor does
+/// not accept caller-provided identity, so even code that can name this module
+/// cannot forge a lease that passes a different pool's identity check. A pool
+/// implementation keeps its authority private and uses it to mint the
+/// [`ResourceId`] and [`PoolLease`] values for that pool.
 pub mod runtime_internal {
     use super::{PoolId, PoolLease, ResourceId};
     use std::num::NonZeroU64;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Mint a new [`PoolId`].
+    /// Unique authority for one pool's identity and lease constructors.
     ///
-    /// # Safety
-    ///
-    /// Caller must be a runtime-side pool implementation. Forging a
-    /// `PoolId` that collides with a live pool's id lets a forged
-    /// lease pass the release-time identity check.
-    pub unsafe fn pool_id_from_raw(raw: NonZeroU64) -> PoolId {
-        PoolId(raw)
-    }
-
-    /// Mint a new [`ResourceId`].
-    ///
-    /// # Safety
-    ///
-    /// Same contract as [`pool_id_from_raw`] — runtime-internal.
-    pub unsafe fn resource_id_from_raw(raw: u32) -> ResourceId {
-        ResourceId(raw)
-    }
-
-    /// Mint a new [`PoolLease`].
-    ///
-    /// # Safety
-    ///
-    /// Caller must be the pool implementation that owns
-    /// `resource_id` under `pool_id` at `generation`. Constructing a
-    /// lease that duplicates an outstanding lease — or re-uses a
-    /// retired generation — breaks the move-only invariant and lets
-    /// the same resource be handed to two callers concurrently.
-    pub unsafe fn lease_new<H>(
+    /// This type is deliberately not `Clone`: the pool implementation owns the
+    /// sole mint for its identity. Calling [`PoolAuthority::new`] creates a new
+    /// identity rather than accepting one supplied by the caller.
+    #[derive(Debug)]
+    pub struct PoolAuthority {
         pool_id: PoolId,
-        resource_id: ResourceId,
-        generation: u64,
-        handle: H,
-    ) -> PoolLease<H> {
-        PoolLease {
-            pool_id,
-            resource_id,
-            generation,
-            handle,
+    }
+
+    impl PoolAuthority {
+        /// Creates an authority with a process-unique pool identity.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the process exhausts the non-zero `u64` identity space.
+        pub fn new() -> Self {
+            static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
+            let mut raw = NEXT_POOL_ID.load(Ordering::Relaxed);
+            loop {
+                let next = raw.checked_add(1).expect("pool id space exhausted");
+                match NEXT_POOL_ID.compare_exchange_weak(
+                    raw,
+                    next,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => raw = observed,
+                }
+            }
+            let raw = NonZeroU64::new(raw).expect("pool id counter starts non-zero");
+            Self {
+                pool_id: PoolId(raw),
+            }
+        }
+
+        /// Returns this authority's unique pool identity.
+        pub const fn pool_id(&self) -> PoolId {
+            self.pool_id
+        }
+
+        /// Creates a resource identifier in this pool's identity domain.
+        pub const fn resource_id(&self, raw: u32) -> ResourceId {
+            ResourceId(raw)
+        }
+
+        /// Mints a move-only lease under this authority's pool identity.
+        ///
+        /// The owning pool state machine is responsible for issuing at most one
+        /// live lease for each `(resource_id, generation)` pair. A lease minted
+        /// by one authority cannot pass another pool's identity check.
+        pub fn lease<H>(&self, resource_id: u32, generation: u64, handle: H) -> PoolLease<H> {
+            PoolLease {
+                pool_id: self.pool_id,
+                resource_id: self.resource_id(resource_id),
+                generation,
+                handle,
+            }
+        }
+    }
+
+    impl Default for PoolAuthority {
+        fn default() -> Self {
+            Self::new()
         }
     }
 
     /// Consume a lease into its parts. Pools use this to validate
-    /// releases. Safe: destructuring a legitimately-issued lease
-    /// cannot break the pool invariant on its own — only
-    /// [`lease_new`] can.
+    /// releases. Destructuring a legitimately issued lease cannot break the
+    /// pool invariant on its own.
     pub fn lease_into_parts<H>(lease: PoolLease<H>) -> (PoolId, ResourceId, u64, H) {
         (
             lease.pool_id,
@@ -766,5 +776,19 @@ mod tests {
         };
         let report = PoolShutdownReport::from_pressure(CloseMode::Force, &pressure);
         assert!(report.drained());
+    }
+
+    #[test]
+    fn pool_authorities_mint_distinct_identity_domains() {
+        let first = runtime_internal::PoolAuthority::new();
+        let second = runtime_internal::PoolAuthority::new();
+        assert_ne!(first.pool_id(), second.pool_id());
+
+        let lease = first.lease(7, 3, "resource");
+        let (pool_id, resource_id, generation, handle) = runtime_internal::lease_into_parts(lease);
+        assert_eq!(pool_id, first.pool_id());
+        assert_eq!(resource_id, first.resource_id(7));
+        assert_eq!(generation, 3);
+        assert_eq!(handle, "resource");
     }
 }

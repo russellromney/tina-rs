@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 use crate::Deadline;
 
 const NANOS_PER_SEC: u128 = 1_000_000_000;
-const TIMER_SATURATION_CEILING: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 100);
 
 /// Error returned when timer helper configuration is unsafe or meaningless.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -243,8 +242,7 @@ impl Backoff {
 }
 
 fn checked_add_or_max(now: Instant, after: Duration) -> Instant {
-    now.checked_add(after)
-        .unwrap_or_else(|| now.checked_add(TIMER_SATURATION_CEILING).unwrap_or(now))
+    Deadline::from_instant(now, after).instant()
 }
 
 fn elapsed_periods_saturating(overdue: Duration, period: Duration) -> u64 {

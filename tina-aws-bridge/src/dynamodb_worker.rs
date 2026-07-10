@@ -20,7 +20,7 @@ use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::{AttributeValue, ConsumedCapacity, ReturnConsumedCapacity, Select};
 use tina::CallContext;
 use tina::prelude::*;
-use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, sleep};
+use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeError, sleep};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 #[cfg(feature = "tracing")]
@@ -140,9 +140,9 @@ pub enum DynamoInstallError {
     /// Invalid config.
     Config(DynamoConfigError),
     /// Tokio runtime or AWS client construction failed.
-    Build(String),
+    Build(DynamoError),
     /// Tina runtime registration failed.
-    Register(String),
+    Register(ThreadedRuntimeError),
 }
 
 impl std::fmt::Display for DynamoInstallError {
@@ -155,7 +155,15 @@ impl std::fmt::Display for DynamoInstallError {
     }
 }
 
-impl std::error::Error for DynamoInstallError {}
+impl std::error::Error for DynamoInstallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(source) => Some(source),
+            Self::Build(source) => Some(source),
+            Self::Register(source) => Some(source),
+        }
+    }
+}
 
 impl From<DynamoConfigError> for DynamoInstallError {
     fn from(value: DynamoConfigError) -> Self {
@@ -464,12 +472,11 @@ impl<S: Shard + Send + 'static> DynamoWorker<S> {
     {
         config.validate()?;
         let cap = config.mailbox_capacity;
-        let (worker, metrics) =
-            Self::new(config).map_err(|e| DynamoInstallError::Build(e.to_string()))?;
+        let (worker, metrics) = Self::new(config).map_err(DynamoInstallError::Build)?;
         let closer = worker.closer();
         let address = runtime
             .register_with_capacity::<_, Infallible>(worker, cap)
-            .map_err(|e| DynamoInstallError::Register(format!("{e:?}")))?;
+            .map_err(DynamoInstallError::Register)?;
         Ok(InstalledDynamoBridge {
             address,
             closer,

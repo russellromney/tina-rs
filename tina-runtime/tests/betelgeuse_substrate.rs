@@ -702,6 +702,18 @@ impl IOSocket for StuckReleaseSocket {
         ))
     }
 
+    fn send_owned_from(
+        &self,
+        _c: &mut SendOwnedCompletion,
+        buf: Vec<u8>,
+        _start: usize,
+    ) -> Result<(), (io::Error, Vec<u8>)> {
+        Err((
+            io::Error::new(io::ErrorKind::Unsupported, "stuck send_owned_from"),
+            buf,
+        ))
+    }
+
     fn set_nodelay(&self, _on: bool) -> io::Result<()> {
         Ok(())
     }

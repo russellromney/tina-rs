@@ -37,23 +37,29 @@ pub struct TcpReadBufError {
     pub buffer: Vec<u8>,
 }
 
-/// Successful owned-buffer TCP write reply.
+/// Successful owned-buffer write reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TcpWriteOwnedReply {
+pub struct WriteOwnedReply {
     /// Caller-owned bytes returned by the runtime.
     pub bytes: Vec<u8>,
     /// Bytes accepted by the stream.
     pub written: usize,
 }
 
-/// Owned-buffer TCP write failure.
+/// Owned-buffer write failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TcpWriteOwnedError {
+pub struct WriteOwnedError {
     /// The runtime failure.
     pub error: CallError,
     /// Caller-owned bytes returned by the runtime.
     pub bytes: Vec<u8>,
 }
+
+/// TCP compatibility name for [`WriteOwnedReply`].
+pub type TcpWriteOwnedReply = WriteOwnedReply;
+
+/// TCP compatibility name for [`WriteOwnedError`].
+pub type TcpWriteOwnedError = WriteOwnedError;
 
 /// Successful owned-buffer TCP terminal write reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +185,8 @@ pub enum CallInput {
         stream: StreamId,
         /// The payload to write.
         bytes: Vec<u8>,
+        /// First byte in `bytes` to submit.
+        start: usize,
     },
 
     /// Write caller-owned bytes to a stream and close the stream only if the
@@ -399,6 +407,18 @@ pub enum CallInput {
         offset: u64,
     },
 
+    /// Write bytes at `offset` and return the caller-owned buffer.
+    FileWriteAtOwned {
+        /// The file to write.
+        file: FileId,
+        /// Caller-owned bytes to write.
+        bytes: Vec<u8>,
+        /// File offset.
+        offset: u64,
+        /// First byte in `bytes` to submit.
+        start: usize,
+    },
+
     /// Flush file data to stable storage.
     FileFsync {
         /// The file to flush.
@@ -525,6 +545,16 @@ pub enum CallInput {
         bytes: Vec<u8>,
     },
 
+    /// Write `bytes` to a Unix stream and return the caller-owned buffer.
+    UnixWriteOwned {
+        /// The Unix stream to write to.
+        stream: UnixStreamId,
+        /// Caller-owned payload.
+        bytes: Vec<u8>,
+        /// First byte in `bytes` to submit.
+        start: usize,
+    },
+
     /// Close a Unix listener and release its resources. The runtime
     /// removes the underlying socket file when the listener is closed.
     UnixListenerClose {
@@ -578,7 +608,9 @@ impl CallInput {
             Self::ProcessRun { .. } => crate::trace::CallKind::ProcessRun,
             Self::FileOpen { .. } => crate::trace::CallKind::FileOpen,
             Self::FileReadAt { .. } => crate::trace::CallKind::FileReadAt,
-            Self::FileWriteAt { .. } => crate::trace::CallKind::FileWriteAt,
+            Self::FileWriteAt { .. } | Self::FileWriteAtOwned { .. } => {
+                crate::trace::CallKind::FileWriteAt
+            }
             Self::FileFsync { .. } => crate::trace::CallKind::FileFsync,
             Self::FileSize { .. } => crate::trace::CallKind::FileSize,
             Self::FileClose { .. } => crate::trace::CallKind::FileClose,
@@ -597,7 +629,9 @@ impl CallInput {
             Self::UnixAccept { .. } => crate::trace::CallKind::UnixAccept,
             Self::UnixConnect { .. } => crate::trace::CallKind::UnixConnect,
             Self::UnixRead { .. } => crate::trace::CallKind::UnixRead,
-            Self::UnixWrite { .. } => crate::trace::CallKind::UnixWrite,
+            Self::UnixWrite { .. } | Self::UnixWriteOwned { .. } => {
+                crate::trace::CallKind::UnixWrite
+            }
             Self::UnixListenerClose { .. } => crate::trace::CallKind::UnixListenerClose,
             Self::UnixStreamClose { .. } => crate::trace::CallKind::UnixStreamClose,
         }
@@ -880,6 +914,22 @@ pub enum CallOutput {
         count: usize,
     },
 
+    /// A positional file write completed and returned its buffer.
+    FileWroteOwned {
+        /// Caller-owned bytes returned by the runtime.
+        bytes: Vec<u8>,
+        /// The number of bytes written.
+        count: usize,
+    },
+
+    /// A positional file write failed and returned its buffer.
+    FileWroteOwnedFailed {
+        /// Caller-owned bytes returned by the runtime.
+        bytes: Vec<u8>,
+        /// Runtime failure.
+        error: CallError,
+    },
+
     /// File data was flushed.
     FileSynced,
 
@@ -973,6 +1023,22 @@ pub enum CallOutput {
         count: usize,
     },
 
+    /// A Unix stream write completed and returned its buffer.
+    UnixWroteOwned {
+        /// Caller-owned bytes returned by the runtime.
+        bytes: Vec<u8>,
+        /// Bytes accepted by the runtime.
+        count: usize,
+    },
+
+    /// A Unix stream write failed and returned its buffer.
+    UnixWroteOwnedFailed {
+        /// Caller-owned bytes returned by the runtime.
+        bytes: Vec<u8>,
+        /// Runtime failure.
+        error: CallError,
+    },
+
     /// A Unix listener was closed and its resources released.
     UnixListenerClosed,
 
@@ -988,6 +1054,9 @@ pub enum CallOutput {
 /// Why a runtime-owned call failed before it could complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CallError {
+    /// A runtime completion violated its own call contract.
+    InvariantViolation,
+
     /// The referenced listener or stream id is not registered with the
     /// runtime.
     InvalidResource,

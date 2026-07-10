@@ -47,6 +47,7 @@ struct Route {
 /// [`Self::method_not_allowed`] the router distinguishes 404 (path
 /// unknown) from 405 (method mismatch on a known path).
 #[derive(Clone)]
+#[must_use = "routers must be dispatched or retained after adding routes"]
 pub struct Router {
     routes: Vec<Route>,
     not_found: RouteHandler,
@@ -181,6 +182,7 @@ struct StatefulRoute<S: 'static> {
 
 /// In-isolate router with `&mut S` access. See module docs.
 #[derive(Clone)]
+#[must_use = "routers must be dispatched or retained after adding routes"]
 pub struct StatefulRouter<S: 'static> {
     routes: Vec<StatefulRoute<S>>,
     not_found: StatefulHandler<S>,

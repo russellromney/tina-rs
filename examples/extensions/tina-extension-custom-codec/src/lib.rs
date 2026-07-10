@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tina::{Address, Context, Effect, Isolate, Outbound, Shard, ShardId};
-use tina_codec::{FrameDecision, SyncCodec};
+use tina_codec::{DecodeStatus, FrameDecision, SyncCodec, decode_chunk};
 use tina_runtime::{
     RuntimeCall, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerId, UnixReadReply,
     UnixStreamId, UnixWriteReply, sleep, unix_accept, unix_bind, unix_close_stream, unix_connect,
@@ -76,22 +76,27 @@ impl SyncCodec for SemicolonCodec {
     type Frame = Vec<u8>;
     type Malformed = SemicolonMalformed;
 
-    fn feed(&mut self, bytes: &[u8]) {
+    fn feed(&mut self, bytes: &[u8]) -> usize {
         if self.full {
-            return;
+            return 0;
         }
-        // Bounded per frame: append until the current unframed suffix
-        // crosses the cap. A delimiter that arrives before the cap still
-        // yields its frame, even if later bytes in the same read overflow
-        // the next frame.
-        for byte in bytes {
-            self.buf.push(*byte);
-            let unframed = self.buf.iter().rev().take_while(|b| **b != b';').count();
-            if unframed > self.max_frame {
-                self.full = true;
-                return;
-            }
+        if self.buf.last() == Some(&b';') {
+            return 0;
         }
+        let room = self
+            .max_frame
+            .saturating_add(1)
+            .saturating_sub(self.buf.len());
+        let through_delimiter = bytes
+            .iter()
+            .position(|byte| *byte == b';')
+            .map_or(bytes.len(), |index| index + 1);
+        let consumed = room.min(through_delimiter);
+        self.buf.extend_from_slice(&bytes[..consumed]);
+        if consumed == room && self.buf.last() != Some(&b';') {
+            self.full = true;
+        }
+        consumed
     }
 
     fn next_frame(&mut self) -> FrameDecision<Self::Frame, Self::Malformed> {
@@ -181,30 +186,29 @@ impl Isolate for CodecServer {
                 if bytes.is_empty() {
                     return self.close();
                 }
-                self.codec.feed(&bytes);
                 let mut reply = Vec::new();
                 let mut tear_down = false;
-                loop {
-                    match self.codec.next_frame() {
-                        FrameDecision::NeedMore => break,
-                        FrameDecision::Frame(frame) => {
-                            self.seen.lock().unwrap().push(frame.clone());
-                            if frame == b"quit" {
-                                // Flush whatever we already framed, then close.
-                                self.closing = true;
-                                break;
-                            }
+                let seen = &self.seen;
+                let closing = &mut self.closing;
+                let status = decode_chunk(&mut self.codec, &bytes, |frame| {
+                    if !*closing {
+                        seen.lock().unwrap().push(frame.clone());
+                        if frame == b"quit" {
+                            // Flush whatever we already framed, then close.
+                            *closing = true;
+                        } else {
                             reply.extend_from_slice(b"ok:");
                             reply.extend_from_slice(&frame);
                             reply.push(b';');
                         }
-                        FrameDecision::Malformed(_) | FrameDecision::Full => {
-                            // Bad stream: tear down now, discard partial reply.
-                            *self.rejected.lock().unwrap() = true;
-                            tear_down = true;
-                            break;
-                        }
                     }
+                });
+                if !self.closing
+                    && matches!(status, DecodeStatus::Malformed(_) | DecodeStatus::Full)
+                {
+                    // Bad stream: tear down now, discard partial reply.
+                    *self.rejected.lock().unwrap() = true;
+                    tear_down = true;
                 }
                 if tear_down {
                     return self.close();
@@ -463,11 +467,23 @@ mod tests {
     #[test]
     fn delimiter_before_later_overflow_keeps_finished_frame() {
         let mut codec = SemicolonCodec::new(4);
-        codec.feed(b"ok;abcdef");
-        assert!(matches!(
-            codec.next_frame(),
-            FrameDecision::Frame(ref f) if f == b"ok"
-        ));
-        assert!(matches!(codec.next_frame(), FrameDecision::Full));
+        let mut frames = Vec::new();
+        let status = decode_chunk(&mut codec, b"ok;abcdef", |frame| frames.push(frame));
+        assert_eq!(frames, [b"ok".to_vec()]);
+        assert_eq!(status, DecodeStatus::Full);
+    }
+
+    #[test]
+    fn quit_ignores_an_oversize_suffix_in_the_same_transport_chunk() {
+        let result = run_codec_service(
+            PathBuf::from("/tmp/tina_ext_codec_quit_suffix.sock"),
+            b"quit;abcdef".to_vec(),
+            4,
+        );
+        assert_eq!(result.server_saw, [b"quit".to_vec()]);
+        assert!(
+            !result.rejected,
+            "quit is an intentional close, not bad input"
+        );
     }
 }

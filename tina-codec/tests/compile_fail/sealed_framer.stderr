@@ -1,7 +1,7 @@
 error[E0277]: the trait bound `MyFramer: tina_codec::sealed::Sealed` is not satisfied
-  --> tests/compile_fail/sealed_framer.rs:15:5
+  --> tests/compile_fail/sealed_framer.rs:17:5
    |
-15 |     fn next_frame(&mut self) -> FrameDecision<Self::Frame, Self::Malformed> {
+17 |     fn next_frame(&mut self) -> FrameDecision<Self::Frame, Self::Malformed> {
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unsatisfied trait bound
    |
 help: the trait `tina_codec::sealed::Sealed` is not implemented for `MyFramer`

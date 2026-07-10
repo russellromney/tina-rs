@@ -2461,6 +2461,7 @@ impl<S: Shard, M: FromHttpRequest + Send + 'static> Drop for HttpConnection<S, M
 /// | `TargetFull`          | `503 Service Unavailable`    |
 /// | `Timeout`             | `504 Gateway Timeout`        |
 /// | `TargetClosed`        | `500 Internal Server Error`  |
+/// | `InvariantViolation`  | `500 Internal Server Error`  |
 /// | `InvalidResource`     | `500 Internal Server Error`  |
 /// | `Io`                  | `500 Internal Server Error`  |
 /// | `Unsupported`         | `500 Internal Server Error`  |
@@ -2485,7 +2486,8 @@ fn response_for_call_error(error: &CallError) -> HttpResponse {
         // carries the precise reason. Listed exhaustively so a future
         // CallError variant in tina-runtime forces a compile error here
         // rather than silently routing through a default.
-        CallError::InvalidResource
+        CallError::InvariantViolation
+        | CallError::InvalidResource
         | CallError::NotFound
         | CallError::Io
         | CallError::Unsupported

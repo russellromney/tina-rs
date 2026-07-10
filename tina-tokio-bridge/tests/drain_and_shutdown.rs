@@ -69,6 +69,44 @@ fn drain_and_shutdown_succeeds_when_no_handles_outstanding() {
 }
 
 #[test]
+fn drain_and_shutdown_accepts_maximum_timeout() {
+    let mut host = make_host();
+    let report = host
+        .drain_and_shutdown(Duration::MAX)
+        .expect("maximum drain timeout is accepted");
+    assert!(report.drained_within_timeout);
+    assert_eq!(report.outstanding_handles_at_shutdown, 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_drain_and_shutdown_accepts_maximum_timeout() {
+    let mut host = make_host();
+    let report = host
+        .drain_and_shutdown_async(Duration::MAX)
+        .await
+        .expect("maximum async drain timeout is accepted");
+    assert!(report.drained_within_timeout);
+    assert_eq!(report.outstanding_handles_at_shutdown, 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bridge_call_accepts_maximum_timeout() {
+    let host = make_host();
+    let handle = host
+        .register_bridge::<EchoIsolate, u32, u32, Infallible>(
+            EchoIsolate,
+            8,
+            Duration::from_millis(100),
+        )
+        .expect("register bridge");
+
+    assert_eq!(handle.call_with_timeout(42, Duration::MAX).await, Ok(42));
+    drop(handle);
+    host.shutdown()
+        .expect("shutdown after maximum-timeout call");
+}
+
+#[test]
 fn drain_and_shutdown_waits_for_outstanding_handles_to_drop() {
     let mut host = make_host();
     let handle = host
