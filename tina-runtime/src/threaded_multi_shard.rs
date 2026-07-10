@@ -26,7 +26,8 @@ use crate::capabilities::RuntimeCapabilities;
 use crate::clock::MonotonicClock;
 use crate::driver::BetelgeuseDriver;
 use crate::errors::{
-    ShutdownWaitError, ThreadedRegisterBootstrapError, ThreadedRuntimeError, ThreadedTrySendError,
+    ShutdownWaitError, StartupError, ThreadedRegisterBootstrapError, ThreadedRuntimeError,
+    ThreadedTrySendError,
 };
 use crate::live_report::{
     LiveQueueMetrics, LiveRemoteQueueReport, LiveShardMetrics, LiveShardState, LiveTopologyReport,
@@ -38,8 +39,8 @@ use crate::observer::TraceObserver;
 use crate::sharded::ReplyAdapter;
 use crate::shutdown::{SharedShutdownState, ShutdownWorker, ThreadedShutdownHandle, handle_for};
 use crate::threaded::{
-    CommandSender, ThreadedCommand, ThreadedRuntimeConfig,
-    deliver_shutdown_signal_and_drain_with_remote, run_host_call,
+    CommandSender, DEFAULT_STARTUP_HANDSHAKE_TIMEOUT, ThreadedCommand, ThreadedRuntimeConfig,
+    deliver_shutdown_signal_and_drain_with_remote, panic_payload_message, run_host_call,
 };
 use crate::trace::{RuntimeEvent, SendRejectedReason};
 use crate::{
@@ -84,6 +85,56 @@ struct ThreadedRemoteWiring {
     shard_metrics: BTreeMap<ShardId, Arc<LiveShardMetrics>>,
 }
 
+type StartingWorker = (
+    ShardId,
+    thread::JoinHandle<ThreadedWorkerExit>,
+    mpsc::Receiver<Result<(), StartupError>>,
+);
+
+fn cleanup_startup_workers<S, F>(
+    commands: &BTreeMap<ShardId, CommandSender<S, F>>,
+    workers: Vec<(ShardId, thread::JoinHandle<ThreadedWorkerExit>)>,
+) where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + Clone + 'static,
+{
+    for (shard, _) in &workers {
+        if let Some(commands) = commands.get(shard) {
+            let _ = commands.send(ThreadedCommand::Shutdown);
+        }
+    }
+    let join_deadline = Instant::now() + Duration::from_millis(100);
+    while workers.iter().any(|(_, worker)| !worker.is_finished()) && Instant::now() < join_deadline
+    {
+        thread::sleep(Duration::from_millis(1));
+    }
+    for (_, worker) in workers {
+        // A timed-out startup may be stuck in arbitrary user code. Rust cannot
+        // cancel that thread, so detach it; dropping all command senders makes
+        // it exit if startup eventually completes.
+        if worker.is_finished() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn shard_worker_config(
+    config: ThreadedRuntimeConfig,
+    ordinal: usize,
+) -> Result<ThreadedRuntimeConfig, StartupError> {
+    let configured_core = config
+        .configured_core
+        .map(|base| {
+            base.checked_add(ordinal)
+                .ok_or(StartupError::ConfiguredCoreOverflow { base, ordinal })
+        })
+        .transpose()?;
+    Ok(ThreadedRuntimeConfig {
+        configured_core,
+        ..config
+    })
+}
+
 impl<S, F> ThreadedMultiShardRuntime<S, F>
 where
     S: Shard + Send + 'static,
@@ -94,7 +145,16 @@ where
     where
         I: IntoIterator<Item = S>,
     {
-        Self::with_config(shards, mailbox_factory, ThreadedRuntimeConfig::default())
+        Self::try_new(shards, mailbox_factory)
+            .expect("failed to start Tina multi-shard threaded runtime")
+    }
+
+    /// Fallible form of [`Self::new`].
+    pub fn try_new<I>(shards: I, mailbox_factory: F) -> Result<Self, StartupError>
+    where
+        I: IntoIterator<Item = S>,
+    {
+        Self::try_with_config(shards, mailbox_factory, ThreadedRuntimeConfig::default())
     }
 
     /// Starts one live worker thread per shard with explicit queue config.
@@ -102,7 +162,20 @@ where
     where
         I: IntoIterator<Item = S>,
     {
-        Self::with_config_and_optional_trace_observer(shards, mailbox_factory, config, None)
+        Self::try_with_config(shards, mailbox_factory, config)
+            .expect("failed to start Tina multi-shard threaded runtime")
+    }
+
+    /// Fallible form of [`Self::with_config`].
+    pub fn try_with_config<I>(
+        shards: I,
+        mailbox_factory: F,
+        config: ThreadedRuntimeConfig,
+    ) -> Result<Self, StartupError>
+    where
+        I: IntoIterator<Item = S>,
+    {
+        Self::try_with_config_and_optional_trace_observer(shards, mailbox_factory, config, None)
     }
 
     /// Like [`Self::with_config`] but wires one trace observer on
@@ -118,7 +191,21 @@ where
     where
         I: IntoIterator<Item = S>,
     {
-        Self::with_config_and_optional_trace_observer(
+        Self::try_with_config_and_trace_observer(shards, mailbox_factory, config, observer)
+            .expect("failed to start Tina multi-shard threaded runtime")
+    }
+
+    /// Fallible form of [`Self::with_config_and_trace_observer`].
+    pub fn try_with_config_and_trace_observer<I>(
+        shards: I,
+        mailbox_factory: F,
+        config: ThreadedRuntimeConfig,
+        observer: Arc<dyn TraceObserver>,
+    ) -> Result<Self, StartupError>
+    where
+        I: IntoIterator<Item = S>,
+    {
+        Self::try_with_config_and_optional_trace_observer(
             shards,
             mailbox_factory,
             config,
@@ -126,66 +213,25 @@ where
         )
     }
 
-    fn with_config_and_optional_trace_observer<I>(
+    fn try_with_config_and_optional_trace_observer<I>(
         shards: I,
         mailbox_factory: F,
         config: ThreadedRuntimeConfig,
         observer: Option<Arc<dyn TraceObserver>>,
-    ) -> Self
+    ) -> Result<Self, StartupError>
     where
         I: IntoIterator<Item = S>,
     {
-        if config.command_capacity == 0 {
-            panic!("ThreadedMultiShardRuntime requires command capacity > 0");
-        }
-        if config.storage_lane_capacity == 0 {
-            panic!("ThreadedMultiShardRuntime requires storage lane capacity > 0");
-        }
-        if config.dns_lane_capacity == 0 {
-            panic!("ThreadedMultiShardRuntime requires DNS lane capacity > 0");
-        }
-        if config.tls_lane_capacity == 0 {
-            panic!("ThreadedMultiShardRuntime requires TLS lane capacity > 0");
-        }
-        if config.process_lane_capacity == 0 {
-            panic!("ThreadedMultiShardRuntime requires process lane capacity > 0");
-        }
-        if config.signal_capacity == 0 {
-            panic!("ThreadedMultiShardRuntime requires signal capacity > 0");
-        }
-        if config.timer_capacity == 0 {
-            panic!("ThreadedMultiShardRuntime requires timer capacity > 0");
-        }
-        if config.shard_pair_capacity == 0 {
-            panic!("ThreadedMultiShardRuntime requires shard-pair capacity > 0");
-        }
-        if config.remote_inbound_drain_budget == 0 {
-            panic!("ThreadedMultiShardRuntime requires remote inbound drain budget > 0");
-        }
-        if config.hot_drain_max_rounds == 0 {
-            panic!("ThreadedMultiShardRuntime requires hot_drain_max_rounds > 0");
-        }
-        if config.hot_drain_max_elapsed.is_zero() {
-            panic!("ThreadedMultiShardRuntime requires hot_drain_max_elapsed > 0");
-        }
-        if config.idle_repoll_interval.is_zero() {
-            panic!("ThreadedMultiShardRuntime requires idle_repoll_interval > 0");
-        }
-        if config.driver_completion_drain_budget == 0 {
-            panic!("ThreadedMultiShardRuntime requires driver_completion_drain_budget > 0");
-        }
+        config.validate()?;
 
         let mut shards: Vec<S> = shards.into_iter().collect();
         if shards.is_empty() {
-            panic!("ThreadedMultiShardRuntime requires at least one shard");
+            return Err(StartupError::NoShards);
         }
         shards.sort_by_key(Shard::id);
         for pair in shards.windows(2) {
             if pair[0].id() == pair[1].id() {
-                panic!(
-                    "ThreadedMultiShardRuntime received duplicate shard id {}",
-                    pair[0].id().get()
-                );
+                return Err(StartupError::DuplicateShard(pair[0].id()));
             }
         }
 
@@ -193,10 +239,7 @@ where
         let mut shard_metrics = BTreeMap::new();
         let mut receivers = Vec::with_capacity(shards.len());
         for (ordinal, shard) in shards.iter().enumerate() {
-            let worker_config = ThreadedRuntimeConfig {
-                configured_core: config.configured_core.map(|core| core + ordinal),
-                ..config
-            };
+            let worker_config = shard_worker_config(config, ordinal)?;
             let (sender, receiver) = std::sync::mpsc::sync_channel(config.command_capacity);
             commands.insert(shard.id(), CommandSender::new(sender));
             shard_metrics.insert(
@@ -252,15 +295,29 @@ where
         }
 
         let ids = IdSource::new();
-        let mut handles = Vec::with_capacity(shards.len());
+        let mut handles: Vec<StartingWorker> = Vec::with_capacity(shards.len());
         for (ordinal, (shard, (_shard_id, receiver))) in
             shards.into_iter().zip(receivers).enumerate()
         {
-            let worker_config = ThreadedRuntimeConfig {
-                configured_core: config.configured_core.map(|core| core + ordinal),
-                ..config
+            let worker_config = shard_worker_config(config, ordinal)?;
+            let factory = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                mailbox_factory.clone()
+            })) {
+                Ok(factory) => factory,
+                Err(payload) => {
+                    cleanup_startup_workers(
+                        &commands,
+                        handles
+                            .into_iter()
+                            .map(|(shard, handle, _)| (shard, handle))
+                            .collect(),
+                    );
+                    return Err(StartupError::WorkerStartupPanicked {
+                        shard: shard.id(),
+                        message: panic_payload_message(&payload),
+                    });
+                }
             };
-            let factory = mailbox_factory.clone();
             let ids = ids.per_shard();
             let shard_id = shard.id();
             let remote_wiring = ThreadedRemoteWiring {
@@ -279,51 +336,119 @@ where
                     .expect("shard metrics exist for worker"),
             );
             let worker_observer = observer.clone();
-            handles.push((
-                shard_id,
-                thread::Builder::new()
-                    .name(format!("tina-shard-{}", shard_id.get()))
-                    .spawn(move || {
-                        let io_loop = io_loop(Global).expect(
-                            "failed to initialise Betelgeuse IO loop for tina-runtime shard",
-                        );
-                        let runtime = Runtime::with_clock_and_ids_and_driver_and_preallocation(
-                            shard,
-                            factory,
-                            Box::new(MonotonicClock),
-                            ids,
-                            Box::new(BetelgeuseDriver::with_io_loop_and_capacities(
-                                io_loop,
-                                worker_config.storage_lane_capacity,
-                                worker_config.dns_lane_capacity,
-                                worker_config.tls_lane_capacity,
-                                worker_config.process_lane_capacity,
-                                worker_config.signal_capacity,
-                                worker_config.timer_capacity,
-                            )),
-                            worker_config.preallocation,
-                        );
-                        let mut runtime = runtime;
-                        runtime.set_trace_retention(worker_config.trace_retention);
-                        runtime.set_driver_completion_drain_budget(
-                            worker_config.driver_completion_drain_budget,
-                        );
-                        runtime.set_trace_observer(worker_observer);
-                        threaded_worker_loop_with_remote(
-                            runtime,
-                            receiver,
-                            worker_config,
-                            remote_wiring,
-                            shard_metrics_for_worker,
-                        )
+            let (startup_tx, startup_rx) = mpsc::channel::<Result<(), StartupError>>();
+            let handle = match thread::Builder::new()
+                .name(format!("tina-shard-{}", shard_id.get()))
+                .spawn(move || {
+                    let initialized =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let io_loop = io_loop(Global).map_err(|source| {
+                                StartupError::IoLoopInitialization {
+                                    shard: shard_id,
+                                    source,
+                                }
+                            })?;
+                            let runtime = Runtime::with_clock_and_ids_and_driver_and_preallocation(
+                                shard,
+                                factory,
+                                Box::new(MonotonicClock),
+                                ids,
+                                Box::new(BetelgeuseDriver::with_io_loop_and_capacities(
+                                    io_loop,
+                                    worker_config.storage_lane_capacity,
+                                    worker_config.dns_lane_capacity,
+                                    worker_config.tls_lane_capacity,
+                                    worker_config.process_lane_capacity,
+                                    worker_config.signal_capacity,
+                                    worker_config.timer_capacity,
+                                )),
+                                worker_config.preallocation,
+                            );
+                            let mut runtime = runtime;
+                            runtime.set_trace_retention(worker_config.trace_retention);
+                            runtime.set_driver_completion_drain_budget(
+                                worker_config.driver_completion_drain_budget,
+                            );
+                            runtime.set_trace_observer(worker_observer);
+                            Ok::<_, StartupError>(runtime)
+                        }));
+                    let runtime = match initialized {
+                        Ok(Ok(runtime)) => runtime,
+                        Ok(Err(error)) => {
+                            shard_metrics_for_worker.set_state(LiveShardState::Failed);
+                            let _ = startup_tx.send(Err(error));
+                            return ThreadedWorkerExit::failed(
+                                ThreadedRuntimeError::WorkerStopped,
+                                Vec::new(),
+                            );
+                        }
+                        Err(payload) => {
+                            shard_metrics_for_worker.set_state(LiveShardState::Failed);
+                            let _ = startup_tx.send(Err(StartupError::WorkerStartupPanicked {
+                                shard: shard_id,
+                                message: panic_payload_message(&payload),
+                            }));
+                            return ThreadedWorkerExit::failed(
+                                ThreadedRuntimeError::WorkerStopped,
+                                Vec::new(),
+                            );
+                        }
+                    };
+                    let _ = startup_tx.send(Ok(()));
+                    drop(startup_tx);
+                    threaded_worker_loop_with_remote(
+                        runtime,
+                        receiver,
+                        worker_config,
+                        remote_wiring,
+                        shard_metrics_for_worker,
+                    )
+                }) {
+                Ok(handle) => handle,
+                Err(source) => {
+                    cleanup_startup_workers(
+                        &commands,
+                        handles
+                            .into_iter()
+                            .map(|(shard, handle, _)| (shard, handle))
+                            .collect(),
+                    );
+                    return Err(StartupError::ThreadSpawn {
+                        shard: shard_id,
+                        source,
+                    });
+                }
+            };
+            handles.push((shard_id, handle, startup_rx));
+        }
+
+        for (shard_id, _, startup_rx) in &handles {
+            let failure = match startup_rx.recv_timeout(DEFAULT_STARTUP_HANDSHAKE_TIMEOUT) {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Some(StartupError::WorkerHandshakeDisconnected(*shard_id))
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    Some(StartupError::WorkerHandshakeTimeout {
+                        shard: *shard_id,
+                        timeout: DEFAULT_STARTUP_HANDSHAKE_TIMEOUT,
                     })
-                    .expect("failed to spawn Tina threaded shard worker"),
-            ));
+                }
+            };
+            if let Some(error) = failure {
+                let handles = handles
+                    .into_iter()
+                    .map(|(shard, handle, _)| (shard, handle))
+                    .collect();
+                cleanup_startup_workers(&commands, handles);
+                return Err(error);
+            }
         }
 
         let workers: Vec<ShutdownWorker<S, F>> = handles
             .into_iter()
-            .map(|(shard_id, handle)| {
+            .map(|(shard_id, handle, _)| {
                 let metrics = Arc::clone(
                     shard_metrics
                         .get(&shard_id)
@@ -347,13 +472,13 @@ where
             remote_metrics.clone(),
         ));
 
-        Self {
+        Ok(Self {
             commands,
             shard_metrics,
             remote_metrics,
             shutdown,
             control_call_timeout: config.control_call_timeout,
-        }
+        })
     }
 
     /// Registers one root isolate on a chosen shard.

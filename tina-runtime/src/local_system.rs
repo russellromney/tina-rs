@@ -6,6 +6,7 @@
 //! `ThreadedRuntime`.
 
 use std::alloc::Global;
+use std::fmt;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -17,7 +18,9 @@ use tina_supervisor::SupervisorConfig;
 use crate::call::IntoErasedCall;
 use crate::capabilities::RuntimeCapabilities;
 use crate::driver;
-use crate::errors::{ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError};
+use crate::errors::{
+    StartupError, ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError,
+};
 use crate::live_report::{LiveShardReport, LiveShardState, LiveTopologyReport};
 use crate::mailbox::MailboxFactory;
 use crate::observer::TraceObserver;
@@ -185,8 +188,28 @@ pub enum LocalSystemConfigError {
     ZeroTimerCapacity,
 }
 
+impl fmt::Display for LocalSystemConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let field = match self {
+            Self::ZeroIngressCapacity => "ingress_capacity",
+            Self::ZeroShardPairCapacity => "shard_pair_capacity",
+            Self::ZeroRemoteInboundDrainBudget => "remote_inbound_drain_budget",
+            Self::ZeroStorageLaneCapacity => "storage_lane_capacity",
+            Self::ZeroDnsLaneCapacity => "dns_lane_capacity",
+            Self::ZeroTlsLaneCapacity => "tls_lane_capacity",
+            Self::ZeroProcessLaneCapacity => "process_lane_capacity",
+            Self::ZeroSignalCapacity => "signal_capacity",
+            Self::ZeroTimerCapacity => "timer_capacity",
+        };
+        write!(f, "{field} must be greater than zero")
+    }
+}
+
+impl std::error::Error for LocalSystemConfigError {}
+
 pub(crate) type ThreadedCommandFn<S, F> = Box<dyn FnOnce(&mut Runtime<S, F>) + Send>;
-pub(crate) type ThreadedIoLoopFactory = Box<dyn FnOnce() -> IOLoopHandle<Global> + Send>;
+pub(crate) type ThreadedIoLoopFactory =
+    Box<dyn FnOnce() -> std::io::Result<IOLoopHandle<Global>> + Send>;
 pub(crate) type ThreadedWorkerJoin = JoinHandle<ThreadedWorkerExit>;
 
 pub(crate) struct ThreadedWorkerExit {
@@ -935,26 +958,35 @@ where
     }
 
     /// Builds the local app and starts its worker.
+    ///
+    /// # Panics
+    ///
+    /// Panics when [`Self::try_build`] returns a startup error. Applications
+    /// should prefer `try_build`; this method is a setup/test convenience.
     pub fn build(self) -> LocalSystem<S, F> {
-        self.config
-            .validate()
-            .expect("invalid LocalSystemConfig for single-shard system");
+        self.try_build()
+            .expect("failed to build single-shard local system")
+    }
+
+    /// Validates configuration and starts the worker, returning startup failures.
+    pub fn try_build(self) -> Result<LocalSystem<S, F>, StartupError> {
+        self.config.validate()?;
         let runtime = match self.trace_observer {
-            Some(observer) => ThreadedRuntime::with_config_and_trace_observer(
+            Some(observer) => ThreadedRuntime::try_with_config_and_trace_observer(
                 self.shard,
                 self.mailbox_factory,
                 self.config.threaded_runtime_config(),
                 observer,
             ),
-            None => ThreadedRuntime::with_config(
+            None => ThreadedRuntime::try_with_config(
                 self.shard,
                 self.mailbox_factory,
                 self.config.threaded_runtime_config(),
             ),
-        };
-        LocalSystem {
+        }?;
+        Ok(LocalSystem {
             runtime: Some(runtime),
-        }
+        })
     }
 }
 
@@ -1127,26 +1159,35 @@ where
     }
 
     /// Builds the multi-shard local app and starts one worker per shard.
+    ///
+    /// # Panics
+    ///
+    /// Panics when [`Self::try_build`] returns a startup error. Applications
+    /// should prefer `try_build`; this method is a setup/test convenience.
     pub fn build(self) -> LocalMultiShardSystem<S, F> {
-        self.config
-            .validate()
-            .expect("invalid LocalSystemConfig for multi-shard system");
+        self.try_build()
+            .expect("failed to build multi-shard local system")
+    }
+
+    /// Validates topology/configuration and starts every shard worker.
+    pub fn try_build(self) -> Result<LocalMultiShardSystem<S, F>, StartupError> {
+        self.config.validate()?;
         let runtime = match self.trace_observer {
-            Some(observer) => ThreadedMultiShardRuntime::with_config_and_trace_observer(
+            Some(observer) => ThreadedMultiShardRuntime::try_with_config_and_trace_observer(
                 self.shards,
                 self.mailbox_factory,
                 self.config.threaded_runtime_config(),
                 observer,
             ),
-            None => ThreadedMultiShardRuntime::with_config(
+            None => ThreadedMultiShardRuntime::try_with_config(
                 self.shards,
                 self.mailbox_factory,
                 self.config.threaded_runtime_config(),
             ),
-        };
-        LocalMultiShardSystem {
+        }?;
+        Ok(LocalMultiShardSystem {
             runtime: Some(runtime),
-        }
+        })
     }
 }
 

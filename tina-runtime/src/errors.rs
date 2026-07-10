@@ -5,6 +5,183 @@ use std::fmt;
 
 use tina::ShardId;
 
+/// Invalid bounded worker configuration supplied at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadedRuntimeConfigError {
+    /// `command_capacity` is zero.
+    ZeroCommandCapacity,
+    /// `shard_pair_capacity` is zero.
+    ZeroShardPairCapacity,
+    /// `remote_inbound_drain_budget` is zero.
+    ZeroRemoteInboundDrainBudget,
+    /// `storage_lane_capacity` is zero.
+    ZeroStorageLaneCapacity,
+    /// `dns_lane_capacity` is zero.
+    ZeroDnsLaneCapacity,
+    /// `tls_lane_capacity` is zero.
+    ZeroTlsLaneCapacity,
+    /// `process_lane_capacity` is zero.
+    ZeroProcessLaneCapacity,
+    /// `signal_capacity` is zero.
+    ZeroSignalCapacity,
+    /// `timer_capacity` is zero.
+    ZeroTimerCapacity,
+    /// `hot_drain_max_rounds` is zero.
+    ZeroHotDrainMaxRounds,
+    /// `hot_drain_max_elapsed` is zero.
+    ZeroHotDrainMaxElapsed,
+    /// `idle_repoll_interval` is zero.
+    ZeroIdleRePollInterval,
+    /// `idle_wait` is zero.
+    ZeroIdleWait,
+    /// `control_call_timeout` is zero.
+    ZeroControlCallTimeout,
+    /// `driver_completion_drain_budget` is zero.
+    ZeroDriverCompletionDrainBudget,
+}
+
+impl fmt::Display for ThreadedRuntimeConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let field = match self {
+            Self::ZeroCommandCapacity => "command_capacity",
+            Self::ZeroShardPairCapacity => "shard_pair_capacity",
+            Self::ZeroRemoteInboundDrainBudget => "remote_inbound_drain_budget",
+            Self::ZeroStorageLaneCapacity => "storage_lane_capacity",
+            Self::ZeroDnsLaneCapacity => "dns_lane_capacity",
+            Self::ZeroTlsLaneCapacity => "tls_lane_capacity",
+            Self::ZeroProcessLaneCapacity => "process_lane_capacity",
+            Self::ZeroSignalCapacity => "signal_capacity",
+            Self::ZeroTimerCapacity => "timer_capacity",
+            Self::ZeroHotDrainMaxRounds => "hot_drain_max_rounds",
+            Self::ZeroHotDrainMaxElapsed => "hot_drain_max_elapsed",
+            Self::ZeroIdleRePollInterval => "idle_repoll_interval",
+            Self::ZeroIdleWait => "idle_wait",
+            Self::ZeroControlCallTimeout => "control_call_timeout",
+            Self::ZeroDriverCompletionDrainBudget => "driver_completion_drain_budget",
+        };
+        write!(f, "{field} must be greater than zero")
+    }
+}
+
+impl Error for ThreadedRuntimeConfigError {}
+
+/// Failure to construct a live threaded runtime.
+#[derive(Debug)]
+pub enum StartupError {
+    /// A low-level threaded runtime setting is invalid.
+    InvalidThreadedConfig(ThreadedRuntimeConfigError),
+    /// A local-system setting is invalid.
+    InvalidLocalSystemConfig(crate::LocalSystemConfigError),
+    /// A multi-shard topology contains no shards.
+    NoShards,
+    /// A multi-shard topology repeats a shard id.
+    DuplicateShard(ShardId),
+    /// Per-worker core assignment overflowed `usize`.
+    ConfiguredCoreOverflow {
+        /// Requested core for the first worker.
+        base: usize,
+        /// Stable worker ordinal being assigned.
+        ordinal: usize,
+    },
+    /// Betelgeuse could not initialize its I/O loop.
+    IoLoopInitialization {
+        /// Shard whose worker was starting.
+        shard: ShardId,
+        /// Underlying platform I/O error.
+        source: std::io::Error,
+    },
+    /// The operating system refused to create a worker thread.
+    ThreadSpawn {
+        /// Shard whose worker was being spawned.
+        shard: ShardId,
+        /// Underlying thread creation error.
+        source: std::io::Error,
+    },
+    /// Startup code panicked while preparing a worker.
+    WorkerStartupPanicked {
+        /// Shard whose worker panicked.
+        shard: ShardId,
+        /// Captured panic message.
+        message: String,
+    },
+    /// The worker exited without publishing a startup result.
+    WorkerHandshakeDisconnected(ShardId),
+    /// The worker did not publish a startup result within the bounded wait.
+    WorkerHandshakeTimeout {
+        /// Shard whose startup did not complete.
+        shard: ShardId,
+        /// Constructor-side wait budget.
+        timeout: std::time::Duration,
+    },
+}
+
+impl fmt::Display for StartupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidThreadedConfig(error) => {
+                write!(f, "invalid threaded runtime config: {error}")
+            }
+            Self::InvalidLocalSystemConfig(error) => {
+                write!(f, "invalid local system config: {error}")
+            }
+            Self::NoShards => write!(f, "multi-shard runtime requires at least one shard"),
+            Self::DuplicateShard(shard) => write!(f, "duplicate shard id {}", shard.get()),
+            Self::ConfiguredCoreOverflow { base, ordinal } => write!(
+                f,
+                "configured core assignment overflowed for base {base} and worker ordinal {ordinal}"
+            ),
+            Self::IoLoopInitialization { shard, source } => write!(
+                f,
+                "failed to initialize Betelgeuse I/O loop for shard {}: {source}",
+                shard.get()
+            ),
+            Self::ThreadSpawn { shard, source } => write!(
+                f,
+                "failed to spawn worker thread for shard {}: {source}",
+                shard.get()
+            ),
+            Self::WorkerStartupPanicked { shard, message } => {
+                write!(f, "startup for shard {} panicked: {message}", shard.get())
+            }
+            Self::WorkerHandshakeDisconnected(shard) => write!(
+                f,
+                "worker for shard {} stopped before publishing its startup handshake",
+                shard.get()
+            ),
+            Self::WorkerHandshakeTimeout { shard, timeout } => write!(
+                f,
+                "worker for shard {} did not finish startup within {timeout:?}",
+                shard.get()
+            ),
+        }
+    }
+}
+
+impl Error for StartupError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidThreadedConfig(error) => Some(error),
+            Self::InvalidLocalSystemConfig(error) => Some(error),
+            Self::IoLoopInitialization { source, .. } | Self::ThreadSpawn { source, .. } => {
+                Some(source)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl From<ThreadedRuntimeConfigError> for StartupError {
+    fn from(value: ThreadedRuntimeConfigError) -> Self {
+        Self::InvalidThreadedConfig(value)
+    }
+}
+
+impl From<crate::LocalSystemConfigError> for StartupError {
+    fn from(value: crate::LocalSystemConfigError) -> Self {
+        Self::InvalidLocalSystemConfig(value)
+    }
+}
+
 /// Error returned by setup/control operations on [`crate::ThreadedRuntime`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadedRuntimeError {

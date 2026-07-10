@@ -5320,31 +5320,17 @@ fn local_system_reports_live_owned_resources_and_shutdown_cleanup() {
 }
 
 #[test]
-fn local_system_join_report_reports_worker_failure_terminal_state() {
-    let app = LocalSystem::single_shard(AppShard(60), PanickingMailboxFactory)
+fn local_system_try_build_reports_worker_startup_failure() {
+    let error = LocalSystem::single_shard(AppShard(60), PanickingMailboxFactory)
         .ingress_capacity(8)
         .trace_retention(TraceRetention::Bounded(16))
-        .build();
+        .try_build()
+        .err()
+        .expect("panicking factory must fail startup");
 
-    assert_eq!(app.state(), LocalSystemState::Accepting);
-    assert_eq!(
-        app.register_root::<LlamaService, Infallible>(
-            LlamaService {
-                seen: Arc::new(Mutex::new(Vec::new())),
-            },
-            8,
-        ),
-        Err(ThreadedRuntimeError::WorkerStopped)
-    );
-
-    let terminal = app.shutdown().drain().join_report();
-    assert_eq!(terminal.state(), LocalSystemState::Failed);
-    assert_eq!(
-        terminal.shutdown_report().final_state(),
-        LocalSystemState::Failed
-    );
-    assert!(!terminal.shutdown_report().clean());
-    assert_eq!(terminal.summary(), Default::default());
-    assert_eq!(terminal.error(), Some(ThreadedRuntimeError::WorkerStopped));
-    assert!(terminal.trace().is_empty());
+    assert!(matches!(
+        error,
+        tina_runtime::StartupError::WorkerStartupPanicked { shard, ref message }
+            if shard == ShardId::new(60) && message.contains("test mailbox factory panic")
+    ));
 }
