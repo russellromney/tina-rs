@@ -3,8 +3,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{
-    CancelOutcome, Context, Effect, RequestContext, ServiceRequestAddress, SingleShard, noop,
-    reply_to, send_event,
+    CancelOutcome, Effect, RequestContext, ServiceRequestAddress, SingleShard, noop, reply_to,
+    send_event,
 };
 use tina_runtime::{
     CallGroupToken, CallOutcome, CallReplyRejectedReason, CallSelectSet,
