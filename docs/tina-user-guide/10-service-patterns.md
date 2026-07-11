@@ -587,9 +587,10 @@ match shared.wait(key.clone(), call) {
 
 For split services, continuation builders keep the domain event visible and
 wrap the routing envelope themselves. Use `then_service_event` for ordinary
-sleep, call, and cancelable-call continuations. When a `RequestCall` defers one
-sleep or isolate call, use `reply_service_event`; the closure still receives
-the `RequestContext`, so caller authority remains explicit:
+timer, I/O, isolate-call, cancelable-call, and cancel-acknowledgement
+continuations. When a `RequestCall` defers one runtime or isolate call, use
+`reply_service_event`; the closure still receives the `RequestContext`, so
+caller authority remains explicit:
 
 ```rust
 call.defer(call(self.store, StoreMsg::Get(key), timeout))

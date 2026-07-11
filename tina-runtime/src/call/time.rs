@@ -87,6 +87,26 @@ impl<T, E> TypedCall<T, E> {
         }))
     }
 
+    /// Turns this runtime-owned call into a split service's later event.
+    ///
+    /// The translator still receives the complete typed result. This helper
+    /// hides only the split-service routing envelope; it does not discard I/O
+    /// failures or otherwise change the call's outcome.
+    pub fn then_service_event<I, F, Event, Request>(self, translator: F) -> tina::Effect<I>
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        F: FnOnce(Result<T, E>) -> Event + 'static,
+        T: 'static,
+        E: 'static,
+        Event: 'static,
+        Request: 'static,
+    {
+        self.then(move |result| tina::ServiceMessage::Event(translator(result)))
+    }
+
     /// Like [`reply`](Self::reply), but also carries the caller's
     /// [`RequestContext`] into the continuation message.
     #[deprecated(
@@ -285,8 +305,7 @@ impl SleepCall {
         E: 'static,
         Q: 'static,
     {
-        self.inner
-            .then(move |result| tina::ServiceMessage::Event(translator(result)))
+        self.inner.then_service_event(translator)
     }
 
     /// Carry caller authority into the wake continuation.
