@@ -164,13 +164,13 @@ impl ObjectLane {
                     self.accepted += 1;
                     match &self.backend {
                         WorkBackend::FakeSleep { work } => {
-                            call.defer(sleep(*work)).reply(move |request, result| {
-                                tina::ServiceMessage::Event(LaneEvent::PutFinished {
+                            call.defer(sleep(*work)).reply_service_event(move |request, result| {
+                                LaneEvent::PutFinished {
                                     request,
                                     key,
                                     permit,
                                     result: sleep_to_work_result(result),
-                                })
+                                }
                             })
                         }
                         WorkBackend::AwsS3 {
@@ -192,13 +192,13 @@ impl ObjectLane {
                                 ),
                                 *timeout,
                             );
-                            call.defer(issued).reply(move |request, outcome| {
-                                tina::ServiceMessage::Event(LaneEvent::PutFinished {
+                            call.defer(issued).reply_service_event(move |request, outcome| {
+                                LaneEvent::PutFinished {
                                     request,
                                     key,
                                     permit,
                                     result: s3_outcome_to_work_result(outcome),
-                                })
+                                }
                             })
                         }
                     }

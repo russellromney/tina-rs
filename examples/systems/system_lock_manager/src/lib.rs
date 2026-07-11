@@ -261,12 +261,12 @@ impl LockManager {
         let lease = self.lease;
         call.reply_and(
             LockReply::Renewed { holder_id },
-            vec![sleep(lease).then(move |_| {
-                tina::ServiceMessage::Event(LockEvent::LeaseExpired {
+            vec![sleep(lease).then_service_event(move |_| {
+                LockEvent::LeaseExpired {
                     key: key_for_msg,
                     holder_id,
                     expiry_token: token,
-                })
+                }
             })],
         )
     }
@@ -328,12 +328,12 @@ impl LockManager {
                         },
                     },
                 ),
-                sleep(lease).then(move |_| {
-                    tina::ServiceMessage::Event(LockEvent::LeaseExpired {
+                sleep(lease).then_service_event(move |_| {
+                    LockEvent::LeaseExpired {
                         key: key_for_msg,
                         holder_id: new_holder_id,
                         expiry_token: token,
-                    })
+                    }
                 }),
             ];
         }
@@ -357,12 +357,12 @@ impl LockManager {
             LockReply::Granted {
                 handle: LockHandle { key, holder_id },
             },
-            vec![sleep(lease).then(move |_| {
-                tina::ServiceMessage::Event(LockEvent::LeaseExpired {
+            vec![sleep(lease).then_service_event(move |_| {
+                LockEvent::LeaseExpired {
                     key: key_for_msg,
                     holder_id,
                     expiry_token: 1,
-                })
+                }
             })],
         )
     }

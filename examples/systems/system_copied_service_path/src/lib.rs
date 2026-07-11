@@ -191,8 +191,8 @@ impl Gateway {
                     // fsync/INSERT here instead of pushing to a `Vec`.
                     self.ledger.push(id);
                     self.next_id = id + 1;
-                    sleep(hold).then(move |result| {
-                        tina::ServiceMessage::Event(GatewayEvent::HoldDone { id, result })
+                    sleep(hold).then_service_event(move |result| {
+                        GatewayEvent::HoldDone { id, result }
                     })
                 }
                 // Pending capacity == scope capacity, and every pending

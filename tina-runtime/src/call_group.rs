@@ -447,6 +447,31 @@ where
         Ok(effect)
     }
 
+    /// Like [`start_cancelable`](Self::start_cancelable), but the translator
+    /// returns a domain event and this helper wraps the split-service envelope.
+    pub fn start_cancelable_service_event<I, Event, Request, T, F>(
+        &mut self,
+        key: K,
+        call: CancelableCall<T, R>,
+        translator: F,
+    ) -> Result<tina::Effect<I>, CallGroupStartError<K>>
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        F: FnOnce(K, CallGroupToken, CallOutcome<R>) -> Event + 'static,
+        K: Clone + 'static,
+        Event: 'static,
+        Request: 'static,
+        T: Send + 'static,
+        R: 'static,
+    {
+        self.start_cancelable(key, call, move |key, token, outcome| {
+            tina::ServiceMessage::Event(translator(key, token, outcome))
+        })
+    }
+
     fn reset_completed_if_empty(&mut self) {
         if self.entries.is_empty() && matches!(self.race_state, RaceState::Complete) {
             self.branch_outcomes.clear();
@@ -1005,6 +1030,31 @@ where
         Ok(effect)
     }
 
+    /// Like [`start_cancelable`](Self::start_cancelable), but the translator
+    /// returns a domain event and this helper wraps the split-service envelope.
+    pub fn start_cancelable_service_event<I, Event, Request, T, F>(
+        &mut self,
+        key: K,
+        call: CancelableCall<T, R>,
+        translator: F,
+    ) -> Result<tina::Effect<I>, CallSetStartError<K>>
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        F: FnOnce(K, CallGroupToken, CallOutcome<R>) -> Event + 'static,
+        K: Clone + 'static,
+        Event: 'static,
+        Request: 'static,
+        T: Send + 'static,
+        R: 'static,
+    {
+        self.start_cancelable(key, call, move |key, token, outcome| {
+            tina::ServiceMessage::Event(translator(key, token, outcome))
+        })
+    }
+
     /// Records one terminal branch outcome.
     ///
     /// Any terminal outcome (reply, timeout, rejection, ...) completes
@@ -1341,6 +1391,31 @@ where
         let _ = self.reserved_tokens.swap_remove(reserved_pos);
         self.entries.push(SetEntry { key, token, handle });
         Ok(effect)
+    }
+
+    /// Like [`start_cancelable`](Self::start_cancelable), but the translator
+    /// returns a domain event and this helper wraps the split-service envelope.
+    pub fn start_cancelable_service_event<I, Event, Request, T, F>(
+        &mut self,
+        key: K,
+        call: CancelableCall<T, R>,
+        translator: F,
+    ) -> Result<tina::Effect<I>, CallSetStartError<K>>
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        F: FnOnce(K, CallGroupToken, CallOutcome<R>) -> Event + 'static,
+        K: Clone + 'static,
+        Event: 'static,
+        Request: 'static,
+        T: Send + 'static,
+        R: 'static,
+    {
+        self.start_cancelable(key, call, move |key, token, outcome| {
+            tina::ServiceMessage::Event(translator(key, token, outcome))
+        })
     }
 
     /// Records and returns one terminal branch outcome.

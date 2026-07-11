@@ -58,7 +58,7 @@ impl Probe {
         match request {
             ProbeRequest::Request => call
                 .defer(sleep(Duration::from_millis(self.delay_ms)))
-                .reply(|req, _| tina::ServiceMessage::Event(ProbeEvent::SleepDone(req))),
+                .reply_service_event(|req, _| ProbeEvent::SleepDone(req)),
         }
     }
 }
@@ -104,7 +104,7 @@ impl Db {
         match request {
             DbRequest::Request => call
                 .defer(sleep(Duration::from_millis(self.delay_ms)))
-                .reply(|req, _| tina::ServiceMessage::Event(DbEvent::SleepDone(req))),
+                .reply_service_event(|req, _| DbEvent::SleepDone(req)),
         }
     }
 }
@@ -144,10 +144,8 @@ tina::flow! {
                     DbRequest::Request,
                     Duration::from_millis(50),
                 )
-                .then_with_request(req, |req, outcome| {
-                    tina::ServiceMessage::Event(ServiceEvent::Readiness(ReadinessFlow::Dbed(
-                        req, outcome,
-                    )))
+                .then_service_event_with_request(req, |req, outcome| {
+                    ServiceEvent::Readiness(ReadinessFlow::Dbed(req, outcome))
                 }),
                 _ => reply_to(req, ServiceReply::NotReady),
             }
@@ -202,10 +200,8 @@ impl Service {
                     ProbeRequest::Request,
                     Duration::from_millis(50),
                 ))
-                .reply(|req, outcome| {
-                    tina::ServiceMessage::Event(ServiceEvent::Readiness(ReadinessFlow::Probed(
-                        req, outcome,
-                    )))
+                .reply_service_event(|req, outcome| {
+                    ServiceEvent::Readiness(ReadinessFlow::Probed(req, outcome))
                 }),
         }
     }

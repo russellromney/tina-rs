@@ -282,8 +282,8 @@ impl Relay {
                     FakeOutboundMsg::Send(event),
                     timeout,
                 ))
-                .reply(|request, outcome| {
-                    tina::ServiceMessage::Event(RelayEvent::FakeFinished { request, outcome })
+                .reply_service_event(|request, outcome| {
+                    RelayEvent::FakeFinished { request, outcome }
                 }),
             OutboundPort::Sqs(sqs) => {
                 let address = sqs.address;
@@ -299,8 +299,8 @@ impl Relay {
                     }),
                     bridge_timeout,
                 );
-                call.defer(issued).reply(|request, outcome| {
-                    tina::ServiceMessage::Event(RelayEvent::SqsFinished { request, outcome })
+                call.defer(issued).reply_service_event(|request, outcome| {
+                    RelayEvent::SqsFinished { request, outcome }
                 })
             }
         }

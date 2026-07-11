@@ -141,9 +141,8 @@ struct Soak {
 // steps. Neither step carries a `RequestContext` in the message, so each
 // uses `-> raw SleepReply` instead of the call-shaped `-> T` arrow: the
 // field is `SleepReply` verbatim (no `CallOutcome` wrap), and the body has
-// no `req` to thread. Continuations land as
-// `ServiceMessage::Event(SoakEvent::Flow(...))` so the split-service form
-// can drop the hand-written reject arm.
+// no `req` to thread. Continuations land as domain events via
+// `then_service_event` so the split-service form never names the envelope.
 tina::flow! {
     pub flow SoakFlow for Soak {
         reply SoakReply;
@@ -242,10 +241,10 @@ impl Soak {
                     self.next_qid = qid + 1;
                     let started_ms = self.now_ms();
                     let fake = self.fake_http;
-                    sleep(fake).then(move |result| {
-                        tina::ServiceMessage::Event(SoakEvent::Flow(SoakFlow::HttpReleased(
+                    sleep(fake).then_service_event(move |result| {
+                        SoakEvent::Flow(SoakFlow::HttpReleased(
                             qid, worker_id, request_id, started_ms, result,
-                        )))
+                        ))
                     })
                 }
                 Err(tina_runtime::GuardedInsertError::Full { reply, .. }) => {
@@ -292,10 +291,10 @@ impl Soak {
             .map_err(|_| ())
             .expect("re-admission after take cannot fail");
         let fake = self.fake_db;
-        sleep(fake).then(move |result| {
-            tina::ServiceMessage::Event(SoakEvent::Flow(SoakFlow::DbReleased(
+        sleep(fake).then_service_event(move |result| {
+            SoakEvent::Flow(SoakFlow::DbReleased(
                 qid, worker_id, request_id, started_ms, result,
-            )))
+            ))
         })
     }
 

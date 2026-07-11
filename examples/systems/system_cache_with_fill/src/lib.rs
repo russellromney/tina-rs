@@ -198,12 +198,12 @@ impl Cache {
                 let generation = entry.generation;
                 entry.filling = Some(FillState { generation });
                 self.fills_started += 1;
-                let fill_effect = sleep(self.fill_delay).then(move |result| {
-                    tina::ServiceMessage::Event(CacheEvent::FillDone {
+                let fill_effect = sleep(self.fill_delay).then_service_event(move |result| {
+                    CacheEvent::FillDone {
                         key,
                         generation,
                         result,
-                    })
+                    }
                 });
                 request_effect_after_shared_wait(permit, fill_effect)
             }

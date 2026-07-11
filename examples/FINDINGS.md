@@ -14,6 +14,41 @@ valid; the long-form history lives in
 Finding numbers are stable across phases — when a finding closes it
 moves to the [Closed](#closed) section below with the same number.
 
+### 2026-07-11 Envelope-free continuation cohort
+
+Closed the remaining application-level `ServiceMessage::Event` /
+`ServiceMessage::Request` construction in the examples corpus by
+migrating onto the landed helpers (`then_service_event`,
+`reply_service_event`, `call_request`, `call_cancelable_request`,
+`send_event`, `register_split_service`) and two small missing set/scope
+helpers:
+
+- `CallGroup` / `CallJoinSet` / `CallSelectSet::start_cancelable_service_event`
+- `RequestScope::cancel_into_service_event_effect`
+
+**Migrated (no remaining envelope construction in effect/call sites):**
+
+- specimens: `backpressure_chain`, `cancellation_chain`,
+  `multi_turn_request_context`, `request_scope_fanout`, `scatter_gather`,
+  `two_stage_pipeline` (comment only), `worker_pool`
+- systems: `api_gateway_limits`, `bounded_object_lane`, `cache_with_fill`,
+  `copied_service_path`, `job_queue`, `lock_manager`, `metrics_shipper`,
+  `scoped_request_tree`, `soak_http_db`, `webhook_relay`,
+  `ergonomics_playground` (also switched races/batch/cache probes onto
+  typed `ServiceRequestAddress` + `register_split_service`)
+
+**Still open after this cohort (not envelope construction):**
+
+- Raw `impl Isolate` blocks (extensions custom-codec, local I/O specimens,
+  websocket/room gateways, driver clients in ergonomics_playground) —
+  next cohort: macro/`#[isolate]` form where lanes allow.
+- Production-shaped hosts still on bare `ThreadedRuntime::new` rather
+  than `LocalSystem` + fallible startup — next cohort.
+- `specimen_sharded_fanout_read` Bind/Start paired-registration ceremony
+  (finding 3) — still a framework gap.
+- Type aliases like `SoakMsg = ServiceMessage<…>` remain only where an
+  `HttpListener` (or similar rail) needs the envelope type parameter.
+
 ### 2026-07-09 Examples Canonicalization Pass
 
 Swept the example crates to the current canonical Tina shapes. Every

@@ -4,6 +4,26 @@ This file records completed work.
 
 ## Unreleased
 
+### Split-service set / scope event helpers
+
+- `CallGroup::start_cancelable_service_event`,
+  `CallJoinSet::start_cancelable_service_event`, and
+  `CallSelectSet::start_cancelable_service_event` take a domain-event
+  translator and wrap the split-service envelope internally — the same
+  shape as `then_service_event` for ordinary calls.
+- `RequestScope::cancel_into_service_event_effect` is the cancel twin:
+  translators return domain events, not `ServiceMessage::Event(...)`.
+
+### Envelope-free example cohort
+
+Migrated remaining example call sites off manual `ServiceMessage`
+construction onto `then_service_event` / `reply_service_event` /
+`call_request` / `call_cancelable_request` / `send_event` /
+`register_split_service` and the set/scope helpers above. Specimens and
+systems that still name `ServiceMessage` only do so in type aliases for
+HTTP listener wiring (`HttpListener<…, ServiceMessage<…>>`), not in
+application effect construction.
+
 ### Single-lane service authoring
 
 - `#[tina_runtime::isolate(event = Event)]` defines an event-only service

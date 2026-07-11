@@ -235,8 +235,8 @@ impl Gateway {
             {
                 Ok(_ticket) => {
                     self.next_qid = qid + 1;
-                    sleep(hold).then(move |result| {
-                        tina::ServiceMessage::Event(GatewayEvent::HoldDone { qid, route, result })
+                    sleep(hold).then_service_event(move |result| {
+                        GatewayEvent::HoldDone { qid, route, result }
                     })
                 }
                 Err(ConcurrencyGuardedInsertError::Admission {

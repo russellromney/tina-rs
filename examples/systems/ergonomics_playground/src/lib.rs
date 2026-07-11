@@ -3,14 +3,14 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{
-    Address, CancelOutcome, Context, Effect, Isolate, RequestContext, SingleShard, noop, reply_to,
-    send,
+    CancelOutcome, Context, Effect, Isolate, RequestContext, ServiceRequestAddress, SingleShard,
+    noop, reply_to, send_event,
 };
 use tina_runtime::{
     CallGroupToken, CallOutcome, CallReplyRejectedReason, CallSelectSet,
     DeferredReplyRejectedReason, PendingReplies, RuntimeCall, RuntimeEventKind, SharedWork,
-    SharedWorkError, SleepReply, call, call_cancelable, cancel_call, request_effect_after_park,
-    request_effect_after_shared_wait, sleep,
+    SharedWorkError, SleepReply, call_cancelable_request, call_request, cancel_call,
+    request_effect_after_park, request_effect_after_shared_wait, sleep,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -76,7 +76,7 @@ impl Provider {
         match request {
             ProviderRequest::Quote => call
                 .defer(sleep(self.delay))
-                .reply(|req, result| tina::ServiceMessage::Event(ProviderEvent::Done(req, result))),
+                .reply_service_event(ProviderEvent::Done),
         }
     }
 }
@@ -112,7 +112,7 @@ struct PendingQuote {
 
 #[derive(Debug)]
 struct QuoteGateway {
-    providers: [Address<tina::ServiceMessage<ProviderEvent, ProviderRequest>, ProviderQuote>; 2],
+    providers: [ServiceRequestAddress<ProviderEvent, ProviderRequest, ProviderQuote>; 2],
     pending: Option<PendingQuote>,
     cancel_outcomes: Rc<RefCell<usize>>,
 }
@@ -125,19 +125,13 @@ impl QuoteGateway {
         for (idx, provider) in self.providers.iter().copied().enumerate() {
             let key = idx as u32;
             let effect = set
-                .start_cancelable(
+                .start_cancelable_service_event(
                     key,
-                    call_cancelable(
-                        provider,
-                        tina::ServiceMessage::Request(ProviderRequest::Quote),
-                        CALL_TIMEOUT,
-                    ),
-                    |key, token, outcome| {
-                        tina::ServiceMessage::Event(QuoteEvent::ProviderReturned {
-                            key,
-                            token,
-                            outcome,
-                        })
+                    call_cancelable_request(provider, ProviderRequest::Quote, CALL_TIMEOUT),
+                    |key, token, outcome| QuoteEvent::ProviderReturned {
+                        key,
+                        token,
+                        outcome,
                     },
                 )
                 .expect("fresh set accepts each provider");
@@ -254,7 +248,7 @@ impl QuoteGateway {
 
 #[derive(Debug)]
 enum QuoteClientMsg {
-    Begin(Address<tina::ServiceMessage<QuoteEvent, QuoteRequest>, QuoteReply>),
+    Begin(ServiceRequestAddress<QuoteEvent, QuoteRequest, QuoteReply>),
     Returned(CallOutcome<QuoteReply>),
 }
 
@@ -280,12 +274,8 @@ impl Isolate for QuoteClient {
     ) -> Effect<Self> {
         match msg {
             QuoteClientMsg::Begin(gateway) => {
-                call(
-                    gateway,
-                    tina::ServiceMessage::Request(QuoteRequest::GetQuote),
-                    CALL_TIMEOUT,
-                )
-                .then(QuoteClientMsg::Returned)
+                call_request(gateway, QuoteRequest::GetQuote, CALL_TIMEOUT)
+                    .then(QuoteClientMsg::Returned)
             }
             QuoteClientMsg::Returned(CallOutcome::Replied(reply)) => {
                 self.replies.borrow_mut().push(reply);
@@ -313,21 +303,36 @@ pub fn run_quote_race_probe() -> anyhow::Result<QuoteRaceReport> {
 
 fn run_quote_race_with(quotes: [ProviderQuote; 2]) -> anyhow::Result<QuoteRaceReport> {
     let mut sim = Simulator::new(SingleShard, SimulatorConfig::default());
-    let slow = sim.register(Provider {
-        quote: quotes[0],
-        delay: Duration::from_millis(30),
-    });
-    let fast = sim.register(Provider {
-        quote: quotes[1],
-        delay: Duration::from_millis(5),
-    });
+    let slow = sim
+        .register_split_service::<Provider, ProviderEvent, ProviderRequest, std::convert::Infallible>(
+            Provider {
+                quote: quotes[0],
+                delay: Duration::from_millis(30),
+            },
+            8,
+        )
+        .requests;
+    let fast = sim
+        .register_split_service::<Provider, ProviderEvent, ProviderRequest, std::convert::Infallible>(
+            Provider {
+                quote: quotes[1],
+                delay: Duration::from_millis(5),
+            },
+            8,
+        )
+        .requests;
 
     let cancel_outcomes = Rc::new(RefCell::new(0));
-    let gateway = sim.register(QuoteGateway {
-        providers: [slow, fast],
-        pending: None,
-        cancel_outcomes: Rc::clone(&cancel_outcomes),
-    });
+    let gateway = sim
+        .register_split_service::<QuoteGateway, QuoteEvent, QuoteRequest, std::convert::Infallible>(
+            QuoteGateway {
+                providers: [slow, fast],
+                pending: None,
+                cancel_outcomes: Rc::clone(&cancel_outcomes),
+            },
+            8,
+        )
+        .requests;
     let replies = Rc::new(RefCell::new(Vec::new()));
     let client = sim.register(QuoteClient {
         replies: Rc::clone(&replies),
@@ -476,9 +481,7 @@ impl Batcher {
                             noop()
                         } else {
                             self.timer_armed = true;
-                            sleep(self.window).then(|result| {
-                                tina::ServiceMessage::Event(BatcherEvent::Flush(result))
-                            })
+                            sleep(self.window).then_service_event(BatcherEvent::Flush)
                         };
                         request_effect_after_park(permit, effect)
                     }
@@ -495,7 +498,7 @@ impl Batcher {
 
 #[derive(Debug)]
 enum BatchClientMsg {
-    Begin(Address<tina::ServiceMessage<BatcherEvent, BatcherRequest>, BatchReply>),
+    Begin(tina_runtime::SplitServiceHandle<BatcherEvent, BatcherRequest, BatchReply>),
     Returned(CallOutcome<BatchReply>),
 }
 
@@ -528,16 +531,16 @@ impl Isolate for BatchClient {
                     .iter()
                     .copied()
                     .map(|value| {
-                        call(
-                            batcher,
-                            tina::ServiceMessage::Request(BatcherRequest::Submit(value)),
+                        call_request(
+                            batcher.requests,
+                            BatcherRequest::Submit(value),
                             CALL_TIMEOUT,
                         )
                         .then(BatchClientMsg::Returned)
                     })
                     .collect();
                 if self.drain_after_submit {
-                    calls.push(send(batcher, tina::ServiceMessage::Event(BatcherEvent::Drain)));
+                    calls.push(send_event(batcher.events, BatcherEvent::Drain));
                 }
                 Effect::Batch(calls)
             }
@@ -552,15 +555,19 @@ impl Isolate for BatchClient {
 
 pub fn run_debounced_batch_probe() -> anyhow::Result<DebouncedBatchReport> {
     let mut sim = Simulator::new(SingleShard, SimulatorConfig::default());
-    let batcher = sim.register(Batcher {
-        pending: PendingReplies::with_capacity(3).named("ergonomics.batch.pending"),
-        values: Vec::new(),
-        next_qid: 1,
-        next_batch: 1,
-        timer_armed: false,
-        closed: false,
-        window: Duration::from_millis(10),
-    });
+    let batcher = sim
+        .register_split_service::<Batcher, BatcherEvent, BatcherRequest, std::convert::Infallible>(
+            Batcher {
+                pending: PendingReplies::with_capacity(3).named("ergonomics.batch.pending"),
+                values: Vec::new(),
+                next_qid: 1,
+                next_batch: 1,
+                timer_armed: false,
+                closed: false,
+                window: Duration::from_millis(10),
+            },
+            8,
+        );
     let replies = Rc::new(RefCell::new(Vec::new()));
     let client = sim.register(BatchClient {
         values: vec![2, 3, 5, 7, 11],
@@ -605,15 +612,19 @@ pub fn run_debounced_batch_probe() -> anyhow::Result<DebouncedBatchReport> {
 
 pub fn run_debounced_batch_drain_probe() -> anyhow::Result<DebouncedBatchReport> {
     let mut sim = Simulator::new(SingleShard, SimulatorConfig::default());
-    let batcher = sim.register(Batcher {
-        pending: PendingReplies::with_capacity(4).named("ergonomics.batch.drain.pending"),
-        values: Vec::new(),
-        next_qid: 1,
-        next_batch: 1,
-        timer_armed: false,
-        closed: false,
-        window: Duration::from_millis(50),
-    });
+    let batcher = sim
+        .register_split_service::<Batcher, BatcherEvent, BatcherRequest, std::convert::Infallible>(
+            Batcher {
+                pending: PendingReplies::with_capacity(4).named("ergonomics.batch.drain.pending"),
+                values: Vec::new(),
+                next_qid: 1,
+                next_batch: 1,
+                timer_armed: false,
+                closed: false,
+                window: Duration::from_millis(50),
+            },
+            8,
+        );
     let replies = Rc::new(RefCell::new(Vec::new()));
     let client = sim.register(BatchClient {
         values: vec![2, 3, 5],
@@ -707,9 +718,7 @@ impl Upstream {
         match request {
             UpstreamRequest::Fetch => {
                 *self.calls.borrow_mut() += 1;
-                call.defer(sleep(self.delay)).reply(|req, result| {
-                    tina::ServiceMessage::Event(UpstreamEvent::Done(req, result))
-                })
+                call.defer(sleep(self.delay)).reply_service_event(UpstreamEvent::Done)
             }
         }
     }
@@ -731,7 +740,7 @@ struct Cache {
     cached: Option<u64>,
     filling: bool,
     waiters: SharedWork<&'static str, CacheReply>,
-    upstream: Address<tina::ServiceMessage<UpstreamEvent, UpstreamRequest>, FillReply>,
+    upstream: ServiceRequestAddress<UpstreamEvent, UpstreamRequest, FillReply>,
 }
 
 #[tina_runtime::isolate(event = CacheEvent, request = CacheRequest, reply = CacheReply)]
@@ -777,14 +786,12 @@ impl Cache {
                             request_effect_after_shared_wait(permit, noop())
                         } else {
                             self.filling = true;
-                            let effect = call(
+                            let effect = call_request(
                                 self.upstream,
-                                tina::ServiceMessage::Request(UpstreamRequest::Fetch),
+                                UpstreamRequest::Fetch,
                                 CALL_TIMEOUT,
                             )
-                            .then(|outcome| {
-                                tina::ServiceMessage::Event(CacheEvent::FillReturned(outcome))
-                            });
+                            .then_service_event(CacheEvent::FillReturned);
                             request_effect_after_shared_wait(permit, effect)
                         }
                     }
@@ -798,7 +805,7 @@ impl Cache {
 
 #[derive(Debug)]
 enum CacheClientMsg {
-    Begin(Address<tina::ServiceMessage<CacheEvent, CacheRequest>, CacheReply>),
+    Begin(ServiceRequestAddress<CacheEvent, CacheRequest, CacheReply>),
     Returned(CallOutcome<CacheReply>),
 }
 
@@ -827,9 +834,9 @@ impl Isolate for CacheClient {
             CacheClientMsg::Begin(cache) => {
                 let calls = (0..self.callers)
                     .map(|_| {
-                        call(
+                        call_request(
                             cache,
-                            tina::ServiceMessage::Request(CacheRequest::Get("price:alpaca")),
+                            CacheRequest::Get("price:alpaca"),
                             CALL_TIMEOUT,
                         )
                         .then(CacheClientMsg::Returned)
@@ -849,18 +856,28 @@ impl Isolate for CacheClient {
 pub fn run_single_flight_cache_probe() -> anyhow::Result<CacheFillReport> {
     let mut sim = Simulator::new(SingleShard, SimulatorConfig::default());
     let upstream_calls = Rc::new(RefCell::new(0));
-    let upstream = sim.register(Upstream {
-        value: 42,
-        delay: Duration::from_millis(10),
-        calls: Rc::clone(&upstream_calls),
-    });
-    let cache = sim.register(Cache {
-        key: "price:alpaca",
-        cached: None,
-        filling: false,
-        waiters: SharedWork::with_capacity(3).named("ergonomics.cache.waiters"),
-        upstream,
-    });
+    let upstream = sim
+        .register_split_service::<Upstream, UpstreamEvent, UpstreamRequest, std::convert::Infallible>(
+            Upstream {
+                value: 42,
+                delay: Duration::from_millis(10),
+                calls: Rc::clone(&upstream_calls),
+            },
+            8,
+        )
+        .requests;
+    let cache = sim
+        .register_split_service::<Cache, CacheEvent, CacheRequest, std::convert::Infallible>(
+            Cache {
+                key: "price:alpaca",
+                cached: None,
+                filling: false,
+                waiters: SharedWork::with_capacity(3).named("ergonomics.cache.waiters"),
+                upstream,
+            },
+            8,
+        )
+        .requests;
     let replies = Rc::new(RefCell::new(Vec::new()));
     let client = sim.register(CacheClient {
         callers: 5,
