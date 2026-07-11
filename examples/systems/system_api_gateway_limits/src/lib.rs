@@ -16,9 +16,9 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, CapacitySummary, DefaultThreadedMailboxFactory, GuardedPendingReplies,
-    SharedCapacityReservation, SharedCapacityScope, SleepReply, SplitServiceHandle,
-    ThreadedRuntime, format_assertion_failure, format_discovery_line, sleep,
+    CallOutcome, CapacitySummary, ConcurrencyGuardedInsertError, ConcurrencyPendingReplies,
+    DefaultThreadedMailboxFactory, SharedCapacityReservation, SharedCapacityScope, SleepReply,
+    SplitServiceHandle, ThreadedRuntime, format_assertion_failure, format_discovery_line, sleep,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -137,7 +137,7 @@ struct Gateway {
     list_weight: usize,
     upload_body: usize,
     list_body: usize,
-    pending: GuardedPendingReplies<u64, GatewayReply, SharedCapacityReservation>,
+    pending: ConcurrencyPendingReplies<u64, GatewayReply, SharedCapacityReservation>,
     next_qid: u64,
 }
 
@@ -182,8 +182,10 @@ impl Gateway {
             list_weight,
             upload_body,
             list_body,
-            pending: GuardedPendingReplies::with_capacity(pending_capacity)
-                .named("system_api_gateway_limits.pending"),
+            pending: ConcurrencyPendingReplies::with_capacity(
+                "system_api_gateway_limits.pending",
+                pending_capacity,
+            ),
             next_qid: 1,
         }
     }
@@ -237,20 +239,33 @@ impl Gateway {
                         tina::ServiceMessage::Event(GatewayEvent::HoldDone { qid, route, result })
                     })
                 }
-                Err(tina_runtime::GuardedInsertError::Full { reply, .. }) => {
-                    // Lease drops automatically when the error is consumed.
-                    let cap = self.pending.capacity();
+                Err(ConcurrencyGuardedInsertError::Admission {
+                    reply, failure, ..
+                }) => {
+                    let report = failure.report();
                     reply_to::<Self>(
                         reply,
                         GatewayReply::Full {
                             filled: "gateway.pending".into(),
                             requested: 1,
-                            current: cap,
-                            max: cap,
+                            current: report.current,
+                            max: report.capacity,
                         },
                     )
                 }
-                Err(tina_runtime::GuardedInsertError::DuplicateKey { reply, .. }) => {
+                Err(ConcurrencyGuardedInsertError::PendingFull { reply, .. }) => {
+                    let report = self.pending.report();
+                    reply_to::<Self>(
+                        reply,
+                        GatewayReply::Full {
+                            filled: "gateway.pending_mismatch".into(),
+                            requested: 1,
+                            current: report.parked,
+                            max: report.admission.capacity,
+                        },
+                    )
+                }
+                Err(ConcurrencyGuardedInsertError::DuplicateKey { reply, .. }) => {
                     reply_to::<Self>(
                         reply,
                         GatewayReply::Full {
@@ -266,16 +281,14 @@ impl Gateway {
     }
 
     fn hold_done(&mut self, qid: u64, route: Route, _result: SleepReply) -> Effect<Self> {
-        let Some((slot, charge)) = self.pending.take_by_key(&qid) else {
-            return noop();
-        };
-        let effect = reply_to(
-            slot,
+        let Some(effect) = self.pending.reply_by_key::<Self>(
+            &qid,
             GatewayReply::Ok {
                 route: route.label(),
             },
-        );
-        drop(charge);
+        ) else {
+            return noop();
+        };
         effect
     }
 }

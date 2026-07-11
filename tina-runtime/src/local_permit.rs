@@ -312,6 +312,9 @@ impl Drop for Permit {
 /// instances. Used by tests and reports to detect leaked permits.
 static DROPPED_PERMIT_COUNT: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+pub(crate) static DROPPED_PERMIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Returns the process-wide dropped-permit count.
 pub fn dropped_permit_count() -> u64 {
     DROPPED_PERMIT_COUNT.load(Ordering::Relaxed)
@@ -421,6 +424,7 @@ mod tests {
 
     #[test]
     fn dropped_permit_increments_global_counter() {
+        let _guard = DROPPED_PERMIT_TEST_LOCK.lock().expect("drop test lock");
         let baseline = dropped_permit_count();
         let mut gate = LocalPermitGate::with_capacity(1);
         let permit = gate.try_admit().unwrap();

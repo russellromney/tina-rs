@@ -54,6 +54,7 @@ mod capabilities;
 pub mod capacity;
 mod child_lifecycle;
 mod clock;
+mod concurrency_pending;
 pub mod deferred;
 mod drain_state;
 mod driver;
@@ -100,6 +101,11 @@ pub use admission::{
     AdmissionDecision, AdmissionFailure, AdmissionReport, ConcurrencyLimit, ConcurrencyPermit,
     ConcurrencyReleaseError, KeyedLimit, KeyedPermit, KeyedReleaseError, KeyedSlotReport,
     PressureAction, RateGrant, RateKeyState, RateLimit, ServicePolicy, SurfaceName,
+};
+pub use concurrency_pending::{
+    ConcurrencyGuardedInsertError, ConcurrencyInsertError, ConcurrencyParkError,
+    ConcurrencyParkTicket, ConcurrencyPendingInitError, ConcurrencyPendingReplies,
+    ConcurrencyPendingReport, ConcurrencyReplyError, request_effect_after_concurrency_park,
 };
 pub use drain_state::{AdmitDecision, DrainReport, DrainStage, DrainState};
 pub use errors::{
