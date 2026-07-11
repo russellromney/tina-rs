@@ -16,8 +16,8 @@ use tina::{
 use super::*;
 use crate::{
     CallKind, CallOutcome, PendingCancelableCallSet, PendingCancelableInsertError,
-    PendingCancelableRemoveError, PendingCancelableTicket, RuntimeCall, RuntimeEventKind,
-    SendOutcome, call, call_cancelable, sleep,
+    PendingCancelableRemoveError, PendingCancelableTicket, RequestPendingCancelableInsertError,
+    RuntimeCall, RuntimeEventKind, SendOutcome, call, call_cancelable, sleep,
 };
 
 fn step_to_idle<S, F>(runtime: &mut Runtime<S, F>)
@@ -1424,14 +1424,15 @@ fn isolate_call_cancelable_defer_admits_before_dispatch_and_drains_on_owner_stop
 }
 
 // ---------------------------------------------------------------------------
-// PendingCancelableCall::reply_request on the split-service RequestCall path
+// RequestPendingCancelableInsertError::reply on the split-request path
 //
 // `HandleSvc` above answers `Full`/`DuplicateKey` from plain `CallContext`,
 // where `reply_to(...)` already returns the right `Effect<Self>` type. A
 // split-service `handle_request` returns `RequestEffect<Self>` instead, so
 // that plain spelling does not type-check there — this is the shape
 // `system_job_queue`'s `Queue::submit` hits, and the scenario
-// `PendingCancelableCall::reply_request` exists to answer.
+// `RequestPendingCancelableInsertError::reply` exists to answer while
+// consuming the matching one-use permit returned by failed admission.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -1508,21 +1509,21 @@ impl SplitHandleSvc {
             .try_admit(&mut self.pending, key, SplitHandleSvcMsg::ProbeResult)
         {
             Ok(effect) => effect,
-            Err(PendingCancelableInsertError::Full { token }) => {
-                token.reply_request::<Self>(SvcReply::Busy)
+            Err(error @ RequestPendingCancelableInsertError::Full { .. }) => {
+                error.reply(SvcReply::Busy)
             }
-            Err(PendingCancelableInsertError::DuplicateKey { token }) => {
-                token.reply_request::<Self>(SvcReply::Duplicate)
+            Err(error @ RequestPendingCancelableInsertError::DuplicateKey { .. }) => {
+                error.reply(SvcReply::Duplicate)
             }
         }
     }
 }
 
 #[test]
-fn split_service_pending_cancelable_full_replies_via_reply_request() {
-    // Real Full: capacity 1, two concurrent StartKey calls under distinct
-    // keys, probe holds the first call open so the second sees the set
-    // still occupied when it tries to admit.
+fn split_service_pending_cancelable_rejections_reply_via_admission_error() {
+    // Real DuplicateKey and Full: capacity 1, three concurrent StartKey calls.
+    // The probe holds key 1 open, so the second key 1 is DuplicateKey and key
+    // 2 is Full when each tries to admit.
     let (mut runtime, _clock) = new_manual_runtime();
     let child_calls = Rc::new(RefCell::new(0));
     let probe = runtime.register(
@@ -1598,6 +1599,9 @@ fn split_service_pending_cancelable_full_replies_via_reply_request() {
         .try_send(caller, SClientMsg::Start { key: 1, svc })
         .unwrap();
     runtime
+        .try_send(caller, SClientMsg::Start { key: 1, svc })
+        .unwrap();
+    runtime
         .try_send(caller, SClientMsg::Start { key: 2, svc })
         .unwrap();
     step_to_idle(&mut runtime);
@@ -1609,8 +1613,11 @@ fn split_service_pending_cancelable_full_replies_via_reply_request() {
     );
     assert_eq!(
         out.borrow().as_slice(),
-        [(2, CallOutcome::Replied(SvcReply::Busy))],
-        "the Full admission must settle through reply_request, not panic or hang",
+        [
+            (1, CallOutcome::Replied(SvcReply::Duplicate)),
+            (2, CallOutcome::Replied(SvcReply::Busy)),
+        ],
+        "both rejected admissions must settle through their returned permits",
     );
 }
 

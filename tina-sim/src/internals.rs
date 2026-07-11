@@ -725,6 +725,7 @@ where
     Outbound: 'static,
     S: Shard,
 {
+    #[allow(unsafe_code)]
     fn handle_boxed(
         &mut self,
         message: Box<dyn Any>,
@@ -740,7 +741,8 @@ where
         let effect = {
             let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id).with_now(now);
             if let Some(caller) = caller {
-                ctx = ctx.with_caller(caller);
+                // SAFETY: simulator dispatch allocated this caller for this delivery.
+                ctx = unsafe { ctx.with_caller(caller) };
             }
             self.isolate.handle(*message, &mut ctx)
         };
@@ -748,6 +750,7 @@ where
         erase_effect::<I, S, Msg, Outbound>(effect)
     }
 
+    #[allow(unsafe_code)]
     fn handle_call_boxed(
         &mut self,
         message: Box<dyn Any>,
@@ -761,10 +764,15 @@ where
         });
 
         let effect = {
-            let ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id)
-                .with_now(now)
-                .with_caller(caller);
-            self.isolate.handle_call(*message, CallContext::new(ctx))
+            let call = unsafe {
+                // SAFETY: simulator dispatch allocated this caller for this delivery.
+                CallContext::new(
+                    Context::<_, I::Reply>::new_typed(shard, isolate_id)
+                        .with_now(now)
+                        .with_caller(caller),
+                )
+            };
+            self.isolate.handle_call(*message, call)
         };
 
         erase_effect::<I, S, Msg, Outbound>(effect)

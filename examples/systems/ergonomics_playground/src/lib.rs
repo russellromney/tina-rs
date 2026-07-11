@@ -471,7 +471,7 @@ impl Batcher {
                 let qid = self.next_qid;
                 let next_qid = qid + 1;
                 match self.pending.park_request(qid, call) {
-                    Ok(ticket) => {
+                    Ok((_ticket, permit)) => {
                         self.next_qid = next_qid;
                         self.values.push((qid, value));
                         let effect = if self.timer_armed {
@@ -482,7 +482,7 @@ impl Batcher {
                                 tina::ServiceMessage::Event(BatcherEvent::Flush(result))
                             })
                         };
-                        request_effect_after_park(&ticket, effect)
+                        request_effect_after_park(permit, effect)
                     }
                     Err(tina_runtime::ParkError::Full { call, .. }) => call.reply(BatchReply::Full),
                     Err(tina_runtime::ParkError::DuplicateKey { call, .. }) => {
@@ -774,9 +774,9 @@ impl Cache {
                     return call_ctx.reply(CacheReply::Hit(value));
                 }
                 match self.waiters.wait(self.key, call_ctx) {
-                    Ok(ticket) => {
+                    Ok((_ticket, permit)) => {
                         if self.filling {
-                            request_effect_after_shared_wait(&ticket, noop())
+                            request_effect_after_shared_wait(permit, noop())
                         } else {
                             self.filling = true;
                             let effect = call(
@@ -787,7 +787,7 @@ impl Cache {
                             .then(|outcome| {
                                 tina::ServiceMessage::Event(CacheEvent::FillReturned(outcome))
                             });
-                            request_effect_after_shared_wait(&ticket, effect)
+                            request_effect_after_shared_wait(permit, effect)
                         }
                     }
                     Err(SharedWorkError::Full { call, .. })

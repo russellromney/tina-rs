@@ -190,10 +190,10 @@ impl Cache {
         }
 
         match self.waiters.wait(key.clone(), call) {
-            Ok(ticket) => {
+            Ok((_ticket, permit)) => {
                 let entry = self.entries.entry(key.clone()).or_default();
                 if entry.filling.is_some() {
-                    return request_effect_after_shared_wait(&ticket, noop());
+                    return request_effect_after_shared_wait(permit, noop());
                 }
                 let generation = entry.generation;
                 entry.filling = Some(FillState { generation });
@@ -205,7 +205,7 @@ impl Cache {
                         result,
                     })
                 });
-                request_effect_after_shared_wait(&ticket, fill_effect)
+                request_effect_after_shared_wait(permit, fill_effect)
             }
             Err(SharedWorkError::Full { call, .. }) => {
                 self.busy_replies += 1;

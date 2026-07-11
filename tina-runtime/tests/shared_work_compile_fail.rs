@@ -2,9 +2,8 @@
 //!
 //! - `SharedWorkTicket` has crate-private fields; user code cannot
 //!   write a struct literal.
-//! - `request_effect_after_shared_wait(&ticket, _)` only accepts a
-//!   real `&SharedWorkTicket<K>`. A non-ticket argument is a compile
-//!   error.
+//! - `request_effect_after_shared_wait(permit, _)` only accepts the move-only
+//!   turn permit returned beside a real ticket.
 //!
 //! Together these mean a `RequestEffect<I>` from `noop()` cannot
 //! escape `SharedWork::wait` / `wait_call`.
@@ -16,7 +15,7 @@ fn shared_work_ticket_cannot_be_forged_with_struct_literal() {
 }
 
 #[test]
-fn shared_work_request_effect_rejects_non_ticket() {
+fn shared_work_request_effect_rejects_non_permit() {
     let cases = trybuild::TestCases::new();
     cases.compile_fail("tests/shared_work_compile_fail/shared_work_request_effect_from_noop.rs");
 }

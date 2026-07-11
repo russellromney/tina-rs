@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use tina::{ChildDefinition, prelude::*};
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, PendingCancelableCallSet,
-    PendingCancelableInsertError, PendingCancelableRemoveError, PendingCancelableTicket,
+    PendingCancelableRemoveError, PendingCancelableTicket, RequestPendingCancelableInsertError,
     SleepReply, ThreadedRuntime, call_cancelable_request, sleep,
 };
 
@@ -409,14 +409,14 @@ impl Queue {
             // pending cap = workers, so a full pending set while an idle
             // worker slot exists should never happen in normal accounting.
             // If it ever does, answer the caller typed instead of stranding
-            // the already-captured `RequestCall` behind a panic.
-            Err(PendingCancelableInsertError::Full { token }) => {
+            // the already-captured request authority behind a panic.
+            Err(error @ RequestPendingCancelableInsertError::Full { .. }) => {
                 self.stats.jobs_busy_rejected += 1;
-                token.reply_request::<Self>(QueueReply::Busy)
+                error.reply(QueueReply::Busy)
             }
             // Monotonic `next_id` never repeats, so a duplicate key is a
             // real accounting bug worth failing loudly on.
-            Err(PendingCancelableInsertError::DuplicateKey { .. }) => {
+            Err(RequestPendingCancelableInsertError::DuplicateKey { .. }) => {
                 panic!("duplicate job id {id:?} — queue accounting bug")
             }
         }

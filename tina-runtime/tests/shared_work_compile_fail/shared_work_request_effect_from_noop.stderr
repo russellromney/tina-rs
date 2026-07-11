@@ -1,15 +1,15 @@
 error[E0308]: mismatched types
-  --> tests/shared_work_compile_fail/shared_work_request_effect_from_noop.rs:35:63
+  --> tests/shared_work_compile_fail/shared_work_request_effect_from_noop.rs:35:58
    |
-35 |     let _ = request_effect_after_shared_wait::<NoTicket, u32>(&not_a_ticket, tina::noop());
-   |             ------------------------------------------------- ^^^^^^^^^^^^^ expected `&SharedWorkTicket<u32>`, found `&u32`
+35 |     let _ = request_effect_after_shared_wait::<NoTicket>(not_a_permit, tina::noop());
+   |             -------------------------------------------- ^^^^^^^^^^^^ expected `RequestEffectPermit<'_, NoTicket>`, found `u32`
    |             |
    |             arguments to this function are incorrect
    |
-   = note: expected reference `&SharedWorkTicket<u32>`
-              found reference `&u32`
+   = note: expected struct `RequestEffectPermit<'_, NoTicket>`
+                found type `u32`
 note: function defined here
   --> src/shared_work.rs
    |
-   | pub fn request_effect_after_shared_wait<I, K>(
+   | pub fn request_effect_after_shared_wait<I>(
    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -198,6 +198,49 @@ where
     effect: Effect<I>,
 }
 
+/// One-use proof that a request caller was captured into a [`RequestContext`].
+///
+/// Runtime adapters carry this permit beside the captured request authority
+/// until they have built the ordinary [`Effect`] that continues the request.
+/// Consuming the permit is the only public way to wrap that effect as a
+/// [`RequestEffect`]. The permit cannot be constructed or cloned by
+/// application code.
+///
+/// [`RequestContext`]: crate::RequestContext
+#[must_use = "a RequestEffectPermit must be consumed to finish request-effect construction"]
+pub struct RequestEffectPermit<'request, I>
+where
+    I: Isolate,
+{
+    _request: std::marker::PhantomData<fn(&'request mut I) -> &'request mut I>,
+}
+
+impl<'request, I> RequestEffectPermit<'request, I>
+where
+    I: Isolate,
+{
+    pub(crate) fn new() -> Self {
+        Self {
+            _request: std::marker::PhantomData,
+        }
+    }
+
+    /// Consumes this permit to wrap work for the request that produced it.
+    pub fn apply(self, effect: Effect<I>) -> RequestEffect<I> {
+        RequestEffect::from_consumed_effect(effect)
+    }
+}
+
+impl<I> std::fmt::Debug for RequestEffectPermit<'_, I>
+where
+    I: Isolate,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestEffectPermit")
+            .finish_non_exhaustive()
+    }
+}
+
 impl<I> RequestEffect<I>
 where
     I: Isolate,

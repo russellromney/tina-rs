@@ -381,7 +381,7 @@ where
         &mut self,
         key: K,
         call: RequestCall<'a, I>,
-    ) -> Result<WaitTicket<K>, WaitError<'a, K, I>>
+    ) -> Result<(WaitTicket<K>, tina::RequestEffectPermit<'a, I>), WaitError<'a, K, I>>
     where
         I: Isolate<Reply = R>,
         R: 'static,
@@ -402,8 +402,8 @@ where
             return Err(WaitError::Full { key, call });
         }
 
-        let req = call.into_call_context().into_request_context();
-        Ok(self.store_entry(key, req.into_deferred()))
+        let (req, permit) = call.into_request_context_with_permit();
+        Ok((self.store_entry(key, req.into_deferred()), permit))
     }
 
     /// Park the current call-context caller as a waiter under `key`.
