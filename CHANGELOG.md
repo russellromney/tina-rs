@@ -18,6 +18,11 @@ This file records completed work.
   `LocalMultiShardSystem` delegate the same capability-typed registrations,
   and all five multi-owner/facade surfaces expose `try_send_event` without a
   public `ServiceMessage` envelope.
+- `LocalSystem` and `LocalMultiShardSystem` now expose the two host-call shapes
+  that their registration APIs require: `call_blocking` for ordinary roots and
+  `call_blocking_request` for request/split service capabilities. Both preserve
+  `CallOutcome` terminal truth; backend-specific host-wait tuning remains on
+  the lower threaded owners.
 
 ### Concurrency-charged parked callers
 

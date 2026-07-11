@@ -1084,6 +1084,14 @@ from shard A into target shard B" and has a remote-path proof.
 by `addr.shard()`; no `call_blocking_on` exists anywhere in
 `tina-runtime/src`, matching the "no host-to-shard variant" claim.
 
+The preferred `LocalSystem` and `LocalMultiShardSystem` facades now forward
+only the two host-call shapes justified by their public registrations:
+`call_blocking` for `register_root[_on]` and `call_blocking_request` for
+request/split service handles. The multi-shard facade keeps address-owned
+routing and the same unknown-shard panic convention. Separate host-wait
+budgeting remains a lower-level threaded-runtime control rather than widening
+the app facade.
+
 ### 24. Register-and-bootstrap helper for start-up effects — closed
 
 **Surfaced by:** `system_job_queue`, `system_session_auth`.

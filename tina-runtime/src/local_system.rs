@@ -900,6 +900,45 @@ where
         self.runtime().try_send_event(address, event)
     }
 
+    /// Performs one typed isolate call from the host thread and returns its
+    /// ordinary terminal [`crate::CallOutcome`].
+    ///
+    /// This is the host-call companion to [`Self::register_root`]. The timeout
+    /// is the target call deadline; backend admission and worker failures are
+    /// returned as [`ThreadedRuntimeError`].
+    pub fn call_blocking<M, R>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        timeout: Duration,
+    ) -> Result<crate::CallOutcome<R>, ThreadedRuntimeError>
+    where
+        M: Send + 'static,
+        R: Send + 'static,
+    {
+        self.runtime().call_blocking(address, message, timeout)
+    }
+
+    /// Performs one blocking host call through a split-service request
+    /// capability.
+    ///
+    /// The request is wrapped in the private service envelope by the runtime;
+    /// callers retain the full [`crate::CallOutcome`] terminal vocabulary.
+    pub fn call_blocking_request<Event, Request, Reply>(
+        &self,
+        address: tina::ServiceRequestAddress<Event, Request, Reply>,
+        request: Request,
+        timeout: Duration,
+    ) -> Result<crate::CallOutcome<Reply>, ThreadedRuntimeError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+        Reply: Send + 'static,
+    {
+        self.runtime()
+            .call_blocking_request(address, request, timeout)
+    }
+
     /// Attempts one ingress send and observes the mailbox outcome.
     pub fn send_and_observe<M: Send + 'static, R: 'static>(
         &self,
@@ -1458,6 +1497,51 @@ where
         Request: Send + 'static,
     {
         self.runtime().try_send_event(address, event)
+    }
+
+    /// Performs one typed isolate call from the host thread, routed by the
+    /// shard carried in `address`.
+    ///
+    /// This is the host-call companion to [`Self::register_root_on`]. It
+    /// preserves the backend's [`crate::CallOutcome`] terminal vocabulary.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the address targets a shard not owned by this local system,
+    /// matching [`Self::try_send`] and the lower-level threaded owner.
+    pub fn call_blocking<M, R>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        timeout: Duration,
+    ) -> Result<crate::CallOutcome<R>, ThreadedRuntimeError>
+    where
+        M: Send + 'static,
+        R: Send + 'static,
+    {
+        self.runtime().call_blocking(address, message, timeout)
+    }
+
+    /// Performs one blocking host call through a split-service request
+    /// capability, routed by the shard carried in `address`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the address targets a shard not owned by this local system,
+    /// matching [`Self::call_blocking`].
+    pub fn call_blocking_request<Event, Request, Reply>(
+        &self,
+        address: tina::ServiceRequestAddress<Event, Request, Reply>,
+        request: Request,
+        timeout: Duration,
+    ) -> Result<crate::CallOutcome<Reply>, ThreadedRuntimeError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+        Reply: Send + 'static,
+    {
+        self.runtime()
+            .call_blocking_request(address, request, timeout)
     }
 
     /// Returns retained trace without failing the observability path.
