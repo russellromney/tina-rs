@@ -561,11 +561,12 @@ where
             DEFAULT_STARTUP_HANDSHAKE_TIMEOUT,
             STARTUP_CLEANUP_JOIN_TIMEOUT,
             |name, worker| thread::Builder::new().name(name).spawn(worker),
+            || {},
         )
     }
 
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    fn try_with_config_observer_io_loop_and_spawner<G, H>(
+    fn try_with_config_observer_io_loop_and_spawner<G, H, J>(
         shard: S,
         mailbox_factory: F,
         config: ThreadedRuntimeConfig,
@@ -574,6 +575,7 @@ where
         startup_timeout: Duration,
         startup_cleanup_timeout: Duration,
         spawner: H,
+        handshake_timeout_hook: J,
     ) -> Result<Self, StartupError>
     where
         G: FnOnce() -> std::io::Result<IOLoopHandle<Global>> + Send + 'static,
@@ -581,6 +583,7 @@ where
             String,
             Box<dyn FnOnce() -> ThreadedWorkerExit + Send>,
         ) -> std::io::Result<thread::JoinHandle<ThreadedWorkerExit>>,
+        J: FnOnce(),
     {
         config.validate()?;
 
@@ -631,6 +634,7 @@ where
                 return Err(StartupError::WorkerHandshakeDisconnected(shard_id));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                handshake_timeout_hook();
                 let _ = commands.try_send(ThreadedCommand::Shutdown);
                 let cleanup_deadline = Instant::now() + startup_cleanup_timeout;
                 while !handle.is_finished() && Instant::now() < cleanup_deadline {
@@ -2121,6 +2125,7 @@ mod startup_tests {
             Duration::from_millis(10),
             STARTUP_CLEANUP_JOIN_TIMEOUT,
             |_name, _worker| Err(std::io::Error::other("injected spawn failure")),
+            || {},
         )
         .err()
         .expect("spawn failure must fail startup");
@@ -2143,6 +2148,7 @@ mod startup_tests {
             Duration::from_millis(10),
             STARTUP_CLEANUP_JOIN_TIMEOUT,
             |_name, _worker| thread::Builder::new().spawn(|| ThreadedWorkerExit::clean(Vec::new())),
+            || {},
         )
         .err()
         .expect("missing handshake must fail startup");
@@ -2159,6 +2165,7 @@ mod startup_tests {
         let worker_exited = Arc::new(AtomicBool::new(false));
         let worker_exited_after_run = Arc::clone(&worker_exited);
         let (worker_started_tx, worker_started_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_worker_tx, release_worker_rx) = std::sync::mpsc::sync_channel(0);
         let error = ThreadedRuntime::try_with_config_observer_io_loop_and_spawner(
             SingleShard,
             DefaultThreadedMailboxFactory,
@@ -2172,7 +2179,9 @@ mod startup_tests {
                     worker_started_tx
                         .send(())
                         .expect("constructor still waits for the worker");
-                    thread::sleep(Duration::from_millis(30));
+                    release_worker_rx
+                        .recv()
+                        .expect("timeout path releases the blocked worker");
                     let exit = worker();
                     worker_exited_after_run.store(true, Ordering::Release);
                     exit
@@ -2181,6 +2190,11 @@ mod startup_tests {
                     .recv()
                     .expect("worker wrapper reports that it started");
                 Ok(handle)
+            },
+            move || {
+                release_worker_tx
+                    .send(())
+                    .expect("timed-out worker still waits for release");
             },
         )
         .err()
