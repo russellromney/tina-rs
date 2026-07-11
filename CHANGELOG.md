@@ -4,6 +4,16 @@ This file records completed work.
 
 ## Unreleased
 
+### Single-lane service authoring
+
+- `#[tina_runtime::isolate(event = Event)]` defines an event-only service
+  without a placeholder request type or request handler.
+- `#[tina_runtime::isolate(request = Request, reply = Reply)]` defines a
+  request-only service without a placeholder event type or event handler.
+- Runtime, threaded-runtime, and simulator registration return only the usable
+  `EventServiceHandle` or `RequestServiceHandle`; application call sites do not
+  name the internal `ServiceMessage` envelope or `Infallible` lane.
+
 ### Four split-service API helpers (#292)
 
 The 2026-07-09 examples-canonicalization sweep left four small gaps where

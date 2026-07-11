@@ -287,11 +287,23 @@ where
         &self,
         address: tina::ServiceEventAddress<Event, Request>,
         event: Event,
-    ) -> Result<(), TrySendError<tina::ServiceMessage<Event, Request>>> {
-        self.try_send(
+    ) -> Result<(), TrySendError<Event>> {
+        match self.try_send(
             address.address().address(),
             tina::ServiceMessage::Event(event),
-        )
+        ) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(tina::ServiceMessage::Event(event))) => {
+                Err(TrySendError::Full(event))
+            }
+            Err(TrySendError::Closed(tina::ServiceMessage::Event(event))) => {
+                Err(TrySendError::Closed(event))
+            }
+            Err(TrySendError::Full(tina::ServiceMessage::Request(_)))
+            | Err(TrySendError::Closed(tina::ServiceMessage::Request(_))) => {
+                unreachable!("runtime returned a different split-service payload than it received")
+            }
+        }
     }
 
     /// Returns the stored direct-parent lineage in registration order.

@@ -646,6 +646,61 @@ where
             .map(crate::SplitServiceHandle::from_address)
     }
 
+    /// Threaded mirror of [`crate::Runtime::register_event_service`].
+    #[allow(private_bounds)]
+    pub fn register_event_service<I, Event, Outbound>(
+        &self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Result<crate::EventServiceHandle<Event>, ThreadedRuntimeError>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<Event, std::convert::Infallible>,
+                Reply = (),
+                Send = TinaOutbound<Outbound>,
+            > + Send
+            + 'static,
+        Event: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: 'static,
+    {
+        self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
+            .map(|address| crate::SplitServiceHandle::from_address(address).events)
+    }
+
+    /// Threaded mirror of [`crate::Runtime::register_request_service`].
+    #[allow(private_bounds)]
+    pub fn register_request_service<I, Request, Outbound>(
+        &self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Result<crate::RequestServiceHandle<Request, I::Reply>, ThreadedRuntimeError>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<std::convert::Infallible, Request>,
+                Send = TinaOutbound<Outbound>,
+            > + tina::CallableIsolate
+            + Send
+            + 'static,
+        Request: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: 'static,
+    {
+        self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
+            .map(|address| crate::SplitServiceHandle::from_address(address).requests)
+    }
+
     /// Threaded mirror of [`Runtime::register_with_capacity_and_bootstrap`].
     ///
     /// The mailbox is allocated and the bootstrap message is prefilled before

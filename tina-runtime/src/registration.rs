@@ -7,7 +7,8 @@
 //! - public registration APIs (`register`, `register_with_capacity`,
 //!   `register_with_capacity_and_bootstrap`,
 //!   `register_with_capacity_using`, `register_service`,
-//!   `register_service_send_only`, `register_split_service`,
+//!   `register_service_send_only`, `register_event_service`,
+//!   `register_request_service`, `register_split_service`,
 //!   `supervise`, `try_supervise`);
 //! - registered-address bookkeeping (`entry_index`, `entry_by_isolate`,
 //!   `child_record_index_by_child`, `supervisor_index`,
@@ -256,6 +257,63 @@ where
     {
         let address = self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity);
         SplitServiceHandle::from_address(address)
+    }
+
+    /// Registers an event-only service and returns only its event capability.
+    #[allow(private_bounds)]
+    pub fn register_event_service<I, Event, Outbound>(
+        &mut self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> crate::EventServiceHandle<Event>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<Event, std::convert::Infallible>,
+                Reply = (),
+                Send = TinaOutbound<Outbound>,
+            > + 'static,
+        Event: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
+        Outbound: 'static,
+    {
+        SplitServiceHandle::from_address(
+            self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity),
+        )
+        .events
+    }
+
+    /// Registers a request-only service and returns only its request capability.
+    #[allow(private_bounds)]
+    pub fn register_request_service<I, Request, Outbound>(
+        &mut self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> crate::RequestServiceHandle<Request, I::Reply>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<std::convert::Infallible, Request>,
+                Send = TinaOutbound<Outbound>,
+            > + tina::CallableIsolate
+            + 'static,
+        Request: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
+        Outbound: 'static,
+    {
+        SplitServiceHandle::from_address(
+            self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity),
+        )
+        .requests
     }
 
     /// Registers one isolate and prefills its mailbox with `bootstrap` so the

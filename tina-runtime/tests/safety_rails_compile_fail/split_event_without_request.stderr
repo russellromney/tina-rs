@@ -1,5 +1,0 @@
-error: `event = ...` and `request = ...` must be supplied together
-  --> tests/safety_rails_compile_fail/split_event_without_request.rs:11:6
-   |
-11 | impl Service {
-   |      ^^^^^^^
