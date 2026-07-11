@@ -272,9 +272,10 @@ impl Producer {
 ```
 
 Construct `ProducerMsg::Burst` with `BoundedItems::try_from_iter` at the
-request boundary, returning a typed application reply on error as in the
-first example. The event handler cannot accidentally receive an unbounded
-raw collection.
+admission boundary. In a request handler, return a typed application reply on
+error as in the first example; an event producer can handle the typed
+`BoundedItemsError` directly. The event handler cannot accidentally receive an
+unbounded raw collection.
 
 This is the heart of Tina service shape.
 

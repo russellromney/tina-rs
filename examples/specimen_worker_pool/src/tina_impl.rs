@@ -1,11 +1,11 @@
 use std::convert::Infallible;
 use std::time::Duration;
 
-use tina::prelude::*;
 use tina::CallRejectedReason;
+use tina::prelude::*;
 use tina_runtime::{
-    BoundedItems, CallOutcome, DefaultThreadedMailboxFactory, ParkError, PendingReplies, SleepReply,
-    ThreadedRuntime, bounded_batch, call_request, request_effect_after_park, sleep,
+    BoundedItems, CallOutcome, DefaultThreadedMailboxFactory, ParkError, PendingReplies,
+    SleepReply, ThreadedRuntime, bounded_batch, call_request, request_effect_after_park, sleep,
 };
 
 use crate::{CLIENTS, MAX_PENDING, Report, WORKERS, expected_for};
@@ -199,9 +199,9 @@ impl Driver {
                 )
                 .expect("driver workload must fit the frontend pending bound");
                 let calls = payloads.map_effects(|(i, payload)| {
-                        call_request(frontend, FrontendRequest::Submit(payload), CALL_TIMEOUT)
-                            .then(move |outcome| DriverMsg::Returned(i, outcome))
-                    });
+                    call_request(frontend, FrontendRequest::Submit(payload), CALL_TIMEOUT)
+                        .then(move |outcome| DriverMsg::Returned(i, outcome))
+                });
                 bounded_batch(calls)
             }
             DriverMsg::Returned(i, outcome) => {
@@ -214,7 +214,19 @@ impl Driver {
                         self.outcome.correct += 1;
                     }
                     CallOutcome::Replied(FrontendReply::Result(_)) => self.outcome.wrong += 1,
-                    _ => self.outcome.failed += 1,
+                    CallOutcome::Replied(
+                        FrontendReply::PendingFull
+                        | FrontendReply::DuplicateRequest
+                        | FrontendReply::WorkerTimerFailed
+                        | FrontendReply::WorkerFull
+                        | FrontendReply::WorkerClosed
+                        | FrontendReply::WorkerTimeout
+                        | FrontendReply::WorkerRejected(_),
+                    )
+                    | CallOutcome::Full
+                    | CallOutcome::Closed
+                    | CallOutcome::Timeout
+                    | CallOutcome::Rejected(_) => self.outcome.failed += 1,
                 }
                 self.remaining -= 1;
                 if self.remaining == 0 {
@@ -283,7 +295,9 @@ pub fn run() -> anyhow::Result<Report> {
         .wait(Duration::from_secs(10))
         .map_err(|e| anyhow::anyhow!("driver finishes: {e:?}"))?;
 
-    let _ = runtime.shutdown();
+    runtime
+        .shutdown()
+        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e}"))?;
 
     Ok(Report {
         clients: CLIENTS,
@@ -300,6 +314,10 @@ mod tests {
 
     #[test]
     fn worker_terminal_outcomes_remain_distinct_frontend_replies() {
+        assert_eq!(
+            frontend_reply_from_worker(CallOutcome::Replied(WorkerReply::Result(42))),
+            FrontendReply::Result(42)
+        );
         assert_eq!(
             frontend_reply_from_worker(CallOutcome::Replied(WorkerReply::TimerFailed)),
             FrontendReply::WorkerTimerFailed
@@ -326,5 +344,6 @@ mod tests {
                 FrontendReply::WorkerRejected(reason)
             );
         }
+        assert_ne!(FrontendReply::PendingFull, FrontendReply::WorkerFull);
     }
 }

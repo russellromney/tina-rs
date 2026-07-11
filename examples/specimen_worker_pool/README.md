@@ -35,16 +35,17 @@ worker each client mapped to.
 - Pending-table pressure and every worker terminal outcome remain
   distinct: `PendingFull`, `WorkerFull`, `WorkerClosed`,
   `WorkerTimeout`, and `WorkerRejected(reason)` are not coalesced.
-- The driver workload passes through the same service-owned pending
-  cap before it becomes a call batch, so this specimen does not teach
-  a raw request-sized `Effect::Batch` as the copied path.
+- The driver workload passes through a producer-owned cap aligned with
+  the frontend pending cap before it becomes a call batch, so this
+  specimen does not teach a raw request-sized `Effect::Batch` as the
+  copied path.
 
 ## What feels worse
 
 - The frontend has to thread `qid` through a closure passed to
   `call_request(worker, ..., timeout).then(move |outcome| FrontendEvent::WorkerDone(qid, outcome))`.
-  The closure-form `.reply` is the price for stuffing a correlator
-  into the continuation message.
-- `Frontend::Submit / WorkerDone` enum still carries the message
-  shape; a sugar that hides "id-correlated dispatch" behind one
-  helper would help.
+  The closure-form `.then` is the price for stuffing a correlator into
+  the continuation event.
+- The `FrontendRequest::Submit` / `FrontendEvent::WorkerDone` enums
+  still carry the message shape; a sugar that hides "id-correlated
+  dispatch" behind one helper would help.
