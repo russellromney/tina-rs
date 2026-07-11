@@ -5,9 +5,9 @@ use std::time::Duration;
 use tina::TrySendError;
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultMailboxFactory, DefaultThreadedMailboxFactory, EventServiceHandle,
-    LocalSystem, MultiShardRuntime, RequestServiceHandle, SplitServiceHandle,
-    ThreadedMultiShardRuntime, ThreadedRuntimeError,
+    CallError, CallOutcome, DefaultMailboxFactory, DefaultThreadedMailboxFactory,
+    EventServiceHandle, LocalSystem, MultiShardRuntime, RequestServiceHandle, SplitServiceHandle,
+    ThreadedMultiShardRuntime, ThreadedRuntimeError, sleep,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -69,11 +69,15 @@ impl RequestService {
 #[derive(Debug)]
 enum SplitEvent {
     Reset,
+    Stop,
+    Delayed(RequestContext<u32>, Result<(), CallError>),
 }
 
 #[derive(Debug)]
 enum SplitRequest {
     Read,
+    Hold,
+    Reject,
 }
 
 struct SplitService;
@@ -92,6 +96,10 @@ impl SplitService {
     ) -> Effect<Self> {
         match event {
             SplitEvent::Reset => noop(),
+            SplitEvent::Stop => stop(),
+            SplitEvent::Delayed(request, Ok(())) | SplitEvent::Delayed(request, Err(_)) => {
+                reply_to(request, 8)
+            }
         }
     }
 
@@ -102,6 +110,40 @@ impl SplitService {
     ) -> RequestEffect<Self> {
         match request {
             SplitRequest::Read => caller.reply(7),
+            SplitRequest::Hold => {
+                caller
+                    .defer(sleep(Duration::from_millis(200)))
+                    .reply(|request, outcome| {
+                        tina::ServiceMessage::Event(SplitEvent::Delayed(request, outcome))
+                    })
+            }
+            SplitRequest::Reject => caller.reject(tina::CallRejectedReason::UnsupportedMessage),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RootMessage {
+    Read,
+}
+
+struct RootService(u32);
+
+#[tina_runtime::isolate(message = RootMessage, reply = u32, shard = ServiceShard)]
+impl RootService {
+    fn handle(
+        &mut self,
+        message: RootMessage,
+        _ctx: &mut Context<'_, ServiceShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match message {
+            RootMessage::Read => reply(self.0),
+        }
+    }
+
+    fn handle_call(&mut self, message: RootMessage, caller: CallContext<'_, Self>) -> Effect<Self> {
+        match message {
+            RootMessage::Read => caller.reply(self.0),
         }
     }
 }
@@ -252,12 +294,60 @@ fn canonical_local_facades_delegate_service_registration_and_events() {
     let single_split = single
         .register_split_service(SplitService, 4)
         .expect("single split service registered");
+    let single_root = single
+        .register_root::<RootService, std::convert::Infallible>(RootService(19), 4)
+        .expect("single root registered");
     let _: EventServiceHandle<Event> = single_events;
     let _: RequestServiceHandle<Request, u32> = single_requests;
     let _: SplitServiceHandle<SplitEvent, SplitRequest, u32> = single_split;
     single
         .try_send_event(single_events, Event::Record(60))
         .expect("single facade event admitted");
+    assert_eq!(
+        single
+            .call_blocking_request(single_requests, Request::Read, Duration::from_secs(1),)
+            .expect("single request call driven"),
+        CallOutcome::Replied(13)
+    );
+    assert_eq!(
+        single
+            .call_blocking_request(
+                single_split.requests,
+                SplitRequest::Hold,
+                Duration::from_millis(10),
+            )
+            .expect("single delayed request call driven"),
+        CallOutcome::Timeout
+    );
+    assert_eq!(
+        single
+            .call_blocking_request(
+                single_split.requests,
+                SplitRequest::Reject,
+                Duration::from_secs(1),
+            )
+            .expect("single rejected request call driven"),
+        CallOutcome::Rejected(tina::CallRejectedReason::UnsupportedMessage)
+    );
+    assert_eq!(
+        single
+            .call_blocking(single_root, RootMessage::Read, Duration::from_secs(1))
+            .expect("single root call driven"),
+        CallOutcome::Replied(19)
+    );
+    single
+        .try_send_event(single_split.events, SplitEvent::Stop)
+        .expect("single split stop admitted");
+    assert_eq!(
+        single
+            .call_blocking_request(
+                single_split.requests,
+                SplitRequest::Read,
+                Duration::from_secs(1),
+            )
+            .expect("single closed request call driven"),
+        CallOutcome::Closed
+    );
     single
         .shutdown()
         .join()
@@ -284,6 +374,13 @@ fn canonical_local_facades_delegate_service_registration_and_events() {
     let multi_split = multi
         .register_split_service_on(ShardId::new(60), SplitService, 4)
         .expect("multi split service registered");
+    let multi_root = multi
+        .register_root_on::<RootService, std::convert::Infallible>(
+            ShardId::new(70),
+            RootService(23),
+            4,
+        )
+        .expect("multi root registered");
     let _: EventServiceHandle<Event> = multi_events;
     let _: RequestServiceHandle<Request, u32> = multi_requests;
     let _: SplitServiceHandle<SplitEvent, SplitRequest, u32> = multi_split;
@@ -291,6 +388,29 @@ fn canonical_local_facades_delegate_service_registration_and_events() {
     multi
         .try_send_event(multi_events, Event::Record(70))
         .expect("multi facade event admitted");
+    assert_eq!(
+        multi
+            .call_blocking_request(multi_requests, Request::Read, Duration::from_secs(1),)
+            .expect("multi request call driven"),
+        CallOutcome::Replied(17)
+    );
+    assert_eq!(
+        multi
+            .call_blocking_request(
+                multi_split.requests,
+                SplitRequest::Read,
+                Duration::from_secs(1),
+            )
+            .expect("multi split request call driven"),
+        CallOutcome::Replied(7)
+    );
+    assert_eq!(multi_root.shard(), ShardId::new(70));
+    assert_eq!(
+        multi
+            .call_blocking(multi_root, RootMessage::Read, Duration::from_secs(1))
+            .expect("multi root call driven"),
+        CallOutcome::Replied(23)
+    );
     assert!(matches!(
         multi.register_event_service_on(
             ShardId::new(99),
@@ -306,4 +426,35 @@ fn canonical_local_facades_delegate_service_registration_and_events() {
         .join()
         .expect("multi local system shuts down");
     assert_eq!(multi_seen.load(Ordering::Acquire), 70);
+}
+
+#[test]
+fn local_multi_request_call_panics_on_an_address_from_an_unknown_shard() {
+    let local = LocalSystem::multi_shard(DefaultThreadedMailboxFactory)
+        .shard(ServiceShard(80))
+        .build();
+    let foreign = LocalSystem::multi_shard(DefaultThreadedMailboxFactory)
+        .shard(ServiceShard(99))
+        .build();
+    let foreign_service = foreign
+        .register_split_service_on(ShardId::new(99), SplitService, 4)
+        .expect("foreign split service registered");
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = local.call_blocking_request(
+            foreign_service.requests,
+            SplitRequest::Read,
+            Duration::from_millis(50),
+        );
+    }));
+    assert!(result.is_err(), "unknown shard must remain a loud misuse");
+
+    local
+        .shutdown()
+        .join()
+        .expect("local system shuts down after rejected call");
+    foreign
+        .shutdown()
+        .join()
+        .expect("foreign local system shuts down");
 }
