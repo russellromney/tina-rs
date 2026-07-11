@@ -150,8 +150,8 @@ struct Pipeline {
 // crate used to hand-roll as `PipelineMsg::{Parsed,Validated,Executed}` plus
 // a `qid`-keyed `PendingReplies` table. The caller's `RequestContext` now
 // threads through `req` directly, so the qid indirection is gone too.
-// Continuations land as `ServiceMessage::Event(PipelineEvent::Stage(...))`
-// so the split-service form can drop the hand-written reject arm.
+// Continuations land as domain events via `then_service_event*` helpers
+// so the split-service form never names the envelope.
 tina::flow! {
     flow PipelineFlow for Pipeline {
         reply PipelineReply;

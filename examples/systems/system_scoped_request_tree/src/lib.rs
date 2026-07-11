@@ -313,12 +313,12 @@ impl Tree {
 
         let timer_id = timer.id();
         let deadline_effect: Effect<Self> = sleep(REQUEST_DEADLINE)
-            .then(move |_| tina::ServiceMessage::Event(TreeEvent::Deadline(id, timer_id)));
+            .then_service_event(move |_| TreeEvent::Deadline(id, timer_id));
 
         let source = stream.source;
         let expected = stream.content_length;
         let pull = call(source, HttpConnectionMsg::body_next(), CHILD_TIMEOUT)
-            .then(move |outcome| tina::ServiceMessage::Event(TreeEvent::Chunk(id, outcome)));
+            .then_service_event(move |outcome| TreeEvent::Chunk(id, outcome));
 
         call_ctx.capture(move |req_ctx| {
             self.pending.insert(
@@ -348,7 +348,7 @@ impl Tree {
                 tree.accumulated += bytes.len();
                 let source = tree.source;
                 call(source, HttpConnectionMsg::body_next(), CHILD_TIMEOUT)
-                    .then(move |outcome| tina::ServiceMessage::Event(TreeEvent::Chunk(id, outcome)))
+                    .then_service_event(move |outcome| TreeEvent::Chunk(id, outcome))
             }
             CallOutcome::Replied(RequestChunkReply::Eof) => {
                 if tree.accumulated < tree.expected {
@@ -362,7 +362,7 @@ impl Tree {
                     // ignored; the real completion is the `EnrichDone`
                     // worker-return.
                     call(enrich, EnrichMsg::Release, CHILD_TIMEOUT)
-                        .then(|_| tina::ServiceMessage::Event(TreeEvent::EnrichReleased))
+                        .then_service_event(|_| TreeEvent::EnrichReleased)
                 }
             }
             CallOutcome::Replied(RequestChunkReply::Error(_)) => {
@@ -447,9 +447,10 @@ impl Tree {
         let _ = self.timers.cancel(tree.timer.id());
         let (cancel_report, cancel_effect) =
             tree.scope
-                .cancel_into_effect::<Self, _, _>(cause, move |_scope, label, outcome| {
-                    tina::ServiceMessage::Event(TreeEvent::ChildCancelled(label, outcome))
-                });
+                .cancel_into_service_event_effect::<Self, _, _, _>(
+                    cause,
+                    move |_scope, label, outcome| TreeEvent::ChildCancelled(label, outcome),
+                );
         // Remove from the set, then snapshot capacity so the report shows
         // the slot reclaimed.
         let _ = self.scopes.remove(&id);

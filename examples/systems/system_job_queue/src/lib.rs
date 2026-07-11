@@ -230,8 +230,8 @@ impl Worker {
                 call.capture(move |req| {
                     let slot = req.into_deferred();
                     self.current = Some(WorkerCurrent { id, payload, cancelled: false, slot });
-                    sleep(Duration::from_millis(sleep_ms)).then(move |result| {
-                        tina::ServiceMessage::Event(WorkerEvent::Wake { id, result })
+                    sleep(Duration::from_millis(sleep_ms)).then_service_event(move |result| {
+                        WorkerEvent::Wake { id, result }
                     })
                 })
             }

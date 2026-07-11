@@ -59,8 +59,8 @@ impl Worker {
             // Vary the wait by id so replies arrive out of dispatch order.
             WorkerRequest::Do(payload) => {
                 let id = self.id;
-                call.defer(sleep(self.work)).reply(move |req, reply| {
-                    tina::ServiceMessage::Event(WorkerEvent::Done(req, reply, payload + id))
+                call.defer(sleep(self.work)).reply_service_event(move |req, reply| {
+                    WorkerEvent::Done(req, reply, payload + id)
                 })
             }
         }

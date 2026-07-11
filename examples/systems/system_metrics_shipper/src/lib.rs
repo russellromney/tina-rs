@@ -526,8 +526,8 @@ impl Sink {
                 if self.flush_delay.is_zero() {
                     return self.reply_for_batch(call, batch);
                 }
-                call.defer(sleep(self.flush_delay)).reply(move |req, _| {
-                    tina::ServiceMessage::Event(SinkEvent::Complete { req, batch })
+                call.defer(sleep(self.flush_delay)).reply_service_event(move |req, _| {
+                    SinkEvent::Complete { req, batch }
                 })
             }
             SinkRequest::Stats => call.reply(SinkReply::Stats(SinkStats {

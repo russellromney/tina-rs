@@ -210,7 +210,7 @@ impl ServiceA {
                     // specimen exists to teach.
                     self.budget + Duration::from_millis(50),
                 ))
-                .reply(|req, outcome| tina::ServiceMessage::Event(AEvent::BDone(req, outcome)))
+                .reply_service_event(AEvent::BDone)
             }
         }
     }
