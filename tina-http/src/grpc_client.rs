@@ -126,6 +126,7 @@ impl GrpcTarget {
     /// ```
     pub fn http2_connection<S: Shard + 'static>(&self) -> Http2ClientConnection<S> {
         Http2ClientConnection::new(self.http2.clone(), Http2ClientLimits::default())
+            .expect("default HTTP/2 client limits are valid")
     }
 
     /// The gRPC message-size limits for this target.

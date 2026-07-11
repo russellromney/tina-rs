@@ -192,7 +192,8 @@ impl GrpcHarness {
     {
         let listener = runtime
             .register_with_capacity::<Http2Listener<TestShard, M>, _>(
-                Http2Listener::<TestShard, M>::new("127.0.0.1:0".parse().unwrap(), service, config),
+                Http2Listener::<TestShard, M>::new("127.0.0.1:0".parse().unwrap(), service, config)
+                    .expect("valid HTTP/2 server config"),
                 config.listener_mailbox_capacity,
             )
             .expect("register listener");

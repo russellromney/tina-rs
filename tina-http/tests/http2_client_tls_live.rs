@@ -222,7 +222,8 @@ fn make_client_unstarted(
 ) -> Address<Http2ClientMsg, Http2ClientReply> {
     runtime
         .register_with_capacity::<Http2ClientConnection<TestShard>, _>(
-            Http2ClientConnection::<TestShard>::new(target, Http2ClientLimits::default()),
+            Http2ClientConnection::<TestShard>::new(target, Http2ClientLimits::default())
+                .expect("default HTTP/2 client limits are valid"),
             32,
         )
         .expect("register client")

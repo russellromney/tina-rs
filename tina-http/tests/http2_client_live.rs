@@ -70,7 +70,8 @@ fn start_server() -> (
     };
     let listener = runtime
         .register_with_capacity::<Http2Listener<TestShard>, _>(
-            Http2Listener::<TestShard>::new("127.0.0.1:0".parse().unwrap(), counter, config),
+            Http2Listener::<TestShard>::new("127.0.0.1:0".parse().unwrap(), counter, config)
+                .expect("valid HTTP/2 server config"),
             config.listener_mailbox_capacity,
         )
         .expect("register http2 listener");
@@ -91,7 +92,8 @@ fn make_client(
 ) -> Address<Http2ClientMsg, Http2ClientReply> {
     let client = runtime
         .register_with_capacity::<Http2ClientConnection<TestShard>, _>(
-            Http2ClientConnection::<TestShard>::new(target, limits),
+            Http2ClientConnection::<TestShard>::new(target, limits)
+                .expect("valid HTTP/2 client limits"),
             32,
         )
         .expect("register http2 client");
@@ -309,7 +311,8 @@ fn h2c_post_in_window_body_round_trips_against_real_server() {
     };
     let listener = runtime
         .register_with_capacity::<Http2Listener<TestShard>, _>(
-            Http2Listener::<TestShard>::new("127.0.0.1:0".parse().unwrap(), counter, config),
+            Http2Listener::<TestShard>::new("127.0.0.1:0".parse().unwrap(), counter, config)
+                .expect("valid HTTP/2 server config"),
             config.listener_mailbox_capacity,
         )
         .expect("register http2 listener");
@@ -574,7 +577,8 @@ fn h2c_open_stream_reassembles_multi_frame_response_body() {
     };
     let listener = runtime
         .register_with_capacity::<Http2Listener<TestShard>, _>(
-            Http2Listener::<TestShard>::new("127.0.0.1:0".parse().unwrap(), counter, config),
+            Http2Listener::<TestShard>::new("127.0.0.1:0".parse().unwrap(), counter, config)
+                .expect("valid HTTP/2 server config"),
             config.listener_mailbox_capacity,
         )
         .expect("register http2 listener");

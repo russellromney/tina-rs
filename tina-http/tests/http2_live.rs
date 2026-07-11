@@ -32,6 +32,7 @@ const FLAG_END_HEADERS: u8 = 0x4;
 const FLAG_PADDED: u8 = 0x8;
 const FLAG_PRIORITY: u8 = 0x20;
 const SETTINGS_ENABLE_PUSH: u16 = 0x2;
+const SETTINGS_MAX_CONCURRENT_STREAMS: u16 = 0x3;
 const SETTINGS_INITIAL_WINDOW_SIZE: u16 = 0x4;
 const SETTINGS_MAX_FRAME_SIZE: u16 = 0x5;
 
@@ -57,7 +58,8 @@ impl Http2Harness {
             .expect("register counter");
         let listener = runtime
             .register_with_capacity::<Http2Listener<TestShard>, _>(
-                Http2Listener::<TestShard>::new("127.0.0.1:0".parse().unwrap(), counter, config),
+                Http2Listener::<TestShard>::new("127.0.0.1:0".parse().unwrap(), counter, config)
+                    .expect("valid HTTP/2 server config"),
                 config.listener_mailbox_capacity,
             )
             .expect("register http2 listener");
@@ -85,7 +87,8 @@ impl Http2Harness {
     {
         let listener = runtime
             .register_with_capacity::<Http2Listener<TestShard, M>, _>(
-                Http2Listener::<TestShard, M>::new("127.0.0.1:0".parse().unwrap(), service, config),
+                Http2Listener::<TestShard, M>::new("127.0.0.1:0".parse().unwrap(), service, config)
+                    .expect("valid HTTP/2 server config"),
                 config.listener_mailbox_capacity,
             )
             .expect("register http2 listener");
@@ -258,7 +261,7 @@ fn hpack_string(value: &str, out: &mut Vec<u8>) {
 
 fn read_response_body(stream: &mut TcpStream, stream_id: u32) -> Vec<u8> {
     let mut body = Vec::new();
-    for _ in 0..8 {
+    for _ in 0..32 {
         let frame = read_frame(stream);
         if frame.stream_id != stream_id {
             continue;
@@ -349,6 +352,21 @@ fn window_update_increment(frame: &TestFrame) -> u32 {
     let mut buf = [0_u8; 4];
     buf.copy_from_slice(&frame.payload[..4]);
     u32::from_be_bytes(buf) & 0x7fff_ffff
+}
+
+fn decode_settings(frame: &TestFrame) -> Vec<(u16, u32)> {
+    assert_eq!(frame.ty, FRAME_SETTINGS);
+    assert_eq!(frame.payload.len() % 6, 0);
+    frame
+        .payload
+        .chunks_exact(6)
+        .map(|entry| {
+            (
+                u16::from_be_bytes([entry[0], entry[1]]),
+                u32::from_be_bytes([entry[2], entry[3], entry[4], entry[5]]),
+            )
+        })
+        .collect()
 }
 
 struct StreamingResponseService {
@@ -590,6 +608,71 @@ impl BufferedResponseService {
 }
 
 #[test]
+fn server_initial_handshake_advertises_exact_validated_limits() {
+    let config = Http2ServerConfig {
+        limits: Http2Limits {
+            max_frame_size: 64 * 1024,
+            max_concurrent_streams: 0,
+            connection_outbound_queue_capacity: 1,
+            initial_connection_window: 100_000,
+            initial_stream_window: 100_000,
+            ..Http2Limits::default()
+        },
+        ..Http2ServerConfig::default()
+    };
+    let harness = Http2Harness::start(config);
+    let mut stream = TcpStream::connect_timeout(&harness.addr, Duration::from_secs(2))
+        .expect("connect raw HTTP/2 peer");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream.write_all(CLIENT_PREFACE).unwrap();
+    write_frame(&mut stream, FRAME_SETTINGS, 0, 0, &[]);
+
+    let settings = read_frame(&mut stream);
+    assert_eq!(settings.flags & FLAG_ACK, 0);
+    let advertised = decode_settings(&settings);
+    assert!(advertised.contains(&(SETTINGS_MAX_CONCURRENT_STREAMS, 0)));
+    assert!(advertised.contains(&(SETTINGS_INITIAL_WINDOW_SIZE, 100_000)));
+    assert!(advertised.contains(&(SETTINGS_MAX_FRAME_SIZE, 64 * 1024)));
+    assert!(advertised.iter().all(|(id, _)| *id != SETTINGS_ENABLE_PUSH));
+
+    let connection_credit = read_frame(&mut stream);
+    assert_eq!(connection_credit.stream_id, 0);
+    assert_eq!(
+        window_update_increment(&connection_credit),
+        100_000 - 65_535
+    );
+
+    let settings_ack = read_frame(&mut stream);
+    assert_eq!(settings_ack.ty, FRAME_SETTINGS);
+    assert_ne!(settings_ack.flags & FLAG_ACK, 0);
+    harness.shutdown();
+}
+
+#[test]
+fn outbound_capacity_one_completes_settings_handshake_and_request() {
+    let config = Http2ServerConfig {
+        limits: Http2Limits {
+            connection_outbound_queue_capacity: 1,
+            ..Http2Limits::default()
+        },
+        ..Http2ServerConfig::default()
+    };
+    let harness = Http2Harness::start(config);
+    let mut stream = connect_h2(harness.addr);
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS | FLAG_END_STREAM,
+        1,
+        &request_headers("GET", "/counter"),
+    );
+    assert_eq!(read_response_body(&mut stream, 1), b"0");
+    harness.shutdown();
+}
+
+#[test]
 fn http2_h2c_unary_request_response() {
     let harness = Http2Harness::start(Http2ServerConfig::default());
     let mut stream = connect_h2(harness.addr);
@@ -632,7 +715,15 @@ fn buffered_response_larger_than_default_window_advances_as_peer_credits_bytes()
             16,
         )
         .expect("register buffered response service");
-    let harness = Http2Harness::start_with_service(runtime, service, Http2ServerConfig::default());
+    let server_config = Http2ServerConfig {
+        limits: Http2Limits {
+            max_frame_size: 64 * 1024,
+            max_response_body_bytes: BODY_LEN,
+            ..Http2Limits::default()
+        },
+        ..Http2ServerConfig::default()
+    };
+    let harness = Http2Harness::start_with_service(runtime, service, server_config);
     let mut stream = connect_h2(harness.addr);
 
     write_frame(
@@ -1306,7 +1397,6 @@ fn http2_settings_max_frame_size_controls_outbound_splitting() {
         limits: Http2Limits {
             max_body_bytes: 30_000,
             max_response_body_bytes: 30_000,
-            initial_connection_window: 30_000,
             initial_stream_window: 30_000,
             ..Http2Limits::default()
         },
@@ -1359,7 +1449,6 @@ fn http2_peer_max_frame_size_splits_large_user_response() {
         limits: Http2Limits {
             max_body_bytes: 40_000,
             max_response_body_bytes: 40_000,
-            initial_connection_window: 40_000,
             initial_stream_window: 40_000,
             ..Http2Limits::default()
         },
@@ -1422,7 +1511,6 @@ fn http2_multi_frame_response_marks_end_stream_only_on_last_data_frame() {
         limits: Http2Limits {
             max_body_bytes: 60_000,
             max_response_body_bytes: 60_000,
-            initial_connection_window: 60_000,
             initial_stream_window: 60_000,
             ..Http2Limits::default()
         },
@@ -2016,7 +2104,7 @@ fn http2_data_after_completed_stream_resets_stream_and_keeps_connection() {
 fn http2_oversized_frame_sends_goaway() {
     let config = Http2ServerConfig {
         limits: Http2Limits {
-            max_frame_size: 1,
+            max_frame_size: 16_384,
             ..Http2Limits::default()
         },
         ..Http2ServerConfig::default()
@@ -2024,7 +2112,7 @@ fn http2_oversized_frame_sends_goaway() {
     let harness = Http2Harness::start(config);
     let mut stream = connect_h2(harness.addr);
 
-    write_frame(&mut stream, FRAME_PING, 0, 0, b"12345678");
+    write_frame(&mut stream, FRAME_PING, 0, 0, &vec![0; 16_385]);
 
     let frame = read_until_goaway(&mut stream);
     assert_eq!(frame.stream_id, 0);
@@ -2172,6 +2260,32 @@ fn http2_window_update_unblocks_bounded_pending_response() {
 }
 
 #[test]
+fn configured_initial_receive_window_accepts_body_larger_than_65535() {
+    let config = Http2ServerConfig {
+        limits: Http2Limits {
+            initial_connection_window: 100_000,
+            initial_stream_window: 100_000,
+            max_body_bytes: 100_000,
+            ..Http2Limits::default()
+        },
+        ..Http2ServerConfig::default()
+    };
+    let harness = Http2Harness::start(config);
+    let mut stream = connect_h2(harness.addr);
+    write_frame(
+        &mut stream,
+        FRAME_HEADERS,
+        FLAG_END_HEADERS,
+        1,
+        &request_headers("POST", "/counter"),
+    );
+    write_data_chunks(&mut stream, 1, &vec![b'x'; 70_000]);
+
+    assert_eq!(read_response_body(&mut stream, 1), b"1");
+    harness.shutdown();
+}
+
+#[test]
 fn http2_stream_window_blocked_response_does_not_block_unrelated_stream() {
     let runtime = ThreadedRuntime::with_config(
         TestShard,
@@ -2302,11 +2416,12 @@ fn http2_peer_goaway_stops_new_streams_visibly() {
 }
 
 #[test]
-fn http2_inbound_data_obeys_stream_window() {
+fn http2_inbound_data_obeys_connection_window() {
     let config = Http2ServerConfig {
         limits: Http2Limits {
-            initial_connection_window: 2,
-            initial_stream_window: 2,
+            max_frame_size: 100_000,
+            initial_stream_window: 100_000,
+            max_body_bytes: 100_000,
             ..Http2Limits::default()
         },
         ..Http2ServerConfig::default()
@@ -2321,7 +2436,13 @@ fn http2_inbound_data_obeys_stream_window() {
         1,
         &request_headers("POST", "/echo"),
     );
-    write_frame(&mut stream, FRAME_DATA, FLAG_END_STREAM, 1, b"abc");
+    write_frame(
+        &mut stream,
+        FRAME_DATA,
+        FLAG_END_STREAM,
+        1,
+        &vec![b'x'; 65_536],
+    );
 
     let frame = read_frame(&mut stream);
     assert_eq!(frame.ty, FRAME_GOAWAY);
@@ -2337,7 +2458,6 @@ fn http2_inbound_data_obeys_stream_window() {
 fn http2_stream_flow_control_error_resets_only_bad_stream() {
     let config = Http2ServerConfig {
         limits: Http2Limits {
-            initial_connection_window: 100,
             initial_stream_window: 2,
             ..Http2Limits::default()
         },

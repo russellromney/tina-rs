@@ -20,7 +20,7 @@ pub use client::{
     Http2ClientRequestBody, Http2ClientResponse, Http2ClientStreamCall,
     Http2ClientStreamingRequest, Http2ResponseChunk,
 };
-pub use errors::Http2ProtocolError;
+pub use errors::{Http2ConfigError, Http2ProtocolError};
 pub use server::{
     Http2Connection, Http2ConnectionMsg, Http2ConnectionReply, Http2ConnectionReport, Http2Limits,
     Http2Listener, Http2ListenerMsg, Http2Outcome, Http2RequestParts, Http2ServerConfig,

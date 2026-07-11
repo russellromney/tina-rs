@@ -80,7 +80,8 @@ fn start_server() -> (
     };
     let listener = runtime
         .register_with_capacity::<Http2Listener<TestShard>, _>(
-            Http2Listener::<TestShard>::new("127.0.0.1:0".parse().unwrap(), counter, config),
+            Http2Listener::<TestShard>::new("127.0.0.1:0".parse().unwrap(), counter, config)
+                .expect("valid HTTP/2 server config"),
             config.listener_mailbox_capacity,
         )
         .expect("register http2 listener");
@@ -106,7 +107,8 @@ fn live_http2_client_socket_work_is_unsupported_under_dst_replay() {
                     addr,
                 },
                 Http2ClientLimits::default(),
-            ),
+            )
+            .expect("default HTTP/2 client limits are valid"),
             32,
         )
         .expect("register http2 client");

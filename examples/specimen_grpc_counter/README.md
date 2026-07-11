@@ -14,7 +14,7 @@ should copy: register one `Http2ClientConnection` isolate, wrap it in a
 
 ```rust,ignore
 let conn = runtime.register_with_capacity::<Http2ClientConnection<S>, _>(
-    Http2ClientConnection::new(target, Default::default()), 32)?;
+    Http2ClientConnection::new(target, Default::default())?, 32)?;
 runtime.try_send(conn, Http2ClientMsg::Begin)?;
 let client = GrpcClient::new(conn, GrpcLimits::default());
 
