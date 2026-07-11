@@ -61,6 +61,23 @@ call(counter, CounterMsg::Add(1), Duration::from_millis(20))
     .then(ClientMsg::CounterReturned)
 ```
 
+## Registration Across Owners
+
+Use the service shape at registration time so callers receive only the lanes
+they can use:
+
+| Owner | Single-shard form | Chosen-shard form |
+| --- | --- | --- |
+| explicit runtime | `Runtime::register_*_service` | `MultiShardRuntime::register_*_service_on` |
+| live runtime | `ThreadedRuntime::register_*_service` | `ThreadedMultiShardRuntime::register_*_service_on` |
+| simulator | `Simulator::register_*_service` | `MultiShardSimulator::register_*_service_on` |
+| canonical live facade | `LocalSystem::register_*_service` | `LocalMultiShardSystem::register_*_service_on` |
+
+Here `*` is `event`, `request`, or `split`. Event ingress uses
+`try_send_event(handle, event)` on the owning runtime or facade. The event is
+returned as the domain type on explicit-runtime and simulator `Full` or
+`Closed` errors; users do not unwrap the internal service envelope.
+
 ## Service That Does I/O
 
 The service can answer later.

@@ -506,6 +506,102 @@ where
         })
     }
 
+    /// Registers one split event/request service on a chosen shard.
+    ///
+    /// Returns [`ThreadedRuntimeError::UnknownShard`] when `shard` is not
+    /// owned by this runtime.
+    #[allow(private_bounds)]
+    pub fn register_split_service_on<I, Event, Request, Outbound>(
+        &self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Result<crate::SplitServiceHandle<Event, Request, I::Reply>, ThreadedRuntimeError>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<Event, Request>,
+                Send = TinaOutbound<Outbound>,
+            > + tina::CallableIsolate
+            + Send
+            + 'static,
+        Event: 'static,
+        Request: 'static,
+        I::Reply: Send + 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: Send + 'static,
+    {
+        self.register_with_capacity_on::<I, Outbound>(shard, isolate, mailbox_capacity)
+            .map(crate::SplitServiceHandle::from_address)
+    }
+
+    /// Registers one event-only service on a chosen shard.
+    ///
+    /// Returns [`ThreadedRuntimeError::UnknownShard`] when `shard` is not
+    /// owned by this runtime.
+    #[allow(private_bounds)]
+    pub fn register_event_service_on<I, Event, Outbound>(
+        &self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Result<crate::EventServiceHandle<Event>, ThreadedRuntimeError>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<Event, std::convert::Infallible>,
+                Reply = (),
+                Send = TinaOutbound<Outbound>,
+            > + Send
+            + 'static,
+        Event: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: Send + 'static,
+    {
+        self.register_with_capacity_on::<I, Outbound>(shard, isolate, mailbox_capacity)
+            .map(|address| crate::SplitServiceHandle::from_address(address).events)
+    }
+
+    /// Registers one request-only service on a chosen shard.
+    ///
+    /// Returns [`ThreadedRuntimeError::UnknownShard`] when `shard` is not
+    /// owned by this runtime.
+    #[allow(private_bounds)]
+    pub fn register_request_service_on<I, Request, Outbound>(
+        &self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Result<crate::RequestServiceHandle<Request, I::Reply>, ThreadedRuntimeError>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<std::convert::Infallible, Request>,
+                Send = TinaOutbound<Outbound>,
+            > + tina::CallableIsolate
+            + Send
+            + 'static,
+        Request: 'static,
+        I::Reply: Send + 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: Send + 'static,
+    {
+        self.register_with_capacity_on::<I, Outbound>(shard, isolate, mailbox_capacity)
+            .map(|address| crate::SplitServiceHandle::from_address(address).requests)
+    }
+
     /// Threaded multi-shard mirror of
     /// [`Runtime::register_with_capacity_and_bootstrap`].
     #[allow(private_bounds, clippy::type_complexity)]
@@ -683,6 +779,26 @@ where
                 Err(ThreadedTrySendError::WorkerStopped)
             }
         }
+    }
+
+    /// Attempts bounded ingress through a service event capability.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the address targets a shard not owned by this runtime.
+    pub fn try_send_event<Event, Request>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        event: Event,
+    ) -> Result<(), ThreadedTrySendError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+    {
+        self.try_send(
+            address.address().address(),
+            tina::ServiceMessage::Event(event),
+        )
     }
 
     /// Registers a typed result waiter for the isolate at `address` on the
