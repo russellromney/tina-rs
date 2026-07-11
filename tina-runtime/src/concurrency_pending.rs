@@ -191,6 +191,13 @@ pub enum ConcurrencyReplyError<K, R> {
         /// Key type witness.
         _key: PhantomData<fn(K) -> K>,
     },
+    /// The caller closed before settlement.
+    CallerGone {
+        /// Reply value returned unchanged.
+        reply: R,
+        /// Key type witness.
+        _key: PhantomData<fn(K) -> K>,
+    },
 }
 
 /// Bounded parked callers charged against one local concurrency policy.
@@ -214,6 +221,12 @@ impl<K: PartialEq, R, G> std::fmt::Debug for ConcurrencyPendingReplies<K, R, G> 
 }
 
 impl<K: PartialEq, R, G> ConcurrencyPendingReplies<K, R, G> {
+    /// Build a shed-on-full parked-caller owner with a fixed local capacity.
+    pub fn with_capacity(surface: impl Into<crate::SurfaceName>, capacity: usize) -> Self {
+        Self::try_from_limit(ConcurrencyLimit::with_capacity(surface, capacity))
+            .expect("a newly constructed ConcurrencyLimit is idle")
+    }
+
     /// Build from a configured, idle concurrency policy.
     ///
     /// A policy with outstanding permits is returned unchanged; accepting it
@@ -254,6 +267,9 @@ impl<K: PartialEq, R, G> ConcurrencyPendingReplies<K, R, G> {
         guard: G,
     ) -> Result<ConcurrencyParkTicket<K>, ConcurrencyGuardedInsertError<K, R, G>> {
         self.sweep();
+        if self.pending.reject_duplicate_key(&key) {
+            return Err(ConcurrencyGuardedInsertError::DuplicateKey { key, reply, guard });
+        }
         let permit = match self.limit.try_admit().into_admitted() {
             Ok(permit) => permit,
             Err(failure) => {
@@ -267,7 +283,7 @@ impl<K: PartialEq, R, G> ConcurrencyPendingReplies<K, R, G> {
         };
         match self
             .pending
-            .insert_deferred_guarded(key, reply, (permit, guard))
+            .insert_deferred_guarded_without_sweep(key, reply, (permit, guard))
         {
             Ok(ticket) => Ok(ConcurrencyParkTicket(ticket)),
             Err(GuardedInsertError::DuplicateKey {
@@ -289,8 +305,8 @@ impl<K: PartialEq, R, G> ConcurrencyPendingReplies<K, R, G> {
         }
     }
 
-    /// Reply to a parked caller by generation-stamped ticket. The permit is
-    /// released as a completion before the reply effect becomes observable.
+    /// Reply to a parked caller by generation-stamped ticket. An open caller's
+    /// permit is released as completed; an already closed caller is retired.
     pub fn reply_ticket<I>(
         &mut self,
         ticket: ConcurrencyParkTicket<K>,
@@ -302,6 +318,15 @@ impl<K: PartialEq, R, G> ConcurrencyPendingReplies<K, R, G> {
     {
         match self.pending.take_ticket(ticket.0) {
             Ok((slot, (permit, guard))) => {
+                if slot.state() == tina::DeferredSlotState::Closed {
+                    self.pending.record_reclaimed();
+                    self.retire(permit);
+                    drop(guard);
+                    return Err(ConcurrencyReplyError::CallerGone {
+                        reply,
+                        _key: PhantomData,
+                    });
+                }
                 self.release(permit);
                 drop(guard);
                 Ok(reply_to::<I>(slot, reply))
@@ -320,12 +345,19 @@ impl<K: PartialEq, R, G> ConcurrencyPendingReplies<K, R, G> {
 
     fn take_by_key_for_reply(&mut self, key: &K) -> Option<(DeferredReply<R>, G)> {
         let (slot, (permit, guard)) = self.pending.take_by_key(key)?;
+        if slot.state() == tina::DeferredSlotState::Closed {
+            self.pending.record_reclaimed();
+            self.retire(permit);
+            drop(guard);
+            return None;
+        }
         self.release(permit);
         Some((slot, guard))
     }
 
-    /// Reply by key, release the concurrency charge as completed, and drop the
-    /// auxiliary guard. Prefer tickets where stale-key ABA is possible.
+    /// Reply by key, settle the concurrency charge, and drop the auxiliary
+    /// guard. An already closed caller retires and returns `None`. Prefer
+    /// tickets where stale-key ABA is possible.
     pub fn reply_by_key<I>(&mut self, key: &K, reply: R) -> Option<Effect<I>>
     where
         I: Isolate<Reply = R>,
@@ -336,9 +368,9 @@ impl<K: PartialEq, R, G> ConcurrencyPendingReplies<K, R, G> {
         Some(reply_to::<I>(slot, reply))
     }
 
-    /// Abandon a parked caller by key and retire its local charge. The closed
-    /// reply slot and auxiliary guard are returned for explicit caller-owned
-    /// cleanup or stage handoff.
+    /// Abandon a parked caller by key and retire its local charge. The reply
+    /// slot and auxiliary guard are returned for explicit caller-owned cleanup
+    /// or stage handoff.
     pub fn retire_by_key(&mut self, key: &K) -> Option<(DeferredReply<R>, G)> {
         let (slot, (permit, guard)) = self.pending.take_by_key(key)?;
         self.retire(permit);
@@ -398,12 +430,6 @@ impl<K: PartialEq, R, G> Drop for ConcurrencyPendingReplies<K, R, G> {
 }
 
 impl<K: PartialEq, R> ConcurrencyPendingReplies<K, R, ()> {
-    /// Build a shed-on-full parked-caller owner with a fixed local capacity.
-    pub fn with_capacity(surface: impl Into<crate::SurfaceName>, capacity: usize) -> Self {
-        Self::try_from_limit(ConcurrencyLimit::with_capacity(surface, capacity))
-            .expect("a newly constructed ConcurrencyLimit is idle")
-    }
-
     /// Park split-service caller authority after concurrency admission.
     #[allow(clippy::result_large_err)]
     pub fn park_request<'a, I>(
@@ -419,11 +445,17 @@ impl<K: PartialEq, R> ConcurrencyPendingReplies<K, R, ()> {
         R: 'static,
     {
         self.sweep();
+        if self.pending.reject_duplicate_key(&key) {
+            return Err(ConcurrencyParkError::DuplicateKey { key, call });
+        }
         let permit = match self.limit.try_admit().into_admitted() {
             Ok(permit) => permit,
             Err(failure) => return Err(ConcurrencyParkError::Admission { key, call, failure }),
         };
-        match self.pending.park_request_guarded(key, call, (permit, ())) {
+        match self
+            .pending
+            .park_request_guarded_without_sweep(key, call, (permit, ()))
+        {
             Ok((ticket, effect_permit)) => Ok((ConcurrencyParkTicket(ticket), effect_permit)),
             Err(GuardedParkError::DuplicateKey {
                 key,
@@ -490,6 +522,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
     use tina::runtime_internal::{deferred_from_handle, handle_from_shared};
     use tina::{DeferredSlotShared, DeferredSlotState, SingleShard};
 
@@ -504,6 +538,22 @@ mod tests {
             std::sync::Arc::new(DeferredSlotShared::new(id, std::any::TypeId::of::<u32>()));
         shared.set_state(DeferredSlotState::Closed);
         deferred_from_handle(handle_from_shared(shared))
+    }
+
+    fn fake_slot_with_shared(id: u64) -> (DeferredReply<u32>, std::sync::Arc<DeferredSlotShared>) {
+        let shared =
+            std::sync::Arc::new(DeferredSlotShared::new(id, std::any::TypeId::of::<u32>()));
+        let reply = deferred_from_handle(handle_from_shared(std::sync::Arc::clone(&shared)));
+        (reply, shared)
+    }
+
+    #[derive(Debug)]
+    struct DropCounter(Rc<Cell<u32>>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
     }
 
     #[derive(Debug)]
@@ -528,12 +578,12 @@ mod tests {
     fn full_duplicate_and_reply_keep_counts_honest() {
         let mut pending = ConcurrencyPendingReplies::with_capacity("test.parked", 2);
         let first = pending.insert_deferred(1, fake_slot(1)).unwrap();
+        let second = pending.insert_deferred(2, fake_slot(2)).unwrap();
 
         assert!(matches!(
-            pending.insert_deferred(1, fake_slot(2)),
+            pending.insert_deferred(1, fake_slot(3)),
             Err(ConcurrencyInsertError::DuplicateKey { .. })
         ));
-        let second = pending.insert_deferred(2, fake_slot(3)).unwrap();
         assert!(matches!(
             pending.insert_deferred(3, fake_slot(4)),
             Err(ConcurrencyInsertError::Admission {
@@ -548,7 +598,10 @@ mod tests {
         assert!(report.counts_agree());
         assert_eq!(report.parked, 0);
         assert_eq!(report.completed_count, 2);
-        assert_eq!(report.retired_count, 1, "duplicate admission rolled back");
+        assert_eq!(
+            report.retired_count, 0,
+            "duplicates are rejected before admission"
+        );
         assert_eq!(report.admission.full_count, 1);
         assert_eq!(report.pending_full_count, 0);
     }
@@ -578,6 +631,75 @@ mod tests {
         drop(drained);
         drop(pending);
         assert_eq!(crate::dropped_permit_count(), before);
+    }
+
+    #[test]
+    fn reply_to_already_closed_caller_retires_instead_of_completing() {
+        let mut pending = ConcurrencyPendingReplies::with_capacity("test.late_reply", 2);
+        let (first, first_shared) = fake_slot_with_shared(1);
+        let (second, second_shared) = fake_slot_with_shared(2);
+        let ticket = pending.insert_deferred(1, first).unwrap();
+        pending.insert_deferred(2, second).unwrap();
+        first_shared.set_state(DeferredSlotState::Closed);
+        second_shared.set_state(DeferredSlotState::Closed);
+
+        assert!(matches!(
+            pending.reply_ticket::<TestIso>(ticket, 10),
+            Err(ConcurrencyReplyError::CallerGone { reply: 10, .. })
+        ));
+        assert!(pending.reply_by_key::<TestIso>(&2, 11).is_none());
+
+        let report = pending.report();
+        assert!(report.counts_agree());
+        assert_eq!(report.parked, 0);
+        assert_eq!(report.caller_gone_count, 2);
+        assert_eq!(report.completed_count, 0);
+        assert_eq!(report.retired_count, 2);
+    }
+
+    #[test]
+    fn auxiliary_guards_remain_caller_owned_on_every_rejection() {
+        let drops = Rc::new(Cell::new(0));
+        let guard = || DropCounter(Rc::clone(&drops));
+        let mut pending =
+            ConcurrencyPendingReplies::<u64, u32, DropCounter>::with_capacity("test.guards", 1);
+        let (first, first_shared) = fake_slot_with_shared(1);
+        pending.insert_deferred_guarded(1, first, guard()).unwrap();
+
+        let duplicate = pending
+            .insert_deferred_guarded(1, fake_slot(2), guard())
+            .expect_err("duplicate key must be rejected before admission");
+        let ConcurrencyGuardedInsertError::DuplicateKey {
+            guard: duplicate_guard,
+            ..
+        } = duplicate
+        else {
+            panic!("duplicate key must retain precedence at capacity");
+        };
+        assert_eq!(drops.get(), 0);
+        drop(duplicate_guard);
+
+        let full = pending
+            .insert_deferred_guarded(2, fake_slot(3), guard())
+            .expect_err("distinct key must be rejected by admission");
+        let ConcurrencyGuardedInsertError::Admission {
+            guard: full_guard,
+            failure: AdmissionFailure::Full(_),
+            ..
+        } = full
+        else {
+            panic!("full admission must return the auxiliary guard");
+        };
+        drop(full_guard);
+
+        first_shared.set_state(DeferredSlotState::Closed);
+        assert!(pending.reply_by_key::<TestIso>(&1, 9).is_none());
+        assert_eq!(drops.get(), 3, "each auxiliary guard drops exactly once");
+        let report = pending.report();
+        assert_eq!(report.completed_count, 0);
+        assert_eq!(report.retired_count, 1);
+        assert_eq!(report.duplicate_key_count, 1);
+        assert_eq!(report.admission.full_count, 1);
     }
 
     #[test]

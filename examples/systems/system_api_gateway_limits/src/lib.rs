@@ -16,10 +16,9 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, CapacitySummary, ConcurrencyGuardedInsertError, ConcurrencyLimit,
-    ConcurrencyPendingReplies, DefaultThreadedMailboxFactory, SharedCapacityReservation,
-    SharedCapacityScope, SleepReply, SplitServiceHandle, ThreadedRuntime,
-    format_assertion_failure, format_discovery_line, sleep,
+    CallOutcome, CapacitySummary, ConcurrencyGuardedInsertError, ConcurrencyPendingReplies,
+    DefaultThreadedMailboxFactory, SharedCapacityReservation, SharedCapacityScope, SleepReply,
+    SplitServiceHandle, ThreadedRuntime, format_assertion_failure, format_discovery_line, sleep,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -183,11 +182,10 @@ impl Gateway {
             list_weight,
             upload_body,
             list_body,
-            pending: ConcurrencyPendingReplies::try_from_limit(ConcurrencyLimit::with_capacity(
+            pending: ConcurrencyPendingReplies::with_capacity(
                 "system_api_gateway_limits.pending",
                 pending_capacity,
-            ))
-            .expect("new concurrency limit is idle"),
+            ),
             next_qid: 1,
         }
     }
