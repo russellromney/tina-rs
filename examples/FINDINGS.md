@@ -14,6 +14,23 @@ valid; the long-form history lives in
 Finding numbers are stable across phases — when a finding closes it
 moves to the [Closed](#closed) section below with the same number.
 
+### 2026-07-11 Raw `impl Isolate` → macro cohort (partial)
+
+Converted remaining mechanical raw/`isolate_types!` blocks onto
+`#[tina::isolate]` / `#[tina_runtime::isolate]`:
+
+- `tina-extension-custom-codec` CodecServer + CodecClient (`shard = CodecShard`)
+- `specimen_http_body_streaming` StreamingService
+- `specimen_webhook_publisher` Driver
+- `ergonomics_playground` QuoteClient / BatchClient / CacheClient
+
+**Still raw (next slice):** `specimen_local_io_codec_ipc/*`,
+`specimen_sharded_fanout_read`, `specimen_sqlite_counter`,
+`specimen_grpc_counter`, `specimen_cross_shard_child_ownership`,
+`specimen_websocket_room`, `system_realtime_rooms`, `mini_saas_api`
+Controller/NotifySink. Some of these own non-default `Io`/`Send`/shard
+shapes and need careful macro attributes rather than a rename.
+
 ### 2026-07-11 Envelope-free continuation cohort
 
 Closed the remaining application-level `ServiceMessage::Event` /

@@ -36,16 +36,8 @@ struct StreamingService {
     chunked_source: Address<ResponseChunkMsg, ResponseChunkReply>,
 }
 
-impl Isolate for StreamingService {
-    tina::isolate_types! {
-        message: HttpRequest,
-        reply: HttpResponse,
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        io: Infallible,
-        shard: SingleShard,
-    }
-
+#[tina::isolate(message = HttpRequest, reply = HttpResponse)]
+impl StreamingService {
     fn handle(
         &mut self,
         request: HttpRequest,
@@ -61,9 +53,7 @@ impl Isolate for StreamingService {
     ) -> Effect<Self> {
         call.reply(self.response_for(request))
     }
-}
 
-impl StreamingService {
     fn response_for(&self, request: HttpRequest) -> HttpResponse {
         match request.path.as_str() {
             "/big" => HttpResponse::stream_known_length(

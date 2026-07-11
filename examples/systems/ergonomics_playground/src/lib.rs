@@ -3,12 +3,12 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{
-    CancelOutcome, Context, Effect, Isolate, RequestContext, ServiceRequestAddress, SingleShard,
-    noop, reply_to, send_event,
+    CancelOutcome, Effect, RequestContext, ServiceRequestAddress, SingleShard, noop, reply_to,
+    send_event,
 };
 use tina_runtime::{
     CallGroupToken, CallOutcome, CallReplyRejectedReason, CallSelectSet,
-    DeferredReplyRejectedReason, PendingReplies, RuntimeCall, RuntimeEventKind, SharedWork,
+    DeferredReplyRejectedReason, PendingReplies, RuntimeEventKind, SharedWork,
     SharedWorkError, SleepReply, call_cancelable_request, call_request, cancel_call,
     request_effect_after_park, request_effect_after_shared_wait, sleep,
 };
@@ -257,20 +257,12 @@ struct QuoteClient {
     replies: Rc<RefCell<Vec<QuoteReply>>>,
 }
 
-impl Isolate for QuoteClient {
-    type Message = QuoteClientMsg;
-    type Reply = ();
-    type Send = tina::Outbound<std::convert::Infallible>;
-    type Spawn = std::convert::Infallible;
-    type Fact = std::convert::Infallible;
-    type SpawnObserved = std::convert::Infallible;
-    type Io = RuntimeCall<QuoteClientMsg>;
-    type Shard = SingleShard;
-
+#[tina_runtime::isolate(message = QuoteClientMsg)]
+impl QuoteClient {
     fn handle(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        msg: QuoteClientMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             QuoteClientMsg::Begin(gateway) => {
@@ -509,20 +501,15 @@ struct BatchClient {
     drain_after_submit: bool,
 }
 
-impl Isolate for BatchClient {
-    type Message = BatchClientMsg;
-    type Reply = ();
-    type Fact = std::convert::Infallible;
-    type Send = tina::Outbound<tina::ServiceMessage<BatcherEvent, BatcherRequest>>;
-    type Spawn = std::convert::Infallible;
-    type SpawnObserved = std::convert::Infallible;
-    type Io = RuntimeCall<BatchClientMsg>;
-    type Shard = SingleShard;
-
+#[tina_runtime::isolate(
+    message = BatchClientMsg,
+    send = tina::Outbound<tina::ServiceMessage<BatcherEvent, BatcherRequest>>
+)]
+impl BatchClient {
     fn handle(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        msg: BatchClientMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             BatchClientMsg::Begin(batcher) => {
@@ -815,20 +802,12 @@ struct CacheClient {
     replies: Rc<RefCell<Vec<CacheReply>>>,
 }
 
-impl Isolate for CacheClient {
-    type Message = CacheClientMsg;
-    type Reply = ();
-    type Send = tina::Outbound<std::convert::Infallible>;
-    type Spawn = std::convert::Infallible;
-    type SpawnObserved = std::convert::Infallible;
-    type Io = RuntimeCall<CacheClientMsg>;
-    type Fact = std::convert::Infallible;
-    type Shard = SingleShard;
-
+#[tina_runtime::isolate(message = CacheClientMsg)]
+impl CacheClient {
     fn handle(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        msg: CacheClientMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             CacheClientMsg::Begin(cache) => {

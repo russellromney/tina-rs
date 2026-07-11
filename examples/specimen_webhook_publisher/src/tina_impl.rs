@@ -25,7 +25,7 @@ use tina_reqwest_bridge::{
     ReqwestAddress, ReqwestCallError, ReqwestCallOutcome, ReqwestConfig, ReqwestMsg,
     ReqwestRequest, ReqwestResponse, ReqwestWorker, flatten_outcome, send_request,
 };
-use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, call};
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, call};
 
 use crate::{Report, WebhookServer};
 
@@ -94,17 +94,13 @@ impl Driver {
     }
 }
 
-impl Isolate for Driver {
-    tina::isolate_types! {
-        message: DriverMsg,
-        reply: (),
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        io: RuntimeCall<DriverMsg>,
-        shard: SingleShard,
-    }
-
-    fn handle(&mut self, msg: DriverMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+#[tina_runtime::isolate(message = DriverMsg)]
+impl Driver {
+    fn handle(
+        &mut self,
+        msg: DriverMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             DriverMsg::Run(url) => {
                 self.url = url;
