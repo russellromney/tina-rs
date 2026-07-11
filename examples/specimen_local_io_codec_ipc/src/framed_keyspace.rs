@@ -2,11 +2,10 @@
 //! Unix-domain socket pair. Demonstrates how
 //! `tina_codec::LengthDelimitedFramer` slots beside Tina-owned I/O.
 
-use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use tina::{Address, Context, Effect, Isolate, Outbound, Shard, ShardId};
+use tina::{Address, Context, Effect, Shard, ShardId};
 use tina_codec::{DecodeStatus, LengthDelimitedFramer, LengthPrefix, decode_chunk, encode_into};
 use tina_runtime::{
     LoopStep, RuntimeCall, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerId,
@@ -47,20 +46,12 @@ struct KeyspaceServer {
     saw_full: Arc<Mutex<bool>>,
 }
 
-impl Isolate for KeyspaceServer {
-    type Message = ServerMsg;
-    type Reply = ();
-    type Send = Outbound<Infallible>;
-    type Spawn = Infallible;
-    type SpawnObserved = Infallible;
-    type Io = RuntimeCall<ServerMsg>;
-    type Fact = Infallible;
-    type Shard = KeyspaceShard;
-
+#[tina_runtime::isolate(message = ServerMsg, shard = KeyspaceShard)]
+impl KeyspaceServer {
     fn handle(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        msg: ServerMsg,
+        _ctx: &mut Context<'_, KeyspaceShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             ServerMsg::Start => unix_bind(self.path.clone()).then(ServerMsg::Bound),
@@ -149,20 +140,12 @@ struct KeyspaceClient {
     received: Arc<Mutex<Vec<u8>>>,
 }
 
-impl Isolate for KeyspaceClient {
-    type Message = ClientMsg;
-    type Reply = ();
-    type Send = Outbound<Infallible>;
-    type Spawn = Infallible;
-    type SpawnObserved = Infallible;
-    type Io = RuntimeCall<ClientMsg>;
-    type Fact = Infallible;
-    type Shard = KeyspaceShard;
-
+#[tina_runtime::isolate(message = ClientMsg, shard = KeyspaceShard)]
+impl KeyspaceClient {
     fn handle(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        msg: ClientMsg,
+        _ctx: &mut Context<'_, KeyspaceShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             ClientMsg::Start => unix_connect(self.path.clone()).then(ClientMsg::Connected),

@@ -1,9 +1,8 @@
 use std::cell::RefCell;
-use std::convert::Infallible;
 use std::rc::Rc;
 
 use tina::{ChildDefinition, ChildRef, RestartBudget, RestartPolicy, SpawnObservedRemote, prelude::*};
-use tina_runtime::{DefaultMailboxFactory, MultiShardRuntime, RuntimeCall};
+use tina_runtime::{DefaultMailboxFactory, MultiShardRuntime};
 use tina_supervisor::SupervisorConfig;
 
 #[derive(Debug, Clone, Copy)]
@@ -22,21 +21,12 @@ enum WorkerMsg {
 
 struct Worker;
 
-impl Isolate for Worker {
-    type Message = WorkerMsg;
-    type Reply = ();
-    type Send = Outbound<Infallible>;
-    type Spawn = Infallible;
-    type SpawnObserved = Infallible;
-    type SpawnObservedRemote = Infallible;
-    type Io = RuntimeCall<Self::Message>;
-    type Fact = Infallible;
-    type Shard = DemoShard;
-
+#[tina_runtime::isolate(message = WorkerMsg, shard = DemoShard)]
+impl Worker {
     fn handle(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        msg: WorkerMsg,
+        _ctx: &mut Context<'_, DemoShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             WorkerMsg::Ping => noop(),

@@ -1,11 +1,10 @@
 //! Bounded file streaming using the simulator's file rails and
 //! `tina_runtime::FileReadChunks`.
 
-use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use tina::{Context, Effect, Isolate, Outbound, Shard, ShardId};
+use tina::{Context, Effect, Shard, ShardId};
 use tina_runtime::{
     CallError, FileId, FileLoopEnd, FileLoopReport, FileLoopStep, FileOpenOptions, FileReadChunks,
     FileReadReply, FileWriteAll, FileWriteOwnedReply, RuntimeCall, file_close, file_open,
@@ -42,20 +41,12 @@ struct Ingest {
     finished: IngestFinishedSlot,
 }
 
-impl Isolate for Ingest {
-    type Message = IngestMsg;
-    type Reply = ();
-    type Send = Outbound<Infallible>;
-    type Spawn = Infallible;
-    type SpawnObserved = Infallible;
-    type Io = RuntimeCall<IngestMsg>;
-    type Fact = Infallible;
-    type Shard = IngestShard;
-
+#[tina_runtime::isolate(message = IngestMsg, shard = IngestShard)]
+impl Ingest {
     fn handle(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        msg: IngestMsg,
+        _ctx: &mut Context<'_, IngestShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             IngestMsg::Start => {
@@ -157,20 +148,12 @@ fn seed_file(sim: &mut Simulator<IngestShard>, path: &std::path::Path, bytes: Ve
         helper: Option<FileWriteAll>,
     }
 
-    impl Isolate for Seeder {
-        type Message = SeederMsg;
-        type Reply = ();
-        type Send = Outbound<Infallible>;
-        type Spawn = Infallible;
-        type SpawnObserved = Infallible;
-        type Io = RuntimeCall<SeederMsg>;
-        type Fact = Infallible;
-        type Shard = IngestShard;
-
+    #[tina_runtime::isolate(message = SeederMsg, shard = IngestShard)]
+    impl Seeder {
         fn handle(
             &mut self,
-            msg: Self::Message,
-            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+            msg: SeederMsg,
+            _ctx: &mut Context<'_, IngestShard, Self::Reply>,
         ) -> Effect<Self> {
             match msg {
                 SeederMsg::Start => file_open(
@@ -326,20 +309,12 @@ impl CopyPump {
     }
 }
 
-impl Isolate for CopyPump {
-    type Message = CopyMsg;
-    type Reply = ();
-    type Send = Outbound<Infallible>;
-    type Spawn = Infallible;
-    type SpawnObserved = Infallible;
-    type Io = RuntimeCall<CopyMsg>;
-    type Fact = Infallible;
-    type Shard = IngestShard;
-
+#[tina_runtime::isolate(message = CopyMsg, shard = IngestShard)]
+impl CopyPump {
     fn handle(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        msg: CopyMsg,
+        _ctx: &mut Context<'_, IngestShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             CopyMsg::Start => file_open(self.src_path.clone(), FileOpenOptions::read_only())

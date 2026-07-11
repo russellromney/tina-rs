@@ -2,11 +2,10 @@
 //! `tina_codec::LineFramer`. The client connects, sends a few line-
 //! delimited commands, and the server echoes responses.
 
-use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use tina::{Address, Context, Effect, Isolate, Outbound, Shard, ShardId};
+use tina::{Address, Context, Effect, Shard, ShardId};
 use tina_codec::{DecodeStatus, LineFramer, decode_chunk};
 use tina_runtime::{
     LoopStep, RuntimeCall, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerId,
@@ -49,20 +48,12 @@ struct AdminServer {
     malformed: Arc<Mutex<bool>>,
 }
 
-impl Isolate for AdminServer {
-    type Message = ServerMsg;
-    type Reply = ();
-    type Send = Outbound<Infallible>;
-    type Spawn = Infallible;
-    type SpawnObserved = Infallible;
-    type Io = RuntimeCall<ServerMsg>;
-    type Fact = Infallible;
-    type Shard = AdminShard;
-
+#[tina_runtime::isolate(message = ServerMsg, shard = AdminShard)]
+impl AdminServer {
     fn handle(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        msg: ServerMsg,
+        _ctx: &mut Context<'_, AdminShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             ServerMsg::Start => unix_bind(self.path.clone()).then(ServerMsg::Bound),
@@ -163,20 +154,12 @@ struct AdminClient {
     received: Arc<Mutex<Vec<u8>>>,
 }
 
-impl Isolate for AdminClient {
-    type Message = ClientMsg;
-    type Reply = ();
-    type Send = Outbound<Infallible>;
-    type Spawn = Infallible;
-    type SpawnObserved = Infallible;
-    type Io = RuntimeCall<ClientMsg>;
-    type Fact = Infallible;
-    type Shard = AdminShard;
-
+#[tina_runtime::isolate(message = ClientMsg, shard = AdminShard)]
+impl AdminClient {
     fn handle(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        msg: ClientMsg,
+        _ctx: &mut Context<'_, AdminShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             ClientMsg::Start => unix_connect(self.path.clone()).then(ClientMsg::Connected),

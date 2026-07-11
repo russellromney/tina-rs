@@ -10,7 +10,7 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use tina::prelude::*;
-use tina_runtime::{DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime};
+use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime};
 use tina_sqlite_bridge::{
     InstalledSqliteBridge, SqliteAddress, SqliteConfig, SqliteExecutedOutcome,
     SqliteOutcomeClass, SqliteOutcomeExt, SqliteRowsOutcome, SqliteTransientReason, SqliteWorker,
@@ -91,16 +91,8 @@ struct Caller {
     sink: Arc<ExecSink>,
 }
 
-impl Isolate for Caller {
-    tina::isolate_types! {
-        message: CallerMsg,
-        reply: (),
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        io: RuntimeCall<CallerMsg>,
-        shard: SingleShard,
-    }
-
+#[tina_runtime::isolate(message = CallerMsg)]
+impl Caller {
     fn handle(
         &mut self,
         msg: CallerMsg,
@@ -177,16 +169,8 @@ struct QueryCaller {
     sink: Arc<QuerySink>,
 }
 
-impl Isolate for QueryCaller {
-    tina::isolate_types! {
-        message: QueryCallerMsg,
-        reply: (),
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        io: RuntimeCall<QueryCallerMsg>,
-        shard: SingleShard,
-    }
-
+#[tina_runtime::isolate(message = QueryCallerMsg)]
+impl QueryCaller {
     fn handle(
         &mut self,
         msg: QueryCallerMsg,

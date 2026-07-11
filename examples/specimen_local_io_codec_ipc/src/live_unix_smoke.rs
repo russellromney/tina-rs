@@ -14,7 +14,7 @@ use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tina::{Context, Effect, Isolate, Mailbox, Outbound, Shard, ShardId, TrySendError, noop};
+use tina::{Context, Effect, Isolate, Mailbox, Shard, ShardId, TrySendError, noop};
 use tina_runtime::{
     CallError, LocalSystem, MailboxFactory, RuntimeCall, UnixBindReply, UnixListenerId, unix_bind,
     unix_close_listener,
@@ -97,20 +97,12 @@ struct Probe {
     observed: Observed,
 }
 
-impl Isolate for Probe {
-    type Message = Msg;
-    type Reply = ();
-    type Send = Outbound<Infallible>;
-    type Spawn = Infallible;
-    type SpawnObserved = Infallible;
-    type Io = RuntimeCall<Msg>;
-    type Fact = Infallible;
-    type Shard = ProbeShard;
-
+#[tina_runtime::isolate(message = Msg, shard = ProbeShard)]
+impl Probe {
     fn handle(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        msg: Msg,
+        _ctx: &mut Context<'_, ProbeShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             Msg::Start => unix_bind(self.path.clone()).then(Msg::Bound),
