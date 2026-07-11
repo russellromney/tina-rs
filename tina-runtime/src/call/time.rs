@@ -190,18 +190,17 @@ where
     }
 
     /// Builds a request effect whose continuation is a split service event.
-    pub fn reply_service_event<I, F, Event, Request>(self, translator: F) -> tina::RequestEffect<I>
+    pub fn reply_service_event<F, Event, Request>(self, translator: F) -> tina::RequestEffect<I>
     where
         I: tina::Isolate<
                 Message = tina::ServiceMessage<Event, Request>,
-                Reply = Q,
                 Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
             >,
-        F: FnOnce(tina::RequestContext<Q>, Result<T, E>) -> Event + 'static,
+        F: FnOnce(tina::RequestContext<I::Reply>, Result<T, E>) -> Event + 'static,
         Event: 'static,
         Request: 'static,
     {
-        crate::call::request_effect_from_consumed_effect(
+        self.permit.apply(
             self.inner
                 .reply(move |req, result| tina::ServiceMessage::Event(translator(req, result))),
         )
