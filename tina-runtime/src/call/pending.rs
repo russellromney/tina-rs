@@ -316,6 +316,27 @@ where
         (effect, handle)
     }
 
+    /// Returns an ordinary split-service event continuation and cancel handle.
+    ///
+    /// This does not carry caller authority. Code starting in a request
+    /// handler must continue to use `defer_cancelable` and store its visible
+    /// pending token so either completion or cancellation can settle it.
+    pub fn then_service_event<I, F, E, Q>(
+        self,
+        translator: F,
+    ) -> (tina::Effect<I>, tina::CallHandle<R>)
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<E, Q>,
+                Io = RuntimeCall<tina::ServiceMessage<E, Q>>,
+            >,
+        F: FnOnce(CallOutcome<R>) -> E + 'static,
+        E: 'static,
+        Q: 'static,
+    {
+        self.then(move |outcome| tina::ServiceMessage::Event(translator(outcome)))
+    }
+
     /// Like [`reply`](Self::reply), but also carries the caller's
     /// [`RequestContext`] into the continuation message.
     #[deprecated(

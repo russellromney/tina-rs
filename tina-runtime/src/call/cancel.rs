@@ -41,6 +41,24 @@ impl CancelCallBuilder {
         let shared = tina::runtime_internal::call_handle_inner_into_shared(self.inner);
         tina::Effect::Io(RuntimeCall::cancel_call_with_handle(shared, translator))
     }
+
+    /// Returns the cancel effect as a split service's later event.
+    ///
+    /// The domain event receives the unchanged [`CancelOutcome`], including
+    /// `NotAdmitted` and `AlreadyCompleted`; only the routing envelope is
+    /// supplied by this helper.
+    pub fn then_service_event<I, F, Event, Request>(self, translator: F) -> tina::Effect<I>
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        F: FnOnce(CancelOutcome) -> Event + 'static,
+        Event: 'static,
+        Request: 'static,
+    {
+        self.then(move |outcome| tina::ServiceMessage::Event(translator(outcome)))
+    }
 }
 
 /// Like [`crate::call`], but `.then(...)` also produces a caller-owned

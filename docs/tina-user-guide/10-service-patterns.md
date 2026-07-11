@@ -585,9 +585,8 @@ match shared.wait(key.clone(), call) {
         if entry.filling.is_some() {
             return request_effect_after_shared_wait(&ticket, noop());
         }
-        let fill = sleep(self.fill_delay).then(move |result| {
-            ServiceMessage::Event(CacheEvent::FillDone { key, result })
-        });
+        let fill = sleep(self.fill_delay)
+            .then_service_event(move |result| CacheEvent::FillDone { key, result });
         entry.filling = Some(FillState::default());
         request_effect_after_shared_wait(&ticket, fill)
     }
@@ -602,6 +601,23 @@ match shared.wait(key.clone(), call) {
   the upstream call/timer, retry policy.
 - What not to use: hand-rolled `HashMap<key, VecDeque<id>>` next to
   `PendingReplies`. That is exactly what `SharedWork` exists to replace.
+
+For split services, continuation builders keep the domain event visible and
+wrap the routing envelope themselves. Use `then_service_event` for ordinary
+timer, I/O, isolate-call, cancelable-call, and cancel-acknowledgement
+continuations. When a `RequestCall` defers one runtime or isolate call, use
+`reply_service_event`; the closure still receives the `RequestContext`, so
+caller authority remains explicit:
+
+```rust
+call.defer(call(self.store, StoreMsg::Get(key), timeout))
+    .reply_service_event(CacheEvent::StoreReturned)
+```
+
+For a hand-written multi-step flow that already owns a `RequestContext`, use
+`then_service_event_with_request`. These helpers hide only
+`ServiceMessage::Event(...)`; outcomes, errors, request contexts, and cancel
+handles keep their existing types and obligations.
 
 ### One active cancelable request per key → `PendingCancelableCallSet`
 

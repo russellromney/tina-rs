@@ -32,6 +32,19 @@ This file records completed work.
 - Added one combined pressure/lifecycle report and simulator coverage for
   completion, duplicate-key refusal, and concurrency `Full` behavior.
 
+### Split-service continuation events
+
+Added focused continuation helpers that keep split-service domain code out of
+the raw `ServiceMessage` envelope. `TypedCall`, `SleepCall`, `IsolateCall`,
+`CancelableCall`, and `CancelCallBuilder` now expose `then_service_event`;
+`IsolateCall` also exposes `then_service_event_with_request` for an
+already-captured `RequestContext`.
+The request-deferred typed-call and isolate-call adapters expose
+`reply_service_event`, preserving their must-answer authority while wrapping
+the resulting domain event internally. Representative applied examples and a
+live runtime test cover timer, typed I/O, isolate-call, cancelable-call,
+cancel-acknowledgement, and deferred-reply delivery.
+
 ### Four split-service API helpers (#292)
 
 The 2026-07-09 examples-canonicalization sweep left four small gaps where

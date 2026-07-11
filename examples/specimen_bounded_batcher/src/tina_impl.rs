@@ -89,9 +89,8 @@ impl Batcher {
                             self.timer_gen += 1;
                             let g = self.timer_gen;
                             self.pending_timer_gen = Some(g);
-                            let tick_effect = sleep(self.interval).then(move |reply| {
-                                tina::ServiceMessage::Event(BatcherEvent::Tick(g, reply))
-                            });
+                            let tick_effect = sleep(self.interval)
+                                .then_service_event(move |reply| BatcherEvent::Tick(g, reply));
                             return request_effect_after_park(permit, tick_effect);
                         }
                         request_effect_after_park(permit, noop())

@@ -300,7 +300,7 @@ impl Tree {
 
         // Start the cancelable enrich child and register it into the scope.
         let (enrich_effect, handle) = call_cancelable(self.enrich, EnrichMsg::Work, CHILD_TIMEOUT)
-            .then(move |outcome| tina::ServiceMessage::Event(TreeEvent::EnrichDone(id, outcome)));
+            .then_service_event(move |outcome| TreeEvent::EnrichDone(id, outcome));
         if scope.register("enrich", handle).is_err() {
             // Child cap is sized for exactly this rail; a failure is a bug.
             let _ = self.scopes.remove(&id);

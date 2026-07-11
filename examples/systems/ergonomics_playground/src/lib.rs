@@ -158,12 +158,10 @@ impl QuoteGateway {
             .into_iter()
             .map(|request| {
                 let (key, token, handle) = request.into_parts();
-                cancel_call(handle).then(move |outcome| {
-                    tina::ServiceMessage::Event(QuoteEvent::Cancelled {
-                        key,
-                        token,
-                        outcome,
-                    })
+                cancel_call(handle).then_service_event(move |outcome| QuoteEvent::Cancelled {
+                    key,
+                    token,
+                    outcome,
                 })
             })
             .collect()
