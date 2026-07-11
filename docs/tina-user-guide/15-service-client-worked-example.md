@@ -36,11 +36,19 @@ enum HttpClientMsg {
     Fetch(HttpRequest),
     Connected(
         RequestContext<HttpClientReply>,
-        Result<StreamId, CallError>,
+        Result<(StreamId, SocketAddr, SocketAddr), CallError>,
         HttpRequest,
     ),
-    Wrote(RequestContext<HttpClientReply>, Result<usize, CallError>),
-    Read(RequestContext<HttpClientReply>, Result<Vec<u8>, CallError>),
+    Wrote(
+        RequestContext<HttpClientReply>,
+        StreamId,
+        Result<usize, CallError>,
+    ),
+    Read(
+        RequestContext<HttpClientReply>,
+        StreamId,
+        Result<Vec<u8>, CallError>,
+    ),
 }
 
 #[derive(Debug)]
@@ -51,7 +59,6 @@ enum HttpClientReply {
 
 struct HttpClient {
     target: SocketAddr,
-    stream: Option<StreamId>,
 }
 
 #[tina_runtime::isolate(
@@ -68,33 +75,34 @@ impl HttpClient {
         match msg {
             HttpClientMsg::Fetch(_) => noop(),
 
-            HttpClientMsg::Connected(request, Ok(stream), outbound) => {
-                self.stream = Some(stream);
+            HttpClientMsg::Connected(request, Ok((stream, _, _)), outbound) => {
                 tcp_write(stream, encode_request(outbound)).then_with_request(
                     request,
-                    HttpClientMsg::Wrote,
+                    move |request, result| HttpClientMsg::Wrote(request, stream, result),
                 )
             }
             HttpClientMsg::Connected(request, Err(_), _) => {
                 reply_to(request, HttpClientReply::Failed(HttpClientError::Connect))
             }
 
-            HttpClientMsg::Wrote(request, Ok(_)) => {
-                let stream = self.stream.expect("connected before write");
-                tcp_read(stream, 8192).then_with_request(request, HttpClientMsg::Read)
+            HttpClientMsg::Wrote(request, stream, Ok(_)) => {
+                tcp_read(stream, 8192).then_with_request(
+                    request,
+                    move |request, result| HttpClientMsg::Read(request, stream, result),
+                )
             }
-            HttpClientMsg::Wrote(request, Err(_)) => {
+            HttpClientMsg::Wrote(request, _stream, Err(_)) => {
                 reply_to(request, HttpClientReply::Failed(HttpClientError::Write))
             }
 
-            HttpClientMsg::Read(request, Ok(bytes)) => match decode_response(bytes) {
+            HttpClientMsg::Read(request, _stream, Ok(bytes)) => match decode_response(bytes) {
                 Ok(response) => reply_to(request, HttpClientReply::Response(response)),
                 Err(_) => reply_to(
                     request,
                     HttpClientReply::Failed(HttpClientError::Parse),
                 ),
             },
-            HttpClientMsg::Read(request, Err(_)) => {
+            HttpClientMsg::Read(request, _stream, Err(_)) => {
                 reply_to(request, HttpClientReply::Failed(HttpClientError::Read))
             }
         }
@@ -120,7 +128,9 @@ impl HttpClient {
 The first `call.defer(...).reply(...)` consumes the current `CallContext` and
 creates the first continuation carrying `RequestContext<HttpClientReply>`.
 Later runtime calls use `then_with_request(...)` to move that same one-shot
-authority forward. Every terminal branch consumes it with `reply_to(...)`.
+authority forward. The corresponding `StreamId` moves through those messages
+too; it is not stored in one shared client slot that concurrent calls could
+overwrite. Every terminal branch consumes the request with `reply_to(...)`.
 
 For a single runtime call, prefer the shorter
 `call.defer(work).reply(Continuation)` form. For longer workflows, keep the

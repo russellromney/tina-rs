@@ -62,7 +62,7 @@ An interleaving-exploration layer over the existing DST cases.
   across runs (this is what makes a discovered violation reproducible and
   shrinkable). No `HashMap` iteration / `Instant::now` / unseeded rng in the
   explored path (already true from phase 160 — do not regress).
-- Model preservation (SYSTEM.md): the axis only reorders handling of already-
+- Model preservation: the axis only reorders handling of already-
   popped messages; causal delivery within a round is unchanged. Exploration walks
   existing legal interleavings; it must not invent new causal edges.
 - The axis stays default-off. Only the new exploration tests opt into
@@ -108,7 +108,8 @@ An interleaving-exploration layer over the existing DST cases.
   proven axis-usefulness pattern to generalize.
 - `tina-sim/src/config.rs` (`SchedulerFaultMode`, `FaultConfig`)
 - `.intent/phases/160-sim-maturation/plan.md` (the axis this builds on)
-- `.intent/SYSTEM.md` (determinism/replay + model-preservation contract)
+- `docs/tina-user-guide/08-simulation-and-dst.md` (the current determinism,
+  replay, and model-preservation contract)
 
 ## What not to touch
 

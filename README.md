@@ -32,40 +32,42 @@ Clone the repository and run:
 cargo run --locked -p tina-runtime --example bounded_mailbox
 ```
 
-This worker has room for two queued jobs. A third send returns typed `Full`
-with the undelivered job still owned by the caller. After one runtime step
-frees capacity, the same job can be retried. Once the worker stops, later sends
-return typed `Closed`.
+This first example isolates the host admission boundary. A host producer fills
+a worker's two-slot mailbox. The third `Runtime::try_send` returns typed `Full`
+with the undelivered job still owned by the host. After one deterministic
+runtime step frees capacity, the host retries that exact job. Once the worker
+stops, another send returns typed `Closed` with its job too.
 
 ```text
-send Run(3) -> Full(Run(3)); caller retains the job
-processed job=1
-processed job=2
-processed job=3
-mailbox closed
+send Run(3) -> Full(Run(3)); host retains the job
+retry Run(3) after one step -> Accepted
+send Run(4) after stop -> Closed(Run(4)); host retains the job
 ```
 
 The complete program is below. Its checked-in source is
 [`tina-runtime/examples/bounded_mailbox.rs`](tina-runtime/examples/bounded_mailbox.rs),
-which normal all-target workspace checks compile.
+which the normal all-target workspace checks compile. A test also requires this
+README block to remain byte-for-byte synchronized with that source.
 
+<!-- bounded-mailbox-source -->
 ```rust
 use std::convert::Infallible;
+use std::fmt;
 
-use tina::prelude::*;
 use tina::TrySendError;
+use tina::prelude::*;
 use tina_runtime::{DefaultMailboxFactory, Runtime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Job {
+pub enum Job {
     Run(u64),
     Stop,
 }
 
 #[derive(Debug)]
-struct Worker;
+pub struct Worker;
 
-#[tina::isolate(message = Job)]
+#[tina_runtime::isolate(message = Job)]
 impl Worker {
     fn handle(
         &mut self,
@@ -73,16 +75,40 @@ impl Worker {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match job {
-            Job::Run(id) => {
-                println!("processed job={id}");
-                noop()
-            }
+            Job::Run(_) => noop(),
             Job::Stop => stop(),
         }
     }
 }
 
-fn main() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScenarioReport {
+    pub rejected: Job,
+    pub retried: Job,
+    pub closed: Job,
+}
+
+impl fmt::Display for ScenarioReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            formatter,
+            "send {:?} -> Full({:?}); host retains the job",
+            self.rejected, self.rejected
+        )?;
+        writeln!(
+            formatter,
+            "retry {:?} after one step -> Accepted",
+            self.retried
+        )?;
+        write!(
+            formatter,
+            "send {:?} after stop -> Closed({:?}); host retains the job",
+            self.closed, self.closed
+        )
+    }
+}
+
+pub fn run_scenario() -> ScenarioReport {
     let mut runtime = Runtime::new(SingleShard, DefaultMailboxFactory);
     let worker = runtime.register_with_capacity::<Worker, Infallible>(Worker, 2);
 
@@ -90,14 +116,12 @@ fn main() {
     runtime.try_send(worker, Job::Run(2)).expect("job 2 fits");
 
     let rejected = match runtime.try_send(worker, Job::Run(3)) {
-        Err(TrySendError::Full(job)) => {
-            println!("send {job:?} -> Full({job:?}); caller retains the job");
-            job
-        }
+        Err(TrySendError::Full(job)) => job,
         other => panic!("expected typed Full, got {other:?}"),
     };
+    assert_eq!(rejected, Job::Run(3), "Full returns the attempted job");
 
-    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 1, "one worker handles one queued job");
     runtime
         .try_send(worker, rejected)
         .expect("retry fits after one step");
@@ -105,23 +129,40 @@ fn main() {
     while runtime.step() > 0 {}
 
     runtime.try_send(worker, Job::Stop).expect("stop fits");
-    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 1, "worker handles stop");
 
-    match runtime.try_send(worker, Job::Run(4)) {
-        Err(TrySendError::Closed(Job::Run(4))) => println!("mailbox closed"),
+    let closed = match runtime.try_send(worker, Job::Run(4)) {
+        Err(TrySendError::Closed(job)) => job,
         other => panic!("expected typed Closed, got {other:?}"),
+    };
+    assert_eq!(closed, Job::Run(4), "Closed returns the attempted job");
+
+    ScenarioReport {
+        rejected,
+        retried: rejected,
+        closed,
     }
+}
+
+fn main() {
+    println!("{}", run_scenario());
 }
 ```
 
-The important facts are visible at the call site:
+The host-boundary facts are visible at the call site:
 
 1. Capacity is chosen when the isolate is registered.
 2. Admission never silently grows a queue.
 3. `Full` and `Closed` are typed outcomes.
-4. A refused send returns ownership of the message, so retry policy remains
-   with the caller.
+4. A refused host send returns ownership of the message, so retry policy
+   remains with the host.
 5. The explicit-step runtime makes the pressure transition deterministic.
+
+Inside an isolate, `send(...)` is an effect and therefore cannot return a
+synchronous result to the current handler. When the sending isolate needs the
+outcome, it uses `send_observed(...).then(...)`; the continuation receives
+typed `SendOutcome::Accepted`, `SendOutcome::Full`, or `SendOutcome::Closed`.
+That distinction keeps host admission and isolate-to-isolate pressure honest.
 
 For the smallest complete live program, run:
 
