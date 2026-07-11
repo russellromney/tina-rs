@@ -14,6 +14,19 @@ This file records completed work.
   `EventServiceHandle` or `RequestServiceHandle`; application call sites do not
   name the internal `ServiceMessage` envelope or `Infallible` lane.
 
+### Concurrency-charged parked callers
+
+- Added `ConcurrencyPendingReplies`, a bounded owner that composes
+  `ConcurrencyLimit` with deferred reply slots. Local permits stay private and
+  move-only: intentional replies count as completions; caller-gone sweeps,
+  drains, admission rollbacks, and owner drop retire them exactly once.
+- Added optional auxiliary RAII guards for multi-budget requests without a
+  sidecar table. `system_api_gateway_limits` now uses the combined owner for
+  its local parked-work cap while retaining its atomic multi-scope capacity
+  reservation.
+- Added one combined pressure/lifecycle report and simulator coverage for
+  completion, duplicate-key refusal, and concurrency `Full` behavior.
+
 ### Four split-service API helpers (#292)
 
 The 2026-07-09 examples-canonicalization sweep left four small gaps where

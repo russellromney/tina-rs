@@ -47,14 +47,16 @@ fn mint_guarded_seq() -> u64 {
 /// };
 /// ```
 pub struct GuardedParkTicket<K> {
+    owner_id: u64,
     slot: usize,
     generation: u64,
     _key: PhantomData<fn(K) -> K>,
 }
 
 impl<K> GuardedParkTicket<K> {
-    fn new(slot: usize, generation: u64) -> Self {
+    fn new(owner_id: u64, slot: usize, generation: u64) -> Self {
         Self {
+            owner_id,
             slot,
             generation,
             _key: PhantomData,
@@ -65,6 +67,7 @@ impl<K> GuardedParkTicket<K> {
 impl<K> std::fmt::Debug for GuardedParkTicket<K> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GuardedParkTicket")
+            .field("owner_id", &self.owner_id)
             .field("slot", &self.slot)
             .field("generation", &self.generation)
             .finish()
@@ -80,6 +83,7 @@ struct GuardedEntry<K, R, G> {
 /// Bounded fixed-capacity slot table that pairs a parked caller with one
 /// RAII `G` guard. See module docs for the invariants the helper keeps.
 pub struct GuardedPendingReplies<K, R, G> {
+    owner_id: u64,
     capacity: usize,
     slots: Vec<Option<GuardedEntry<K, R, G>>>,
     generations: Vec<u64>,
@@ -283,6 +287,7 @@ where
         }
         let seq = mint_guarded_seq();
         Self {
+            owner_id: seq,
             capacity,
             slots,
             generations,
@@ -384,6 +389,27 @@ where
             if take && self.remove_slot(idx).is_some() {
                 reclaimed += 1;
                 self.reclaimed += 1;
+            }
+        }
+        reclaimed
+    }
+
+    /// Reclaim closed caller slots and return their keys and guards.
+    ///
+    /// This is the explicit-settlement sibling of [`Self::sweep`]. It is
+    /// useful when dropping `G` is not itself the correct release operation,
+    /// such as a move-only local permit that must be retired against its
+    /// owning gate. Reply slots are closed already and are dropped here.
+    pub fn reclaim_closed(&mut self) -> Vec<(K, G)> {
+        let mut reclaimed = Vec::new();
+        for idx in 0..self.slots.len() {
+            let take = matches!(
+                self.slots[idx].as_ref().map(|entry| entry.reply.state()),
+                Some(DeferredSlotState::Closed)
+            );
+            if take && let Some(entry) = self.remove_slot(idx) {
+                self.reclaimed = self.reclaimed.saturating_add(1);
+                reclaimed.push((entry.key, entry.guard));
             }
         }
         reclaimed
@@ -495,7 +521,7 @@ where
         &mut self,
         ticket: GuardedParkTicket<K>,
     ) -> Result<(DeferredReply<R>, G), GuardedTakeError<K>> {
-        if ticket.slot >= self.slots.len() {
+        if ticket.owner_id != self.owner_id || ticket.slot >= self.slots.len() {
             return Err(GuardedTakeError::StaleTicket);
         }
         if self.generations[ticket.slot] != ticket.generation {
@@ -580,7 +606,7 @@ where
         if self.current > self.high_water {
             self.high_water = self.current;
         }
-        GuardedParkTicket::new(idx, generation)
+        GuardedParkTicket::new(self.owner_id, idx, generation)
     }
 
     fn remove_slot(&mut self, idx: usize) -> Option<GuardedEntry<K, R, G>> {
@@ -673,6 +699,25 @@ mod tests {
         assert_eq!(count.get(), 0, "guard alive while parked");
         let _: Effect<TestIso> = box_.reply_ticket(ticket, 7).unwrap();
         assert_eq!(count.get(), 1, "guard drops on reply");
+    }
+
+    #[test]
+    fn ticket_from_another_owner_cannot_remove_same_slot_and_generation() {
+        let (_count, mint) = counter();
+        let mut left = GuardedPendingReplies::<u32, u32, DropCounter>::with_capacity(1);
+        let mut right = GuardedPendingReplies::<u32, u32, DropCounter>::with_capacity(1);
+        let left_ticket = left
+            .insert_deferred_guarded(1, fake_slot(10), mint())
+            .unwrap();
+        right
+            .insert_deferred_guarded(2, fake_slot(11), mint())
+            .unwrap();
+
+        assert!(matches!(
+            right.take_ticket(left_ticket),
+            Err(GuardedTakeError::StaleTicket)
+        ));
+        assert_eq!(right.len(), 1, "wrong-owner ticket must not remove entry");
     }
 
     #[test]

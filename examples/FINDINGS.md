@@ -154,11 +154,13 @@ together.
 
 What is still active after reading the specimens and systems:
 
-- **Admission across parked work.** `system_api_gateway_limits` and
-  `system_soak_http_db` still show "park this caller while holding this
-  charge" ceremony. The multi-scope charge/rollback half now has
-  `SharedCapacityReservation`; the remaining gap is a park-friendly local
-  concurrency charge.
+- **Admission across parked work.** Closed for local concurrency by
+  `ConcurrencyPendingReplies`: one bounded owner holds the local
+  `ConcurrencyLimit`, parked caller, and optional auxiliary RAII guard.
+  `system_api_gateway_limits` uses it with `SharedCapacityReservation`, so
+  owner-stop and caller-gone cleanup no longer depend on dropping an explicit
+  local permit. Multi-stage guard replacement in `system_soak_http_db` remains
+  intentionally explicit because it changes which external budget is held.
 - **Race / cancel / retry ceremony.** `ergonomics_playground` and
   `system_job_queue` show the model is correct. `CallGroup::start_cancelable`
   now removes the branch-start token/handle ceremony, and Phase 120 added
@@ -220,16 +222,15 @@ What felt good:
 
 What felt rough:
 
-- **`ConcurrencyPermit` is not drop-to-release, but shared capacity is**, and
-  the mismatch fights the deferred-reply pattern. `GuardedPendingReplies`
-  releases its guard by *dropping* it; a dropped `ConcurrencyPermit`
-  leaks the inner `LocalPermitGate` permit (loudly, but still a leak),
-  while `SharedCapacityReservation` releases clean. This is why
-  `system_api_gateway_limits` stays on `SharedCapacityScope` instead of
-  migrating to `ConcurrencyLimit`. **Build:** a park-friendly
-  concurrency charge that releases on drop (or a guarded pending box
-  that calls an explicit releaser), so the local-gate path composes with
-  multi-turn parking the way shared capacity already does.
+- **Closed: local concurrency across parked work.**
+  `ConcurrencyPendingReplies` owns both the `ConcurrencyLimit` and guarded
+  pending slots, rather than changing `ConcurrencyPermit`'s deliberately loud
+  drop semantics. Reply releases as completed; caller-gone sweep, drain,
+  rollback, and owner drop retire without completion. Because permits never
+  leave the owner, wrong-gate release is unrepresentable and no `Arc`/atomic
+  back-reference is required. Its report exposes policy current, parked
+  current, completion/retirement, duplicate, reclaim, and both Full counters;
+  `counts_agree()` makes ownership drift directly testable.
 - **Charging two shared budgets per request used to be manual two-phase with
   rollback.** Closed by `SharedCapacityReservation::try_reserve([...])`, which
   admits every charge or drops earlier leases before returning the full scope.
