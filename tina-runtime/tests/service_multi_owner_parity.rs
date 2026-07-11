@@ -77,6 +77,7 @@ enum SplitEvent {
 enum SplitRequest {
     Read,
     Hold,
+    Reject,
 }
 
 struct SplitService;
@@ -116,6 +117,7 @@ impl SplitService {
                         tina::ServiceMessage::Event(SplitEvent::Delayed(request, outcome))
                     })
             }
+            SplitRequest::Reject => caller.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }
@@ -316,6 +318,16 @@ fn canonical_local_facades_delegate_service_registration_and_events() {
             )
             .expect("single delayed request call driven"),
         CallOutcome::Timeout
+    );
+    assert_eq!(
+        single
+            .call_blocking_request(
+                single_split.requests,
+                SplitRequest::Reject,
+                Duration::from_secs(1),
+            )
+            .expect("single rejected request call driven"),
+        CallOutcome::Rejected(tina::CallRejectedReason::UnsupportedMessage)
     );
     assert_eq!(
         single
