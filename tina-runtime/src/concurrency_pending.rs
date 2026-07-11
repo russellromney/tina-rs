@@ -410,7 +410,10 @@ impl<K: PartialEq, R> ConcurrencyPendingReplies<K, R, ()> {
         &mut self,
         key: K,
         call: RequestCall<'a, I>,
-    ) -> Result<ConcurrencyParkTicket<K>, ConcurrencyParkError<'a, K, I>>
+    ) -> Result<
+        (ConcurrencyParkTicket<K>, tina::RequestEffectPermit<'a, I>),
+        ConcurrencyParkError<'a, K, I>,
+    >
     where
         I: Isolate<Reply = R>,
         R: 'static,
@@ -421,7 +424,7 @@ impl<K: PartialEq, R> ConcurrencyPendingReplies<K, R, ()> {
             Err(failure) => return Err(ConcurrencyParkError::Admission { key, call, failure }),
         };
         match self.pending.park_request_guarded(key, call, (permit, ())) {
-            Ok(ticket) => Ok(ConcurrencyParkTicket(ticket)),
+            Ok((ticket, effect_permit)) => Ok((ConcurrencyParkTicket(ticket), effect_permit)),
             Err(GuardedParkError::DuplicateKey {
                 key,
                 call,
@@ -471,16 +474,17 @@ impl<K: PartialEq, R> ConcurrencyPendingReplies<K, R, ()> {
 }
 
 /// Build a request effect after [`ConcurrencyPendingReplies::park_request`]
-/// consumed caller authority. The ticket is an unforgeable admission witness.
-pub fn request_effect_after_concurrency_park<I, K>(
-    ticket: &ConcurrencyParkTicket<K>,
+/// consumed caller authority. The one-use permit is minted only after the
+/// caller has been captured successfully; the separate ticket remains
+/// available for later completion routing.
+pub fn request_effect_after_concurrency_park<I>(
+    permit: tina::RequestEffectPermit<'_, I>,
     effect: Effect<I>,
 ) -> RequestEffect<I>
 where
     I: Isolate,
 {
-    let _ = ticket;
-    crate::call::request_effect_from_consumed_effect(effect)
+    permit.apply(effect)
 }
 
 #[cfg(test)]

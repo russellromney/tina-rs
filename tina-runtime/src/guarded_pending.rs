@@ -449,7 +449,10 @@ where
         key: K,
         call: RequestCall<'a, I>,
         guard: G,
-    ) -> Result<GuardedParkTicket<K>, GuardedParkError<'a, K, I, G>>
+    ) -> Result<
+        (GuardedParkTicket<K>, tina::RequestEffectPermit<'a, I>),
+        GuardedParkError<'a, K, I, G>,
+    >
     where
         I: Isolate<Reply = R>,
         R: 'static,
@@ -471,8 +474,8 @@ where
             return Err(GuardedParkError::Full { key, call, guard });
         }
 
-        let req = call.into_call_context().into_request_context();
-        Ok(self.store_entry(key, req.into_deferred(), guard))
+        let (req, permit) = call.into_request_context_with_permit();
+        Ok((self.store_entry(key, req.into_deferred(), guard), permit))
     }
 
     /// Park the current call-context caller along with a guard.

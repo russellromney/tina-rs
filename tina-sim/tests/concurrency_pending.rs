@@ -65,8 +65,8 @@ impl Service {
     ) -> RequestEffect<Self> {
         match request {
             Request::Hold { key, duration } => match self.pending.park_request(key, call) {
-                Ok(ticket) => request_effect_after_concurrency_park(
-                    &ticket,
+                Ok((_ticket, permit)) => request_effect_after_concurrency_park(
+                    permit,
                     sleep(duration)
                         .then(move |_| tina::ServiceMessage::Event(Event::Complete(key))),
                 ),
