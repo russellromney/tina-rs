@@ -4,10 +4,10 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use tina::{Context, Effect, Shard, ShardId};
+use tina::{Effect, Shard, ShardId};
 use tina_runtime::{
     CallError, FileId, FileLoopEnd, FileLoopReport, FileLoopStep, FileOpenOptions, FileReadChunks,
-    FileReadReply, FileWriteAll, FileWriteOwnedReply, RuntimeCall, file_close, file_open,
+    FileReadReply, FileWriteAll, FileWriteOwnedReply, file_close, file_open,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 

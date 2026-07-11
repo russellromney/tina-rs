@@ -5,12 +5,12 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use tina::{Address, Context, Effect, Shard, ShardId};
+use tina::{Address, Effect, Shard, ShardId};
 use tina_codec::{DecodeStatus, LengthDelimitedFramer, LengthPrefix, decode_chunk, encode_into};
 use tina_runtime::{
-    LoopStep, RuntimeCall, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerId,
-    UnixReadReply, UnixStreamId, UnixWriteAll, UnixWriteOwnedReply, unix_accept, unix_bind,
-    unix_close_stream, unix_connect, unix_read,
+    LoopStep, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerId, UnixReadReply,
+    UnixStreamId, UnixWriteAll, UnixWriteOwnedReply, unix_accept, unix_bind, unix_close_stream,
+    unix_connect, unix_read,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 

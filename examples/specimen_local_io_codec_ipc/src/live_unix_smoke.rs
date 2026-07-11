@@ -14,9 +14,9 @@ use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tina::{Context, Effect, Isolate, Mailbox, Shard, ShardId, TrySendError, noop};
+use tina::{Mailbox, Shard, ShardId, TrySendError, noop};
 use tina_runtime::{
-    CallError, LocalSystem, MailboxFactory, RuntimeCall, UnixBindReply, UnixListenerId, unix_bind,
+    CallError, LocalSystem, MailboxFactory, UnixBindReply, UnixListenerId, unix_bind,
     unix_close_listener,
 };
 
