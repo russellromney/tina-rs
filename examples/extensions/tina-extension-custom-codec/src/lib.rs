@@ -21,16 +21,15 @@
 //! The service runs over `tina_sim`'s deterministic Unix-domain socket
 //! rails, so the smoke test is reproducible — no wall-clock timing.
 
-use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use tina::{Address, Context, Effect, Isolate, Outbound, Shard, ShardId};
+use tina::{Address, Effect, Shard, ShardId};
 use tina_codec::{DecodeStatus, FrameDecision, SyncCodec, decode_chunk};
 use tina_runtime::{
-    LoopStep, RuntimeCall, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerId,
-    UnixReadReply, UnixStreamId, UnixWriteAll, UnixWriteOwnedReply, unix_accept, unix_bind,
-    unix_close_stream, unix_connect, unix_read,
+    LoopStep, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerId, UnixReadReply,
+    UnixStreamId, UnixWriteAll, UnixWriteOwnedReply, unix_accept, unix_bind, unix_close_stream,
+    unix_connect, unix_read,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -144,20 +143,12 @@ struct CodecServer {
     rejected: Arc<Mutex<bool>>,
 }
 
-impl Isolate for CodecServer {
-    type Message = ServerMsg;
-    type Reply = ();
-    type Send = Outbound<Infallible>;
-    type Spawn = Infallible;
-    type SpawnObserved = Infallible;
-    type Io = RuntimeCall<ServerMsg>;
-    type Fact = Infallible;
-    type Shard = CodecShard;
-
+#[tina_runtime::isolate(message = ServerMsg, shard = CodecShard)]
+impl CodecServer {
     fn handle(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        msg: ServerMsg,
+        _ctx: &mut Context<'_, CodecShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             ServerMsg::Start => unix_bind(self.path.clone()).then(ServerMsg::Bound),
@@ -235,9 +226,7 @@ impl Isolate for CodecServer {
             ServerMsg::Done => Effect::Stop,
         }
     }
-}
 
-impl CodecServer {
     fn close(&mut self) -> Effect<Self> {
         if let Some(stream) = self.stream.take() {
             unix_close_stream(stream).then(|_| ServerMsg::Done)
@@ -264,20 +253,12 @@ struct CodecClient {
     received: Arc<Mutex<Vec<u8>>>,
 }
 
-impl Isolate for CodecClient {
-    type Message = ClientMsg;
-    type Reply = ();
-    type Send = Outbound<Infallible>;
-    type Spawn = Infallible;
-    type SpawnObserved = Infallible;
-    type Io = RuntimeCall<ClientMsg>;
-    type Fact = Infallible;
-    type Shard = CodecShard;
-
+#[tina_runtime::isolate(message = ClientMsg, shard = CodecShard)]
+impl CodecClient {
     fn handle(
         &mut self,
-        msg: Self::Message,
-        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        msg: ClientMsg,
+        _ctx: &mut Context<'_, CodecShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
             ClientMsg::Start => unix_connect(self.path.clone()).then(ClientMsg::Connected),
