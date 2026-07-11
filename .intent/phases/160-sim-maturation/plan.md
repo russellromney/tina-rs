@@ -29,7 +29,7 @@ order in which ready isolates are dispatched within one `step()` round.
   causal delivery inside a round — only trace event-id interleaving and the
   order of side-effecting resource ops (call ids, peer output). This is exactly
   the model-preserving "local-send delivery order can shift in seeded ways"
-  that SYSTEM.md already licenses.
+  allowed by the simulator's established model-preservation contract.
 
 Why gated behind a mode instead of always-on: many existing tests run non-zero
 seeds and pin exact traces/behavior under the current fault-only perturbation.

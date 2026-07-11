@@ -1,8 +1,8 @@
 //! Smallest runnable boundedness example.
 //!
-//! A worker has room for two queued jobs. The third send returns typed `Full`
-//! with the undelivered job, which the caller retries after one runtime step.
-//! Once the worker stops, another send returns typed `Closed`.
+//! A host producer fills a worker's two-slot mailbox. The third send returns
+//! typed `Full` with the undelivered job, which the host retries after one
+//! runtime step. Once the worker stops, another send returns typed `Closed`.
 //!
 //! Run with:
 //! ```bash
@@ -10,21 +10,22 @@
 //! ```
 
 use std::convert::Infallible;
+use std::fmt;
 
 use tina::TrySendError;
 use tina::prelude::*;
 use tina_runtime::{DefaultMailboxFactory, Runtime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Job {
+pub enum Job {
     Run(u64),
     Stop,
 }
 
 #[derive(Debug)]
-struct Worker;
+pub struct Worker;
 
-#[tina::isolate(message = Job)]
+#[tina_runtime::isolate(message = Job)]
 impl Worker {
     fn handle(
         &mut self,
@@ -32,16 +33,40 @@ impl Worker {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match job {
-            Job::Run(id) => {
-                println!("processed job={id}");
-                noop()
-            }
+            Job::Run(_) => noop(),
             Job::Stop => stop(),
         }
     }
 }
 
-fn main() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScenarioReport {
+    pub rejected: Job,
+    pub retried: Job,
+    pub closed: Job,
+}
+
+impl fmt::Display for ScenarioReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            formatter,
+            "send {:?} -> Full({:?}); host retains the job",
+            self.rejected, self.rejected
+        )?;
+        writeln!(
+            formatter,
+            "retry {:?} after one step -> Accepted",
+            self.retried
+        )?;
+        write!(
+            formatter,
+            "send {:?} after stop -> Closed({:?}); host retains the job",
+            self.closed, self.closed
+        )
+    }
+}
+
+pub fn run_scenario() -> ScenarioReport {
     let mut runtime = Runtime::new(SingleShard, DefaultMailboxFactory);
     let worker = runtime.register_with_capacity::<Worker, Infallible>(Worker, 2);
 
@@ -49,12 +74,10 @@ fn main() {
     runtime.try_send(worker, Job::Run(2)).expect("job 2 fits");
 
     let rejected = match runtime.try_send(worker, Job::Run(3)) {
-        Err(TrySendError::Full(job)) => {
-            println!("send {job:?} -> Full({job:?}); caller retains the job");
-            job
-        }
+        Err(TrySendError::Full(job)) => job,
         other => panic!("expected typed Full, got {other:?}"),
     };
+    assert_eq!(rejected, Job::Run(3), "Full returns the attempted job");
 
     assert_eq!(runtime.step(), 1, "one worker handles one queued job");
     runtime
@@ -66,8 +89,19 @@ fn main() {
     runtime.try_send(worker, Job::Stop).expect("stop fits");
     assert_eq!(runtime.step(), 1, "worker handles stop");
 
-    match runtime.try_send(worker, Job::Run(4)) {
-        Err(TrySendError::Closed(Job::Run(4))) => println!("mailbox closed"),
+    let closed = match runtime.try_send(worker, Job::Run(4)) {
+        Err(TrySendError::Closed(job)) => job,
         other => panic!("expected typed Closed, got {other:?}"),
+    };
+    assert_eq!(closed, Job::Run(4), "Closed returns the attempted job");
+
+    ScenarioReport {
+        rejected,
+        retried: rejected,
+        closed,
     }
+}
+
+fn main() {
+    println!("{}", run_scenario());
 }
