@@ -13,6 +13,11 @@ This file records completed work.
 - Runtime, threaded-runtime, and simulator registration return only the usable
   `EventServiceHandle` or `RequestServiceHandle`; application call sites do not
   name the internal `ServiceMessage` envelope or `Infallible` lane.
+- Multi-shard runtime, threaded, and simulator owners now mirror those service
+  shapes with `register_{split,event,request}_service_on`. `LocalSystem` and
+  `LocalMultiShardSystem` delegate the same capability-typed registrations,
+  and all five multi-owner/facade surfaces expose `try_send_event` without a
+  public `ServiceMessage` envelope.
 
 ### Concurrency-charged parked callers
 

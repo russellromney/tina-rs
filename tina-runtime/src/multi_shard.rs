@@ -211,6 +211,101 @@ where
             .register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
     }
 
+    /// Registers one split event/request service on the requested shard.
+    #[allow(private_bounds)]
+    pub fn register_split_service_on<I, Event, Request, Outbound>(
+        &mut self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> crate::SplitServiceHandle<Event, Request, I::Reply>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<Event, Request>,
+                Send = TinaOutbound<Outbound>,
+            > + tina::CallableIsolate
+            + 'static,
+        Event: 'static,
+        Request: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: 'static,
+    {
+        crate::SplitServiceHandle::from_address(self.register_with_capacity_on::<I, Outbound>(
+            shard,
+            isolate,
+            mailbox_capacity,
+        ))
+    }
+
+    /// Registers one event-only service on the requested shard.
+    #[allow(private_bounds)]
+    pub fn register_event_service_on<I, Event, Outbound>(
+        &mut self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> crate::EventServiceHandle<Event>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<Event, std::convert::Infallible>,
+                Reply = (),
+                Send = TinaOutbound<Outbound>,
+            > + 'static,
+        Event: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: 'static,
+    {
+        crate::SplitServiceHandle::from_address(self.register_with_capacity_on::<I, Outbound>(
+            shard,
+            isolate,
+            mailbox_capacity,
+        ))
+        .events
+    }
+
+    /// Registers one request-only service on the requested shard.
+    #[allow(private_bounds)]
+    pub fn register_request_service_on<I, Request, Outbound>(
+        &mut self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> crate::RequestServiceHandle<Request, I::Reply>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<std::convert::Infallible, Request>,
+                Send = TinaOutbound<Outbound>,
+            > + tina::CallableIsolate
+            + 'static,
+        Request: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: 'static,
+    {
+        crate::SplitServiceHandle::from_address(self.register_with_capacity_on::<I, Outbound>(
+            shard,
+            isolate,
+            mailbox_capacity,
+        ))
+        .requests
+    }
+
     /// Multi-shard mirror of [`Runtime::register_with_capacity_and_bootstrap`].
     #[allow(private_bounds, clippy::type_complexity)]
     pub fn register_with_capacity_and_bootstrap_on<I, Outbound>(
@@ -320,6 +415,30 @@ where
         message: M,
     ) -> Result<(), TrySendError<M>> {
         self.runtime(address.shard()).try_send(address, message)
+    }
+
+    /// Attempts one event send through a service event capability.
+    pub fn try_send_event<Event: 'static, Request: 'static>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        event: Event,
+    ) -> Result<(), TrySendError<Event>> {
+        match self.try_send(
+            address.address().address(),
+            tina::ServiceMessage::Event(event),
+        ) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(tina::ServiceMessage::Event(event))) => {
+                Err(TrySendError::Full(event))
+            }
+            Err(TrySendError::Closed(tina::ServiceMessage::Event(event))) => {
+                Err(TrySendError::Closed(event))
+            }
+            Err(TrySendError::Full(tina::ServiceMessage::Request(_)))
+            | Err(TrySendError::Closed(tina::ServiceMessage::Request(_))) => {
+                unreachable!("runtime returned a different service payload than it received")
+            }
+        }
     }
 
     /// Runs one global deterministic round in ascending shard-id order.

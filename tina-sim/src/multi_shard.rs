@@ -224,6 +224,106 @@ where
             .register_with_mailbox_capacity::<I, Msg, Outbound>(isolate, mailbox_capacity)
     }
 
+    /// Registers one split event/request service on the requested shard.
+    #[allow(private_bounds)]
+    pub fn register_split_service_on<I, Event, Request, Outbound>(
+        &mut self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> tina_runtime::SplitServiceHandle<Event, Request, I::Reply>
+    where
+        I: Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Shard = S,
+                Send = TinaOutbound<Outbound>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            > + tina::CallableIsolate
+            + 'static,
+        I::Io: RuntimeCallable,
+        I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
+        I::Reply: 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
+        Event: 'static,
+        Request: 'static,
+        Outbound: 'static,
+    {
+        tina_runtime::SplitServiceHandle::from_address(
+            self.register_with_capacity_on::<I, tina::ServiceMessage<Event, Request>, Outbound>(
+                shard,
+                isolate,
+                mailbox_capacity,
+            ),
+        )
+    }
+
+    /// Registers one event-only service on the requested shard.
+    #[allow(private_bounds)]
+    pub fn register_event_service_on<I, Event, Outbound>(
+        &mut self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> tina_runtime::EventServiceHandle<Event>
+    where
+        I: Isolate<
+                Message = tina::ServiceMessage<Event, std::convert::Infallible>,
+                Reply = (),
+                Shard = S,
+                Send = TinaOutbound<Outbound>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, std::convert::Infallible>>,
+            > + 'static,
+        I::Io: RuntimeCallable,
+        I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
+        Event: 'static,
+        Outbound: 'static,
+    {
+        tina_runtime::SplitServiceHandle::from_address(self.register_with_capacity_on::<
+            I,
+            tina::ServiceMessage<Event, std::convert::Infallible>,
+            Outbound,
+        >(shard, isolate, mailbox_capacity))
+        .events
+    }
+
+    /// Registers one request-only service on the requested shard.
+    #[allow(private_bounds)]
+    pub fn register_request_service_on<I, Request, Outbound>(
+        &mut self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> tina_runtime::RequestServiceHandle<Request, I::Reply>
+    where
+        I: Isolate<
+                Message = tina::ServiceMessage<std::convert::Infallible, Request>,
+                Shard = S,
+                Send = TinaOutbound<Outbound>,
+                Io = RuntimeCall<tina::ServiceMessage<std::convert::Infallible, Request>>,
+            > + tina::CallableIsolate
+            + 'static,
+        I::Io: RuntimeCallable,
+        I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
+        I::Reply: 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
+        Request: 'static,
+        Outbound: 'static,
+    {
+        self.register_split_service_on::<I, std::convert::Infallible, Request, Outbound>(
+            shard,
+            isolate,
+            mailbox_capacity,
+        )
+        .requests
+    }
+
     /// Register a [`ReplyAdapter<M, T, S>`] on a chosen shard.
     /// Simulator parity for the multi-shard runtime forms.
     ///
@@ -268,6 +368,30 @@ where
         message: M,
     ) -> Result<(), TrySendError<M>> {
         self.simulator(address.shard()).try_send(address, message)
+    }
+
+    /// Attempts one event send through a service event capability.
+    pub fn try_send_event<Event: 'static, Request: 'static>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        event: Event,
+    ) -> Result<(), TrySendError<Event>> {
+        match self.try_send(
+            address.address().address(),
+            tina::ServiceMessage::Event(event),
+        ) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(tina::ServiceMessage::Event(event))) => {
+                Err(TrySendError::Full(event))
+            }
+            Err(TrySendError::Closed(tina::ServiceMessage::Event(event))) => {
+                Err(TrySendError::Closed(event))
+            }
+            Err(TrySendError::Full(tina::ServiceMessage::Request(_)))
+            | Err(TrySendError::Closed(tina::ServiceMessage::Request(_))) => {
+                unreachable!("simulator returned a different service payload than it received")
+            }
+        }
     }
 
     /// Advances the shared virtual monotonic time by `by`.
