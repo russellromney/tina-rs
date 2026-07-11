@@ -22,8 +22,9 @@ use crate::capabilities::RuntimeCapabilities;
 use crate::clock::MonotonicClock;
 use crate::driver::{self, BetelgeuseDriver};
 use crate::errors::{
-    SendObservedUntilError, ShutdownWaitError, SuperviseError, ThreadedRegisterBootstrapError,
-    ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError,
+    SendObservedUntilError, ShutdownWaitError, StartupError, SuperviseError,
+    ThreadedRegisterBootstrapError, ThreadedRuntimeConfigError, ThreadedRuntimeError,
+    ThreadedSendObservedError, ThreadedTrySendError,
 };
 use crate::host_burst::HostBurstOutcomes;
 use crate::host_call_dispatcher::{
@@ -177,6 +178,60 @@ impl Default for ThreadedRuntimeConfig {
     }
 }
 
+impl ThreadedRuntimeConfig {
+    /// Validates every non-zero bounded worker setting before any thread starts.
+    pub fn validate(&self) -> Result<(), ThreadedRuntimeConfigError> {
+        use ThreadedRuntimeConfigError as Error;
+
+        if self.command_capacity == 0 {
+            return Err(Error::ZeroCommandCapacity);
+        }
+        if self.shard_pair_capacity == 0 {
+            return Err(Error::ZeroShardPairCapacity);
+        }
+        if self.remote_inbound_drain_budget == 0 {
+            return Err(Error::ZeroRemoteInboundDrainBudget);
+        }
+        if self.storage_lane_capacity == 0 {
+            return Err(Error::ZeroStorageLaneCapacity);
+        }
+        if self.dns_lane_capacity == 0 {
+            return Err(Error::ZeroDnsLaneCapacity);
+        }
+        if self.tls_lane_capacity == 0 {
+            return Err(Error::ZeroTlsLaneCapacity);
+        }
+        if self.process_lane_capacity == 0 {
+            return Err(Error::ZeroProcessLaneCapacity);
+        }
+        if self.signal_capacity == 0 {
+            return Err(Error::ZeroSignalCapacity);
+        }
+        if self.timer_capacity == 0 {
+            return Err(Error::ZeroTimerCapacity);
+        }
+        if self.hot_drain_max_rounds == 0 {
+            return Err(Error::ZeroHotDrainMaxRounds);
+        }
+        if self.hot_drain_max_elapsed.is_zero() {
+            return Err(Error::ZeroHotDrainMaxElapsed);
+        }
+        if self.idle_repoll_interval.is_zero() {
+            return Err(Error::ZeroIdleRepollInterval);
+        }
+        if self.idle_wait.is_zero() {
+            return Err(Error::ZeroIdleWait);
+        }
+        if self.control_call_timeout.is_zero() {
+            return Err(Error::ZeroControlCallTimeout);
+        }
+        if self.driver_completion_drain_budget == 0 {
+            return Err(Error::ZeroDriverCompletionDrainBudget);
+        }
+        Ok(())
+    }
+}
+
 /// Default host-control-call timeout. Generous so a healthy but busy worker is
 /// never cut off; low enough that a wedged handler surfaces as
 /// [`ThreadedRuntimeError::WorkerUnresponsive`] in tens of seconds instead of
@@ -221,6 +276,12 @@ pub const HOST_CALL_DISPATCHER_POOL_SIZE: usize = 8;
 /// `call_blocking` wrapper so a target call timeout can be delivered as
 /// `CallOutcome::Timeout` instead of racing the host wait timer.
 pub const DEFAULT_HOST_CALL_DELIVERY_GRACE: Duration = Duration::from_millis(100);
+
+/// Maximum time a constructor waits for a worker to prove initialization.
+pub const DEFAULT_STARTUP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounded best-effort join window after startup has already failed.
+pub(crate) const STARTUP_CLEANUP_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Bounded command sender for the worker's explicit command queue.
 pub(crate) struct CommandSender<S, F>
@@ -347,11 +408,6 @@ where
     /// Begin / Returned handlers in the same turn — same parallelism the
     /// old per-call `HostCallDriver` enjoyed — without the per-call mailbox /
     /// isolate-entry / handler-box allocations.
-    ///
-    /// Empty means the worker thread died before publishing addresses (e.g.
-    /// a panicking mailbox factory): `call_blocking` surfaces `WorkerStopped`
-    /// instead of hanging or panicking the constructor, matching the
-    /// deferred-failure model the rest of `ThreadedRuntime`'s API uses.
     dispatchers: Arc<Vec<Address<DispatcherMsg<S>, ()>>>,
     /// Round-robin selector for the dispatcher pool. Wrapping atomic add is
     /// cheap and stays correct under concurrent host-thread access; modulo
@@ -370,13 +426,28 @@ where
 {
     /// Starts one worker thread for one shard runtime.
     pub fn new(shard: S, mailbox_factory: F) -> Self {
-        Self::with_config(shard, mailbox_factory, ThreadedRuntimeConfig::default())
+        Self::try_new(shard, mailbox_factory).expect("failed to start Tina threaded runtime")
+    }
+
+    /// Fallible form of [`Self::new`].
+    pub fn try_new(shard: S, mailbox_factory: F) -> Result<Self, StartupError> {
+        Self::try_with_config(shard, mailbox_factory, ThreadedRuntimeConfig::default())
     }
 
     /// Starts one worker thread with explicit bounded-command configuration.
     pub fn with_config(shard: S, mailbox_factory: F, config: ThreadedRuntimeConfig) -> Self {
-        Self::with_config_and_io_loop_factory(shard, mailbox_factory, config, || {
-            io_loop(Global).expect("failed to initialise Betelgeuse IO loop for tina-runtime")
+        Self::try_with_config(shard, mailbox_factory, config)
+            .expect("failed to start Tina threaded runtime")
+    }
+
+    /// Fallible form of [`Self::with_config`].
+    pub fn try_with_config(
+        shard: S,
+        mailbox_factory: F,
+        config: ThreadedRuntimeConfig,
+    ) -> Result<Self, StartupError> {
+        Self::try_with_config_and_io_loop_factory(shard, mailbox_factory, config, || {
+            io_loop(Global)
         })
     }
 
@@ -389,12 +460,23 @@ where
         config: ThreadedRuntimeConfig,
         observer: Arc<dyn TraceObserver>,
     ) -> Self {
-        Self::with_config_observer_and_io_loop_factory(
+        Self::try_with_config_and_trace_observer(shard, mailbox_factory, config, observer)
+            .expect("failed to start Tina threaded runtime")
+    }
+
+    /// Fallible form of [`Self::with_config_and_trace_observer`].
+    pub fn try_with_config_and_trace_observer(
+        shard: S,
+        mailbox_factory: F,
+        config: ThreadedRuntimeConfig,
+        observer: Arc<dyn TraceObserver>,
+    ) -> Result<Self, StartupError> {
+        Self::try_with_config_observer_and_io_loop_factory(
             shard,
             mailbox_factory,
             config,
             Some(observer),
-            || io_loop(Global).expect("failed to initialise Betelgeuse IO loop for tina-runtime"),
+            || io_loop(Global),
         )
     }
 
@@ -412,7 +494,23 @@ where
     where
         G: FnOnce() -> IOLoopHandle<Global> + Send + 'static,
     {
-        Self::with_config_observer_and_io_loop_factory(
+        Self::try_with_config_and_io_loop_factory(shard, mailbox_factory, config, move || {
+            Ok(io_loop_factory())
+        })
+        .expect("failed to start Tina threaded runtime")
+    }
+
+    /// Starts one worker with a fallible I/O-loop factory.
+    pub fn try_with_config_and_io_loop_factory<G>(
+        shard: S,
+        mailbox_factory: F,
+        config: ThreadedRuntimeConfig,
+        io_loop_factory: G,
+    ) -> Result<Self, StartupError>
+    where
+        G: FnOnce() -> std::io::Result<IOLoopHandle<Global>> + Send + 'static,
+    {
+        Self::try_with_config_observer_and_io_loop_factory(
             shard,
             mailbox_factory,
             config,
@@ -433,42 +531,58 @@ where
     where
         G: FnOnce() -> IOLoopHandle<Global> + Send + 'static,
     {
-        if config.command_capacity == 0 {
-            panic!("ThreadedRuntime requires command capacity > 0");
-        }
-        if config.storage_lane_capacity == 0 {
-            panic!("ThreadedRuntime requires storage lane capacity > 0");
-        }
-        if config.dns_lane_capacity == 0 {
-            panic!("ThreadedRuntime requires DNS lane capacity > 0");
-        }
-        if config.tls_lane_capacity == 0 {
-            panic!("ThreadedRuntime requires TLS lane capacity > 0");
-        }
-        if config.process_lane_capacity == 0 {
-            panic!("ThreadedRuntime requires process lane capacity > 0");
-        }
-        if config.signal_capacity == 0 {
-            panic!("ThreadedRuntime requires signal capacity > 0");
-        }
-        if config.timer_capacity == 0 {
-            panic!("ThreadedRuntime requires timer capacity > 0");
-        }
-        if config.remote_inbound_drain_budget == 0 {
-            panic!("ThreadedRuntime requires remote inbound drain budget > 0");
-        }
-        if config.hot_drain_max_rounds == 0 {
-            panic!("ThreadedRuntime requires hot_drain_max_rounds > 0");
-        }
-        if config.hot_drain_max_elapsed.is_zero() {
-            panic!("ThreadedRuntime requires hot_drain_max_elapsed > 0");
-        }
-        if config.idle_repoll_interval.is_zero() {
-            panic!("ThreadedRuntime requires idle_repoll_interval > 0");
-        }
-        if config.driver_completion_drain_budget == 0 {
-            panic!("ThreadedRuntime requires driver_completion_drain_budget > 0");
-        }
+        Self::try_with_config_observer_and_io_loop_factory(
+            shard,
+            mailbox_factory,
+            config,
+            observer,
+            move || Ok(io_loop_factory()),
+        )
+        .expect("failed to start Tina threaded runtime")
+    }
+
+    /// Fallible constructor underlying every single-shard startup path.
+    pub fn try_with_config_observer_and_io_loop_factory<G>(
+        shard: S,
+        mailbox_factory: F,
+        config: ThreadedRuntimeConfig,
+        observer: Option<Arc<dyn TraceObserver>>,
+        io_loop_factory: G,
+    ) -> Result<Self, StartupError>
+    where
+        G: FnOnce() -> std::io::Result<IOLoopHandle<Global>> + Send + 'static,
+    {
+        Self::try_with_config_observer_io_loop_and_spawner(
+            shard,
+            mailbox_factory,
+            config,
+            observer,
+            io_loop_factory,
+            DEFAULT_STARTUP_HANDSHAKE_TIMEOUT,
+            STARTUP_CLEANUP_JOIN_TIMEOUT,
+            |name, worker| thread::Builder::new().name(name).spawn(worker),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn try_with_config_observer_io_loop_and_spawner<G, H>(
+        shard: S,
+        mailbox_factory: F,
+        config: ThreadedRuntimeConfig,
+        observer: Option<Arc<dyn TraceObserver>>,
+        io_loop_factory: G,
+        startup_timeout: Duration,
+        startup_cleanup_timeout: Duration,
+        spawner: H,
+    ) -> Result<Self, StartupError>
+    where
+        G: FnOnce() -> std::io::Result<IOLoopHandle<Global>> + Send + 'static,
+        H: FnOnce(
+            String,
+            Box<dyn FnOnce() -> ThreadedWorkerExit + Send>,
+        ) -> std::io::Result<thread::JoinHandle<ThreadedWorkerExit>>,
+    {
+        config.validate()?;
 
         let (commands, receiver) = std::sync::mpsc::sync_channel(config.command_capacity);
         let shard_id = shard.id();
@@ -485,10 +599,11 @@ where
         // dispatcher pool's addresses back to the host once the runtime is
         // built and registered. We block briefly on construction so
         // `call_blocking` can use the addresses immediately.
-        let (dispatcher_tx, dispatcher_rx) = std::sync::mpsc::channel::<WorkerHandshake<S>>();
-        let handle = thread::Builder::new()
-            .name(worker_name)
-            .spawn(move || {
+        let (dispatcher_tx, dispatcher_rx) =
+            std::sync::mpsc::channel::<Result<WorkerHandshake<S>, StartupError>>();
+        let handle = spawner(
+            worker_name,
+            Box::new(move || {
                 threaded_worker_loop(
                     shard,
                     mailbox_factory,
@@ -499,18 +614,35 @@ where
                     worker_observer,
                     dispatcher_tx,
                 )
-            })
-            .expect("failed to spawn Tina threaded worker");
-        // `Disconnected` means the worker thread died before it could
-        // register the dispatcher pool — surface that to subsequent ops as
-        // `WorkerStopped`, don't panic the constructor. `Timeout` means the
-        // worker is stuck (registration normally takes microseconds); 5s is
-        // far past any plausible setup time, so panic in that case.
-        let dispatchers = match dispatcher_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(handshake) => Arc::new(handshake.dispatchers),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Arc::new(Vec::new()),
+            }),
+        )
+        .map_err(|source| StartupError::ThreadSpawn {
+            shard: shard_id,
+            source,
+        })?;
+        let dispatchers = match dispatcher_rx.recv_timeout(startup_timeout) {
+            Ok(Ok(handshake)) => Arc::new(handshake.dispatchers),
+            Ok(Err(error)) => {
+                let _ = handle.join();
+                return Err(error);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = handle.join();
+                return Err(StartupError::WorkerHandshakeDisconnected(shard_id));
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                panic!("worker failed to publish host-call dispatcher pool in 5s");
+                let _ = commands.try_send(ThreadedCommand::Shutdown);
+                let cleanup_deadline = Instant::now() + startup_cleanup_timeout;
+                while !handle.is_finished() && Instant::now() < cleanup_deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                if handle.is_finished() {
+                    let _ = handle.join();
+                }
+                return Err(StartupError::WorkerHandshakeTimeout {
+                    shard: shard_id,
+                    timeout: startup_timeout,
+                });
             }
         };
         let commands = CommandSender::new(commands);
@@ -524,14 +656,14 @@ where
             signaled: false,
         }));
 
-        Self {
+        Ok(Self {
             commands,
             dispatchers,
             dispatcher_next,
             metrics,
             shutdown,
             control_call_timeout: config.control_call_timeout,
-        }
+        })
     }
 
     /// Registers one root isolate and lets the worker allocate its mailbox.
@@ -1728,6 +1860,16 @@ where
     }
 }
 
+pub(crate) fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn threaded_worker_loop<S, F>(
     shard: S,
@@ -1737,54 +1879,70 @@ pub(crate) fn threaded_worker_loop<S, F>(
     io_loop_factory: ThreadedIoLoopFactory,
     metrics: Arc<LiveShardMetrics>,
     observer: Option<Arc<dyn TraceObserver>>,
-    dispatcher_tx: std::sync::mpsc::Sender<WorkerHandshake<S>>,
+    dispatcher_tx: std::sync::mpsc::Sender<Result<WorkerHandshake<S>, StartupError>>,
 ) -> ThreadedWorkerExit
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + 'static,
 {
-    let mut runtime = Runtime::with_clock_and_ids_and_driver_and_preallocation(
-        shard,
-        mailbox_factory,
-        Box::new(MonotonicClock),
-        IdSource::new(),
-        Box::new(BetelgeuseDriver::with_io_loop_and_capacities(
-            io_loop_factory(),
-            config.storage_lane_capacity,
-            config.dns_lane_capacity,
-            config.tls_lane_capacity,
-            config.process_lane_capacity,
-            config.signal_capacity,
-            config.timer_capacity,
-        )),
-        config.preallocation,
-    );
-    runtime.set_trace_retention(config.trace_retention);
-    runtime.set_driver_completion_drain_budget(config.driver_completion_drain_budget);
-    // Wire the observer before any event records.
-    runtime.set_trace_observer(observer);
-
-    // Register the persistent host-call dispatcher pool and publish their
-    // addresses back to the host so `call_blocking` can target them without
-    // a per-call isolate registration (phase 145 Rock 5). Each dispatcher's
-    // mailbox is sized to `command_capacity`: at peak, an in-flight host
-    // call routed to a given dispatcher occupies at most one slot in that
-    // dispatcher's mailbox (Begin pending or Returned pending, never both),
-    // matching the command-queue backpressure bound.
-    let mut dispatcher_addrs = Vec::with_capacity(HOST_CALL_DISPATCHER_POOL_SIZE);
-    for _ in 0..HOST_CALL_DISPATCHER_POOL_SIZE {
-        let addr = runtime.register_with_capacity::<HostCallDispatcher<S>, Infallible>(
-            HostCallDispatcher::new(),
-            config.command_capacity,
+    let shard_id = shard.id();
+    let initialized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let io_loop = io_loop_factory().map_err(|source| StartupError::IoLoopInitialization {
+            shard: shard_id,
+            source,
+        })?;
+        let mut runtime = Runtime::with_clock_and_ids_and_driver_and_preallocation(
+            shard,
+            mailbox_factory,
+            Box::new(MonotonicClock),
+            IdSource::new(),
+            Box::new(BetelgeuseDriver::with_io_loop_and_capacities(
+                io_loop,
+                config.storage_lane_capacity,
+                config.dns_lane_capacity,
+                config.tls_lane_capacity,
+                config.process_lane_capacity,
+                config.signal_capacity,
+                config.timer_capacity,
+            )),
+            config.preallocation,
         );
-        dispatcher_addrs.push(addr);
-    }
-    // If the host hung up between spawn and registration we just drop the
-    // handshake; the worker continues to run normally and the host will
-    // surface its own panic via the recv_timeout on its side.
-    let _ = dispatcher_tx.send(WorkerHandshake {
+        runtime.set_trace_retention(config.trace_retention);
+        runtime.set_driver_completion_drain_budget(config.driver_completion_drain_budget);
+        runtime.set_trace_observer(observer);
+
+        let mut dispatcher_addrs = Vec::with_capacity(HOST_CALL_DISPATCHER_POOL_SIZE);
+        for _ in 0..HOST_CALL_DISPATCHER_POOL_SIZE {
+            let addr = runtime.register_with_capacity::<HostCallDispatcher<S>, Infallible>(
+                HostCallDispatcher::new(),
+                config.command_capacity,
+            );
+            dispatcher_addrs.push(addr);
+        }
+        Ok::<_, StartupError>((runtime, dispatcher_addrs))
+    }));
+
+    let (mut runtime, dispatcher_addrs) = match initialized {
+        Ok(Ok(initialized)) => initialized,
+        Ok(Err(error)) => {
+            metrics.set_state(LiveShardState::Failed);
+            let _ = dispatcher_tx.send(Err(error));
+            return ThreadedWorkerExit::failed(ThreadedRuntimeError::WorkerStopped, Vec::new());
+        }
+        Err(payload) => {
+            metrics.set_state(LiveShardState::Failed);
+            let error = StartupError::WorkerStartupPanicked {
+                shard: shard_id,
+                message: panic_payload_message(&payload),
+            };
+            let _ = dispatcher_tx.send(Err(error));
+            return ThreadedWorkerExit::failed(ThreadedRuntimeError::WorkerStopped, Vec::new());
+        }
+    };
+
+    let _ = dispatcher_tx.send(Ok(WorkerHandshake {
         dispatchers: dispatcher_addrs,
-    });
+    }));
     drop(dispatcher_tx);
 
     // Pin this worker (if requested and the platform can) only after the driver
@@ -1942,5 +2100,100 @@ pub(crate) fn deliver_shutdown_signal_and_drain_with_remote<S, F, FR>(
         if runtime.step_with_remote(route_remote) == 0 {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use crate::DefaultThreadedMailboxFactory;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tina::SingleShard;
+
+    #[test]
+    fn thread_spawn_error_is_typed() {
+        let error = ThreadedRuntime::try_with_config_observer_io_loop_and_spawner(
+            SingleShard,
+            DefaultThreadedMailboxFactory,
+            ThreadedRuntimeConfig::default(),
+            None,
+            || io_loop(Global),
+            Duration::from_millis(10),
+            STARTUP_CLEANUP_JOIN_TIMEOUT,
+            |_name, _worker| Err(std::io::Error::other("injected spawn failure")),
+        )
+        .err()
+        .expect("spawn failure must fail startup");
+
+        assert!(matches!(
+            error,
+            StartupError::ThreadSpawn { shard, ref source }
+                if shard == ShardId::new(0) && source.to_string() == "injected spawn failure"
+        ));
+    }
+
+    #[test]
+    fn disconnected_handshake_is_typed() {
+        let error = ThreadedRuntime::try_with_config_observer_io_loop_and_spawner(
+            SingleShard,
+            DefaultThreadedMailboxFactory,
+            ThreadedRuntimeConfig::default(),
+            None,
+            || io_loop(Global),
+            Duration::from_millis(10),
+            STARTUP_CLEANUP_JOIN_TIMEOUT,
+            |_name, _worker| thread::Builder::new().spawn(|| ThreadedWorkerExit::clean(Vec::new())),
+        )
+        .err()
+        .expect("missing handshake must fail startup");
+
+        assert!(matches!(
+            error,
+            StartupError::WorkerHandshakeDisconnected(shard) if shard == ShardId::new(0)
+        ));
+    }
+
+    #[test]
+    fn handshake_timeout_is_typed() {
+        let timeout = Duration::from_millis(10);
+        let worker_exited = Arc::new(AtomicBool::new(false));
+        let worker_exited_after_run = Arc::clone(&worker_exited);
+        let (worker_started_tx, worker_started_rx) = std::sync::mpsc::sync_channel(0);
+        let error = ThreadedRuntime::try_with_config_observer_io_loop_and_spawner(
+            SingleShard,
+            DefaultThreadedMailboxFactory,
+            ThreadedRuntimeConfig::default(),
+            None,
+            || io_loop(Global),
+            timeout,
+            Duration::from_secs(5),
+            move |_name, worker| {
+                let handle = thread::Builder::new().spawn(move || {
+                    worker_started_tx
+                        .send(())
+                        .expect("constructor still waits for the worker");
+                    thread::sleep(Duration::from_millis(30));
+                    let exit = worker();
+                    worker_exited_after_run.store(true, Ordering::Release);
+                    exit
+                })?;
+                worker_started_rx
+                    .recv()
+                    .expect("worker wrapper reports that it started");
+                Ok(handle)
+            },
+        )
+        .err()
+        .expect("late handshake must fail startup");
+
+        assert!(matches!(
+            error,
+            StartupError::WorkerHandshakeTimeout { shard, timeout: actual }
+                if shard == ShardId::new(0) && actual == timeout
+        ));
+        assert!(
+            worker_exited.load(Ordering::Acquire),
+            "a late worker should consume shutdown and join during the cleanup window"
+        );
     }
 }

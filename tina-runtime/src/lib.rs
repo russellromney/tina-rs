@@ -104,8 +104,8 @@ pub use admission::{
 pub use drain_state::{AdmitDecision, DrainReport, DrainStage, DrainState};
 pub use errors::{
     RegisterBootstrapError, SendObservedUntilError, ShutdownRequestError, ShutdownWaitError,
-    SuperviseError, ThreadedRegisterBootstrapError, ThreadedRuntimeError,
-    ThreadedSendObservedError, ThreadedTrySendError,
+    StartupError, SuperviseError, ThreadedRegisterBootstrapError, ThreadedRuntimeConfigError,
+    ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError,
 };
 pub use full_handling::{
     FullDecision, FullExhaustionReason, FullHandling, FullHandlingReport, FullHandlingToken,
@@ -154,8 +154,8 @@ pub(crate) use dispatch::{ChildRecordSnapshot, SupervisorRecordSnapshot};
 pub use shutdown::ThreadedShutdownHandle;
 pub use single_call_gate::SingleCallGate;
 pub use threaded::{
-    DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, HOST_CALL_DISPATCHER_POOL_SIZE, ThreadedRuntime,
-    ThreadedRuntimeConfig,
+    DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, DEFAULT_STARTUP_HANDSHAKE_TIMEOUT,
+    HOST_CALL_DISPATCHER_POOL_SIZE, ThreadedRuntime, ThreadedRuntimeConfig,
 };
 pub use threaded_multi_shard::ThreadedMultiShardRuntime;
 
