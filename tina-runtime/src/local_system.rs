@@ -1326,6 +1326,9 @@ where
     }
 
     /// Registers one split event/request root service on the chosen shard.
+    ///
+    /// Returns [`ThreadedRuntimeError::UnknownShard`] when `shard` is not
+    /// owned by this local system.
     #[allow(private_bounds)]
     pub fn register_split_service_on<I, Event, Request, Outbound>(
         &self,
@@ -1360,6 +1363,9 @@ where
     }
 
     /// Registers one event-only root service on the chosen shard.
+    ///
+    /// Returns [`ThreadedRuntimeError::UnknownShard`] when `shard` is not
+    /// owned by this local system.
     #[allow(private_bounds)]
     pub fn register_event_service_on<I, Event, Outbound>(
         &self,
@@ -1388,6 +1394,9 @@ where
     }
 
     /// Registers one request-only root service on the chosen shard.
+    ///
+    /// Returns [`ThreadedRuntimeError::UnknownShard`] when `shard` is not
+    /// owned by this local system.
     #[allow(private_bounds)]
     pub fn register_request_service_on<I, Request, Outbound>(
         &self,
@@ -1435,6 +1444,10 @@ where
     }
 
     /// Attempts bounded ingress through a service event capability.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the address targets a shard not owned by this local system.
     pub fn try_send_event<Event, Request>(
         &self,
         address: tina::ServiceEventAddress<Event, Request>,

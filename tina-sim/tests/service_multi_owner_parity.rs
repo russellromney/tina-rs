@@ -1,9 +1,13 @@
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use tina::TrySendError;
 use tina::prelude::*;
-use tina_runtime::{EventServiceHandle, RequestServiceHandle, SplitServiceHandle};
+use tina_runtime::{
+    CallOutcome, EventServiceHandle, RequestServiceHandle, SplitServiceHandle, call_request,
+};
 use tina_sim::{MultiShardSimulator, SimulatorConfig};
 
 #[derive(Debug, Clone, Copy)]
@@ -102,6 +106,47 @@ impl SplitService {
     }
 }
 
+#[derive(Debug)]
+enum ClientMessage {
+    Start(RequestServiceHandle<Request, u32>),
+    RequestReturned(CallOutcome<u32>),
+    SplitReturned(CallOutcome<u32>),
+}
+
+struct Client {
+    split: tina::ServiceRequestAddress<SplitEvent, SplitRequest, u32>,
+    observed: Arc<AtomicU32>,
+}
+
+#[tina_runtime::isolate(message = ClientMessage, shard = ServiceShard)]
+impl Client {
+    fn handle(
+        &mut self,
+        message: ClientMessage,
+        _ctx: &mut Context<'_, ServiceShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match message {
+            ClientMessage::Start(requests) => {
+                call_request(requests, Request::Read, Duration::from_millis(10))
+                    .then(ClientMessage::RequestReturned)
+            }
+            ClientMessage::RequestReturned(CallOutcome::Replied(value)) => {
+                self.observed.store(value, Ordering::Release);
+                call_request(self.split, SplitRequest::Read, Duration::from_millis(10))
+                    .then(ClientMessage::SplitReturned)
+            }
+            ClientMessage::SplitReturned(CallOutcome::Replied(value)) => {
+                assert_eq!(self.observed.load(Ordering::Acquire), 37);
+                self.observed.store(value, Ordering::Release);
+                stop()
+            }
+            ClientMessage::RequestReturned(other) | ClientMessage::SplitReturned(other) => {
+                panic!("service request did not reply: {other:?}")
+            }
+        }
+    }
+}
+
 #[test]
 fn simulator_multi_owner_preserves_service_capabilities_and_domain_errors() {
     let mut simulator = MultiShardSimulator::new(
@@ -149,5 +194,35 @@ fn simulator_multi_owner_preserves_service_capabilities_and_domain_errors() {
     simulator
         .try_send_event(split.events, SplitEvent::Reset)
         .expect("split event accepted");
-    let _ = (Request::Read, SplitRequest::Read);
+
+    let request_seen = Arc::new(AtomicU32::new(0));
+    let client = simulator.register_with_capacity_on::<Client, ClientMessage, Infallible>(
+        ShardId::new(2),
+        Client {
+            split: split.requests,
+            observed: Arc::clone(&request_seen),
+        },
+        4,
+    );
+    simulator
+        .try_send(client, ClientMessage::Start(requests))
+        .expect("client start accepted");
+    simulator.run_until_quiescent();
+    assert_eq!(request_seen.load(Ordering::Acquire), 23);
+}
+
+#[test]
+#[should_panic(expected = "unknown shard 99")]
+fn simulator_multi_registration_panics_on_unknown_shard() {
+    let mut simulator = MultiShardSimulator::new(
+        [ServiceShard(1), ServiceShard(2)],
+        SimulatorConfig::default(),
+    );
+    let _ = simulator.register_event_service_on(
+        ShardId::new(99),
+        EventService {
+            seen: Arc::new(AtomicU32::new(0)),
+        },
+        4,
+    );
 }

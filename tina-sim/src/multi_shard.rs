@@ -225,6 +225,10 @@ where
     }
 
     /// Registers one split event/request service on the requested shard.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `shard` is not owned by this simulator.
     #[allow(private_bounds)]
     pub fn register_split_service_on<I, Event, Request, Outbound>(
         &mut self,
@@ -260,6 +264,10 @@ where
     }
 
     /// Registers one event-only service on the requested shard.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `shard` is not owned by this simulator.
     #[allow(private_bounds)]
     pub fn register_event_service_on<I, Event, Outbound>(
         &mut self,
@@ -292,6 +300,10 @@ where
     }
 
     /// Registers one request-only service on the requested shard.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `shard` is not owned by this simulator.
     #[allow(private_bounds)]
     pub fn register_request_service_on<I, Request, Outbound>(
         &mut self,
@@ -371,6 +383,10 @@ where
     }
 
     /// Attempts one event send through a service event capability.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the address targets a shard not owned by this simulator.
     pub fn try_send_event<Event: 'static, Request: 'static>(
         &self,
         address: tina::ServiceEventAddress<Event, Request>,

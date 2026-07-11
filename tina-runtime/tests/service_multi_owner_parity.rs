@@ -7,7 +7,7 @@ use tina::prelude::*;
 use tina_runtime::{
     CallOutcome, DefaultMailboxFactory, DefaultThreadedMailboxFactory, EventServiceHandle,
     LocalSystem, MultiShardRuntime, RequestServiceHandle, SplitServiceHandle,
-    ThreadedMultiShardRuntime,
+    ThreadedMultiShardRuntime, ThreadedRuntimeError,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -151,6 +151,20 @@ fn explicit_multi_owner_preserves_event_pressure_and_shard_choice() {
 }
 
 #[test]
+#[should_panic(expected = "unknown shard 99")]
+fn explicit_multi_registration_panics_on_unknown_shard() {
+    let mut runtime =
+        MultiShardRuntime::new([ServiceShard(10), ServiceShard(20)], DefaultMailboxFactory);
+    let _ = runtime.register_event_service_on(
+        ShardId::new(99),
+        EventService {
+            seen: Arc::new(AtomicU32::new(0)),
+        },
+        4,
+    );
+}
+
+#[test]
 fn threaded_multi_owner_registers_all_service_shapes() {
     let runtime = ThreadedMultiShardRuntime::new(
         [ServiceShard(30), ServiceShard(40)],
@@ -200,12 +214,34 @@ fn threaded_multi_owner_registers_all_service_shapes() {
 }
 
 #[test]
+fn threaded_multi_registration_returns_typed_unknown_shard() {
+    let runtime = ThreadedMultiShardRuntime::new(
+        [ServiceShard(30), ServiceShard(40)],
+        DefaultThreadedMailboxFactory,
+    );
+    let result = runtime.register_event_service_on(
+        ShardId::new(99),
+        EventService {
+            seen: Arc::new(AtomicU32::new(0)),
+        },
+        4,
+    );
+
+    assert!(matches!(
+        result,
+        Err(ThreadedRuntimeError::UnknownShard(shard)) if shard == ShardId::new(99)
+    ));
+    runtime.shutdown().expect("threaded multi owner shuts down");
+}
+
+#[test]
 fn canonical_local_facades_delegate_service_registration_and_events() {
     let single = LocalSystem::single_shard(ServiceShard(50), DefaultThreadedMailboxFactory).build();
+    let single_seen = Arc::new(AtomicU32::new(0));
     let single_events = single
         .register_event_service(
             EventService {
-                seen: Arc::new(AtomicU32::new(0)),
+                seen: Arc::clone(&single_seen),
             },
             4,
         )
@@ -226,16 +262,18 @@ fn canonical_local_facades_delegate_service_registration_and_events() {
         .shutdown()
         .join()
         .expect("single local system shuts down");
+    assert_eq!(single_seen.load(Ordering::Acquire), 60);
 
     let multi = LocalSystem::multi_shard(DefaultThreadedMailboxFactory)
         .shard(ServiceShard(60))
         .shard(ServiceShard(70))
         .build();
+    let multi_seen = Arc::new(AtomicU32::new(0));
     let multi_events = multi
         .register_event_service_on(
             ShardId::new(70),
             EventService {
-                seen: Arc::new(AtomicU32::new(0)),
+                seen: Arc::clone(&multi_seen),
             },
             4,
         )
@@ -253,8 +291,19 @@ fn canonical_local_facades_delegate_service_registration_and_events() {
     multi
         .try_send_event(multi_events, Event::Record(70))
         .expect("multi facade event admitted");
+    assert!(matches!(
+        multi.register_event_service_on(
+            ShardId::new(99),
+            EventService {
+                seen: Arc::new(AtomicU32::new(0)),
+            },
+            4,
+        ),
+        Err(ThreadedRuntimeError::UnknownShard(shard)) if shard == ShardId::new(99)
+    ));
     multi
         .shutdown()
         .join()
         .expect("multi local system shuts down");
+    assert_eq!(multi_seen.load(Ordering::Acquire), 70);
 }
