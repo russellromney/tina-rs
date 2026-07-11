@@ -179,79 +179,13 @@ println!("pressure: {summary}");
 check. The closed/no-pending counts reflect lifecycle, not capacity,
 so they're broken out separately.
 
-## Observed Send
-
-Plain `send` is simple but does not tell sender what happened.
-
-Use observed send when overload matters:
-
-```rust
-use tina_runtime::{send_observed, SendOutcome};
-
-#[derive(Debug, Clone)]
-enum ProducerMsg {
-    Burst(usize),
-    Sent(SendOutcome),
-}
-
-#[tina_runtime::isolate(
-    message = ProducerMsg,
-    send = Outbound<ConsumerMsg>,
-    shard = AppShard
-)]
-impl Producer {
-    fn handle(&mut self, msg: ProducerMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
-        match msg {
-            ProducerMsg::Burst(n) => batch(
-                (0..n)
-                    .map(|i| {
-                        send_observed(self.consumer, ConsumerMsg::Item(i))
-                            .then(ProducerMsg::Sent)
-                    })
-                    .collect(),
-            ),
-            ProducerMsg::Sent(outcome) => {
-                if outcome.is_full() {
-                    self.rejected += 1;
-                }
-                noop()
-            }
-        }
-    }
-}
-```
-
-This is the heart of Tina service shape.
-
-Many async systems accept into a channel or spawned task until pressure appears
-somewhere else.
-
-Tina should be able to say:
-
-```text
-accepted=12000 full=38000 timeouts=0 exit=clean
-```
-
-## Request-Sized Loops
+## Bound Producer Work Before Effects Exist
 
 The review question for every fanout loop is:
 
 ```text
 what is the max in-flight work, and did the service choose it?
 ```
-
-This is the bad shape:
-
-```rust
-let effects = request
-    .items
-    .into_iter()
-    .map(|item| call(worker, WorkerMsg::Run(item), timeout).then(Msg::Done))
-    .collect::<Vec<_>>();
-batch(effects)
-```
-
-The request chose how many effects exist.
 
 Use a service-owned wrapper before effects exist:
 
@@ -282,6 +216,75 @@ tina_runtime::assert_service_owned_bound(
     Some(config.max_items_per_request),
     Some(report.items_observed),
 )?;
+```
+
+Reserve raw `batch(...)` for small, statically bounded collections. This is
+the hazardous shape for request data because the request chooses how many
+effects exist:
+
+```rust
+let effects = request
+    .items
+    .into_iter()
+    .map(|item| call(worker, WorkerMsg::Run(item), timeout).then(Msg::Done))
+    .collect::<Vec<_>>();
+batch(effects)
+```
+
+## Observed Send
+
+Plain `send` is simple but does not tell sender what happened. First bound a
+request-sized burst as shown above; then use observed send when each item's
+overload result matters:
+
+```rust
+use tina_runtime::{BoundedItems, SendOutcome, bounded_batch, send_observed};
+
+#[derive(Debug, Clone)]
+enum ProducerMsg {
+    Burst(BoundedItems<usize>),
+    Sent(SendOutcome),
+}
+
+#[tina_runtime::isolate(
+    message = ProducerMsg,
+    send = Outbound<ConsumerMsg>,
+    shard = AppShard
+)]
+impl Producer {
+    fn handle(&mut self, msg: ProducerMsg, _ctx: &mut Context<'_, AppShard>) -> Effect<Self> {
+        match msg {
+            ProducerMsg::Burst(items) => {
+                bounded_batch(items.map_effects(|i| {
+                    send_observed(self.consumer, ConsumerMsg::Item(i))
+                        .then(ProducerMsg::Sent)
+                }))
+            }
+            ProducerMsg::Sent(outcome) => {
+                if outcome.is_full() {
+                    self.rejected += 1;
+                }
+                noop()
+            }
+        }
+    }
+}
+```
+
+Construct `ProducerMsg::Burst` with `BoundedItems::try_from_iter` at the
+request boundary, returning a typed application reply on error as in the
+first example. The event handler cannot accidentally receive an unbounded
+raw collection.
+
+This is the heart of Tina service shape.
+
+Many async systems accept into a channel or spawned task until pressure appears
+somewhere else.
+
+Tina should be able to say:
+
+```text
+accepted=12000 full=38000 timeouts=0 exit=clean
 ```
 
 ## Bounded Broadcast

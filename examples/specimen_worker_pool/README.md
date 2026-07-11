@@ -7,12 +7,14 @@ out of order.
 
 Primitives used:
 
-- `Context::take_request_context` / `PendingReplies::try_capture` —
-  capture the original caller as a one-shot deferred slot.
+- `PendingReplies::park_request` — consume the original request
+  authority and capture its caller as a one-shot deferred slot.
 - `PendingReplies::take(qid)` — pull the slot back when the worker
   reply matches.
 - `reply_to(slot, value)` — answer the original caller through the
   captured slot.
+- `BoundedItems::try_from_iter` / `bounded_batch` — cap the driver
+  burst before per-item call effects exist.
 
 ## Run
 
@@ -30,13 +32,17 @@ worker each client mapped to.
   whole pending box. No `Arc<Mutex<HashMap>>`, no eviction logic.
 - Out-of-order completion is invisible at the call sites — the slot
   carries the correlation, not the timing.
-- `Full` admission is a typed `FrontendReply::Full` reply; the
-  driver bucket is distinct from a successful result.
+- Pending-table pressure and every worker terminal outcome remain
+  distinct: `PendingFull`, `WorkerFull`, `WorkerClosed`,
+  `WorkerTimeout`, and `WorkerRejected(reason)` are not coalesced.
+- The driver workload passes through the same service-owned pending
+  cap before it becomes a call batch, so this specimen does not teach
+  a raw request-sized `Effect::Batch` as the copied path.
 
 ## What feels worse
 
 - The frontend has to thread `qid` through a closure passed to
-  `call(worker, ..., timeout).then(move |outcome| FrontendMsg::WorkerDone(qid, outcome))`.
+  `call_request(worker, ..., timeout).then(move |outcome| FrontendEvent::WorkerDone(qid, outcome))`.
   The closure-form `.reply` is the price for stuffing a correlator
   into the continuation message.
 - `Frontend::Submit / WorkerDone` enum still carries the message
