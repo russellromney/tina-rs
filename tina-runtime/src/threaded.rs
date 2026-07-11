@@ -559,6 +559,7 @@ where
             observer,
             io_loop_factory,
             DEFAULT_STARTUP_HANDSHAKE_TIMEOUT,
+            STARTUP_CLEANUP_JOIN_TIMEOUT,
             |name, worker| thread::Builder::new().name(name).spawn(worker),
         )
     }
@@ -571,6 +572,7 @@ where
         observer: Option<Arc<dyn TraceObserver>>,
         io_loop_factory: G,
         startup_timeout: Duration,
+        startup_cleanup_timeout: Duration,
         spawner: H,
     ) -> Result<Self, StartupError>
     where
@@ -630,7 +632,7 @@ where
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 let _ = commands.try_send(ThreadedCommand::Shutdown);
-                let cleanup_deadline = Instant::now() + STARTUP_CLEANUP_JOIN_TIMEOUT;
+                let cleanup_deadline = Instant::now() + startup_cleanup_timeout;
                 while !handle.is_finished() && Instant::now() < cleanup_deadline {
                     thread::sleep(Duration::from_millis(1));
                 }
@@ -2062,6 +2064,7 @@ mod startup_tests {
             None,
             || io_loop(Global),
             Duration::from_millis(10),
+            STARTUP_CLEANUP_JOIN_TIMEOUT,
             |_name, _worker| Err(std::io::Error::other("injected spawn failure")),
         )
         .err()
@@ -2083,6 +2086,7 @@ mod startup_tests {
             None,
             || io_loop(Global),
             Duration::from_millis(10),
+            STARTUP_CLEANUP_JOIN_TIMEOUT,
             |_name, _worker| thread::Builder::new().spawn(|| ThreadedWorkerExit::clean(Vec::new())),
         )
         .err()
@@ -2099,6 +2103,7 @@ mod startup_tests {
         let timeout = Duration::from_millis(10);
         let worker_exited = Arc::new(AtomicBool::new(false));
         let worker_exited_after_run = Arc::clone(&worker_exited);
+        let (worker_started_tx, worker_started_rx) = std::sync::mpsc::sync_channel(0);
         let error = ThreadedRuntime::try_with_config_observer_io_loop_and_spawner(
             SingleShard,
             DefaultThreadedMailboxFactory,
@@ -2106,13 +2111,21 @@ mod startup_tests {
             None,
             || io_loop(Global),
             timeout,
-            |_name, worker| {
-                thread::Builder::new().spawn(move || {
+            Duration::from_secs(5),
+            move |_name, worker| {
+                let handle = thread::Builder::new().spawn(move || {
+                    worker_started_tx
+                        .send(())
+                        .expect("constructor still waits for the worker");
                     thread::sleep(Duration::from_millis(30));
                     let exit = worker();
                     worker_exited_after_run.store(true, Ordering::Release);
                     exit
-                })
+                })?;
+                worker_started_rx
+                    .recv()
+                    .expect("worker wrapper reports that it started");
+                Ok(handle)
             },
         )
         .err()
