@@ -11,6 +11,18 @@ valid; the long-form history lives in
 
 ## Active
 
+### 2026-07-11 Raw `impl Isolate` → macro cohort (local I/O + sqlite + cross-shard)
+
+- `specimen_local_io_codec_ipc` — Ingest/Seeder/CopyPump, AdminServer/Client,
+  KeyspaceServer/Client, live Unix Probe all on `#[tina_runtime::isolate]`
+- `specimen_sqlite_counter` Caller/QueryCaller
+- `specimen_cross_shard_child_ownership` Worker
+
+Still raw: websocket/realtime rooms, mini_saas Controller/NotifySink,
+sharded_fanout_read, grpc StreamingEchoSource (specialized Io/Send/protocol
+shapes).
+
+
 Finding numbers are stable across phases — when a finding closes it
 moves to the [Closed](#closed) section below with the same number.
 
