@@ -1409,7 +1409,22 @@ where
             });
         }
 
-        match runtime.call_blocking(handles.pool, WorkerPoolMsg::PressureReport, remaining)? {
+        let pressure =
+            match runtime.call_blocking(handles.pool, WorkerPoolMsg::PressureReport, remaining) {
+                Ok(outcome) => outcome,
+                // The call deadline and the helper's drain deadline are the same
+                // budget. Under scheduler pressure the target timeout can settle
+                // after call_blocking's delivery grace, but that is still a drain
+                // timeout rather than a runtime failure.
+                Err(ThreadedRuntimeError::HostWaitTimeout) => {
+                    return Ok(KeepalivePoolDrainOutcome::TimedOut {
+                        leased: last_leased,
+                    });
+                }
+                Err(error) => return Err(error),
+            };
+
+        match pressure {
             CallOutcome::Replied(WorkerPoolReply::Pressure(report)) => {
                 last_leased = report.leased;
                 if report.leased == 0 {
