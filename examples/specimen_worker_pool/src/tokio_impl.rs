@@ -4,9 +4,16 @@ use tokio::runtime::Builder;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
-use crate::{CLIENTS, Report, WORKERS, expected_for};
+use crate::{CLIENTS, DRIVER_BURST_CAP, Report, WORKERS, expected_for};
 
 type Job = (u64, oneshot::Sender<u64>);
+
+async fn join_workers(mut workers: JoinSet<()>) -> anyhow::Result<()> {
+    while let Some(joined) = workers.join_next().await {
+        joined.map_err(|error| anyhow::anyhow!("worker task: {error}"))?;
+    }
+    Ok(())
+}
 
 pub fn run() -> anyhow::Result<Report> {
     let rt = Builder::new_multi_thread()
@@ -17,7 +24,7 @@ pub fn run() -> anyhow::Result<Report> {
         let mut worker_txs = Vec::with_capacity(WORKERS);
         let mut worker_set = JoinSet::new();
         for w in 0..WORKERS as u64 {
-            let (tx, mut rx) = mpsc::channel::<Job>(8);
+            let (tx, mut rx) = mpsc::channel::<Job>(DRIVER_BURST_CAP);
             worker_txs.push(tx);
             let work = Duration::from_millis(5 + (w * 7) % 20);
             worker_set.spawn(async move {
@@ -56,9 +63,29 @@ pub fn run() -> anyhow::Result<Report> {
             }
         }
         drop(worker_txs);
-        while worker_set.join_next().await.is_some() {}
+        join_workers(worker_set).await?;
 
         report.exit_clean = true;
         Ok(report)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_task_failure_cannot_report_clean_shutdown() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        let result = runtime.block_on(async {
+            let mut workers = JoinSet::new();
+            workers.spawn(async { panic!("intentional worker failure") });
+            join_workers(workers).await
+        });
+        let error = result.expect_err("worker panic must remain visible");
+        assert!(error.to_string().contains("worker task"));
+    }
 }
