@@ -53,6 +53,15 @@ peer close as `CallError::Io`, and proves owner stop cancels a genuinely parked
 write with no report or in-flight authority left. Unix peer-buffer Full is a
 parking condition rather than a user-facing `Full` terminal outcome; the test
 therefore proves bounded park-and-resume instead of inventing a false variant.
+The refill proof also saturates a one-slot service-event mailbox when the
+parked write resumes and proves the continuation is retained through overflow.
+
+Adversarial review found that both Unix and adjacent TCP write-all helpers
+accepted a plausible fabricated or stale owned reply without proving that a
+write was armed or that the reply carried the original allocation. Both now
+track one in-flight write, validate allocation identity, reject unarmed/stale
+advance calls with `InvariantViolation`, and leave genuine in-flight work armed
+when a stale reply is rejected.
 
 This closes the framework prerequisite found by
 `tina-extension-custom-codec`. Migrating that extension to event-only service

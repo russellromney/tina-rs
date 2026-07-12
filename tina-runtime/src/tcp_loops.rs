@@ -82,6 +82,8 @@ impl<I: Isolate> std::fmt::Debug for ReadExactStep<I> {
 pub struct TcpWriteAll {
     stream: StreamId,
     buffer: Option<Vec<u8>>,
+    allocation: usize,
+    in_flight: bool,
     written: usize,
     total: usize,
 }
@@ -90,26 +92,34 @@ impl TcpWriteAll {
     /// Builds a write-all helper. Caller chooses the byte slice.
     pub fn new(stream: StreamId, bytes: Vec<u8>) -> Self {
         let total = bytes.len();
+        let allocation = bytes.as_ptr() as usize;
         Self {
             stream,
             buffer: Some(bytes),
+            allocation,
+            in_flight: false,
             written: 0,
             total,
         }
     }
 
-    /// Returns the effect that issues the next `tcp_write`. Returns
-    /// `None` if the loop has nothing left to send.
+    /// Returns the effect that issues the next `tcp_write`. Returns `None` if
+    /// the loop is complete or already has a write in flight.
     pub fn next_effect<I, M, F>(&mut self, on_progress: F) -> Option<tina::Effect<I>>
     where
         I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(Result<TcpWriteOwnedReply, TcpWriteOwnedError>) -> M + Send + 'static,
         M: 'static,
     {
-        if self.written >= self.total {
+        if self.written >= self.total || self.in_flight {
             return None;
         }
         let bytes = self.buffer.take()?;
+        if bytes.as_ptr() as usize != self.allocation {
+            self.buffer = Some(bytes);
+            return None;
+        }
+        self.in_flight = true;
         Some(tcp_write_owned_from(self.stream, bytes, self.written).then(on_progress))
     }
 
@@ -131,6 +141,15 @@ impl TcpWriteAll {
         F: FnOnce(Result<TcpWriteOwnedReply, TcpWriteOwnedError>) -> M + Send + 'static,
         M: 'static,
     {
+        let returned_allocation = match &reply {
+            Ok(reply) => reply.bytes.as_ptr() as usize,
+            Err(error) => error.bytes.as_ptr() as usize,
+        };
+        if !self.in_flight || returned_allocation != self.allocation {
+            return LoopStep::Failed(CallError::InvariantViolation);
+        }
+        self.in_flight = false;
+
         match reply {
             Ok(reply) => {
                 if reply.bytes.len() != self.total {
@@ -151,6 +170,7 @@ impl TcpWriteAll {
                     self.buffer = Some(reply.bytes);
                     LoopStep::Done(self.written)
                 } else {
+                    self.in_flight = true;
                     let effect = tcp_write_owned_from(self.stream, reply.bytes, self.written)
                         .then(on_progress);
                     LoopStep::Pending(effect)
@@ -171,6 +191,11 @@ impl TcpWriteAll {
     /// Bytes that still need to ship.
     pub fn remaining(&self) -> usize {
         self.total.saturating_sub(self.written)
+    }
+
+    /// Returns whether one owned write currently holds the buffer.
+    pub const fn is_in_flight(&self) -> bool {
+        self.in_flight
     }
 }
 
@@ -379,17 +404,20 @@ mod tests {
         StreamId::new(id)
     }
 
-    fn wrote(bytes: &[u8], written: usize) -> Result<TcpWriteOwnedReply, TcpWriteOwnedError> {
-        Ok(TcpWriteOwnedReply {
-            bytes: bytes.to_vec(),
-            written,
-        })
+    fn arm_write(
+        helper: &mut TcpWriteAll,
+        written: usize,
+    ) -> Result<TcpWriteOwnedReply, TcpWriteOwnedError> {
+        let bytes = helper.buffer.take().expect("buffer stored");
+        helper.in_flight = true;
+        Ok(TcpWriteOwnedReply { bytes, written })
     }
 
     #[test]
     fn write_all_completes_in_one_step_when_kernel_writes_everything() {
         let mut helper = TcpWriteAll::new(stream(1), b"hello".to_vec());
-        let step: LoopStep<DummyIsolate, usize> = helper.advance(wrote(b"hello", 5), Msg::Wrote);
+        let reply = arm_write(&mut helper, 5);
+        let step: LoopStep<DummyIsolate, usize> = helper.advance(reply, Msg::Wrote);
         assert!(matches!(step, LoopStep::Done(5)));
         assert_eq!(helper.written(), 5);
         assert_eq!(helper.remaining(), 0);
@@ -400,6 +428,7 @@ mod tests {
         let mut helper = TcpWriteAll::new(stream(1), b"hello".to_vec());
         let bytes = helper.buffer.take().expect("buffer stored");
         let allocation = bytes.as_ptr();
+        helper.in_flight = true;
         let step: LoopStep<DummyIsolate, usize> =
             helper.advance(Ok(TcpWriteOwnedReply { bytes, written: 5 }), Msg::Wrote);
         assert!(matches!(step, LoopStep::Done(5)));
@@ -412,23 +441,24 @@ mod tests {
     #[test]
     fn write_all_loops_on_partial_writes() {
         let mut helper = TcpWriteAll::new(stream(1), b"hello".to_vec());
-        let step: LoopStep<DummyIsolate, usize> = helper.advance(wrote(b"hello", 2), Msg::Wrote);
+        let reply = arm_write(&mut helper, 2);
+        let step: LoopStep<DummyIsolate, usize> = helper.advance(reply, Msg::Wrote);
         assert!(matches!(step, LoopStep::Pending(_)));
         assert_eq!(helper.written(), 2);
         assert_eq!(helper.remaining(), 3);
 
-        let step: LoopStep<DummyIsolate, usize> = helper.advance(wrote(b"hello", 3), Msg::Wrote);
-        assert!(matches!(step, LoopStep::Done(5)));
-        assert_eq!(helper.remaining(), 0);
+        assert!(helper.is_in_flight());
     }
 
     #[test]
     fn write_all_surfaces_call_error() {
         let mut helper = TcpWriteAll::new(stream(1), b"hello".to_vec());
+        let bytes = helper.buffer.take().expect("buffer stored");
+        helper.in_flight = true;
         let step: LoopStep<DummyIsolate, usize> = helper.advance(
             Err(TcpWriteOwnedError {
                 error: CallError::Io,
-                bytes: b"hello".to_vec(),
+                bytes,
             }),
             Msg::Wrote,
         );
@@ -476,7 +506,8 @@ mod tests {
     #[test]
     fn write_all_treats_zero_progress_with_pending_data_as_io_failure() {
         let mut helper = TcpWriteAll::new(stream(1), b"hello".to_vec());
-        let step: LoopStep<DummyIsolate, usize> = helper.advance(wrote(b"hello", 0), Msg::Wrote);
+        let reply = arm_write(&mut helper, 0);
+        let step: LoopStep<DummyIsolate, usize> = helper.advance(reply, Msg::Wrote);
         assert!(
             matches!(step, LoopStep::Failed(CallError::Io)),
             "zero-progress write on non-empty pending must be a typed failure",
@@ -486,7 +517,8 @@ mod tests {
     #[test]
     fn write_all_rejects_impossible_completion_count() {
         let mut helper = TcpWriteAll::new(stream(1), b"hello".to_vec());
-        let step: LoopStep<DummyIsolate, usize> = helper.advance(wrote(b"hello", 6), Msg::Wrote);
+        let reply = arm_write(&mut helper, 6);
+        let step: LoopStep<DummyIsolate, usize> = helper.advance(reply, Msg::Wrote);
         assert!(matches!(
             step,
             LoopStep::Failed(CallError::InvariantViolation)
@@ -496,12 +528,60 @@ mod tests {
     #[test]
     fn write_all_rejects_a_changed_owned_buffer_length() {
         let mut helper = TcpWriteAll::new(stream(1), b"hello".to_vec());
-        let step: LoopStep<DummyIsolate, usize> = helper.advance(wrote(b"hel", 3), Msg::Wrote);
+        let _ = helper.buffer.take();
+        let bytes = b"hel".to_vec();
+        helper.allocation = bytes.as_ptr() as usize;
+        helper.in_flight = true;
+        let step: LoopStep<DummyIsolate, usize> =
+            helper.advance(Ok(TcpWriteOwnedReply { bytes, written: 3 }), Msg::Wrote);
         assert!(matches!(
             step,
             LoopStep::Failed(CallError::InvariantViolation)
         ));
         assert_eq!(helper.remaining(), 5);
+    }
+
+    #[test]
+    fn write_all_rejects_unarmed_and_stale_owned_replies() {
+        let mut unarmed = TcpWriteAll::new(stream(1), b"hello".to_vec());
+        let step: LoopStep<DummyIsolate, usize> = unarmed.advance(
+            Ok(TcpWriteOwnedReply {
+                bytes: b"hello".to_vec(),
+                written: 5,
+            }),
+            Msg::Wrote,
+        );
+        assert!(matches!(
+            step,
+            LoopStep::Failed(CallError::InvariantViolation)
+        ));
+
+        let mut pending = TcpWriteAll::new(stream(1), b"hello".to_vec());
+        let live_effect = pending
+            .next_effect::<DummyIsolate, _, _>(Msg::Wrote)
+            .expect("write arms");
+        assert!(pending.is_in_flight());
+        assert!(
+            pending
+                .next_effect::<DummyIsolate, _, _>(Msg::Wrote)
+                .is_none()
+        );
+        let step: LoopStep<DummyIsolate, usize> = pending.advance(
+            Ok(TcpWriteOwnedReply {
+                bytes: b"hello".to_vec(),
+                written: 1,
+            }),
+            Msg::Wrote,
+        );
+        assert!(matches!(
+            step,
+            LoopStep::Failed(CallError::InvariantViolation)
+        ));
+        assert!(
+            pending.is_in_flight(),
+            "stale reply cannot disarm live work"
+        );
+        drop(live_effect);
     }
 
     #[test]

@@ -173,7 +173,9 @@ For an event-only split service, `UnixWriteAll::next_service_event` and
 `advance_service_event` accept a domain-event translator and supply the private
 `ServiceMessage::Event` envelope. They preserve the full
 `UnixWriteOwnedReply`, including the caller-owned buffer on failure. Generic
-message isolates continue to use `next_effect` and `advance`.
+message isolates continue to use `next_effect` and `advance`. Both Unix and
+TCP write-all helpers reject unarmed or wrong-allocation replies as invariant
+violations; `is_in_flight` distinguishes an armed write from a completed loop.
 
 ## Native gRPC
 

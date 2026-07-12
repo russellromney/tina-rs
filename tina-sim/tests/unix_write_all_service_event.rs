@@ -27,6 +27,7 @@ impl Shard for UnixServiceShard {
 #[derive(Debug)]
 enum ServerEvent {
     Start,
+    BeginRead,
     Bound(UnixBindReply),
     Accepted(UnixAcceptReply),
     Read(UnixReadReply),
@@ -53,6 +54,11 @@ impl Server {
         match event {
             ServerEvent::Start => {
                 unix_bind(self.path.clone()).then_service_event(ServerEvent::Bound)
+            }
+            ServerEvent::BeginRead => {
+                self.read = true;
+                unix_read(self.stream.expect("accepted stream"), 2)
+                    .then_service_event(ServerEvent::Read)
             }
             ServerEvent::Bound(Ok((listener, _))) => {
                 self.listener = Some(listener);
@@ -107,6 +113,7 @@ struct WriterReport {
 #[derive(Debug)]
 enum WriterEvent {
     Start,
+    Noise,
     Connected(Result<UnixStreamId, CallError>),
     Wrote(UnixWriteOwnedReply),
     Closed(UnixStreamCloseReply),
@@ -136,6 +143,7 @@ impl Writer {
             WriterEvent::Start => {
                 unix_connect(self.path.clone()).then_service_event(WriterEvent::Connected)
             }
+            WriterEvent::Noise => noop(),
             WriterEvent::Connected(Ok(stream)) => {
                 self.stream = Some(stream);
                 let bytes = std::mem::take(&mut self.payload);
@@ -282,6 +290,49 @@ fn live_runtime_and_simulator_share_event_only_write_all_authoring() {
     assert!(sim_report.allocation_preserved);
     assert_eq!(sim_report.write_completions, payload.len().div_ceil(2));
     assert_eq!(*sim_received.lock().unwrap(), payload);
+}
+
+#[test]
+fn full_event_mailbox_retains_resumed_write_continuation() {
+    let payload = b"mailbox-refill".to_vec();
+    let path = socket_path("event-mailbox-full");
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let (writer, report, armed) = writer(path.clone(), payload.clone());
+    let mut config = SimulatorConfig::default();
+    config.unix.default_inbound_capacity = 1;
+    config.unix.default_write_cap = 1;
+    let mut sim = Simulator::new(UnixServiceShard, config);
+    let server = sim.register_event_service(
+        Server {
+            path,
+            listener: None,
+            stream: None,
+            received: Arc::clone(&received),
+            close_on_accept: false,
+            read: false,
+        },
+        8,
+    );
+    let client = sim.register_event_service(writer, 1);
+    assert!(sim.try_send_event(server, ServerEvent::Start).is_ok());
+    assert!(sim.try_send_event(client, WriterEvent::Start).is_ok());
+    while !armed.load(Ordering::Acquire) {
+        assert!(sim.step() > 0, "writer must park after partial progress");
+    }
+
+    assert!(sim.try_send_event(client, WriterEvent::Noise).is_ok());
+    assert!(sim.try_send_event(server, ServerEvent::BeginRead).is_ok());
+    sim.run_until_quiescent();
+
+    assert_eq!(
+        report.lock().unwrap().as_ref(),
+        Some(&WriterReport {
+            outcome: Ok(payload.len()),
+            allocation_preserved: true,
+            write_completions: payload.len(),
+        })
+    );
+    assert_eq!(*received.lock().unwrap(), payload);
 }
 
 #[test]
