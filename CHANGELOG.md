@@ -4,6 +4,16 @@ This file records completed work.
 
 ## Unreleased
 
+### TCP echo example
+
+- Added `examples/specimen_tcp_echo`, a canonical TCP echo server: one listener
+  isolate plus one `EchoConnection` isolate per accepted stream. The same
+  connection isolate runs live over a real loopback socket and, unchanged,
+  inside `tina-sim`'s `Simulator` replayed byte-for-byte from a fixed seed to a
+  saved trace hash. Ships live, simulator, README byte-sync, and host-burst
+  load-shed tests. Documented in a new README section after "Bounded By
+  Construction".
+
 ### LocalSystem host-control parity
 
 - `LocalSystem` and `LocalMultiShardSystem` now forward typed terminal-result

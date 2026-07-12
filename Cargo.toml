@@ -23,6 +23,7 @@ members = [
 exclude = [
     "fuzz",
     "examples/specimen_real_io_chat",
+    "examples/specimen_tcp_echo",
     "examples/specimen_rpc",
     "examples/specimen_mini_keyspace",
     "examples/specimen_axum_counter",

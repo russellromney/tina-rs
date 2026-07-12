@@ -175,6 +175,126 @@ and clean threaded-runtime shutdown. Continue with the
 [First Isolate](docs/tina-user-guide/02-first-isolate.md) chapter and the
 [user-guide index](docs/tina-user-guide/README.md).
 
+## Real I/O: A TCP Echo Server
+
+A TCP echo server is one listener isolate plus one isolate per connection. The
+listener binds a loopback port, accepts in a bounded loop, and spawns a fresh
+`EchoConnection` for each accepted stream. Each connection reads a chunk, writes
+the identical bytes back, and repeats until the peer half-closes. One connection
+is one isolate; nothing is shared between them.
+
+Clone the repository and run:
+
+```sh
+cargo run --manifest-path examples/specimen_tcp_echo/Cargo.toml
+```
+
+```text
+echo: sent 38 bytes, got them back unchanged
+load shed: burst=32 cap=4 -> admitted=4 Full=28 (listener cap for reference: 8)
+```
+
+<!-- TODO: tina_echo.gif -->
+
+The connection isolate is the whole story. Its checked-in source is
+[`examples/specimen_tcp_echo/src/lib.rs`](examples/specimen_tcp_echo/src/lib.rs),
+which normal all-target workspace checks compile.
+
+```rust
+/// One connection's lifecycle, one message per I/O completion.
+#[derive(Debug, Clone)]
+pub enum EchoConnectionMsg {
+    /// Kick off the first read.
+    Begin,
+    /// A read completed (bytes, or an I/O error).
+    Read(TcpReadReply),
+    /// A write completed (accepted byte count, or an I/O error).
+    Wrote(TcpWriteReply),
+    /// The stream close completed.
+    Closed(TcpStreamCloseReply),
+}
+
+/// One accepted TCP stream, echoed back to its peer.
+#[derive(Debug)]
+pub struct EchoConnection {
+    stream: StreamId,
+    max_chunk: usize,
+    /// Bytes read but not yet fully written back. A partial write
+    /// leaves the tail here so the echo is never truncated.
+    pending: Vec<u8>,
+}
+
+impl EchoConnection {
+    fn new(stream: StreamId, max_chunk: usize) -> Self {
+        Self {
+            stream,
+            max_chunk,
+            pending: Vec::new(),
+        }
+    }
+}
+
+#[tina_runtime::isolate(message = EchoConnectionMsg)]
+impl EchoConnection {
+    fn handle(
+        &mut self,
+        msg: EchoConnectionMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            EchoConnectionMsg::Begin => {
+                tcp_read(self.stream, self.max_chunk).then(EchoConnectionMsg::Read)
+            }
+            EchoConnectionMsg::Read(Ok(bytes)) => {
+                if bytes.is_empty() {
+                    tcp_close_stream(self.stream).then(EchoConnectionMsg::Closed)
+                } else {
+                    self.pending = bytes;
+                    tcp_write(self.stream, self.pending.clone()).then(EchoConnectionMsg::Wrote)
+                }
+            }
+            EchoConnectionMsg::Wrote(Ok(count)) => {
+                self.pending.drain(..count);
+                if self.pending.is_empty() {
+                    tcp_read(self.stream, self.max_chunk).then(EchoConnectionMsg::Read)
+                } else {
+                    tcp_write(self.stream, self.pending.clone()).then(EchoConnectionMsg::Wrote)
+                }
+            }
+            EchoConnectionMsg::Closed(Ok(())) => stop(),
+            EchoConnectionMsg::Read(Err(_))
+            | EchoConnectionMsg::Wrote(Err(_))
+            | EchoConnectionMsg::Closed(Err(_)) => stop(),
+        }
+    }
+}
+```
+
+The honest part is what runs this code. The *same* `EchoConnection` source — not
+a reimplementation — drives two runtimes unchanged:
+
+- live, over a real loopback socket on `ThreadedRuntime`
+  ([`tests/live_echo.rs`](examples/specimen_tcp_echo/tests/live_echo.rs));
+- deterministically, inside `tina-sim`'s `Simulator` driven by a scripted peer
+  and replayed byte-for-byte from a fixed seed to a saved trace hash
+  ([`tests/sim_echo.rs`](examples/specimen_tcp_echo/tests/sim_echo.rs)).
+
+`tcp_read` / `tcp_write` / `tcp_close_stream` produce the same `Effect::Io` in
+both places, so the connection's read-echo-read state machine is the same
+program whether a kernel socket or a seeded simulator answers the call.
+
+Backpressure stays explicit but honest. A sequential echo self-paces one read at
+a time, so the wire can never overflow a connection's mailbox. The bounded
+contract still governs every isolate: when a producer outruns a bounded worker,
+the runtime returns a typed `Full` instead of growing an unbounded queue. That
+is the `load shed` line above; the assertion behind it lives in the live test.
+
+Run the proofs directly:
+
+```sh
+cargo test --manifest-path examples/specimen_tcp_echo/Cargo.toml
+```
+
 ## Programming Model
 
 Tina is not a drop-in replacement for Tokio. It is a service architecture
