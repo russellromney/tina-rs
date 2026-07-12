@@ -321,8 +321,8 @@ where
         self.tx.try_send(command)
     }
 
-    /// Blocking bounded admission (used by control-plane `call`/shutdown, never
-    /// the per-request hot path).
+    /// Blocking bounded admission used only by worker-owned shutdown paths,
+    /// never by ordinary host-control calls or the per-request hot path.
     pub(crate) fn send(
         &self,
         command: ThreadedCommand<S, F>,
@@ -1074,9 +1074,9 @@ where
     /// Registers a typed waiter for the targeted isolate's `IsolateStopped`
     /// event on the worker shard.
     ///
-    /// See [`Runtime::observe_isolate_complete`] for semantics. If the worker
-    /// is already stopped the returned waiter resolves immediately to
-    /// [`crate::WaitError::RuntimeStopped`].
+    /// See [`Runtime::observe_isolate_complete`] for waiter semantics. A
+    /// stopped worker or saturated host-control queue is reported eagerly as
+    /// [`ThreadedRuntimeError`] before a waiter is returned.
     pub fn observe_isolate_complete<M: 'static, R: 'static>(
         &self,
         address: Address<M, R>,

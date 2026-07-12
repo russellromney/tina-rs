@@ -319,7 +319,9 @@ pub enum ThreadedRegisterBootstrapError<M> {
     /// registration command was admitted and the bootstrap message is
     /// returned untouched.
     CommandClosed(M),
-    /// The worker thread stopped before it could process the command.
+    /// The worker stopped after command admission but before the host received
+    /// a reply. The command may already have consumed the isolate and
+    /// bootstrap message, so no message authority can be returned.
     WorkerStopped,
     /// A multi-shard operation targeted a shard this runtime does not own.
     UnknownShard(ShardId, M),

@@ -221,6 +221,24 @@ impl ResultProducer {
         stop_with(7_u32)
     }
 }
+
+#[derive(Debug)]
+enum ResultProducerMsMsg {
+    Finish,
+}
+
+struct ResultProducerMs;
+
+#[tina_runtime::isolate(message = ResultProducerMsMsg, shard = TestShard)]
+impl ResultProducerMs {
+    fn handle(
+        &mut self,
+        _msg: ResultProducerMsMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        stop_with(9_u32)
+    }
+}
 #[tina_runtime::isolate(message = SpinnerSimpleMsg, reply = ())]
 impl SpinnerSimple {
     fn handle(
@@ -303,12 +321,22 @@ fn single_shard_registration_full_returns_promptly_without_late_constructor() {
         .expect("fill command queue");
 
     let constructed = Arc::new(AtomicU32::new(0));
+    let constructor_drops = Arc::new(AtomicU32::new(0));
     let runtime_for_register = Arc::clone(&runtime);
     let constructed_for_register = Arc::clone(&constructed);
+    let constructor_drops_for_register = Arc::clone(&constructor_drops);
     let (tx, rx) = std::sync::mpsc::channel();
     let register = thread::spawn(move || {
+        struct ConstructorAuthority(Arc<AtomicU32>);
+        impl Drop for ConstructorAuthority {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let authority = ConstructorAuthority(constructor_drops_for_register);
         let result = runtime_for_register
             .register_with_capacity_using::<EchoSimple, Infallible, _>(4, move |_| {
+                let _authority = authority;
                 constructed_for_register.fetch_add(1, Ordering::AcqRel);
                 EchoSimple
             })
@@ -326,6 +354,11 @@ fn single_shard_registration_full_returns_promptly_without_late_constructor() {
     assert_eq!(result.unwrap(), Err(ThreadedRuntimeError::CommandFull));
     register.join().expect("registration thread");
     assert_eq!(constructed.load(Ordering::Acquire), 0);
+    assert_eq!(
+        constructor_drops.load(Ordering::Acquire),
+        1,
+        "a rejected ordinary registration consumes and drops its constructor exactly once"
+    );
 
     release.store(true, Ordering::Release);
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -471,6 +504,61 @@ fn observation_full_is_eager_precise_and_does_not_claim_result_authority() {
         .expect("finish producer");
     assert_eq!(result.wait(Duration::from_secs(2)), Ok(7));
     runtime.shutdown().expect("clean shutdown");
+}
+
+#[test]
+fn multi_shard_observation_full_is_eager_and_refills_on_the_target_shard() {
+    let runtime = multi_runtime(1);
+    let producer = runtime
+        .register_with_capacity_on::<ResultProducerMs, Infallible>(
+            ShardId::new(1),
+            ResultProducerMs,
+            2,
+        )
+        .expect("register result producer");
+    let release = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let spinner = runtime
+        .register_with_capacity_on::<SpinnerMS, Infallible>(
+            ShardId::new(1),
+            SpinnerMS {
+                flag: Arc::clone(&release),
+                entered: Arc::clone(&entered),
+            },
+            4,
+        )
+        .expect("register target-shard spinner");
+    runtime
+        .try_send(spinner, SpinnerMsg::Tick)
+        .expect("occupy target shard");
+    while !entered.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
+    runtime
+        .try_send(spinner, SpinnerMsg::Tick)
+        .expect("fill target-shard command queue");
+
+    assert!(matches!(
+        runtime.observe_result::<u32, _, _>(producer),
+        Err(tina_runtime::ResultWaitError::CommandFull)
+    ));
+
+    release.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let result = loop {
+        match runtime.observe_result::<u32, _, _>(producer) {
+            Ok(waiter) => break waiter,
+            Err(tina_runtime::ResultWaitError::CommandFull) if Instant::now() < deadline => {
+                thread::yield_now();
+            }
+            Err(error) => panic!("multi result authority after refill: {error:?}"),
+        }
+    };
+    runtime
+        .try_send(producer, ResultProducerMsMsg::Finish)
+        .expect("finish multi producer");
+    assert_eq!(result.wait(Duration::from_secs(2)), Ok(9));
+    runtime.shutdown().expect("clean multi shutdown");
 }
 
 #[test]

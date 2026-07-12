@@ -5,16 +5,16 @@
 //! and a custom mailbox that refuses the prefill leaves no registered isolate.
 
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use tina::TrySendError;
 use tina::prelude::*;
+use tina::{Mailbox, TrySendError};
 use tina_runtime::{
-    CallOutcome, DefaultMailboxFactory, DefaultThreadedMailboxFactory, MultiShardRuntime,
-    RegisterBootstrapError, Runtime, ThreadedMultiShardRuntime, ThreadedRegisterBootstrapError,
-    ThreadedRuntime, ThreadedRuntimeConfig,
+    CallOutcome, DefaultMailboxFactory, DefaultThreadedMailboxFactory, MailboxFactory,
+    MultiShardRuntime, RegisterBootstrapError, Runtime, ThreadedMultiShardRuntime,
+    ThreadedRegisterBootstrapError, ThreadedRuntime, ThreadedRuntimeConfig, ThreadedRuntimeError,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -76,6 +76,88 @@ enum GateMsg {
 struct Gate {
     entered: Arc<AtomicBool>,
     release: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+struct DropProbe(Arc<AtomicU32>);
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug)]
+enum OwnedBootstrapMsg {
+    Bootstrap(DropProbe),
+}
+
+struct OwnedBootstrapService {
+    drops: Arc<AtomicU32>,
+}
+
+impl Drop for OwnedBootstrapService {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[tina_runtime::isolate(message = OwnedBootstrapMsg)]
+impl OwnedBootstrapService {
+    fn handle(
+        &mut self,
+        message: OwnedBootstrapMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match message {
+            OwnedBootstrapMsg::Bootstrap(_authority) => noop(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct FailureGate {
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+impl FailureGate {
+    fn enter_and_wait(&self) {
+        let mut state = self.state.lock().expect("failure gate");
+        state.0 = true;
+        self.changed.notify_all();
+        while !state.1 {
+            state = self.changed.wait(state).expect("failure gate wait");
+        }
+    }
+
+    fn wait_until_entered(&self) {
+        let mut state = self.state.lock().expect("failure gate");
+        while !state.0 {
+            state = self.changed.wait(state).expect("failure gate wait");
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("failure gate");
+        state.1 = true;
+        self.changed.notify_all();
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TransitionPanicMailboxFactory {
+    gate: Arc<FailureGate>,
+}
+
+impl MailboxFactory for TransitionPanicMailboxFactory {
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        if capacity == 13 {
+            self.gate.enter_and_wait();
+            panic!("intentional worker transition failure");
+        }
+        DefaultThreadedMailboxFactory.create(capacity)
+    }
 }
 
 #[tina_runtime::isolate(message = GateMsg)]
@@ -269,6 +351,93 @@ fn threaded_bootstrap_closed_command_channel_returns_message() {
         other => panic!("expected recoverable closed command channel, got {other:?}"),
     }
     assert_eq!(delivered.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn threaded_bootstrap_accepted_before_worker_failure_does_not_return_message_authority() {
+    let gate = Arc::new(FailureGate::default());
+    let runtime = Arc::new(ThreadedRuntime::with_config(
+        SingleShard,
+        TransitionPanicMailboxFactory {
+            gate: Arc::clone(&gate),
+        },
+        ThreadedRuntimeConfig {
+            command_capacity: 1,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    ));
+
+    let failing_runtime = Arc::clone(&runtime);
+    let failure = std::thread::spawn(move || {
+        let (service, _, _) = fresh_service();
+        failing_runtime.register_with_capacity::<Service, Infallible>(service, 13)
+    });
+    gate.wait_until_entered();
+
+    let service_drops = [Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0))];
+    let message_drops = [Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0))];
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let mut registrations = Vec::new();
+    for index in 0..2 {
+        let runtime = Arc::clone(&runtime);
+        let result_tx = result_tx.clone();
+        let service_drops = Arc::clone(&service_drops[index]);
+        let message_drops = Arc::clone(&message_drops[index]);
+        registrations.push(std::thread::spawn(move || {
+            let result = runtime.register_with_capacity_and_bootstrap::<_, Infallible>(
+                OwnedBootstrapService {
+                    drops: service_drops,
+                },
+                4,
+                OwnedBootstrapMsg::Bootstrap(DropProbe(message_drops)),
+            );
+            result_tx
+                .send((index, result.map(|_| ())))
+                .expect("report bootstrap registration");
+        }));
+    }
+    drop(result_tx);
+
+    let (rejected_index, rejected) = result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("one registration must be rejected by the full command queue");
+    assert!(matches!(
+        rejected,
+        Err(ThreadedRegisterBootstrapError::CommandFull(
+            OwnedBootstrapMsg::Bootstrap(_)
+        ))
+    ));
+    drop(rejected);
+    assert_eq!(service_drops[rejected_index].load(Ordering::Acquire), 1);
+    assert_eq!(message_drops[rejected_index].load(Ordering::Acquire), 1);
+
+    let accepted_index = 1 - rejected_index;
+    assert_eq!(service_drops[accepted_index].load(Ordering::Acquire), 0);
+    assert_eq!(message_drops[accepted_index].load(Ordering::Acquire), 0);
+
+    gate.release();
+    assert!(matches!(
+        failure.join().expect("failure registration joins"),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    ));
+    let (reported_index, accepted) = result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("accepted registration settles after worker failure");
+    assert_eq!(reported_index, accepted_index);
+    assert!(matches!(
+        accepted,
+        Err(ThreadedRegisterBootstrapError::WorkerStopped)
+    ));
+    assert_eq!(service_drops[accepted_index].load(Ordering::Acquire), 1);
+    assert_eq!(message_drops[accepted_index].load(Ordering::Acquire), 1);
+    assert!(result_rx.recv_timeout(Duration::from_millis(20)).is_err());
+
+    for registration in registrations {
+        registration.join().expect("bootstrap registration joins");
+    }
+    let runtime = Arc::try_unwrap(runtime).unwrap_or_else(|_| panic!("sole runtime owner"));
+    assert_eq!(runtime.shutdown(), Err(ThreadedRuntimeError::WorkerStopped));
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
