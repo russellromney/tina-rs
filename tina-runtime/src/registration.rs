@@ -357,25 +357,11 @@ where
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
+        let isolate_id = IsolateId::new(self.next_isolate_id);
+        self.next_isolate_id += 1;
         let mailbox = self.create_mailbox::<Box<dyn Any>>(mailbox_capacity);
         let boxed: Box<dyn Any> = Box::new(bootstrap);
-        let address = self.register_entry::<I, Outbound>(
-            isolate,
-            None,
-            Box::new(AnyMailboxAdapter { mailbox }),
-        );
-        let entry_index = self
-            .entry_indexes
-            .get(&address.isolate)
-            .copied()
-            .expect("newly registered entry is indexed");
-        if let Err(err) = self.enqueue_entry_message(entry_index, boxed, None) {
-            let removed = self
-                .entries
-                .pop()
-                .expect("newly registered bootstrap entry exists");
-            debug_assert_eq!(removed.id, address.isolate);
-            self.entry_indexes.remove(&address.isolate);
+        if let Err(err) = mailbox.try_send(boxed) {
             let recover = |b: Box<dyn Any>| {
                 *b.downcast::<I::Message>()
                     .expect("bootstrap message type recovered from boxed Any")
@@ -385,6 +371,21 @@ where
                 TrySendError::Closed(b) => RegisterBootstrapError::Closed(recover(b)),
             });
         }
+        let address = self.register_entry_with_id::<I, Outbound>(
+            isolate,
+            None,
+            Box::new(AnyMailboxAdapter { mailbox }),
+            isolate_id,
+        );
+        let entry_index = self
+            .entry_indexes
+            .get(&address.isolate)
+            .copied()
+            .expect("newly registered entry is indexed");
+        self.entries[entry_index]
+            .call_contexts
+            .borrow_mut()
+            .push_back(None);
         Ok(Address::new_with_generation_in(
             self.system_incarnation,
             address.shard,
@@ -711,6 +712,27 @@ where
     {
         let isolate_id = IsolateId::new(self.next_isolate_id);
         self.next_isolate_id += 1;
+        self.register_entry_with_id::<I, Outbound>(isolate, parent, mailbox, isolate_id)
+    }
+
+    fn register_entry_with_id<I, Outbound>(
+        &mut self,
+        isolate: I,
+        parent: Option<IsolateId>,
+        mailbox: Box<dyn ErasedMailbox>,
+        isolate_id: IsolateId,
+    ) -> RegisteredAddress
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
+        I::Message: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
+        Outbound: 'static,
+    {
         let generation = AddressGeneration::new(0);
 
         let entry_index = self.entries.len();
@@ -878,25 +900,11 @@ where
         I::Fact: IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
     {
+        let isolate_id = IsolateId::new(self.next_isolate_id);
+        self.next_isolate_id += 1;
         let mailbox = self.create_mailbox::<Box<dyn Any>>(mailbox_capacity);
         let boxed: Box<dyn Any> = Box::new(bootstrap);
-        let address = self.register_sendable_entry::<I, Outbound>(
-            isolate,
-            None,
-            Box::new(AnyMailboxAdapter { mailbox }),
-        );
-        let entry_index = self
-            .entry_indexes
-            .get(&address.isolate)
-            .copied()
-            .expect("newly registered entry is indexed");
-        if let Err(err) = self.enqueue_entry_message(entry_index, boxed, None) {
-            let removed = self
-                .entries
-                .pop()
-                .expect("newly registered bootstrap entry exists");
-            debug_assert_eq!(removed.id, address.isolate);
-            self.entry_indexes.remove(&address.isolate);
+        if let Err(err) = mailbox.try_send(boxed) {
             let recover = |b: Box<dyn Any>| {
                 *b.downcast::<I::Message>()
                     .expect("bootstrap message type recovered from boxed Any")
@@ -906,6 +914,21 @@ where
                 TrySendError::Closed(b) => RegisterBootstrapError::Closed(recover(b)),
             });
         }
+        let address = self.register_sendable_entry_with_id::<I, Outbound>(
+            isolate,
+            None,
+            Box::new(AnyMailboxAdapter { mailbox }),
+            isolate_id,
+        );
+        let entry_index = self
+            .entry_indexes
+            .get(&address.isolate)
+            .copied()
+            .expect("newly registered entry is indexed");
+        self.entries[entry_index]
+            .call_contexts
+            .borrow_mut()
+            .push_back(None);
         Ok(Address::new_with_generation_in(
             self.system_incarnation,
             address.shard,
@@ -933,6 +956,27 @@ where
     {
         let isolate_id = IsolateId::new(self.next_isolate_id);
         self.next_isolate_id += 1;
+        self.register_sendable_entry_with_id::<I, Outbound>(isolate, parent, mailbox, isolate_id)
+    }
+
+    fn register_sendable_entry_with_id<I, Outbound>(
+        &mut self,
+        isolate: I,
+        parent: Option<IsolateId>,
+        mailbox: Box<dyn ErasedMailbox>,
+        isolate_id: IsolateId,
+    ) -> RegisteredAddress
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
+        I::Message: 'static,
+        I::Reply: Send + 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
+        Outbound: Send + 'static,
+    {
         let generation = AddressGeneration::new(0);
 
         let entry_index = self.entries.len();

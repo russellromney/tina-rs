@@ -233,7 +233,9 @@ Multi-shard owners add `_on(shard, ...)`. The helper:
    prefill.
 
 If the prefill fails, no address is returned and no isolate is
-registered. There is no cleanup-after-registration path.
+registered. The reserved isolate identifier is not reused, so live and
+simulator identity progression stays deterministic. There is no
+cleanup-after-registration path.
 
 Honesty: the returned address may have a full mailbox until `Bootstrap`
 is delivered. Sending immediately after this call can see `Full`. That

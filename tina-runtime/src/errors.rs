@@ -336,7 +336,9 @@ impl Error for ThreadedRuntimeError {}
 ///
 /// No isolate is registered and no address is returned. The bootstrap message
 /// is returned to the caller so it can decide whether to retry with a larger
-/// mailbox capacity or surface the failure.
+/// mailbox capacity or surface the failure. The reserved isolate identifier is
+/// not reused, matching failed constructor registration and simulator replay
+/// determinism.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegisterBootstrapError<M> {
     /// The mailbox refused the bootstrap message because it was already full.

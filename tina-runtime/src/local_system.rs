@@ -869,8 +869,8 @@ where
     ///
     /// The address is returned only after the bootstrap message has been
     /// admitted to the new bounded mailbox. The lower threaded owner preserves
-    /// bootstrap authority on pre-admission failures and rolls registration
-    /// back when mailbox prefill is refused.
+    /// bootstrap authority on pre-admission failures and publishes no isolate
+    /// entry when mailbox prefill is refused.
     #[allow(private_bounds, clippy::type_complexity)]
     pub fn register_root_with_bootstrap<I, Outbound>(
         &self,

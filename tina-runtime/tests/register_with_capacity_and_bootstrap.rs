@@ -5,12 +5,13 @@
 //! and a custom mailbox that refuses the prefill leaves no registered isolate.
 
 use std::convert::Infallible;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use tina::Mailbox;
 use tina::prelude::*;
+use tina::{Mailbox, TrySendError};
 use tina_runtime::{
     CallOutcome, DefaultMailboxFactory, DefaultThreadedMailboxFactory, MailboxFactory,
     MultiShardRuntime, RegisterBootstrapError, Runtime, ThreadedMultiShardRuntime,
@@ -148,6 +149,43 @@ impl FailureGate {
 #[derive(Debug, Clone)]
 struct TransitionPanicMailboxFactory {
     gate: Arc<FailureGate>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PrefillPanicMailboxFactory;
+
+struct PrefillPanicMailbox<T> {
+    capacity: usize,
+    marker: std::marker::PhantomData<T>,
+}
+
+impl<T> Mailbox<T> for PrefillPanicMailbox<T> {
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn try_send(&self, _message: T) -> Result<(), TrySendError<T>> {
+        panic!("intentional bootstrap prefill panic")
+    }
+
+    fn recv(&self) -> Option<T> {
+        None
+    }
+
+    fn is_empty(&self) -> bool {
+        true
+    }
+
+    fn close(&self) {}
+}
+
+impl MailboxFactory for PrefillPanicMailboxFactory {
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        Box::new(PrefillPanicMailbox {
+            capacity,
+            marker: std::marker::PhantomData,
+        })
+    }
 }
 
 impl MailboxFactory for TransitionPanicMailboxFactory {
@@ -744,6 +782,38 @@ fn capacity_zero_mailbox_refuses_prefill_and_leaves_no_address() {
         0,
         "no message should be delivered after failed bootstrap prefill"
     );
+
+    let (retry, _, _) = fresh_service();
+    let retry = runtime
+        .register_with_capacity_and_bootstrap::<_, Infallible>(retry, 1, Msg::Bootstrap)
+        .expect("registration after refused prefill");
+    assert_eq!(
+        retry.isolate(),
+        IsolateId::new(2),
+        "refused prefill reserves identity without publishing an entry"
+    );
+}
+
+#[test]
+fn prefill_panic_leaves_no_entry_and_drops_owned_inputs_once() {
+    let mut runtime = Runtime::new(SingleShard, PrefillPanicMailboxFactory);
+    let service_drops = Arc::new(AtomicU32::new(0));
+    let message_drops = Arc::new(AtomicU32::new(0));
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        let _ = runtime.register_with_capacity_and_bootstrap::<_, Infallible>(
+            OwnedBootstrapService {
+                drops: Arc::clone(&service_drops),
+            },
+            4,
+            OwnedBootstrapMsg::Bootstrap(DropProbe(Arc::clone(&message_drops))),
+        );
+    }));
+
+    assert!(panic.is_err());
+    assert_eq!(service_drops.load(Ordering::Acquire), 1);
+    assert_eq!(message_drops.load(Ordering::Acquire), 1);
+    assert!(runtime.trace().is_empty());
 }
 
 #[test]
