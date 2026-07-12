@@ -81,6 +81,7 @@ pub mod persistence;
 #[allow(unsafe_code)]
 pub mod pool;
 pub mod pressure;
+mod scatter_gather;
 pub mod scope;
 pub mod scope_timer;
 pub mod service_pressure;
@@ -292,6 +293,11 @@ pub use observer::{
     BufferedTraceDrain, BufferedTraceDrainError, BufferedTraceObserver, TraceObserver,
 };
 pub use pressure::{MailboxBudget, PressureReport, PressureSummary, format_pressure_line};
+pub use scatter_gather::{
+    ScatterGather, ScatterGatherAdvance, ScatterGatherAdvanceResult, ScatterGatherCompleted,
+    ScatterGatherRecordError, ScatterGatherRecordResult, ScatterGatherStart,
+    ScatterGatherStartError, ScatterGatherStartFailure, ScatterGatherToken,
+};
 pub use scope::{
     CallContextScopeExt, DeferScopedThrough, DeferredScopedCall, RequestScope, RequestScopeId,
     RequestScopeInsertError, RequestScopeRemoveError, RequestScopeSet,

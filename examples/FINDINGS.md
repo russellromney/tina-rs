@@ -33,6 +33,30 @@ caller that closes after FIFO selection leaves at most a lease-bounded ghost
 holder before expiry rollback. This fully applies closed finding 21 to its
 remaining motivating specimen; no new framework gap surfaced.
 
+### 2026-07-12 Bounded scatter/gather operation prerequisite
+
+`ScatterGather<K, R, Q>` now owns the original `RequestContext`, ordered target
+rows, and cancelable child authority through `CallJoinSet`. `start_service`
+accepts a fully `BoundedItems`-validated target list and a typed call factory;
+the factory receives the configured per-target timeout, so the documented
+deadline cannot drift from the executed call. Missing targets, replies, Full,
+Closed, Timeout, Rejected, and aggregate timeout remain distinct and preserve
+caller order.
+
+Aggregate expiry marks only still-pending rows, emits a bounded cancellation
+batch, and withholds caller authority until every cancel acknowledgement is
+recorded. Generation tokens reject duplicate and late overwrites. The aggregate
+timer also carries an operation token, so a physically non-cancelable timer from
+a completed request cannot expire a newer request in the same coordinator.
+Start failures return the untouched `RequestContext`, and over-cap or duplicate
+input is rejected before the call factory or effect batch exists. One
+coordinator implementation is exercised unchanged on `Runtime`,
+`ThreadedRuntime`, and `Simulator`; owner stop with child authority pending
+closes the original caller.
+
+This is the framework prerequisite for migrating `specimen_scatter_gather` and
+`specimen_sharded_fanout_read`; those example changes remain a separate cohort.
+
 ### 2026-07-11 Bounded shutdown truth across the example corpus
 
 Migrated production examples away from exclusive-`Arc` teardown and
