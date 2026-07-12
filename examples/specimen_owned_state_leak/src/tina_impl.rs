@@ -158,7 +158,7 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register writer: {e:?}"))?;
 
-    let complete = runtime.observe_isolate_complete(writer);
+    let complete = runtime.observe_isolate_complete(writer)?;
     for _ in 0..INTENTIONAL_ESCAPE_WRITES {
         runtime
             .try_send(writer, WriterMsg::Tick)

@@ -130,7 +130,9 @@ fn waiter_resolves_with_bound_addr() {
         .register_with_capacity::<Binder, Infallible>(Binder { addr }, 8)
         .expect("register binder");
 
-    let waiter = runtime.observe_next_bound();
+    let waiter = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
 
     runtime
         .try_send(binder, BindMsg::Start)
@@ -148,7 +150,9 @@ fn waiter_resolves_with_bound_addr() {
 #[test]
 fn waiter_times_out_when_no_bind_submitted() {
     let runtime = make_runtime();
-    let waiter = runtime.observe_next_bound();
+    let waiter = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
 
     let outcome = waiter.wait(Duration::from_millis(50));
     assert_eq!(outcome, Err(WaitError::Timeout));
@@ -161,10 +165,14 @@ fn observation_registration_is_bounded() {
     let runtime = make_runtime();
 
     for _ in 0..1024 {
-        let _waiter = runtime.observe_next_bound();
+        let _waiter = runtime
+            .observe_next_bound()
+            .expect("register bind observer");
     }
 
-    let saturated = runtime.observe_next_bound();
+    let saturated = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     assert_eq!(
         saturated.wait(Duration::from_secs(1)),
         Err(WaitError::ObservationFull)
@@ -176,7 +184,9 @@ fn observation_registration_is_bounded() {
 #[test]
 fn waiter_runtime_stopped_when_runtime_dropped() {
     let runtime = make_runtime();
-    let waiter = runtime.observe_next_bound();
+    let waiter = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
 
     drop(runtime);
 
@@ -192,10 +202,14 @@ fn dropped_waiter_does_not_block_subsequent_observer() {
     // First waiter is dropped immediately. The runtime should skip its
     // disconnected slot and serve the next observer.
     {
-        let _doomed = runtime.observe_next_bound();
+        let _doomed = runtime
+            .observe_next_bound()
+            .expect("register bind observer");
     }
 
-    let live = runtime.observe_next_bound();
+    let live = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
 
     let binder = runtime
         .register_with_capacity::<Binder, Infallible>(Binder { addr }, 8)
@@ -220,7 +234,9 @@ fn waiter_reports_call_failed_on_bad_bind_addr() {
     let binder = runtime
         .register_with_capacity::<Binder, Infallible>(Binder { addr: bad }, 8)
         .expect("register binder");
-    let waiter = runtime.observe_next_bound();
+    let waiter = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime
         .try_send(binder, BindMsg::Start)
         .expect("kick binder");
@@ -243,8 +259,12 @@ fn waiter_serves_observers_in_registration_order() {
     let runtime = make_runtime();
 
     // Bind once, then again. Record both observers, then trigger both binds.
-    let first = runtime.observe_next_bound();
-    let second = runtime.observe_next_bound();
+    let first = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
+    let second = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
 
     let addr_a: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let addr_b: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -321,7 +341,9 @@ fn isolate_complete_waiter_resolves_when_isolate_stops() {
         .expect("register sleeper");
 
     // Register before triggering — same FIFO contract as the bound waiter.
-    let done = runtime.observe_isolate_complete(sleeper);
+    let done = runtime
+        .observe_isolate_complete(sleeper)
+        .expect("register completion observer");
     runtime
         .try_send(sleeper, SleeperMsg::Start)
         .expect("kick sleeper");
@@ -344,7 +366,9 @@ fn isolate_complete_waiter_times_out_when_isolate_lives() {
         )
         .expect("register sleeper");
 
-    let done = runtime.observe_isolate_complete(sleeper);
+    let done = runtime
+        .observe_isolate_complete(sleeper)
+        .expect("register completion observer");
     // Never send Start; the isolate just sits idle.
     let outcome = done.wait(Duration::from_millis(50));
     assert_eq!(outcome, Err(WaitError::Timeout));
@@ -364,7 +388,9 @@ fn operation_done_waiter_resolves_on_matching_call_kind() {
         )
         .expect("register sleeper");
 
-    let waiter = runtime.observe_operation_done(sleeper, CallKind::Sleep);
+    let waiter = runtime
+        .observe_operation_done(sleeper, CallKind::Sleep)
+        .expect("register operation observer");
     runtime
         .try_send(sleeper, SleeperMsg::Start)
         .expect("kick sleeper");
@@ -397,7 +423,9 @@ fn operation_done_waiter_does_not_resolve_on_other_isolate() {
         .expect("register sleeper B");
 
     // Register a waiter on B, but kick A.
-    let waiter = runtime.observe_operation_done(sleeper_b, CallKind::Sleep);
+    let waiter = runtime
+        .observe_operation_done(sleeper_b, CallKind::Sleep)
+        .expect("register operation observer");
     runtime
         .try_send(sleeper_a, SleeperMsg::Start)
         .expect("kick sleeper A");
@@ -503,10 +531,18 @@ fn child_restarted_waiter_resolves_after_panic_and_restart() {
         parent.isolate(),
         parent.generation(),
     );
-    let stale_waiter = runtime.observe_child_restarted(stale_parent);
-    let foreign_waiter = runtime.observe_child_restarted(foreign_parent);
-    let dropped_waiter = runtime.observe_child_restarted(parent);
-    let restart_waiter = runtime.observe_child_restarted(parent);
+    let stale_waiter = runtime
+        .observe_child_restarted(stale_parent)
+        .expect("register restart observer");
+    let foreign_waiter = runtime
+        .observe_child_restarted(foreign_parent)
+        .expect("register restart observer");
+    let dropped_waiter = runtime
+        .observe_child_restarted(parent)
+        .expect("register restart observer");
+    let restart_waiter = runtime
+        .observe_child_restarted(parent)
+        .expect("register restart observer");
     drop(dropped_waiter);
     runtime
         .try_send(parent, ParentMsg::Spawn)
@@ -528,6 +564,7 @@ fn child_restarted_waiter_resolves_after_panic_and_restart() {
     assert_eq!(
         runtime
             .observe_child_restarted(parent)
+            .expect("register restart observer")
             .wait(Duration::from_millis(10)),
         Err(WaitError::Timeout),
         "restart observations are not replayed to late waiters"
@@ -567,7 +604,9 @@ fn child_restarted_waiter_reports_runtime_stopped() {
             8,
         )
         .expect("register parent");
-    let waiter = runtime.observe_child_restarted(parent);
+    let waiter = runtime
+        .observe_child_restarted(parent)
+        .expect("register restart observer");
 
     drop(runtime);
 
@@ -587,12 +626,17 @@ fn abandoned_child_restart_authorities_do_not_exhaust_observation_capacity() {
             tina::IsolateId::new(isolate),
             AddressGeneration::new(7),
         );
-        let waiter = runtime.observe_child_restarted(forged);
+        let waiter = runtime
+            .observe_child_restarted(forged)
+            .expect("register restart observer");
         drop(waiter);
     }
 
     assert_eq!(
-        runtime.observe_next_bound().wait(Duration::from_millis(10)),
+        runtime
+            .observe_next_bound()
+            .expect("register bind observer")
+            .wait(Duration::from_millis(10)),
         Err(WaitError::Timeout),
         "abandoned foreign restart authorities must release the shared cap"
     );
@@ -717,7 +761,9 @@ fn result_waiter_dropped_does_not_block_isolate_stop() {
 
     // Isolate stops cleanly even though waiter went away. Use the standard
     // complete waiter to confirm the lifecycle event still fired.
-    let stopped = runtime.observe_isolate_complete(producer);
+    let stopped = runtime
+        .observe_isolate_complete(producer)
+        .expect("register completion observer");
     runtime
         .try_send(
             producer,
@@ -791,7 +837,9 @@ fn observe_result_is_already_stopped_when_isolate_already_finished() {
     let runtime = make_runtime();
     let producer = spawn_producer(&runtime);
 
-    let stopped = runtime.observe_isolate_complete(producer);
+    let stopped = runtime
+        .observe_isolate_complete(producer)
+        .expect("register completion observer");
     runtime
         .try_send(producer, ResultMsg::FinishWithoutResult)
         .expect("kick producer");
@@ -818,7 +866,9 @@ fn result_waiter_observes_isolate_already_stopped_when_resolved() {
     let result = runtime
         .observe_result::<ResultPayload, _, _>(producer)
         .expect("register result waiter");
-    let stopped = runtime.observe_isolate_complete(producer);
+    let stopped = runtime
+        .observe_isolate_complete(producer)
+        .expect("register completion observer");
 
     runtime
         .try_send(
@@ -936,7 +986,9 @@ fn dropped_result_waiters_for_distinct_isolates_do_not_fill_observation_cap() {
                 .expect("register result waiter");
         }
         // Stop the producer to keep entry table tidy.
-        let stopped = runtime.observe_isolate_complete(producer);
+        let stopped = runtime
+            .observe_isolate_complete(producer)
+            .expect("register completion observer");
         runtime
             .try_send(producer, ResultMsg::FinishWithoutResult)
             .expect("kick producer");
@@ -960,7 +1012,11 @@ fn observe_result_is_observation_full_when_cap_reached() {
     // Saturate the observation registry with bound waiters.
     let mut bound_waiters = Vec::new();
     for _ in 0..1024 {
-        bound_waiters.push(runtime.observe_next_bound());
+        bound_waiters.push(
+            runtime
+                .observe_next_bound()
+                .expect("register bind observer"),
+        );
     }
 
     let producer = spawn_producer(&runtime);

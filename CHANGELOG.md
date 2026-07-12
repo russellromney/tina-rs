@@ -24,6 +24,18 @@ This file records completed work.
   worker failure also settles exactly once as `WorkerStopped` when the worker
   drops its command queue.
 
+### Bounded host-control admission
+
+- Threaded single- and multi-shard control operations now report
+  `ThreadedRuntimeError::CommandFull` immediately when their bounded command
+  queue is saturated instead of blocking before the existing reply timeout.
+- Register-and-bootstrap returns the untouched bootstrap message when command
+  admission is full, closed, or targets an unowned shard. A command rejected at
+  admission cannot execute later after queue refill.
+- Live waiter registration now reports host-control admission failures before
+  callers trigger the observed side effect. Typed result observation preserves
+  its single-result API with `ResultWaitError::CommandFull`.
+
 ### Authoritative child-restart observation
 
 - Child-restart waiters now match the complete parent address identity

@@ -275,7 +275,9 @@ fn main() {
     );
 
     // Watch for the supervised restart before poisoning the worker.
-    let restart = runtime.observe_child_restarted(dispatcher);
+    let restart = runtime
+        .observe_child_restarted(dispatcher)
+        .expect("register restart observer");
 
     // Poison task: the worker panics; OneForOne replaces it.
     runtime

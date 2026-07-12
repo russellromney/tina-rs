@@ -228,7 +228,7 @@ pub fn http_body_pressure_probe() -> anyhow::Result<LoadReport> {
             config.listener_mailbox_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register tina http pressure listener: {e:?}"))?;
-    let bound = runtime.observe_next_bound();
+    let bound = runtime.observe_next_bound()?;
     runtime
         .try_send(listener, HttpListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start tina http pressure listener: {e:?}"))?;
@@ -894,7 +894,7 @@ fn tina_http_row(
             config.listener_mailbox_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register tina http listener: {e:?}"))?;
-    let bound = runtime.observe_next_bound();
+    let bound = runtime.observe_next_bound()?;
     runtime
         .try_send(listener, HttpListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start tina http listener: {e:?}"))?;
@@ -951,7 +951,7 @@ fn tina_http_steady_state_row(
             config.listener_mailbox_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register tina steady http listener: {e:?}"))?;
-    let bound = runtime.observe_next_bound();
+    let bound = runtime.observe_next_bound()?;
     runtime
         .try_send(listener, HttpListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start tina steady http listener: {e:?}"))?;
@@ -1746,7 +1746,7 @@ fn start_h2_server(
             config.listener_mailbox_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register tina http2 listener: {e:?}"))?;
-    let bound = runtime.observe_next_bound();
+    let bound = runtime.observe_next_bound()?;
     runtime
         .try_send(listener, Http2ListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start tina http2 listener: {e:?}"))?;
@@ -2195,7 +2195,7 @@ fn start_grpc_server_with_router(
             config.listener_mailbox_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register tina grpc listener: {e:?}"))?;
-    let bound = runtime.observe_next_bound();
+    let bound = runtime.observe_next_bound()?;
     runtime
         .try_send(listener, Http2ListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start tina grpc listener: {e:?}"))?;
@@ -2433,7 +2433,7 @@ pub fn http2_steady_state_turn_report() -> anyhow::Result<ProtocolTurnReport> {
             config.listener_mailbox_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register tina http2 listener: {e:?}"))?;
-    let bound = runtime.observe_next_bound();
+    let bound = runtime.observe_next_bound()?;
     runtime
         .try_send(listener, Http2ListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start tina http2 listener: {e:?}"))?;
@@ -2874,7 +2874,7 @@ fn start_ws_server(
             config.listener_mailbox_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register tina ws listener: {e:?}"))?;
-    let bound = runtime.observe_next_bound();
+    let bound = runtime.observe_next_bound()?;
     runtime
         .try_send(listener, HttpListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start tina ws listener: {e:?}"))?;

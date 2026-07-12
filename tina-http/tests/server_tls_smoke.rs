@@ -331,7 +331,9 @@ fn observe_next_tls_bound_resolves_when_listener_binds() {
         .register_with_capacity::<HttpsListener<TestShard>, _>(listener_isolate, 8)
         .expect("register https listener");
 
-    let bound = runtime.observe_next_tls_bound();
+    let bound = runtime
+        .observe_next_tls_bound()
+        .expect("register TLS bind observer");
     runtime
         .try_send(listener, HttpsListenerMsg::Start)
         .expect("send Start");
@@ -389,7 +391,9 @@ fn second_start_returns_already_started_without_rebinding() {
         "second Start should reply AlreadyStarted, got {outcome_b:?}"
     );
 
-    let stopped = runtime.observe_isolate_complete(listener);
+    let stopped = runtime
+        .observe_isolate_complete(listener)
+        .expect("register isolate completion observer");
     let _ = runtime.try_send(listener, HttpsListenerMsg::Stop);
     stopped
         .wait(Duration::from_secs(5))
@@ -433,7 +437,9 @@ fn stop_with_pending_accept_closes_listener_cleanly() {
     assert!(matches!(outcome, CallOutcome::Replied(Ok(_))));
 
     // Stop while tls_accept is in flight (no client connecting).
-    let stopped = runtime.observe_isolate_complete(listener);
+    let stopped = runtime
+        .observe_isolate_complete(listener)
+        .expect("register isolate completion observer");
     runtime
         .try_send(listener, HttpsListenerMsg::Stop)
         .expect("send Stop");
@@ -480,7 +486,9 @@ fn stop_before_bound_completes_does_not_leave_listener_held() {
         .register_with_capacity::<HttpsListener<TestShard>, _>(listener_isolate, 8)
         .expect("register https listener");
 
-    let stopped = runtime.observe_isolate_complete(listener);
+    let stopped = runtime
+        .observe_isolate_complete(listener)
+        .expect("register isolate completion observer");
     // Pipeline Start and Stop into the mailbox back-to-back; the
     // worker may schedule them in either order, but both
     // outcomes must converge on a clean shutdown.

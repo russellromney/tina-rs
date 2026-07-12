@@ -38,8 +38,8 @@ use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallInput, CallKind, FileId, ListenerId,
     MailboxFactory, Runtime, RuntimeCall, RuntimeEvent, RuntimeEventKind, StreamId,
     TcpReadBufReply, TcpWriteOwnedReply, ThreadedRuntime, ThreadedRuntimeConfig,
-    ThreadedSendObservedError, ThreadedTrySendError, file_close, file_create, file_fsync,
-    file_read, file_size, file_write, mkdir, tcp_accept, tcp_bind, tcp_close_listener,
+    ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError, file_close, file_create,
+    file_fsync, file_read, file_size, file_write, mkdir, tcp_accept, tcp_bind, tcp_close_listener,
     tcp_close_stream, tcp_connect, tcp_read, tcp_read_buf, tcp_write, tcp_write_owned,
 };
 use tina_supervisor::SupervisorConfig;
@@ -1585,7 +1585,11 @@ fn threaded_runtime_try_send_surfaces_ingress_full_without_blocking_on_worker() 
 
     wake_tx.send(()).expect("release parked handler");
     wait_until(Duration::from_secs(2), "Betelgeuse ingress drain", || {
-        let trace = runtime.complete_trace().expect("Betelgeuse trace");
+        let trace = match runtime.complete_trace() {
+            Ok(trace) => trace,
+            Err(ThreadedRuntimeError::CommandFull) => return false,
+            Err(error) => panic!("Betelgeuse trace: {error}"),
+        };
         trace
             .iter()
             .filter(|event| event.isolate() == blocking_addr.isolate())

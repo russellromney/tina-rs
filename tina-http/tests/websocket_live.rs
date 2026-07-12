@@ -251,7 +251,9 @@ impl Harness {
         let listener = runtime
             .register_with_capacity::<HttpListener<TestShard>, Infallible>(listener_isolate, 8)
             .expect("register listener");
-        let bound = runtime.observe_next_bound();
+        let bound = runtime
+            .observe_next_bound()
+            .expect("register bind observer");
         runtime
             .try_send(listener, HttpListenerMsg::Start)
             .expect("start listener");

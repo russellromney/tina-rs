@@ -146,7 +146,7 @@ pub fn run() -> anyhow::Result<Report> {
             .ok_or_else(|| anyhow::anyhow!("worker addr missing"))?;
         match job {
             Job::Poison => {
-                let restart_waiter = runtime.observe_child_restarted(parent);
+                let restart_waiter = runtime.observe_child_restarted(parent)?;
                 let deadline = Instant::now() + Duration::from_secs(2);
                 runtime
                     .send_observed_until(addr, deadline, Duration::from_millis(1), || {

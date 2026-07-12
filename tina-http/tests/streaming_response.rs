@@ -163,7 +163,9 @@ fn streaming_response_writes_full_body_chunk_by_chunk() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime
         .try_send(listener, HttpListenerMsg::Start)
         .expect("send Start");
@@ -257,7 +259,9 @@ fn streaming_response_handles_early_eof() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime
         .try_send(listener, HttpListenerMsg::Start)
         .expect("send Start");

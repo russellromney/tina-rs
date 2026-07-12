@@ -463,7 +463,7 @@ pub fn start_server() -> anyhow::Result<SpecimenServer> {
         )
         .map_err(|error| anyhow::anyhow!("register listener: {error:?}"))?;
 
-    let bound = runtime.observe_next_bound();
+    let bound = runtime.observe_next_bound()?;
     runtime
         .try_send(listener, Http2ListenerMsg::Start)
         .map_err(|error| anyhow::anyhow!("start listener: {error:?}"))?;

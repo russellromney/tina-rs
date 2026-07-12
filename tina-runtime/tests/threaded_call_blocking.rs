@@ -221,7 +221,9 @@ fn call_blocking_preserves_closed() {
     let stopper = runtime
         .register_with_capacity::<Stopper, Infallible>(Stopper, 4)
         .expect("register stopper");
-    let stopped = runtime.observe_isolate_complete(stopper);
+    let stopped = runtime
+        .observe_isolate_complete(stopper)
+        .expect("register completion observer");
     runtime
         .try_send(stopper, StopperMsg::Stop)
         .expect("send stop");

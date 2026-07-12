@@ -341,6 +341,14 @@ where
     dispatchers: Vec<Address<DispatcherMsg<S>, ()>>,
 }
 
+pub(crate) enum RecoverableControlCallError<T> {
+    NotAdmitted {
+        error: ThreadedRuntimeError,
+        input: T,
+    },
+    Accepted(ThreadedRuntimeError),
+}
+
 pub(crate) enum ThreadedCommand<S, F>
 where
     S: Shard + 'static,
@@ -751,6 +759,8 @@ where
     }
 
     /// Registers one root isolate and lets the worker allocate its mailbox.
+    /// Returns [`ThreadedRuntimeError::CommandFull`] without registering the
+    /// isolate when the bounded host-control queue cannot admit the command.
     #[allow(private_bounds)]
     pub fn register_with_capacity<I, Outbound>(
         &self,
@@ -942,31 +952,34 @@ where
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
-        match self.call(move |runtime| {
-            runtime.register_with_capacity_and_bootstrap::<I, Outbound>(
-                isolate,
-                mailbox_capacity,
-                bootstrap,
-            )
-        }) {
+        match self.call_with_input(
+            (isolate, bootstrap),
+            move |runtime, (isolate, bootstrap)| {
+                runtime.register_with_capacity_and_bootstrap::<I, Outbound>(
+                    isolate,
+                    mailbox_capacity,
+                    bootstrap,
+                )
+            },
+        ) {
             Ok(Ok(address)) => Ok(address),
             Ok(Err(err)) => Err(ThreadedRegisterBootstrapError::from_register(err)),
-            Err(ThreadedRuntimeError::WorkerStopped) => {
+            Err(RecoverableControlCallError::NotAdmitted {
+                error: ThreadedRuntimeError::CommandFull,
+                input: (_, bootstrap),
+            }) => Err(ThreadedRegisterBootstrapError::CommandFull(bootstrap)),
+            Err(RecoverableControlCallError::NotAdmitted {
+                error: ThreadedRuntimeError::WorkerStopped,
+                input: (_, bootstrap),
+            }) => Err(ThreadedRegisterBootstrapError::CommandClosed(bootstrap)),
+            Err(RecoverableControlCallError::Accepted(ThreadedRuntimeError::WorkerStopped)) => {
                 Err(ThreadedRegisterBootstrapError::WorkerStopped)
             }
-            Err(ThreadedRuntimeError::UnknownShard(shard)) => {
-                Err(ThreadedRegisterBootstrapError::UnknownShard(shard))
-            }
-            Err(ThreadedRuntimeError::DriverShutdownFailed)
-            | Err(ThreadedRuntimeError::DriverParkFailed)
-            | Err(ThreadedRuntimeError::CommandFull)
-            | Err(ThreadedRuntimeError::HostWaitTimeout)
-            | Err(ThreadedRuntimeError::WorkerUnresponsive) => {
-                // `call` is blocking-admission, so `CommandFull` is
-                // unreachable today. `WorkerUnresponsive` means the worker
-                // accepted the register command but never answered — from the
-                // caller's view the isolate is not usable, same as stopped.
-                // Map defensively in case the inner helper is ever migrated.
+            Err(RecoverableControlCallError::Accepted(_))
+            | Err(RecoverableControlCallError::NotAdmitted { .. }) => {
+                // Once admitted, the worker may have consumed the message and
+                // registered the isolate before failing to answer. Authority
+                // cannot honestly be returned in that state.
                 Err(ThreadedRegisterBootstrapError::WorkerStopped)
             }
         }
@@ -979,6 +992,8 @@ where
     /// isolate on the shard for the duration — build the value before
     /// calling. `Ctor: Send + 'static` so the closure ships across the
     /// worker command channel.
+    /// The constructor is dropped without executing when command admission
+    /// returns [`ThreadedRuntimeError::CommandFull`].
     #[allow(private_bounds)]
     pub fn register_with_capacity_using<I, Outbound, Ctor>(
         &self,
@@ -1045,23 +1060,15 @@ where
     /// trigger; a registration enqueued after the bind has already completed
     /// will wait for the *next* bind, not the one that just happened.
     ///
-    /// If the worker is already stopped, the returned waiter resolves
-    /// immediately to [`crate::WaitError::RuntimeStopped`] when `wait` is called —
-    /// the waiter itself is the single source of truth for "did this bind
-    /// happen", so no extra registration error is surfaced here.
-    pub fn observe_next_bound(&self) -> BoundAddressWaiter {
-        match self.call(|runtime| runtime.observe_next_bound()) {
-            Ok(waiter) => waiter,
-            Err(_) => observation::stopped_bound_waiter(),
-        }
+    /// Host-control admission failures are returned before the caller triggers
+    /// the bind, so no bind fact can be silently left unobserved.
+    pub fn observe_next_bound(&self) -> Result<BoundAddressWaiter, ThreadedRuntimeError> {
+        self.call(|runtime| runtime.observe_next_bound())
     }
 
     /// Mirrors [`Self::observe_next_bound`] for `tls_bind`.
-    pub fn observe_next_tls_bound(&self) -> BoundAddressWaiter {
-        match self.call(|runtime| runtime.observe_next_tls_bound()) {
-            Ok(waiter) => waiter,
-            Err(_) => observation::stopped_bound_waiter(),
-        }
+    pub fn observe_next_tls_bound(&self) -> Result<BoundAddressWaiter, ThreadedRuntimeError> {
+        self.call(|runtime| runtime.observe_next_tls_bound())
     }
 
     /// Registers a typed waiter for the targeted isolate's `IsolateStopped`
@@ -1073,11 +1080,8 @@ where
     pub fn observe_isolate_complete<M: 'static, R: 'static>(
         &self,
         address: Address<M, R>,
-    ) -> observation::IsolateCompleteWaiter {
-        match self.call(move |runtime| runtime.observe_isolate_complete(address)) {
-            Ok(waiter) => waiter,
-            Err(_) => observation::stopped_isolate_complete_waiter(),
-        }
+    ) -> Result<observation::IsolateCompleteWaiter, ThreadedRuntimeError> {
+        self.call(move |runtime| runtime.observe_isolate_complete(address))
     }
 
     /// Registers a typed waiter for the next runtime call of `call_kind`
@@ -1088,11 +1092,8 @@ where
         &self,
         address: Address<M, R>,
         call_kind: CallKind,
-    ) -> observation::OperationDoneWaiter {
-        match self.call(move |runtime| runtime.observe_operation_done(address, call_kind)) {
-            Ok(waiter) => waiter,
-            Err(_) => observation::stopped_operation_done_waiter(),
-        }
+    ) -> Result<observation::OperationDoneWaiter, ThreadedRuntimeError> {
+        self.call(move |runtime| runtime.observe_operation_done(address, call_kind))
     }
 
     /// Registers a typed waiter for the next supervised restart of any
@@ -1102,11 +1103,8 @@ where
     pub fn observe_child_restarted<M: 'static, R: 'static>(
         &self,
         parent_address: Address<M, R>,
-    ) -> observation::ChildRestartedWaiter {
-        match self.call(move |runtime| runtime.observe_child_restarted(parent_address)) {
-            Ok(waiter) => waiter,
-            Err(_) => observation::stopped_child_restarted_waiter(),
-        }
+    ) -> Result<observation::ChildRestartedWaiter, ThreadedRuntimeError> {
+        self.call(move |runtime| runtime.observe_child_restarted(parent_address))
     }
 
     /// Returns a live child lifecycle report from the worker shard.
@@ -1128,6 +1126,9 @@ where
     ) -> Result<observation::IsolateResultWaiter<T>, observation::ResultWaitError> {
         match self.call(move |runtime| runtime.observe_result::<T, M, R>(address)) {
             Ok(result) => result,
+            Err(ThreadedRuntimeError::CommandFull) => {
+                Err(observation::ResultWaitError::CommandFull)
+            }
             Err(_) => Err(observation::ResultWaitError::RuntimeStopped),
         }
     }
@@ -1918,20 +1919,93 @@ where
         shared.wait_report_for_owner_with_timeout(timeout)
     }
 
+    fn call_with_input<R, T, C>(
+        &self,
+        input: T,
+        command: C,
+    ) -> Result<R, RecoverableControlCallError<T>>
+    where
+        R: Send + 'static,
+        T: Send + 'static,
+        C: FnOnce(&mut Runtime<S, F>, T) -> R + Send + 'static,
+    {
+        let input = Arc::new(std::sync::Mutex::new(Some(input)));
+        let worker_input = Arc::clone(&input);
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let threaded_command = ThreadedCommand::Run(Box::new(move |runtime| {
+            let input = worker_input
+                .lock()
+                .expect("recoverable control-call input lock poisoned")
+                .take()
+                .expect("recoverable control-call input taken exactly once");
+            let _ = reply_tx.send(command(runtime, input));
+        }));
+        match self.commands.try_send(threaded_command) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(command)) => {
+                drop(command);
+                let input = input
+                    .lock()
+                    .expect("recoverable control-call input lock poisoned")
+                    .take()
+                    .expect("unadmitted control call retains its input");
+                return Err(RecoverableControlCallError::NotAdmitted {
+                    error: ThreadedRuntimeError::CommandFull,
+                    input,
+                });
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(command)) => {
+                self.metrics.set_state(LiveShardState::Failed);
+                drop(command);
+                let input = input
+                    .lock()
+                    .expect("recoverable control-call input lock poisoned")
+                    .take()
+                    .expect("unadmitted control call retains its input");
+                return Err(RecoverableControlCallError::NotAdmitted {
+                    error: ThreadedRuntimeError::WorkerStopped,
+                    input,
+                });
+            }
+        }
+
+        match reply_rx.recv_timeout(self.control_call_timeout) {
+            Ok(reply) => Ok(reply),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.metrics.set_state(LiveShardState::Failed);
+                Err(RecoverableControlCallError::Accepted(
+                    ThreadedRuntimeError::WorkerUnresponsive,
+                ))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.metrics.set_state(LiveShardState::Failed);
+                Err(RecoverableControlCallError::Accepted(
+                    ThreadedRuntimeError::WorkerStopped,
+                ))
+            }
+        }
+    }
+
     fn call<R, C>(&self, command: C) -> Result<R, ThreadedRuntimeError>
     where
         R: Send + 'static,
         C: FnOnce(&mut Runtime<S, F>) -> R + Send + 'static,
     {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        self.commands
-            .send(ThreadedCommand::Run(Box::new(move |runtime| {
+        match self
+            .commands
+            .try_send(ThreadedCommand::Run(Box::new(move |runtime| {
                 let _ = reply_tx.send(command(runtime));
-            })))
-            .map_err(|_| {
+            }))) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                return Err(ThreadedRuntimeError::CommandFull);
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                 self.metrics.set_state(LiveShardState::Failed);
-                ThreadedRuntimeError::WorkerStopped
-            })?;
+                return Err(ThreadedRuntimeError::WorkerStopped);
+            }
+        }
         // Bounded wait: a wedged or runaway handler must not hang the host
         // thread forever. RecvError means the worker dropped the sender
         // (stopped); Timeout means it accepted the command but did not answer

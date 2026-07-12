@@ -135,7 +135,9 @@ fn iter_body_source_serves_known_length_response_via_loud_api() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
     let addr = bound.wait(Duration::from_secs(2)).expect("bound");
 
@@ -209,7 +211,9 @@ fn stream_chunked_emits_transfer_encoding_chunked_with_terminator() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
     let addr = bound.wait(Duration::from_secs(2)).expect("bound");
 
@@ -299,7 +303,9 @@ fn early_client_close_during_chunked_records_body_io_error() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
     let addr = bound.wait(Duration::from_secs(2)).expect("bound");
 
@@ -508,7 +514,9 @@ fn chunked_round_trip_property_across_random_payloads() {
         let listener = runtime
             .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
             .expect("register listener");
-        let bound = runtime.observe_next_bound();
+        let bound = runtime
+            .observe_next_bound()
+            .expect("register bind observer");
         runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
         let addr = bound.wait(Duration::from_secs(2)).expect("bound");
 
@@ -651,7 +659,9 @@ fn known_length_client_disconnect_sends_cancel_to_source() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
     let addr = bound.wait(Duration::from_secs(2)).expect("bound");
 
@@ -737,7 +747,9 @@ fn chunked_client_disconnect_sends_cancel_to_source() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
     let addr = bound.wait(Duration::from_secs(2)).expect("bound");
 
@@ -814,7 +826,9 @@ fn chunked_empty_body_emits_only_terminator() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
     let addr = bound.wait(Duration::from_secs(2)).expect("bound");
 
@@ -929,7 +943,9 @@ fn known_length_zero_does_not_pull_source() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
     let addr = bound.wait(Duration::from_secs(2)).expect("bound");
 
@@ -1034,7 +1050,9 @@ fn chunked_source_timeout_records_both_timeout_and_io_error() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
     let addr = bound.wait(Duration::from_secs(2)).expect("bound");
 

@@ -907,7 +907,7 @@ impl RoomServer {
                 config.listener_mailbox_capacity,
             )
             .map_err(|error| anyhow::anyhow!("register listener: {error:?}"))?;
-        let bound = runtime.observe_next_bound();
+        let bound = runtime.observe_next_bound()?;
         runtime
             .try_send(listener, HttpListenerMsg::Start)
             .map_err(|error| anyhow::anyhow!("start listener: {error:?}"))?;

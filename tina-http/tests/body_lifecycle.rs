@@ -179,7 +179,9 @@ fn shutdown_while_streaming_response_drains_body_metrics() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
     let addr = bound.wait(Duration::from_secs(2)).expect("bound");
 
@@ -263,7 +265,9 @@ fn stop_listener_during_active_request_does_not_leak_metrics() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
     let addr = bound.wait(Duration::from_secs(2)).expect("bound");
 

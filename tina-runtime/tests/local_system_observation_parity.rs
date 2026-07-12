@@ -197,7 +197,7 @@ fn local_system_bound_waiter_is_registered_before_bind() {
         .register_root::<Binder, Infallible>(Binder { address: requested }, 4)
         .expect("register binder");
 
-    let waiter = app.observe_next_bound();
+    let waiter = app.observe_next_bound().expect("register bind observer");
     app.try_send(binder, BindMsg::Start).expect("trigger bind");
     let bound = waiter.wait(Duration::from_secs(2)).expect("bound address");
 
@@ -215,7 +215,7 @@ fn local_system_bound_waiter_reports_runtime_stopped() {
     let app = LocalSystem::single_shard(AppShard(2), DefaultThreadedMailboxFactory)
         .try_build()
         .expect("start local system");
-    let waiter = app.observe_next_bound();
+    let waiter = app.observe_next_bound().expect("register bind observer");
     app.shutdown()
         .drain()
         .join_report()
@@ -236,7 +236,9 @@ fn local_system_isolate_complete_preserves_success_and_stopped_worker() {
     let stopper = app
         .register_root::<Stopper, Infallible>(Stopper, 4)
         .expect("register stopper");
-    let complete = app.observe_isolate_complete(stopper);
+    let complete = app
+        .observe_isolate_complete(stopper)
+        .expect("register completion observer");
     app.try_send(stopper, StopMsg::Stop).expect("stop isolate");
     complete
         .wait(Duration::from_secs(1))
@@ -250,11 +252,10 @@ fn local_system_isolate_complete_preserves_success_and_stopped_worker() {
         .request_and_wait_report(Duration::from_secs(2))
         .expect("runtime shutdown");
     report.ensure_clean().expect("clean shutdown");
-    let stopped = app.observe_isolate_complete(live);
-    assert_eq!(
-        stopped.wait(Duration::from_secs(1)),
-        Err(WaitError::RuntimeStopped)
-    );
+    assert!(matches!(
+        app.observe_isolate_complete(live),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    ));
     drop(app);
 }
 
@@ -316,9 +317,15 @@ fn local_system_child_restart_waiter_reports_replacement_truth() {
         parent.isolate(),
         parent.generation(),
     );
-    let stale_waiter = app.observe_child_restarted(stale_parent);
-    let foreign_waiter = app.observe_child_restarted(foreign_parent);
-    let waiter = app.observe_child_restarted(parent);
+    let stale_waiter = app
+        .observe_child_restarted(stale_parent)
+        .expect("register restart observer");
+    let foreign_waiter = app
+        .observe_child_restarted(foreign_parent)
+        .expect("register restart observer");
+    let waiter = app
+        .observe_child_restarted(parent)
+        .expect("register restart observer");
     app.try_send(parent, ParentMsg::Restart)
         .expect("restart child");
     let restarted = waiter.wait(Duration::from_secs(2)).expect("restart event");
@@ -338,6 +345,7 @@ fn local_system_child_restart_waiter_reports_replacement_truth() {
     );
     assert_eq!(
         app.observe_child_restarted(parent)
+            .expect("register restart observer")
             .wait(Duration::from_millis(10)),
         Err(WaitError::Timeout),
         "restart facts are not replayed to late facade waiters"
@@ -347,11 +355,10 @@ fn local_system_child_restart_waiter_reports_replacement_truth() {
         .expect("runtime shutdown")
         .ensure_clean()
         .expect("clean shutdown");
-    assert_eq!(
-        app.observe_child_restarted(parent)
-            .wait(Duration::from_secs(1)),
-        Err(WaitError::RuntimeStopped)
-    );
+    assert!(matches!(
+        app.observe_child_restarted(parent),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    ));
 }
 
 #[test]

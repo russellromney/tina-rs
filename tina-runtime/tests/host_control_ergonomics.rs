@@ -16,9 +16,9 @@ use std::time::{Duration, Instant};
 use tina::prelude::*;
 use tina::{CallRejectedReason, RequestContext, reply_to};
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ShutdownAndWaitError, ShutdownRequestError,
-    ShutdownWaitError, ThreadedMultiShardRuntime, ThreadedRuntime, ThreadedRuntimeConfig,
-    ThreadedRuntimeError, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, ShutdownAndWaitError,
+    ShutdownRequestError, ShutdownWaitError, ThreadedMultiShardRuntime, ThreadedRuntime,
+    ThreadedRuntimeConfig, ThreadedRuntimeError, sleep,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -203,6 +203,24 @@ struct SpinnerSimple {
     flag: Arc<AtomicBool>,
     entered: Arc<AtomicBool>,
 }
+
+#[derive(Debug)]
+enum ResultProducerMsg {
+    Finish,
+}
+
+struct ResultProducer;
+
+#[tina_runtime::isolate(message = ResultProducerMsg)]
+impl ResultProducer {
+    fn handle(
+        &mut self,
+        _msg: ResultProducerMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        stop_with(7_u32)
+    }
+}
 #[tina_runtime::isolate(message = SpinnerSimpleMsg, reply = ())]
 impl SpinnerSimple {
     fn handle(
@@ -259,6 +277,201 @@ fn multi_runtime(
 }
 
 // ------------------------- Rock 1: bounded admission -------------------------
+
+#[test]
+fn single_shard_registration_full_returns_promptly_without_late_constructor() {
+    let runtime = Arc::new(single_runtime(1));
+    let release = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let spinner = runtime
+        .register_with_capacity::<SpinnerSimple, Infallible>(
+            SpinnerSimple {
+                flag: Arc::clone(&release),
+                entered: Arc::clone(&entered),
+            },
+            4,
+        )
+        .expect("register spinner");
+    runtime
+        .try_send(spinner, SpinnerSimpleMsg::Tick)
+        .expect("occupy worker");
+    while !entered.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
+    runtime
+        .try_send(spinner, SpinnerSimpleMsg::Tick)
+        .expect("fill command queue");
+
+    let constructed = Arc::new(AtomicU32::new(0));
+    let runtime_for_register = Arc::clone(&runtime);
+    let constructed_for_register = Arc::clone(&constructed);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let register = thread::spawn(move || {
+        let result = runtime_for_register
+            .register_with_capacity_using::<EchoSimple, Infallible, _>(4, move |_| {
+                constructed_for_register.fetch_add(1, Ordering::AcqRel);
+                EchoSimple
+            })
+            .map(|_| ());
+        tx.send(result).expect("report registration result");
+    });
+    let result = rx.recv_timeout(Duration::from_millis(200));
+    if result.is_err() {
+        release.store(true, Ordering::Release);
+        register
+            .join()
+            .expect("release blocked legacy registration");
+        panic!("registration blocked instead of reporting bounded admission");
+    }
+    assert_eq!(result.unwrap(), Err(ThreadedRuntimeError::CommandFull));
+    register.join().expect("registration thread");
+    assert_eq!(constructed.load(Ordering::Acquire), 0);
+
+    release.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let constructed_for_retry = Arc::clone(&constructed);
+        match runtime.register_with_capacity_using::<EchoSimple, Infallible, _>(4, move |_| {
+            constructed_for_retry.fetch_add(1, Ordering::AcqRel);
+            EchoSimple
+        }) {
+            Ok(_) => break,
+            Err(ThreadedRuntimeError::CommandFull) if Instant::now() < deadline => {
+                thread::yield_now();
+            }
+            Err(error) => panic!("registration after refill failed: {error}"),
+        }
+    }
+    assert_eq!(constructed.load(Ordering::Acquire), 1);
+    Arc::try_unwrap(runtime)
+        .unwrap_or_else(|_| panic!("sole runtime owner"))
+        .shutdown()
+        .expect("clean shutdown");
+}
+
+#[test]
+fn local_system_and_multi_shard_registration_share_bounded_admission() {
+    let app = Arc::new(
+        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+            .ingress_capacity(1)
+            .try_build()
+            .expect("start local system"),
+    );
+    let release = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let spinner = app
+        .register_root::<SpinnerSimple, Infallible>(
+            SpinnerSimple {
+                flag: Arc::clone(&release),
+                entered: Arc::clone(&entered),
+            },
+            4,
+        )
+        .expect("register local spinner");
+    app.try_send(spinner, SpinnerSimpleMsg::Tick)
+        .expect("occupy local worker");
+    while !entered.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
+    app.try_send(spinner, SpinnerSimpleMsg::Tick)
+        .expect("fill local ingress");
+    assert!(matches!(
+        app.register_root::<EchoSimple, Infallible>(EchoSimple, 4),
+        Err(ThreadedRuntimeError::CommandFull)
+    ));
+    release.store(true, Ordering::Release);
+    app.shutdown_handle()
+        .request_and_wait_report(Duration::from_secs(2))
+        .expect("bounded local shutdown")
+        .ensure_clean()
+        .expect("clean local shutdown");
+
+    let runtime = multi_runtime(1);
+    let release = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let spinner = runtime
+        .register_with_capacity_on::<SpinnerMS, Infallible>(
+            ShardId::new(1),
+            SpinnerMS {
+                flag: Arc::clone(&release),
+                entered: Arc::clone(&entered),
+            },
+            4,
+        )
+        .expect("register multi spinner");
+    runtime
+        .try_send(spinner, SpinnerMsg::Tick)
+        .expect("occupy shard");
+    while !entered.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
+    runtime
+        .try_send(spinner, SpinnerMsg::Tick)
+        .expect("fill shard");
+    assert!(matches!(
+        runtime.register_with_capacity_on::<EchoMS, Infallible>(ShardId::new(1), EchoMS, 4,),
+        Err(ThreadedRuntimeError::CommandFull)
+    ));
+    release.store(true, Ordering::Release);
+    runtime
+        .shutdown_handle()
+        .request_and_wait_report(Duration::from_secs(2))
+        .expect("bounded multi shutdown");
+}
+
+#[test]
+fn observation_full_is_eager_precise_and_does_not_claim_result_authority() {
+    let runtime = single_runtime(1);
+    let producer = runtime
+        .register_with_capacity::<ResultProducer, Infallible>(ResultProducer, 2)
+        .expect("register result producer");
+    let release = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let spinner = runtime
+        .register_with_capacity::<SpinnerSimple, Infallible>(
+            SpinnerSimple {
+                flag: Arc::clone(&release),
+                entered: Arc::clone(&entered),
+            },
+            4,
+        )
+        .expect("register spinner");
+    runtime
+        .try_send(spinner, SpinnerSimpleMsg::Tick)
+        .expect("occupy worker");
+    while !entered.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
+    runtime
+        .try_send(spinner, SpinnerSimpleMsg::Tick)
+        .expect("fill command queue");
+
+    assert!(matches!(
+        runtime.observe_isolate_complete(producer),
+        Err(ThreadedRuntimeError::CommandFull)
+    ));
+    assert!(matches!(
+        runtime.observe_result::<u32, _, _>(producer),
+        Err(tina_runtime::ResultWaitError::CommandFull)
+    ));
+
+    release.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let result = loop {
+        match runtime.observe_result::<u32, _, _>(producer) {
+            Ok(waiter) => break waiter,
+            Err(tina_runtime::ResultWaitError::CommandFull) if Instant::now() < deadline => {
+                thread::yield_now();
+            }
+            Err(error) => panic!("result authority after refill: {error:?}"),
+        }
+    };
+    runtime
+        .try_send(producer, ResultProducerMsg::Finish)
+        .expect("finish producer");
+    assert_eq!(result.wait(Duration::from_secs(2)), Ok(7));
+    runtime.shutdown().expect("clean shutdown");
+}
 
 #[test]
 fn single_shard_call_blocking_returns_command_full_when_queue_saturated() {

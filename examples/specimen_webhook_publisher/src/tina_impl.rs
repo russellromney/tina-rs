@@ -185,7 +185,7 @@ pub fn run() -> anyhow::Result<Report> {
         .register_with_capacity::<_, Infallible>(driver, 8)
         .expect("register driver");
 
-    let complete = runtime.observe_isolate_complete(driver_addr);
+    let complete = runtime.observe_isolate_complete(driver_addr)?;
 
     runtime
         .try_send(driver_addr, DriverMsg::Run(url))

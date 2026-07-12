@@ -48,14 +48,19 @@ pub enum WaitError {
 
 /// Outcome of registering or waiting on an [`IsolateResultWaiter`].
 ///
-/// `ObservationFull`, `AlreadyClaimed`, `AlreadyStopped` only fire at
-/// register time. The rest only fire on [`IsolateResultWaiter::wait`].
+/// `CommandFull`, `ObservationFull`, `AlreadyClaimed`, and `AlreadyStopped`
+/// only fire at register time. The rest only fire on
+/// [`IsolateResultWaiter::wait`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultWaitError {
     /// `wait` timed out before the isolate stopped.
     Timeout,
     /// Runtime dropped or shut down before delivery.
     RuntimeStopped,
+    /// The bounded host-control queue could not admit observer registration.
+    /// No result authority was claimed; the caller can retry before triggering
+    /// the isolate.
+    CommandFull,
     /// Observation cap reached; this waiter was not registered.
     ObservationFull,
     /// Another result waiter already holds this `(isolate, generation)`.
@@ -486,24 +491,6 @@ impl std::fmt::Debug for ObservationRegistry {
             .field("max_pending", &self.max_pending)
             .finish()
     }
-}
-
-/// Constructs a waiter whose receiver is already disconnected, so the next
-/// `wait` resolves immediately to [`WaitError::RuntimeStopped`].
-pub(crate) fn stopped_bound_waiter() -> BoundAddressWaiter {
-    BoundAddressWaiter::with_error(WaitError::RuntimeStopped)
-}
-
-pub(crate) fn stopped_isolate_complete_waiter() -> IsolateCompleteWaiter {
-    IsolateCompleteWaiter::with_error(WaitError::RuntimeStopped)
-}
-
-pub(crate) fn stopped_operation_done_waiter() -> OperationDoneWaiter {
-    OperationDoneWaiter::with_error(WaitError::RuntimeStopped)
-}
-
-pub(crate) fn stopped_child_restarted_waiter() -> ChildRestartedWaiter {
-    ChildRestartedWaiter::with_error(WaitError::RuntimeStopped)
 }
 
 impl ObservationRegistry {

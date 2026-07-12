@@ -144,7 +144,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<Report> {
     // Register the bound-address waiter *before* triggering the bind so
     // the registration lands in the runtime's command queue ahead of
     // the bind completion.
-    let bound = runtime.observe_next_bound();
+    let bound = runtime.observe_next_bound()?;
     runtime
         .try_send(listener, ListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start listener: {e:?}"))?;

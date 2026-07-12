@@ -39,9 +39,9 @@ use crate::observer::TraceObserver;
 use crate::sharded::ReplyAdapter;
 use crate::shutdown::{SharedShutdownState, ShutdownWorker, ThreadedShutdownHandle, handle_for};
 use crate::threaded::{
-    CommandSender, DEFAULT_STARTUP_HANDSHAKE_TIMEOUT, STARTUP_CLEANUP_JOIN_TIMEOUT,
-    ThreadedCommand, ThreadedRuntimeConfig, deliver_shutdown_signal_and_drain_with_remote,
-    panic_payload_message, run_host_call,
+    CommandSender, DEFAULT_STARTUP_HANDSHAKE_TIMEOUT, RecoverableControlCallError,
+    STARTUP_CLEANUP_JOIN_TIMEOUT, ThreadedCommand, ThreadedRuntimeConfig,
+    deliver_shutdown_signal_and_drain_with_remote, panic_payload_message, run_host_call,
 };
 use crate::trace::{RuntimeEvent, SendRejectedReason};
 use crate::{
@@ -483,6 +483,8 @@ where
     }
 
     /// Registers one root isolate on a chosen shard.
+    /// Returns [`ThreadedRuntimeError::CommandFull`] without registering the
+    /// isolate when that shard's bounded host-control queue is saturated.
     #[allow(private_bounds)]
     pub fn register_with_capacity_on<I, Outbound>(
         &self,
@@ -623,31 +625,38 @@ where
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
     {
-        match self.call_on(shard, move |runtime| {
-            runtime.register_sendable_with_capacity_and_bootstrap::<I, Outbound>(
-                isolate,
-                mailbox_capacity,
-                bootstrap,
-            )
-        }) {
+        match self.call_on_with_input(
+            shard,
+            (isolate, bootstrap),
+            move |runtime, (isolate, bootstrap)| {
+                runtime.register_sendable_with_capacity_and_bootstrap::<I, Outbound>(
+                    isolate,
+                    mailbox_capacity,
+                    bootstrap,
+                )
+            },
+        ) {
             Ok(Ok(address)) => Ok(address),
             Ok(Err(err)) => Err(ThreadedRegisterBootstrapError::from_register(err)),
-            Err(ThreadedRuntimeError::WorkerStopped) => {
+            Err(RecoverableControlCallError::NotAdmitted {
+                error: ThreadedRuntimeError::CommandFull,
+                input: (_, bootstrap),
+            }) => Err(ThreadedRegisterBootstrapError::CommandFull(bootstrap)),
+            Err(RecoverableControlCallError::NotAdmitted {
+                error: ThreadedRuntimeError::WorkerStopped,
+                input: (_, bootstrap),
+            }) => Err(ThreadedRegisterBootstrapError::CommandClosed(bootstrap)),
+            Err(RecoverableControlCallError::NotAdmitted {
+                error: ThreadedRuntimeError::UnknownShard(shard),
+                input: (_, bootstrap),
+            }) => Err(ThreadedRegisterBootstrapError::UnknownShard(
+                shard, bootstrap,
+            )),
+            Err(RecoverableControlCallError::Accepted(ThreadedRuntimeError::WorkerStopped)) => {
                 Err(ThreadedRegisterBootstrapError::WorkerStopped)
             }
-            Err(ThreadedRuntimeError::UnknownShard(s)) => {
-                Err(ThreadedRegisterBootstrapError::UnknownShard(s))
-            }
-            Err(ThreadedRuntimeError::DriverShutdownFailed)
-            | Err(ThreadedRuntimeError::DriverParkFailed)
-            | Err(ThreadedRuntimeError::CommandFull)
-            | Err(ThreadedRuntimeError::HostWaitTimeout)
-            | Err(ThreadedRuntimeError::WorkerUnresponsive) => {
-                // `call_on` is blocking-admission, so `CommandFull` is
-                // unreachable today. `WorkerUnresponsive` means the shard
-                // accepted the register command but never answered — the
-                // isolate is unusable, same as stopped. Map defensively in case
-                // the inner helper is ever migrated.
+            Err(RecoverableControlCallError::Accepted(_))
+            | Err(RecoverableControlCallError::NotAdmitted { .. }) => {
                 Err(ThreadedRegisterBootstrapError::WorkerStopped)
             }
         }
@@ -833,6 +842,9 @@ where
             runtime.observe_result::<T, M, R>(address)
         }) {
             Ok(result) => result,
+            Err(ThreadedRuntimeError::CommandFull) => {
+                Err(observation::ResultWaitError::CommandFull)
+            }
             Err(_) => Err(observation::ResultWaitError::RuntimeStopped),
         }
     }
@@ -1109,6 +1121,86 @@ where
         )
     }
 
+    fn call_on_with_input<R, T, C>(
+        &self,
+        shard: ShardId,
+        input: T,
+        command: C,
+    ) -> Result<R, RecoverableControlCallError<T>>
+    where
+        R: Send + 'static,
+        T: Send + 'static,
+        C: FnOnce(&mut Runtime<S, F>, T) -> R + Send + 'static,
+    {
+        let Some(sender) = self.commands.get(&shard) else {
+            return Err(RecoverableControlCallError::NotAdmitted {
+                error: ThreadedRuntimeError::UnknownShard(shard),
+                input,
+            });
+        };
+        let input = Arc::new(std::sync::Mutex::new(Some(input)));
+        let worker_input = Arc::clone(&input);
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let threaded_command = ThreadedCommand::Run(Box::new(move |runtime| {
+            let input = worker_input
+                .lock()
+                .expect("recoverable control-call input lock poisoned")
+                .take()
+                .expect("recoverable control-call input taken exactly once");
+            let _ = reply_tx.send(command(runtime, input));
+        }));
+        match sender.try_send(threaded_command) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(command)) => {
+                drop(command);
+                let input = input
+                    .lock()
+                    .expect("recoverable control-call input lock poisoned")
+                    .take()
+                    .expect("unadmitted control call retains its input");
+                return Err(RecoverableControlCallError::NotAdmitted {
+                    error: ThreadedRuntimeError::CommandFull,
+                    input,
+                });
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(command)) => {
+                if let Some(metrics) = self.shard_metrics.get(&shard) {
+                    metrics.set_state(LiveShardState::Failed);
+                }
+                drop(command);
+                let input = input
+                    .lock()
+                    .expect("recoverable control-call input lock poisoned")
+                    .take()
+                    .expect("unadmitted control call retains its input");
+                return Err(RecoverableControlCallError::NotAdmitted {
+                    error: ThreadedRuntimeError::WorkerStopped,
+                    input,
+                });
+            }
+        }
+
+        match reply_rx.recv_timeout(self.control_call_timeout) {
+            Ok(reply) => Ok(reply),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(metrics) = self.shard_metrics.get(&shard) {
+                    metrics.set_state(LiveShardState::Failed);
+                }
+                Err(RecoverableControlCallError::Accepted(
+                    ThreadedRuntimeError::WorkerUnresponsive,
+                ))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if let Some(metrics) = self.shard_metrics.get(&shard) {
+                    metrics.set_state(LiveShardState::Failed);
+                }
+                Err(RecoverableControlCallError::Accepted(
+                    ThreadedRuntimeError::WorkerStopped,
+                ))
+            }
+        }
+    }
+
     fn call_on<R, C>(&self, shard: ShardId, command: C) -> Result<R, ThreadedRuntimeError>
     where
         R: Send + 'static,
@@ -1118,16 +1210,20 @@ where
             return Err(ThreadedRuntimeError::UnknownShard(shard));
         };
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        sender
-            .send(ThreadedCommand::Run(Box::new(move |runtime| {
-                let _ = reply_tx.send(command(runtime));
-            })))
-            .map_err(|_| {
+        match sender.try_send(ThreadedCommand::Run(Box::new(move |runtime| {
+            let _ = reply_tx.send(command(runtime));
+        }))) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                return Err(ThreadedRuntimeError::CommandFull);
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
                 if let Some(metrics) = self.shard_metrics.get(&shard) {
                     metrics.set_state(LiveShardState::Failed);
                 }
-                ThreadedRuntimeError::WorkerStopped
-            })?;
+                return Err(ThreadedRuntimeError::WorkerStopped);
+            }
+        }
         // Bounded wait: a wedged handler on one shard must not hang the host.
         match reply_rx.recv_timeout(self.control_call_timeout) {
             Ok(reply) => Ok(reply),

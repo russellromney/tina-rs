@@ -1038,7 +1038,7 @@ where
     /// Register before triggering the bind. FIFO registration, bounded
     /// observation, call failure, and runtime-stopped outcomes match
     /// [`ThreadedRuntime::observe_next_bound`] exactly.
-    pub fn observe_next_bound(&self) -> crate::BoundAddressWaiter {
+    pub fn observe_next_bound(&self) -> Result<crate::BoundAddressWaiter, ThreadedRuntimeError> {
         self.runtime().observe_next_bound()
     }
 
@@ -1046,7 +1046,7 @@ where
     pub fn observe_isolate_complete<M: 'static, R: 'static>(
         &self,
         address: Address<M, R>,
-    ) -> crate::IsolateCompleteWaiter {
+    ) -> Result<crate::IsolateCompleteWaiter, ThreadedRuntimeError> {
         self.runtime().observe_isolate_complete(address)
     }
 
@@ -1055,7 +1055,7 @@ where
     pub fn observe_child_restarted<M: 'static, R: 'static>(
         &self,
         parent: Address<M, R>,
-    ) -> crate::ChildRestartedWaiter {
+    ) -> Result<crate::ChildRestartedWaiter, ThreadedRuntimeError> {
         self.runtime().observe_child_restarted(parent)
     }
 

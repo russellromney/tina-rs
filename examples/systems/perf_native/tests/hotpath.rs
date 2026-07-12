@@ -1008,7 +1008,9 @@ fn start_http_runtime(
             config.listener_mailbox_capacity,
         )
         .expect("register http listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime
         .try_send(listener, HttpListenerMsg::Start)
         .expect("start http listener");

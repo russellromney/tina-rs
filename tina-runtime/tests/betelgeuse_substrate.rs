@@ -1810,12 +1810,15 @@ fn threaded_multishard_remote_queue_full_is_visible_at_source() {
         .try_send(burst, BurstMsg::Burst)
         .expect("burst handoff accepted");
 
-    wait_until(Duration::from_secs(2), "Betelgeuse remote full", || {
-        let trace = runtime
-            .trace_on(ShardId::new(1))
-            .expect("source shard trace");
-        count_send_rejected_full(&trace) >= 1
-    });
+    wait_until(
+        Duration::from_secs(2),
+        "Betelgeuse remote full",
+        || match runtime.trace_on(ShardId::new(1)) {
+            Ok(trace) => count_send_rejected_full(&trace) >= 1,
+            Err(ThreadedRuntimeError::CommandFull) => false,
+            Err(error) => panic!("source shard trace: {error}"),
+        },
+    );
     wake_tx.send(()).expect("release parked target worker");
 
     let trace = runtime.shutdown().expect("Betelgeuse multishard shutdown");
