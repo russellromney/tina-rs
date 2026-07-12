@@ -112,6 +112,28 @@ timeout in both the HTTP and DB stages, timer-lane Full as an exact
 concurrent workers, and zero HTTP/DB authority after shutdown. Unit accounting
 keeps every call terminal and every outer threaded-host error distinct.
 
+### 2026-07-12 Extension corpus canonicalization ledger
+
+Every crate under `examples/extensions` was read by hand and run with
+`--all-targets`. Four extension proofs already use the smallest current public
+surface and need no migration:
+
+| Example | Current friction | Desired form | API sufficient | Framework prerequisite | Example branch | Tests | Status |
+|---|---|---|---|---|---|---|---|
+| `tina-extension-capacity-surface` | None; owned report data joins `CapacitySummary` directly. | Current `CapacitySurfaceReport` constructors and typed assertions. | yes | none | `agent/extensions-canonical` | 1 unit test | canonical |
+| `tina-extension-compile-fail` | None; public/private ownership boundaries are compile-fail doctests. | Current public constructors with unforgeable private state. | yes | none | `agent/extensions-canonical` | 4 doctests + count guard | canonical |
+| `tina-extension-fake-bridge` | None; bounded worker lifecycle is intentionally outside isolate authoring. | Current typed bridge setup, pressure, timeout warning, late terminal, close, and drain vocabulary. | yes | none | `agent/extensions-canonical` | 2 unit tests | canonical; docs migrated to event handle vocabulary |
+| `tina-extension-service-policy` | None; policy returns exhaustive typed decisions from caller-supplied time. | Current `ServicePolicy` and fixed-capacity key table. | yes | none | `agent/extensions-canonical` | 1 unit test | canonical |
+| `tina-extension-custom-codec` | Server/client are event-only in behavior but use `message = ...`; `UnixWriteAll` continuation translators require the full isolate message, so event-only conversion would manually construct `ServiceMessage::Event`. Unix errors are also collapsed into generic stop paths. | `#[isolate(event = ..., shard = CodecShard)]`, `register_event_service`, `try_send_event`, domain-event continuation helpers, and exhaustive bind/accept/read/write/close outcomes. | no | `UnixWriteAll::next_service_event` and `advance_service_event`, mirroring typed-call `then_service_event` without exposing the service envelope. | pending after framework prerequisite | 5 unit/simulator tests currently green | blocked on framework prerequisite; not retained as legacy |
+
+The custom codec README and extension user guide now show the correct public
+`SyncCodec::feed` signature (`-> usize`). Fake-bridge documentation now teaches
+typed event-only registration and `try_send_event` rather than a generic
+message address. No example-local envelope adapter or duplicate write loop was
+added. Once the two narrow `UnixWriteAll` siblings land in a separate framework
+PR, this cohort must resume and complete the event-only migration; the extension
+sweep is not complete until then.
+
 ### 2026-07-12 Lock-manager keyed FIFO canonicalization
 
 Migrated `system_lock_manager` from the historical

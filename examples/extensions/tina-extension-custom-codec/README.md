@@ -8,7 +8,7 @@ a tiny socket service — with only public APIs.
 `SyncCodec` is the open sync-codec extension trait:
 
 ```rust
-fn feed(&mut self, bytes: &[u8]);
+fn feed(&mut self, bytes: &[u8]) -> usize;
 fn next_frame(&mut self) -> FrameDecision<Self::Frame, Self::Malformed>;
 ```
 
@@ -30,6 +30,17 @@ frame length and rejects an embedded NUL.
 
 The service runs over `tina_sim`'s deterministic Unix-domain rails, so the test
 is reproducible.
+
+## Authoring status
+
+The codec hook itself is canonical. The sample server and client are still
+generic message isolates because `UnixWriteAll` does not yet have
+`next_service_event` / `advance_service_event` siblings. Converting them to
+event-only services today would require application code to construct the
+private `ServiceMessage::Event` routing envelope. The extension sweep records
+that narrow runtime prerequisite in `examples/FINDINGS.md`; after it lands,
+this crate must move to event-only registration and exhaustive typed Unix
+terminal outcomes.
 
 ## Run the smoke test
 

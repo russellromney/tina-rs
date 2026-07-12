@@ -37,10 +37,10 @@
 //!
 //! ```ignore
 //! // From the worker thread, deliver the completion into the isolate
-//! // that is waiting on it. `address` comes from
-//! // `ThreadedRuntime::register_with_capacity`; the isolate then
+//! // that is waiting on it. `events` is an `EventServiceHandle<BridgeEvent>`
+//! // from `ThreadedRuntime::register_event_service`; the isolate then
 //! // replies to the original caller with `reply_to(..)`.
-//! runtime.try_send(address, Msg::Completed { id, output })?;
+//! runtime.try_send_event(events, BridgeEvent::Completed { id, output })?;
 //! ```
 //!
 //! Nothing in that path is private. The bounded admission, the worker
