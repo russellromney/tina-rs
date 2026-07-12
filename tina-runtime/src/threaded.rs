@@ -347,6 +347,7 @@ where
     F: MailboxFactory,
 {
     Run(ThreadedCommandFn<S, F>),
+    RunObserved(Box<dyn ThreadedObservedCommandTask<S, F>>),
     /// A `call_blocking` enqueue. A typed variant instead of a boxed `Run`
     /// closure so the host pays one allocation per call (the type-erased begin
     /// task) instead of two (begin task + command closure). The worker routes
@@ -357,6 +358,85 @@ where
         begin: Box<dyn HostCallTaskBegin<S>>,
     },
     Shutdown,
+}
+
+pub(crate) trait ThreadedObservedCommandTask<S, F>: Send
+where
+    S: Shard + 'static,
+    F: MailboxFactory,
+{
+    fn run(self: Box<Self>, runtime: &mut Runtime<S, F>);
+    fn disarm(self: Box<Self>);
+}
+
+struct SendObservedCommand<M, R, P, O>
+where
+    O: FnOnce(Result<(), ThreadedSendObservedError>),
+{
+    address: Address<M, R>,
+    message: Option<M>,
+    preflight: Option<P>,
+    observer: Option<O>,
+    report_worker_stopped_on_drop: bool,
+}
+
+impl<S, F, M, R, P, O> ThreadedObservedCommandTask<S, F> for SendObservedCommand<M, R, P, O>
+where
+    S: Shard + 'static,
+    F: MailboxFactory + 'static,
+    M: Send + 'static,
+    R: 'static,
+    P: FnOnce(&M) -> Option<ThreadedSendObservedError> + Send + 'static,
+    O: FnOnce(Result<(), ThreadedSendObservedError>) + Send + 'static,
+{
+    fn run(mut self: Box<Self>, runtime: &mut Runtime<S, F>) {
+        self.report_worker_stopped_on_drop = false;
+        let message = self.message.take().expect("observed command runs once");
+        let preflight = self
+            .preflight
+            .take()
+            .expect("observed command preflight runs once");
+        let observer = self
+            .observer
+            .take()
+            .expect("observed command observer runs once");
+        if let Some(error) = preflight(&message) {
+            observer(Err(error));
+            return;
+        }
+        observer(
+            runtime
+                .try_send(self.address, message)
+                .map_err(|error| match error {
+                    TrySendError::Full(_) => ThreadedSendObservedError::MailboxFull,
+                    TrySendError::Closed(_) => ThreadedSendObservedError::MailboxClosed,
+                }),
+        );
+    }
+
+    fn disarm(mut self: Box<Self>) {
+        self.report_worker_stopped_on_drop = false;
+    }
+}
+
+impl<M, R, P, O> Drop for SendObservedCommand<M, R, P, O>
+where
+    O: FnOnce(Result<(), ThreadedSendObservedError>),
+{
+    fn drop(&mut self) {
+        if !self.report_worker_stopped_on_drop {
+            return;
+        }
+        let Some(observer) = self.observer.take() else {
+            return;
+        };
+        // A queued command can be dropped while the receiver unwinds from a
+        // different worker panic. Never let a user observer cause a second
+        // panic during that cleanup.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            observer(Err(ThreadedSendObservedError::WorkerStopped));
+        }));
+    }
 }
 
 /// Routes a `HostCall` command to its dispatcher on the worker thread, turning
@@ -1233,7 +1313,12 @@ where
     /// target `Full` / `Closed` instead of degrading those failures into
     /// timeouts.
     ///
-    /// The observer runs on the worker thread and must stay nonblocking.
+    /// `Ok(())` guarantees that the observer runs exactly once on the worker
+    /// thread. If the worker fails after accepting the command but before
+    /// mailbox admission, the observer receives
+    /// [`ThreadedSendObservedError::WorkerStopped`]. A host-side
+    /// `Err(IngressFull | WorkerStopped)` means the observer will not run.
+    /// The observer must stay nonblocking.
     pub fn try_send_and_observe_with<M, R, O>(
         &self,
         address: Address<M, R>,
@@ -1415,6 +1500,9 @@ where
     /// cleanly. A worker already known failed is rejected before command
     /// enqueue, matching [`Self::try_send`]; no observer or late mailbox side
     /// effect can remain behind that rejection.
+    /// If ingress accepts the command while the worker is transitioning to
+    /// failure, dropping the worker queue invokes the observer exactly once
+    /// with [`ThreadedSendObservedError::WorkerStopped`].
     ///
     /// **Message ownership.** This helper consumes `message` and does not
     /// return it on rejection — same as the underlying
@@ -1448,7 +1536,9 @@ where
     ///
     /// The preflight runs on the worker thread immediately before mailbox
     /// admission. It is for already-queued commands that may have become stale
-    /// before the worker could observe them; it must stay nonblocking.
+    /// before the worker could observe them; it must stay nonblocking. Its
+    /// observer has the same exact-once contract as
+    /// [`Self::try_send_and_observe_with`].
     pub fn try_send_and_observe_with_preflight<M, R, P, O>(
         &self,
         address: Address<M, R>,
@@ -1470,20 +1560,12 @@ where
             return Err(ThreadedTrySendError::WorkerStopped);
         }
 
-        let command = ThreadedCommand::Run(Box::new(move |runtime| {
-            if let Some(error) = preflight(&message) {
-                observer(Err(error));
-                return;
-            }
-
-            observer(
-                runtime
-                    .try_send(address, message)
-                    .map_err(|error| match error {
-                        TrySendError::Full(_) => ThreadedSendObservedError::MailboxFull,
-                        TrySendError::Closed(_) => ThreadedSendObservedError::MailboxClosed,
-                    }),
-            );
+        let command = ThreadedCommand::RunObserved(Box::new(SendObservedCommand {
+            address,
+            message: Some(message),
+            preflight: Some(preflight),
+            observer: Some(observer),
+            report_worker_stopped_on_drop: true,
         }));
 
         match self.commands.try_send(command) {
@@ -1491,11 +1573,19 @@ where
                 self.metrics.ingress.accepted();
                 Ok(())
             }
-            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+            Err(std::sync::mpsc::TrySendError::Full(command)) => {
+                let ThreadedCommand::RunObserved(command) = command else {
+                    unreachable!("observed send enqueues an observed command")
+                };
+                command.disarm();
                 self.metrics.ingress.rejected_full();
                 Err(ThreadedTrySendError::IngressFull)
             }
-            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+            Err(std::sync::mpsc::TrySendError::Disconnected(command)) => {
+                let ThreadedCommand::RunObserved(command) = command else {
+                    unreachable!("observed send enqueues an observed command")
+                };
+                command.disarm();
                 self.metrics.ingress.rejected_closed();
                 self.metrics.set_state(LiveShardState::Failed);
                 Err(ThreadedTrySendError::WorkerStopped)
@@ -1982,6 +2072,10 @@ where
                 command(&mut runtime);
                 continue;
             }
+            Ok(ThreadedCommand::RunObserved(command)) => {
+                command.run(&mut runtime);
+                continue;
+            }
             Ok(ThreadedCommand::HostCall { dispatcher, begin }) => {
                 run_host_call(&mut runtime, dispatcher, begin);
                 continue;
@@ -2014,6 +2108,7 @@ where
             // Shutdown leaves the hot path immediately.
             match receiver.try_recv() {
                 Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
+                Ok(ThreadedCommand::RunObserved(command)) => command.run(&mut runtime),
                 Ok(ThreadedCommand::HostCall { dispatcher, begin }) => {
                     run_host_call(&mut runtime, dispatcher, begin)
                 }
@@ -2061,6 +2156,7 @@ where
         };
         match receiver.recv_timeout(park) {
             Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
+            Ok(ThreadedCommand::RunObserved(command)) => command.run(&mut runtime),
             Ok(ThreadedCommand::HostCall { dispatcher, begin }) => {
                 run_host_call(&mut runtime, dispatcher, begin)
             }

@@ -20,7 +20,9 @@ This file records completed work.
   reject a worker already known failed before enqueueing an observer command,
   matching `try_send`. `WorkerStopped` can no longer be reported as accepted
   work whose observer never fires; host-burst accounting still settles the
-  rejection exactly once.
+  rejection exactly once. An observed command accepted immediately before a
+  worker failure also settles exactly once as `WorkerStopped` when the worker
+  drops its command queue.
 
 ### Authoritative child-restart observation
 
