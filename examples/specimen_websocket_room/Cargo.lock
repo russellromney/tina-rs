@@ -627,6 +627,7 @@ dependencies = [
 name = "specimen_websocket_room"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "http",
  "rcgen",
  "rustls",

@@ -57,7 +57,7 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     // across the topology/health/shutdown fields.
     let mut lifecycle_transitions: Vec<Lifecycle> = vec![Lifecycle::Starting];
 
-    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
     let sqlite = SqliteWorker::<SingleShard>::install(
         &runtime,
         SqliteConfig::path(&db_path)
@@ -397,7 +397,7 @@ pub fn prove_drain_cancels_active_scope() -> anyhow::Result<crate::DrainActiveRe
     let db_path = dir.path().join("mini-saas.sqlite");
     seed_db(&db_path)?;
 
-    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
     let sqlite = SqliteWorker::<SingleShard>::install(
         &runtime,
         SqliteConfig::path(&db_path)
@@ -828,7 +828,7 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
     seed_db(&db_path)?;
 
     let live_trace = tina_proof_harness::LiveTrace::new();
-    let runtime = ThreadedRuntime::with_config_and_trace_observer(
+    let runtime = ThreadedRuntime::try_with_config_and_trace_observer(
         SingleShard,
         DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
@@ -836,7 +836,7 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
             ..Default::default()
         },
         live_trace.observer(),
-    );
+    )?;
     let sqlite = SqliteWorker::<SingleShard>::install(
         &runtime,
         SqliteConfig::path(&db_path)

@@ -102,10 +102,10 @@ impl Coordinator {
 // ---------- Run ----------
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
 
     let chunk_size = WORK_VALUES.len() / WORKER_COUNT as usize;
     let chunks: Vec<Vec<u64>> = (0..WORKER_COUNT as usize)

@@ -14,8 +14,7 @@ use tina_http::{
     WebSocketSessionId, WebSocketSessionMsg, WebSocketSessionOutcome, websocket_upgrade,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime,
-    ThreadedRuntimeConfig, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig, sleep,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -818,13 +817,13 @@ impl Default for RoomServerConfig {
 }
 
 impl RoomServer {
-    pub fn start() -> Self {
+    pub fn start() -> anyhow::Result<Self> {
         Self::start_with(RoomServerConfig::default())
     }
 
-    pub fn start_with(config: RoomServerConfig) -> Self {
-        assert_eq!(
-            config.room_capacity, 1,
+    pub fn start_with(config: RoomServerConfig) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            config.room_capacity == 1,
             "specimen_websocket_room supports one bounded named room"
         );
         let report = Arc::new(SharedReport::default());
@@ -834,7 +833,7 @@ impl RoomServer {
             r.member_capacity = config.member_capacity;
             r.room_high_water = 1;
         });
-        let runtime = ThreadedRuntime::with_config(
+        let runtime = ThreadedRuntime::try_with_config(
             DemoShard,
             DefaultThreadedMailboxFactory,
             ThreadedRuntimeConfig {
@@ -842,7 +841,7 @@ impl RoomServer {
                 idle_wait: Duration::from_millis(1),
                 ..Default::default()
             },
-        );
+        )?;
         let room = runtime
             .register_with_capacity::<Room, Infallible>(
                 Room {
@@ -859,7 +858,7 @@ impl RoomServer {
                 },
                 config.room_mailbox_capacity,
             )
-            .expect("register room");
+            .map_err(|error| anyhow::anyhow!("register room: {error:?}"))?;
         let gateway = runtime
             .register_with_capacity::<Gateway, WebSocketSessionMsg>(
                 Gateway {
@@ -873,7 +872,7 @@ impl RoomServer {
                 },
                 config.gateway_mailbox_capacity,
             )
-            .expect("register gateway");
+            .map_err(|error| anyhow::anyhow!("register gateway: {error:?}"))?;
         let listener_isolate = HttpListener::<DemoShard>::new(
             "127.0.0.1:0".parse().unwrap(),
             gateway,
@@ -886,19 +885,21 @@ impl RoomServer {
                 listener_isolate,
                 config.listener_mailbox_capacity,
             )
-            .expect("register listener");
+            .map_err(|error| anyhow::anyhow!("register listener: {error:?}"))?;
         let bound = runtime.observe_next_bound();
         runtime
             .try_send(listener, HttpListenerMsg::Start)
-            .expect("start listener");
-        let addr = bound.wait(Duration::from_secs(2)).expect("bound address");
-        Self {
+            .map_err(|error| anyhow::anyhow!("start listener: {error:?}"))?;
+        let addr = bound
+            .wait(Duration::from_secs(2))
+            .map_err(|error| anyhow::anyhow!("listener did not bind: {error:?}"))?;
+        Ok(Self {
             addr,
             runtime,
             listener,
             room,
             report,
-        }
+        })
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -930,11 +931,19 @@ impl RoomServer {
         })
     }
 
-    pub fn stop(self) -> RoomReport {
+    pub fn stop(self) -> anyhow::Result<RoomReport> {
         let report = self.report();
-        let _ = self.runtime.try_send(self.listener, HttpListenerMsg::Stop);
-        let _ = self.runtime.shutdown();
-        report
+        let stop = self.runtime.try_send(self.listener, HttpListenerMsg::Stop);
+        let shutdown = self.runtime.shutdown();
+        match (stop, shutdown) {
+            (Ok(()), Ok(_)) => {}
+            (Err(stop), Ok(_)) => anyhow::bail!("stop HTTP listener: {stop:?}"),
+            (Ok(()), Err(shutdown)) => anyhow::bail!("shutdown room runtime: {shutdown:?}"),
+            (Err(stop), Err(shutdown)) => anyhow::bail!(
+                "stop HTTP listener: {stop:?}; shutdown room runtime also failed: {shutdown:?}"
+            ),
+        }
+        Ok(report)
     }
 }
 
@@ -946,16 +955,16 @@ pub struct TlsRoomServer {
 }
 
 impl TlsRoomServer {
-    pub fn start() -> Self {
+    pub fn start() -> anyhow::Result<Self> {
         Self::start_with(RoomServerConfig::default())
     }
 
-    pub fn start_with(config: RoomServerConfig) -> Self {
-        assert_eq!(
-            config.room_capacity, 1,
+    pub fn start_with(config: RoomServerConfig) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            config.room_capacity == 1,
             "specimen_websocket_room supports one bounded named room"
         );
-        let generated = generate_identity();
+        let generated = generate_identity()?;
         let report = Arc::new(SharedReport::default());
         report.update(|r| {
             r.active_rooms = 1;
@@ -963,7 +972,7 @@ impl TlsRoomServer {
             r.member_capacity = config.member_capacity;
             r.room_high_water = 1;
         });
-        let runtime = ThreadedRuntime::with_config(
+        let runtime = ThreadedRuntime::try_with_config(
             DemoShard,
             DefaultThreadedMailboxFactory,
             ThreadedRuntimeConfig {
@@ -971,7 +980,7 @@ impl TlsRoomServer {
                 idle_wait: Duration::from_millis(1),
                 ..Default::default()
             },
-        );
+        )?;
         let room = runtime
             .register_with_capacity::<Room, Infallible>(
                 Room {
@@ -988,7 +997,7 @@ impl TlsRoomServer {
                 },
                 config.room_mailbox_capacity,
             )
-            .expect("register tls room");
+            .map_err(|error| anyhow::anyhow!("register tls room: {error:?}"))?;
         let gateway = runtime
             .register_with_capacity::<Gateway, WebSocketSessionMsg>(
                 Gateway {
@@ -1002,7 +1011,7 @@ impl TlsRoomServer {
                 },
                 config.gateway_mailbox_capacity,
             )
-            .expect("register tls gateway");
+            .map_err(|error| anyhow::anyhow!("register tls gateway: {error:?}"))?;
         let listener_isolate = HttpsListener::<DemoShard>::new(
             "127.0.0.1:0".parse().unwrap(),
             gateway,
@@ -1013,20 +1022,20 @@ impl TlsRoomServer {
                 listener_isolate,
                 config.listener_mailbox_capacity,
             )
-            .expect("register https listener");
+            .map_err(|error| anyhow::anyhow!("register https listener: {error:?}"))?;
         let ready = runtime
             .call_blocking(listener, HttpsListenerMsg::Start, Duration::from_secs(5))
-            .expect("start https");
+            .map_err(|error| anyhow::anyhow!("call https listener: {error:?}"))?;
         let ready = match ready {
             CallOutcome::Replied(Ok(ready)) => ready,
-            other => panic!("https listener did not start: {other:?}"),
+            other => anyhow::bail!("https listener did not start: {other:?}"),
         };
-        Self {
+        Ok(Self {
             addr: ready.local_addr,
             runtime,
             listener,
             report,
-        }
+        })
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -1037,11 +1046,19 @@ impl TlsRoomServer {
         self.report.snapshot()
     }
 
-    pub fn stop(self) -> RoomReport {
+    pub fn stop(self) -> anyhow::Result<RoomReport> {
         let report = self.report();
-        let _ = self.runtime.try_send(self.listener, HttpsListenerMsg::Stop);
-        let _ = self.runtime.shutdown();
-        report
+        let stop = self.runtime.try_send(self.listener, HttpsListenerMsg::Stop);
+        let shutdown = self.runtime.shutdown();
+        match (stop, shutdown) {
+            (Ok(()), Ok(_)) => {}
+            (Err(stop), Ok(_)) => anyhow::bail!("stop HTTPS listener: {stop:?}"),
+            (Ok(()), Err(shutdown)) => anyhow::bail!("shutdown TLS room runtime: {shutdown:?}"),
+            (Err(stop), Err(shutdown)) => anyhow::bail!(
+                "stop HTTPS listener: {stop:?}; shutdown TLS room runtime also failed: {shutdown:?}"
+            ),
+        }
+        Ok(report)
     }
 }
 
@@ -1049,18 +1066,17 @@ struct GeneratedIdentity {
     identity: TlsServerIdentity,
 }
 
-fn generate_identity() -> GeneratedIdentity {
+fn generate_identity() -> anyhow::Result<GeneratedIdentity> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let certified =
-        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen self-sign");
+    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
     let cert_der = certified.cert.der().to_vec();
     let key_der = certified.signing_key.serialize_der();
     let identity = TlsServerIdentity::from_der(vec![cert_der], key_der);
-    GeneratedIdentity { identity }
+    Ok(GeneratedIdentity { identity })
 }
 
-pub fn run() -> RoomReport {
-    let server = RoomServer::start();
+pub fn run() -> anyhow::Result<RoomReport> {
+    let server = RoomServer::start()?;
     run_script(&server);
     server.stop()
 }
@@ -1211,7 +1227,7 @@ mod tests {
     #[test]
     fn specimen_websocket_room_smoke() {
         let _guard = test_guard();
-        let report = crate::run();
+        let report = crate::run().expect("run room specimen");
         assert!(report.client_b_received, "{report:?}");
         assert!(report.broadcast_ok >= 1, "{report:?}");
         assert!(report.broadcast_full >= 1, "{report:?}");
@@ -1222,9 +1238,27 @@ mod tests {
     }
 
     #[test]
+    fn invalid_room_capacity_is_returned_to_the_host() {
+        let result = crate::RoomServer::start_with(crate::RoomServerConfig {
+            room_capacity: 2,
+            ..Default::default()
+        });
+        let error = match result {
+            Ok(_) => panic!("unsupported room capacity must not start a runtime"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("supports one bounded named room"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn real_tungstenite_clients_use_the_room_and_report_endpoint() {
         let _guard = test_guard();
-        let server = crate::RoomServer::start();
+        let server = crate::RoomServer::start().expect("start room server");
         let url = format!("ws://{}/room", server.addr());
         let mut a = connect_room(url.as_str());
         let mut b = connect_room(url.as_str());
@@ -1242,19 +1276,19 @@ mod tests {
         assert!(http_get(server.addr(), "/room-report").contains("\"broadcast_ok\":1"));
         let _ = a.close(None);
         let _ = b.close(None);
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
     fn browser_client_page_is_served_and_points_at_room_websocket() {
         let _guard = test_guard();
-        let server = crate::RoomServer::start();
+        let server = crate::RoomServer::start().expect("start room server");
         let page = http_get(server.addr(), "/");
         assert!(page.contains("new WebSocket"), "{page}");
         assert!(page.contains("/room"), "{page}");
         assert!(page.contains("tina.room.v1"), "{page}");
         assert!(page.contains("location.protocol"), "{page}");
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
@@ -1267,7 +1301,8 @@ mod tests {
                 require_subprotocol: true,
             },
             ..Default::default()
-        });
+        })
+        .expect("start room server");
 
         let bad_origin = raw_upgrade(
             server.addr(),
@@ -1307,7 +1342,7 @@ mod tests {
         assert_eq!(report.rejected_origin, 1, "{report:?}");
         assert_eq!(report.rejected_auth, 1, "{report:?}");
         assert_eq!(report.rejected_subprotocol, 1, "{report:?}");
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
@@ -1316,7 +1351,8 @@ mod tests {
         let server = crate::RoomServer::start_with(crate::RoomServerConfig {
             member_capacity: 2,
             ..Default::default()
-        });
+        })
+        .expect("start room server");
         let url = format!("ws://{}/room", server.addr());
         let mut a = connect_room(url.as_str());
         let mut b = connect_room(url.as_str());
@@ -1339,13 +1375,13 @@ mod tests {
         assert_eq!(report.live_members, 2, "{report:?}");
         let _ = b.close(None);
         let _ = c.close(None);
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
     fn session_report_request_is_bounded_and_visible() {
         let _guard = test_guard();
-        let server = crate::RoomServer::start();
+        let server = crate::RoomServer::start().expect("start room server");
         let url = format!("ws://{}/room", server.addr());
         let mut client = connect_room(url.as_str());
         assert!(client.read().expect("join").is_text());
@@ -1356,7 +1392,7 @@ mod tests {
         assert_eq!(report.session_report_ok, 1, "{report:?}");
         assert_eq!(report.queued_frame_high_water, 0, "{report:?}");
         let _ = client.close(None);
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
@@ -1369,7 +1405,8 @@ mod tests {
             },
             member_capacity: 2,
             ..Default::default()
-        });
+        })
+        .expect("start room server");
         let url = format!("ws://{}/room", server.addr());
         let mut slow = connect_room(url.as_str());
         let mut sender = connect_room(url.as_str());
@@ -1405,13 +1442,13 @@ mod tests {
         let _ = slow.close(None);
         let _ = sender.close(None);
         let _ = healthy.close(None);
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
     fn room_shutdown_closes_existing_clients_and_rejects_new_upgrades() {
         let _guard = test_guard();
-        let server = crate::RoomServer::start();
+        let server = crate::RoomServer::start().expect("start room server");
         let url = format!("ws://{}/room", server.addr());
         let mut client = connect_room(url.as_str());
         assert!(client.read().expect("join").is_text());
@@ -1425,13 +1462,13 @@ mod tests {
             connect(url.as_str()).is_err(),
             "new upgrade after shutdown must fail"
         );
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
     fn room_delete_rejects_new_upgrades_then_create_allows_refill() {
         let _guard = test_guard();
-        let server = crate::RoomServer::start();
+        let server = crate::RoomServer::start().expect("start room server");
         let url = format!("ws://{}/room", server.addr());
         let mut client = connect_room(url.as_str());
         assert!(client.read().expect("join").is_text());
@@ -1455,7 +1492,7 @@ mod tests {
         let report = server.wait_until(Duration::from_secs(2), |r| r.active_rooms == 1);
         assert_eq!(report.active_rooms, 1, "{report:?}");
         let _ = refill.close(None);
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
@@ -1464,7 +1501,8 @@ mod tests {
         let server = crate::RoomServer::start_with(crate::RoomServerConfig {
             idle_room_expiry: Duration::from_millis(20),
             ..Default::default()
-        });
+        })
+        .expect("start room server");
         let url = format!("ws://{}/room", server.addr());
         let mut before_idle = connect_room(url.as_str());
         assert!(before_idle.read().expect("join before idle").is_text());
@@ -1482,13 +1520,13 @@ mod tests {
         let mut client = connect_room(url.as_str());
         assert!(client.read().expect("join after idle create").is_text());
         let _ = client.close(None);
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
     fn shutdown_during_broadcast_closes_clients_without_hanging() {
         let _guard = test_guard();
-        let server = crate::RoomServer::start();
+        let server = crate::RoomServer::start().expect("start room server");
         let url = format!("ws://{}/room", server.addr());
         let mut a = connect_room(url.as_str());
         let mut b = connect_room(url.as_str());
@@ -1518,7 +1556,7 @@ mod tests {
         );
         let _ = a.close(None);
         let _ = b.close(None);
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
@@ -1527,7 +1565,8 @@ mod tests {
         let server = crate::RoomServer::start_with(crate::RoomServerConfig {
             member_capacity: 1,
             ..Default::default()
-        });
+        })
+        .expect("start room server");
         let url = format!("ws://{}/room", server.addr());
         for index in 0..25 {
             let mut client = connect_room(url.as_str());
@@ -1545,13 +1584,13 @@ mod tests {
         let report = server.report();
         assert_eq!(report.joined, 25, "{report:?}");
         assert_eq!(report.live_members, 0, "{report:?}");
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
     fn http_routes_coexist_with_websocket_activity() {
         let _guard = test_guard();
-        let server = crate::RoomServer::start();
+        let server = crate::RoomServer::start().expect("start room server");
         let url = format!("ws://{}/room", server.addr());
         let mut client = connect_room(url.as_str());
         assert!(client.read().expect("join").is_text());
@@ -1570,7 +1609,7 @@ mod tests {
         assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");
 
         let _ = client.close(None);
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
@@ -1590,7 +1629,7 @@ mod tests {
         let report = tls.wait_until(Duration::from_secs(2), |r| r.joined == 1);
         assert_eq!(report.live_members, 1, "{report:?}");
         let _ = ws.close(None);
-        let _ = tls.stop();
+        tls.stop().expect("stop TLS room server");
     }
 
     #[test]
@@ -1599,7 +1638,8 @@ mod tests {
         let server = crate::RoomServer::start_with(crate::RoomServerConfig {
             member_capacity: 8,
             ..Default::default()
-        });
+        })
+        .expect("start room server");
         let url = format!("ws://{}/room", server.addr());
         let mut clients = Vec::new();
         for index in 0..8 {
@@ -1621,7 +1661,7 @@ mod tests {
         for mut client in clients {
             let _ = client.close(None);
         }
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
@@ -1630,7 +1670,8 @@ mod tests {
         let server = crate::RoomServer::start_with(crate::RoomServerConfig {
             member_capacity: 6,
             ..Default::default()
-        });
+        })
+        .expect("start room server");
         let url = format!("ws://{}/room", server.addr());
         let mut clients = Vec::new();
         for index in 0..6 {
@@ -1663,7 +1704,7 @@ mod tests {
         for mut client in clients {
             let _ = client.close(None);
         }
-        let after = server.stop();
+        let after = server.stop().expect("stop room server");
         assert_eq!(after.active_rooms, 1, "{after:?}");
     }
 
@@ -1703,7 +1744,7 @@ mod tests {
                 r.room_high_water = 1;
             });
             let limits = WebSocketLimits::default();
-            let runtime = ThreadedRuntime::with_config(
+            let runtime = ThreadedRuntime::try_with_config(
                 crate::DemoShard,
                 DefaultThreadedMailboxFactory,
                 ThreadedRuntimeConfig {
@@ -1711,7 +1752,8 @@ mod tests {
                     idle_wait: Duration::from_millis(1),
                     ..Default::default()
                 },
-            );
+            )
+            .expect("start runtime");
             let room = runtime
                 .register_with_capacity::<crate::Room, Infallible>(
                     crate::Room {
@@ -1778,11 +1820,21 @@ mod tests {
             self.report.wait_until(timeout, f)
         }
 
-        fn stop(self) -> crate::RoomReport {
+        fn stop(self) -> anyhow::Result<crate::RoomReport> {
             let report = self.report.snapshot();
-            let _ = self.runtime.try_send(self.listener, HttpsListenerMsg::Stop);
-            let _ = self.runtime.shutdown();
-            report
+            let stop = self.runtime.try_send(self.listener, HttpsListenerMsg::Stop);
+            let shutdown = self.runtime.shutdown();
+            match (stop, shutdown) {
+                (Ok(()), Ok(_)) => {}
+                (Err(stop), Ok(_)) => anyhow::bail!("stop test HTTPS listener: {stop:?}"),
+                (Ok(()), Err(shutdown)) => {
+                    anyhow::bail!("shutdown test TLS runtime: {shutdown:?}")
+                }
+                (Err(stop), Err(shutdown)) => anyhow::bail!(
+                    "stop test HTTPS listener: {stop:?}; test runtime shutdown also failed: {shutdown:?}"
+                ),
+            }
+            Ok(report)
         }
     }
 

@@ -78,10 +78,10 @@ impl Store {
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
 
     let mut stores = Vec::with_capacity(SHARDS as usize);
     for _ in 0..SHARDS {

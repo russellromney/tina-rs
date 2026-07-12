@@ -89,10 +89,10 @@ pub fn run() -> anyhow::Result<Report> {
 }
 
 fn run_inner(upstream: &Upstream) -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
 
     let bridge = ReqwestWorker::<SingleShard>::install(&runtime, ReqwestConfig::default())
         .map_err(|e| anyhow::anyhow!("install reqwest bridge: {e}"))?;

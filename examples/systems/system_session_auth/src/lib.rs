@@ -350,7 +350,7 @@ impl AuthWorld {
         let shard_ids: Vec<ShardId> = shard_objs.iter().map(|s| s.id()).collect();
         let placement = ShardPlacement::new("system_session_auth.placement", shard_ids.clone())
             .map_err(|e| anyhow::anyhow!("placement: {e:?}"))?;
-        let runtime = AuthRuntime::new(shard_objs, DefaultThreadedMailboxFactory);
+        let runtime = AuthRuntime::try_new(shard_objs, DefaultThreadedMailboxFactory)?;
         let mut addrs_by_shard = BTreeMap::new();
         for shard_id in &shard_ids {
             let addr = runtime

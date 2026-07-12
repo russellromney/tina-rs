@@ -306,7 +306,7 @@ impl Driver {
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
 
     let parse = runtime
         .register_with_capacity::<_, Infallible>(ParseStage, 32)

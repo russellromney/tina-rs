@@ -65,8 +65,7 @@ impl Driver {
                 // Shape 1: polished send_request helper. Layered match
                 // in PostedViaSendRequest. This is the default a user
                 // should reach for.
-                send_request(self.http, request, self.timeout)
-                    .then(DriverMsg::PostedViaSendRequest)
+                send_request(self.http, request, self.timeout).then(DriverMsg::PostedViaSendRequest)
             }
             2 => {
                 // Shape 2: raw layered call. Functionally identical
@@ -163,11 +162,11 @@ fn check_flat(result: &Result<ReqwestResponse, ReqwestCallError>) {
     }
 }
 
-pub fn run() -> Report {
-    let runtime = Arc::new(ThreadedRuntime::new(
+pub fn run() -> anyhow::Result<Report> {
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
 
     let webhook = WebhookServer::spawn();
     let url = webhook.url();
@@ -191,21 +190,21 @@ pub fn run() -> Report {
         .try_send(driver_addr, DriverMsg::Run(url))
         .expect("kick driver");
 
-    complete
-        .wait(Duration::from_secs(10))
-        .expect(
-            "tina driver did not stop before timeout — the bridge or \
+    complete.wait(Duration::from_secs(10)).expect(
+        "tina driver did not stop before timeout — the bridge or \
              the webhook never finished. The webhook bodies assertion \
              would otherwise blame the wrong layer.",
-        );
+    );
 
     // Let the webhook server's writer task land before snapshotting.
     std::thread::sleep(Duration::from_millis(20));
     let bodies = webhook.snapshot();
     webhook.stop();
 
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
-    Report { bodies }
+    let runtime = Arc::try_unwrap(runtime)
+        .map_err(|_| anyhow::anyhow!("Tina runtime still has owners at shutdown"))?;
+    runtime
+        .shutdown()
+        .map_err(|error| anyhow::anyhow!("shutdown Tina runtime: {error:?}"))?;
+    Ok(Report { bodies })
 }

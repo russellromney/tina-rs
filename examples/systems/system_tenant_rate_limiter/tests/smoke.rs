@@ -92,10 +92,11 @@ fn key_table_full_returns_typed_tenant_table_full() {
 
     // Spin up the limiter ourselves so we can drive three distinct
     // tenants without changing the public `run` shape.
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )
+    .expect("start runtime"));
     let rate = tina_runtime::RateLimit::<&'static str>::new(
         "tenant.rate",
         config.max_tenants,

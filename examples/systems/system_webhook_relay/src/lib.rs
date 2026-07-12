@@ -457,10 +457,10 @@ pub struct RunReport {
 
 /// Run the hermetic relay with the supplied fake-outbound script.
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
 
     let outbound_addr = runtime
         .register_with_capacity::<_, Infallible>(
@@ -501,10 +501,10 @@ pub fn run_against_sqs(
     queue_url: String,
     bridge_timeout: Duration,
 ) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
 
     let relay = runtime
         .register_split_service::<Relay, RelayEvent, RelayRequest, Infallible>(

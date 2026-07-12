@@ -956,10 +956,10 @@ struct World {
 
 impl World {
     fn start(config: &RunConfig) -> anyhow::Result<Self> {
-        let runtime = Arc::new(ThreadedRuntime::new(
+        let runtime = Arc::new(ThreadedRuntime::try_new(
             SingleShard,
             DefaultThreadedMailboxFactory,
-        ));
+        )?);
         let sink = runtime
             .register_split_service::<Sink, SinkEvent, SinkRequest, Infallible>(
                 Sink::new(

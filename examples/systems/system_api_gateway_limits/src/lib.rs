@@ -294,10 +294,10 @@ impl Gateway {
 }
 
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
     let scope = SharedCapacityScope::new("gateway.in_flight", "weight", config.shared_cap);
     let body_scope = SharedCapacityScope::new("gateway.body_bytes", "bytes", config.body_cap);
     let gateway: SplitServiceHandle<GatewayEvent, GatewayRequest, GatewayReply> = runtime

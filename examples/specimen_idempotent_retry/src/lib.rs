@@ -199,10 +199,10 @@ impl Default for RunConfig {
 
 /// Drive one delivery to completion.
 pub fn run(config: RunConfig) -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
 
     let backoff = Backoff::constant(Duration::from_millis(config.backoff_ms), config.max_retries)
         .map_err(|e| anyhow::anyhow!("backoff config: {e:?}"))?;

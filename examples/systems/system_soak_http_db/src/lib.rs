@@ -323,10 +323,10 @@ impl Soak {
 }
 
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
     let soak = Soak::new(&config);
     let http_scope = soak.http_scope.clone();
     let db_scope = soak.db_scope.clone();

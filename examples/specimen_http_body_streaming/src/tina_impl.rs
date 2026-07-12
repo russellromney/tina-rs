@@ -84,7 +84,7 @@ fn body_chunks() -> impl Iterator<Item = Vec<u8>> + Send + 'static {
 
 pub fn run() -> anyhow::Result<Report> {
     let runtime: ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory> =
-        ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+        ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
     let metrics =
         BodyMetrics::with_body_capacity("http.bodies", CHUNK_BYTES, RESPONSE_BODY_BYTES);
 

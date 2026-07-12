@@ -170,7 +170,7 @@ pub fn run() -> anyhow::Result<Report> {
     let server = TestServer::start(FETCH_COUNT)?;
     let addr = server.addr;
 
-    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
     let fetcher = runtime
         .register_with_capacity::<_, Infallible>(
             Fetcher {

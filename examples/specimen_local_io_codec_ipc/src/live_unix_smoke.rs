@@ -123,11 +123,11 @@ impl Probe {
 }
 
 /// Drives the live runtime and reports the live Unix rail behavior.
-pub fn smoke() -> SpecimenReport {
+pub fn smoke() -> anyhow::Result<SpecimenReport> {
     let path = std::env::temp_dir().join(format!("specimen-live-unix-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let observed: Observed = Arc::new(Mutex::new(None));
-    let app = LocalSystem::single_shard(ProbeShard, ProbeMailboxFactory).build();
+    let app = LocalSystem::single_shard(ProbeShard, ProbeMailboxFactory).try_build()?;
     let address = app
         .register_root::<Probe, Infallible>(
             Probe {
@@ -137,8 +137,9 @@ pub fn smoke() -> SpecimenReport {
             },
             8,
         )
-        .expect("register probe");
-    app.try_send(address, Msg::Start).expect("start probe");
+        .map_err(|error| anyhow::anyhow!("register probe: {error:?}"))?;
+    app.try_send(address, Msg::Start)
+        .map_err(|error| anyhow::anyhow!("start probe: {error:?}"))?;
 
     let deadline = Instant::now() + Duration::from_secs(5);
     while observed.lock().expect("observed lock").is_none() {
@@ -148,8 +149,9 @@ pub fn smoke() -> SpecimenReport {
         std::thread::sleep(Duration::from_millis(5));
     }
     let result = *observed.lock().expect("observed lock");
-    let _ = app.shutdown().drain().join();
+    let shutdown = app.shutdown().drain().join();
     let _ = std::fs::remove_file(&path);
+    shutdown.map_err(|error| anyhow::anyhow!("join live Unix runtime: {error:?}"))?;
 
     // On Unix the live lane must bind+close cleanly. On non-Unix the
     // contract is typed `Unsupported`. Either is a passing smoke for
@@ -165,11 +167,11 @@ pub fn smoke() -> SpecimenReport {
             format!("live unix_bind returned {result:?} (expected Unsupported off Unix)"),
         )
     };
-    SpecimenReport {
+    Ok(SpecimenReport {
         name: "live_unix_smoke",
         bytes: 0,
         frames: 0,
         ok,
         note,
-    }
+    })
 }

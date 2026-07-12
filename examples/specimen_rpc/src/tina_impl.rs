@@ -108,7 +108,7 @@ impl Listener {
 // -------------------------------------------------------------------
 
 pub fn run(config: RunConfig) -> anyhow::Result<Report> {
-    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
 
     // 1. Typed dispatch: the `#[service]` macro emits `EchoService`
     //    with a JSON-tuple decoder for each method's args and a JSON

@@ -447,10 +447,10 @@ pub fn run_fifo(config: RunConfig) -> anyhow::Result<FifoReport> {
         lease_ms: 5_000,
         ..config
     };
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
 
@@ -551,10 +551,10 @@ pub fn run_expiry_handoff(config: RunConfig) -> anyhow::Result<ExpiryHandoffRepo
         lease_ms: 100,
         ..config
     };
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
     let key = "expire-key".to_string();
@@ -629,10 +629,10 @@ pub fn run_renewal(config: RunConfig) -> anyhow::Result<RenewalReport> {
         lease_ms: 120,
         ..config
     };
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
     let key = "renew-key".to_string();
@@ -715,10 +715,10 @@ pub fn run_stale_release(config: RunConfig) -> anyhow::Result<StaleReleaseReport
         lease_ms: 5_000,
         ..config
     };
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
     let key = "stale-key".to_string();
@@ -763,10 +763,10 @@ pub fn run_busy_overflow(config: RunConfig) -> anyhow::Result<BusyOverflowReport
         max_waiters_per_key: 2,
         ..config
     };
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
     let key = "busy-key".to_string();

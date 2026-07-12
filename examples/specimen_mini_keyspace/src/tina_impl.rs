@@ -262,7 +262,7 @@ impl Listener {
 // -------------------------------------------------------------------
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
 
     let store = runtime
         .register_with_capacity::<_, Infallible>(Store::default(), 16)

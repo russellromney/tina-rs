@@ -203,7 +203,7 @@ pub fn http_body_pressure_probe() -> anyhow::Result<LoadReport> {
     const TOO_LARGE_BODY_BYTES: usize = 999;
     const PRESSURE_OPS: u64 = 8;
 
-    let runtime = new_runtime();
+    let runtime = new_runtime()?;
     let metrics =
         BodyMetrics::with_body_capacity("perf.http.bodies", MAX_BODY_BYTES, MAX_BODY_BYTES);
     let service = runtime
@@ -462,7 +462,7 @@ impl BodyService {
 }
 
 fn tina_host_enqueue_row() -> anyhow::Result<PerfReport> {
-    let runtime = new_runtime();
+    let runtime = new_runtime()?;
     let count = Arc::new(AtomicU64::new(0));
     let addr = register_counter(&runtime, &count)?;
 
@@ -532,7 +532,7 @@ fn tokio_host_enqueue_row() -> anyhow::Result<PerfReport> {
 }
 
 fn tina_observed_admission_row() -> anyhow::Result<PerfReport> {
-    let runtime = new_runtime();
+    let runtime = new_runtime()?;
     let count = Arc::new(AtomicU64::new(0));
     let addr = register_counter(&runtime, &count)?;
 
@@ -627,7 +627,7 @@ fn tokio_observed_admission_row() -> anyhow::Result<PerfReport> {
 }
 
 fn tina_host_call_row() -> anyhow::Result<PerfReport> {
-    let runtime = new_runtime();
+    let runtime = new_runtime()?;
     let addr = runtime
         .register_with_capacity::<_, Infallible>(Ping, CAPACITY)
         .map_err(|e| anyhow::anyhow!("register tina ping: {e:?}"))?;
@@ -688,7 +688,7 @@ fn tokio_host_call_row() -> anyhow::Result<PerfReport> {
 }
 
 fn tina_service_call_chain_row() -> anyhow::Result<PerfReport> {
-    let runtime = new_runtime();
+    let runtime = new_runtime()?;
     let ping = runtime
         .register_with_capacity::<_, Infallible>(Ping, CAPACITY)
         .map_err(|e| anyhow::anyhow!("register tina chain ping: {e:?}"))?;
@@ -867,7 +867,7 @@ fn tina_http_row(
     keepalive: bool,
     request: fn(SocketAddr) -> anyhow::Result<()>,
 ) -> anyhow::Result<PerfReport> {
-    let runtime = new_runtime();
+    let runtime = new_runtime()?;
     let expected_len = body.len();
     let service = runtime
         .register_with_capacity::<_, Infallible>(
@@ -927,7 +927,7 @@ fn tina_http_steady_state_row(
     kind: &'static str,
     body: Vec<u8>,
 ) -> anyhow::Result<PerfReport> {
-    let runtime = new_runtime();
+    let runtime = new_runtime()?;
     let expected_len = body.len();
     let service = runtime
         .register_with_capacity::<_, Infallible>(
@@ -1557,15 +1557,15 @@ fn wait_count(count: &AtomicU64, expected: u64) {
     }
 }
 
-fn new_runtime() -> Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>> {
-    Arc::new(ThreadedRuntime::with_config(
+fn new_runtime() -> anyhow::Result<Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>> {
+    Ok(Arc::new(ThreadedRuntime::try_with_config(
         SingleShard,
         DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
             command_capacity: CAPACITY,
             ..ThreadedRuntimeConfig::default()
         },
-    ))
+    )?))
 }
 
 fn shutdown_runtime(
@@ -1672,7 +1672,7 @@ struct H2Frame {
 fn start_h2_server(
     body: Vec<u8>,
 ) -> anyhow::Result<(PerfRuntime, Address<Http2ListenerMsg>, SocketAddr)> {
-    let runtime = new_runtime();
+    let runtime = new_runtime()?;
     let service = runtime
         .register_with_capacity::<_, Infallible>(
             BodyService {
@@ -2104,7 +2104,7 @@ const GRPC_STREAM_MESSAGES: usize = 3;
 const GRPC_POOL_CONNECTIONS: usize = WORKERS;
 
 fn start_grpc_server() -> anyhow::Result<(PerfRuntime, Address<Http2ListenerMsg>, SocketAddr)> {
-    let runtime = new_runtime();
+    let runtime = new_runtime()?;
     let limits = GrpcLimits::default();
     let router = grpc_unary_router(limits);
     start_grpc_server_with_router(runtime, router)
@@ -2155,7 +2155,7 @@ fn start_grpc_server_with_router(
 fn start_grpc_streaming_server()
     -> anyhow::Result<(PerfRuntime, Address<Http2ListenerMsg>, SocketAddr)>
 {
-    let runtime = new_runtime();
+    let runtime = new_runtime()?;
     let limits = GrpcLimits::default();
     let buffered_limits = GrpcBufferedStreamLimits::new(limits, GRPC_STREAM_MESSAGES, 16 * 1024);
     let messages = (0..GRPC_STREAM_MESSAGES).map(|i| GrpcPerfReply { value: 40 + i as u64 });
@@ -2317,8 +2317,8 @@ pub struct ProtocolTurnReport {
     pub timeline: Vec<String>,
 }
 
-fn new_runtime_with_observer(observer: Arc<dyn TraceObserver>) -> PerfRuntime {
-    Arc::new(ThreadedRuntime::with_config_and_trace_observer(
+fn new_runtime_with_observer(observer: Arc<dyn TraceObserver>) -> anyhow::Result<PerfRuntime> {
+    Ok(Arc::new(ThreadedRuntime::try_with_config_and_trace_observer(
         SingleShard,
         DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
@@ -2326,7 +2326,7 @@ fn new_runtime_with_observer(observer: Arc<dyn TraceObserver>) -> PerfRuntime {
             ..ThreadedRuntimeConfig::default()
         },
         observer,
-    ))
+    )?))
 }
 
 /// Run one warmed gRPC unary call under a live trace observer and report its
@@ -2335,7 +2335,7 @@ fn new_runtime_with_observer(observer: Arc<dyn TraceObserver>) -> PerfRuntime {
 /// thread.
 pub fn grpc_unary_warmed_turn_report() -> anyhow::Result<ProtocolTurnReport> {
     let observer = Arc::new(ProtocolTurnObserver::new());
-    let runtime = new_runtime_with_observer(observer.clone() as Arc<dyn TraceObserver>);
+    let runtime = new_runtime_with_observer(observer.clone() as Arc<dyn TraceObserver>)?;
     let router = grpc_unary_router(GrpcLimits::default());
     let (runtime, listener, addr) = start_grpc_server_with_router(runtime, router)?;
     let client = start_grpc_client(&runtime, addr)?;
@@ -2365,7 +2365,7 @@ pub fn grpc_unary_warmed_turn_report() -> anyhow::Result<ProtocolTurnReport> {
 /// round trip, the same way the gRPC unary probe does.
 pub fn http2_steady_state_turn_report() -> anyhow::Result<ProtocolTurnReport> {
     let observer = Arc::new(ProtocolTurnObserver::new());
-    let runtime = new_runtime_with_observer(observer.clone() as Arc<dyn TraceObserver>);
+    let runtime = new_runtime_with_observer(observer.clone() as Arc<dyn TraceObserver>)?;
     let body = small_body();
     let service = runtime
         .register_with_capacity::<_, Infallible>(
@@ -2411,7 +2411,7 @@ pub fn http2_steady_state_turn_report() -> anyhow::Result<ProtocolTurnReport> {
 /// streamed round trip — open + every response pull + finish.
 pub fn grpc_server_streaming_turn_report() -> anyhow::Result<ProtocolTurnReport> {
     let observer = Arc::new(ProtocolTurnObserver::new());
-    let runtime = new_runtime_with_observer(observer.clone() as Arc<dyn TraceObserver>);
+    let runtime = new_runtime_with_observer(observer.clone() as Arc<dyn TraceObserver>)?;
     let limits = GrpcLimits::default();
     let buffered_limits = GrpcBufferedStreamLimits::new(limits, GRPC_STREAM_MESSAGES, 16 * 1024);
     let messages = (0..GRPC_STREAM_MESSAGES).map(|i| GrpcPerfReply { value: 40 + i as u64 });
@@ -2816,7 +2816,7 @@ fn start_ws_server(
     pressure_count: Arc<AtomicU64>,
     app_turns: Arc<AtomicU64>,
 ) -> anyhow::Result<(PerfRuntime, HttpListenerAddress, SocketAddr)> {
-    let runtime = new_runtime();
+    let runtime = new_runtime()?;
     let app = runtime
         .register_with_capacity::<_, Infallible>(
             WsApp {

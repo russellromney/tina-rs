@@ -194,10 +194,10 @@ fn close_was_observed(outcome: &CallOutcome<WorkerPoolReply<WorkerHandle>>) -> b
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
 
     let mut workers = Vec::with_capacity(WORKERS);
     for _ in 0..WORKERS {

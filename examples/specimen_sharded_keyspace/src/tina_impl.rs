@@ -233,10 +233,10 @@ impl Driver {
 // ---------- Run ----------
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = ThreadedMultiShardRuntime::new(
+    let runtime = ThreadedMultiShardRuntime::try_new(
         SHARD_RAW_IDS.iter().copied().map(AppShard),
         DefaultThreadedMailboxFactory,
-    );
+    )?;
     let placement = ShardPlacement::new(
         "specimen-sharded-keyspace",
         SHARD_RAW_IDS.iter().copied().map(ShardId::new).collect(),

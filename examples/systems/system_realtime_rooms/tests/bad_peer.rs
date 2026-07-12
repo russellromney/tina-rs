@@ -41,7 +41,7 @@ fn bad_http_peers_and_slow_ws_peer_do_not_break_the_room() {
         presence_tick_ms: 30,
         ..RunConfig::default()
     };
-    let server = RoomServer::start(config);
+    let server = RoomServer::start(config).expect("start room server");
     let addr = server.addr();
 
     // 1) Sequence of HTTP-level bad peers. None of these should crash
@@ -192,7 +192,7 @@ fn bad_http_peers_and_slow_ws_peer_do_not_break_the_room() {
     );
     drop(good);
 
-    let final_stats = server.stop();
+    let final_stats = server.stop().expect("stop room server");
     assert!(
         final_stats.joined >= 2,
         "joined counter must include slow + good clients: {final_stats:?}",

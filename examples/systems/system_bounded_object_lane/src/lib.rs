@@ -236,10 +236,10 @@ pub fn run_against_s3(
     key_prefix: String,
     bridge_timeout: Duration,
 ) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
     let lane = runtime
         .register_split_service::<ObjectLane, LaneEvent, LaneRequest, std::convert::Infallible>(
             ObjectLane {
@@ -269,10 +269,10 @@ pub fn run_against_s3(
 }
 
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
     let lane = runtime
         .register_split_service::<ObjectLane, LaneEvent, LaneRequest, std::convert::Infallible>(
             ObjectLane {

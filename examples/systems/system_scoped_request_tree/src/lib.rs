@@ -488,14 +488,14 @@ fn text(status: StatusCode, body: impl Into<String>) -> HttpResponse {
 /// disconnect, then report what the request tree did.
 pub fn run() -> anyhow::Result<ScopedTreeReport> {
     let obs = Arc::new(Mutex::new(TreeObs::default()));
-    let runtime = ThreadedRuntime::with_config(
+    let runtime = ThreadedRuntime::try_with_config(
         SingleShard,
         DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
             idle_wait: Duration::from_millis(1),
             ..Default::default()
         },
-    );
+    )?;
     let enrich = runtime
         .register_with_capacity::<_, Infallible>(Enrich::default(), 8)
         .map_err(|e| anyhow::anyhow!("register enrich: {e:?}"))?;
