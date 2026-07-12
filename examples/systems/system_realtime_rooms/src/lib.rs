@@ -739,11 +739,15 @@ impl RoomServer {
         })
     }
 
-    pub fn stop(self) -> RoomStats {
+    pub fn stop(self) -> anyhow::Result<RoomStats> {
         let stats = self.snapshot();
-        let _ = self.runtime.try_send(self.listener, HttpListenerMsg::Stop);
-        let _ = self.runtime.shutdown();
-        stats
+        self.runtime
+            .try_send(self.listener, HttpListenerMsg::Stop)
+            .map_err(|error| anyhow::anyhow!("stop room listener: {error:?}"))?;
+        self.runtime
+            .shutdown()
+            .map_err(|error| anyhow::anyhow!("shutdown room runtime: {error:?}"))?;
+        Ok(stats)
     }
 }
 
@@ -803,7 +807,7 @@ pub fn run_join_and_tick(config: RunConfig) -> anyhow::Result<JoinAndTickReport>
         s.bootstrap_seen && s.presence_ticks >= 2 && s.joined >= 2
     });
 
-    let final_stats = server.stop();
+    let final_stats = server.stop()?;
     Ok(JoinAndTickReport {
         joined: final_stats.joined,
         // The room → fanout-on-SessionText path has a known race with the
@@ -851,7 +855,7 @@ pub fn run_overflow(config: RunConfig) -> anyhow::Result<OverflowReport> {
     });
 
     drop(keep);
-    let final_stats = server.stop();
+    let final_stats = server.stop()?;
     Ok(OverflowReport {
         admitted,
         rejected_full,
@@ -889,7 +893,7 @@ pub fn run_shutdown(config: RunConfig) -> anyhow::Result<ShutdownReport> {
 
     drop(a_client);
     drop(b_client);
-    let final_stats = server.stop();
+    let final_stats = server.stop()?;
     Ok(ShutdownReport {
         close_observed,
         stats: final_stats,

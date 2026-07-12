@@ -149,8 +149,9 @@ pub fn smoke() -> anyhow::Result<SpecimenReport> {
         std::thread::sleep(Duration::from_millis(5));
     }
     let result = *observed.lock().expect("observed lock");
-    let _ = app.shutdown().drain().join();
+    let shutdown = app.shutdown().drain().join();
     let _ = std::fs::remove_file(&path);
+    shutdown.map_err(|error| anyhow::anyhow!("join live Unix runtime: {error:?}"))?;
 
     // On Unix the live lane must bind+close cleanly. On non-Unix the
     // contract is typed `Unsupported`. Either is a passing smoke for

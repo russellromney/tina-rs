@@ -192,7 +192,7 @@ fn bad_http_peers_and_slow_ws_peer_do_not_break_the_room() {
     );
     drop(good);
 
-    let final_stats = server.stop();
+    let final_stats = server.stop().expect("stop room server");
     assert!(
         final_stats.joined >= 2,
         "joined counter must include slow + good clients: {final_stats:?}",

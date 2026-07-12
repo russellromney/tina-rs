@@ -931,11 +931,15 @@ impl RoomServer {
         })
     }
 
-    pub fn stop(self) -> RoomReport {
+    pub fn stop(self) -> anyhow::Result<RoomReport> {
         let report = self.report();
-        let _ = self.runtime.try_send(self.listener, HttpListenerMsg::Stop);
-        let _ = self.runtime.shutdown();
-        report
+        self.runtime
+            .try_send(self.listener, HttpListenerMsg::Stop)
+            .map_err(|error| anyhow::anyhow!("stop HTTP listener: {error:?}"))?;
+        self.runtime
+            .shutdown()
+            .map_err(|error| anyhow::anyhow!("shutdown room runtime: {error:?}"))?;
+        Ok(report)
     }
 }
 
@@ -1038,11 +1042,15 @@ impl TlsRoomServer {
         self.report.snapshot()
     }
 
-    pub fn stop(self) -> RoomReport {
+    pub fn stop(self) -> anyhow::Result<RoomReport> {
         let report = self.report();
-        let _ = self.runtime.try_send(self.listener, HttpsListenerMsg::Stop);
-        let _ = self.runtime.shutdown();
-        report
+        self.runtime
+            .try_send(self.listener, HttpsListenerMsg::Stop)
+            .map_err(|error| anyhow::anyhow!("stop HTTPS listener: {error:?}"))?;
+        self.runtime
+            .shutdown()
+            .map_err(|error| anyhow::anyhow!("shutdown TLS room runtime: {error:?}"))?;
+        Ok(report)
     }
 }
 
@@ -1062,7 +1070,7 @@ fn generate_identity() -> anyhow::Result<GeneratedIdentity> {
 pub fn run() -> anyhow::Result<RoomReport> {
     let server = RoomServer::start()?;
     run_script(&server);
-    Ok(server.stop())
+    server.stop()
 }
 
 fn run_script(server: &RoomServer) {
@@ -1260,7 +1268,7 @@ mod tests {
         assert!(http_get(server.addr(), "/room-report").contains("\"broadcast_ok\":1"));
         let _ = a.close(None);
         let _ = b.close(None);
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
@@ -1272,7 +1280,7 @@ mod tests {
         assert!(page.contains("/room"), "{page}");
         assert!(page.contains("tina.room.v1"), "{page}");
         assert!(page.contains("location.protocol"), "{page}");
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
@@ -1326,7 +1334,7 @@ mod tests {
         assert_eq!(report.rejected_origin, 1, "{report:?}");
         assert_eq!(report.rejected_auth, 1, "{report:?}");
         assert_eq!(report.rejected_subprotocol, 1, "{report:?}");
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
@@ -1359,7 +1367,7 @@ mod tests {
         assert_eq!(report.live_members, 2, "{report:?}");
         let _ = b.close(None);
         let _ = c.close(None);
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
@@ -1376,7 +1384,7 @@ mod tests {
         assert_eq!(report.session_report_ok, 1, "{report:?}");
         assert_eq!(report.queued_frame_high_water, 0, "{report:?}");
         let _ = client.close(None);
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
@@ -1426,7 +1434,7 @@ mod tests {
         let _ = slow.close(None);
         let _ = sender.close(None);
         let _ = healthy.close(None);
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
@@ -1446,7 +1454,7 @@ mod tests {
             connect(url.as_str()).is_err(),
             "new upgrade after shutdown must fail"
         );
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
@@ -1476,7 +1484,7 @@ mod tests {
         let report = server.wait_until(Duration::from_secs(2), |r| r.active_rooms == 1);
         assert_eq!(report.active_rooms, 1, "{report:?}");
         let _ = refill.close(None);
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
@@ -1504,7 +1512,7 @@ mod tests {
         let mut client = connect_room(url.as_str());
         assert!(client.read().expect("join after idle create").is_text());
         let _ = client.close(None);
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
@@ -1540,7 +1548,7 @@ mod tests {
         );
         let _ = a.close(None);
         let _ = b.close(None);
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
@@ -1568,7 +1576,7 @@ mod tests {
         let report = server.report();
         assert_eq!(report.joined, 25, "{report:?}");
         assert_eq!(report.live_members, 0, "{report:?}");
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
@@ -1593,7 +1601,7 @@ mod tests {
         assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");
 
         let _ = client.close(None);
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
@@ -1613,7 +1621,7 @@ mod tests {
         let report = tls.wait_until(Duration::from_secs(2), |r| r.joined == 1);
         assert_eq!(report.live_members, 1, "{report:?}");
         let _ = ws.close(None);
-        let _ = tls.stop();
+        tls.stop().expect("stop TLS room server");
     }
 
     #[test]
@@ -1645,7 +1653,7 @@ mod tests {
         for mut client in clients {
             let _ = client.close(None);
         }
-        let _ = server.stop();
+        server.stop().expect("stop room server");
     }
 
     #[test]
@@ -1688,7 +1696,7 @@ mod tests {
         for mut client in clients {
             let _ = client.close(None);
         }
-        let after = server.stop();
+        let after = server.stop().expect("stop room server");
         assert_eq!(after.active_rooms, 1, "{after:?}");
     }
 
@@ -1804,11 +1812,15 @@ mod tests {
             self.report.wait_until(timeout, f)
         }
 
-        fn stop(self) -> crate::RoomReport {
+        fn stop(self) -> anyhow::Result<crate::RoomReport> {
             let report = self.report.snapshot();
-            let _ = self.runtime.try_send(self.listener, HttpsListenerMsg::Stop);
-            let _ = self.runtime.shutdown();
-            report
+            self.runtime
+                .try_send(self.listener, HttpsListenerMsg::Stop)
+                .map_err(|error| anyhow::anyhow!("stop test HTTPS listener: {error:?}"))?;
+            self.runtime
+                .shutdown()
+                .map_err(|error| anyhow::anyhow!("shutdown test TLS runtime: {error:?}"))?;
+            Ok(report)
         }
     }
 
