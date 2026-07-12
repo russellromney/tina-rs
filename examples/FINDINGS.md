@@ -75,9 +75,8 @@ when explicitly selected, through `new`, `from_placement`,
 `try_from_placement`, `address_for`, and key-owner lookup. It shares the
 existing placement-order, typed missing-shard, and fallible-registration
 contracts without exposing the internal `ServiceMessage` envelope. This is the
-narrow prerequisite surfaced by
-`specimen_sharded_fanout_read`; the motivating example migration remains a
-separate cohort.
+narrow prerequisite surfaced and now applied by
+`specimen_sharded_fanout_read`.
 
 Adversarial review factored the raw and typed tables onto one invariant
 implementation, rejected mislabeled capabilities whose actual address shard
@@ -175,40 +174,14 @@ collapsing target outcomes. A capacity-one live probe proves one admitted
 operation, typed `Full` for every excess caller, exact caller settlement, and
 clean shutdown.
 
-`specimen_sharded_fanout_read` exposed one narrower prerequisite before it can
-apply the same coordinator unchanged. Canonical request-only registration
-returns `ServiceRequestAddress<Infallible, ShardCounterRequest,
-ShardCounterReply>`, but `ShardServiceTable` is fixed to raw `Address<M, R>`.
-Today the example would have to downgrade each handle through
-`.address().address()`, expose `ServiceMessage` in its table type, replace the
-table with an example-local lookup vector, or retain the legacy message plus
-`handle_call` form. None is an acceptable public example.
-
-The smallest motivating API is a request-service table whose construction and
-lookup preserve the typed capability:
-
-```rust
-let counters = ShardRequestServiceTable::try_from_placement(placement, |shard| {
-    runtime.register_request_service_on(shard, ShardCounter { value }, 8)
-})?;
-
-let targets = BoundedItems::try_from_iter(config.max_targets,
-    placement.shards().iter().copied().map(|shard| {
-        (shard, counters.address_for(shard).ok())
-    }))?;
-
-operations.start_service(request, config, targets, |counter, timeout| {
-    call_cancelable_request(counter, ShardCounterRequest::Get, timeout)
-}, ScatterCoordEvent::Scatter)?;
-```
-
-A dedicated `ShardRequestServiceTable<Event, Request, Reply>` is preferable to
-making the existing table capability-generic for this prerequisite: it matches
-the concrete request-only use, keeps `ServiceMessage` private, and avoids a new
-public address-capability trait before a second motivating capability exists.
-After that lands, the sharded specimen can delete `ReplyAdapter`, `Bind`,
-`Start`, `pending_targets`, manual outcome sorting, and raw outbound sends, then
-use the same `ScatterGatherEvent`/`ScatterGatherOperations` coordinator shape.
+`specimen_sharded_fanout_read` now applies both prerequisites. Shard counters
+are request-only services stored in `ShardRequestServiceTable`; the coordinator
+has one request, one scatter event, and one capacity-one operations owner.
+`ReplyAdapter`, `Bind`, `Start`, `pending_targets`, manual sorting, raw outbound
+sends, and service-envelope types are gone. The host uses
+`call_blocking_request`, matches every terminal outcome, and rejects partial or
+misrouted reports before producing the public sum. Together the two specimens
+close the motivating scatter/gather example cohort.
 
 ### 2026-07-11 Bounded shutdown truth across the example corpus
 
