@@ -268,7 +268,8 @@ pub fn echo_round_trip(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
         .wait(Duration::from_secs(5))
         .map_err(|e| anyhow::anyhow!("listener did not stop: {e:?}"))?;
     runtime
-        .shutdown()
+        .shutdown_report()
+        .ensure_clean()
         .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
 
     Ok(echoed)
@@ -381,7 +382,8 @@ pub fn run_load_shed(burst: u32, capacity: usize) -> anyhow::Result<LoadShedRepo
     let snap = outcomes.snapshot();
 
     runtime
-        .shutdown()
+        .shutdown_report()
+        .ensure_clean()
         .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
 
     Ok(LoadShedReport {
