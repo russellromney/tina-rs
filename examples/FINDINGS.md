@@ -24,7 +24,9 @@ required first-message ordering and turn startup into a cleanup protocol.
 existing atomic threaded contract. Their typed
 `ThreadedRegisterBootstrapError` preserves the bootstrap message on mailbox
 `Full`/`Closed`, command `Full`/`Closed`, and unknown-shard failures; an
-accepted command followed by worker failure does not counterfeit authority.
+accepted command followed by worker failure does not counterfeit authority,
+and `WorkerUnresponsive` remains distinct from `WorkerStopped` because a
+timed-out accepted command may still register later.
 The simulator now has matching single- and multi-shard
 `register_with_capacity_and_bootstrap[_on]` vocabulary, with prefill before
 entry/address publication. Focused tests prove first delivery, typed host-call

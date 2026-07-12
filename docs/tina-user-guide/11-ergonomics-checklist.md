@@ -241,6 +241,11 @@ Honesty: the returned address may have a full mailbox until `Bootstrap`
 is delivered. Sending immediately after this call can see `Full`. That
 is honest pressure, not a bug.
 
+Threaded owners also distinguish `WorkerStopped` from
+`WorkerUnresponsive`. Both are message-less because the command was already
+accepted, but an unresponsive worker may still complete registration after
+the host-side timeout.
+
 ### Single-in-flight timer
 
 Use `tina_runtime::SingleCallGate` for isolates whose rate-limit

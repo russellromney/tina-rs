@@ -392,6 +392,56 @@ fn threaded_bootstrap_closed_command_channel_returns_message() {
 }
 
 #[test]
+fn threaded_bootstrap_timeout_reports_unresponsive_and_may_register_late() {
+    let runtime = ThreadedRuntime::with_config(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            control_call_timeout: Duration::from_millis(20),
+            ..Default::default()
+        },
+    );
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let gate = runtime
+        .register_with_capacity::<Gate, Infallible>(
+            Gate {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+            1,
+        )
+        .expect("register gate");
+    runtime
+        .try_send(gate, GateMsg::Hold)
+        .expect("occupy worker");
+    while !entered.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+
+    let (service, delivered, _) = fresh_service();
+    assert!(matches!(
+        runtime.register_with_capacity_and_bootstrap::<_, Infallible>(service, 4, Msg::Bootstrap,),
+        Err(ThreadedRegisterBootstrapError::WorkerUnresponsive)
+    ));
+    assert_eq!(delivered.load(Ordering::Acquire), 0);
+
+    release.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while delivered.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        delivered.load(Ordering::Acquire),
+        1,
+        "accepted timed-out registration may execute after the host returns"
+    );
+    runtime
+        .shutdown()
+        .expect("clean shutdown after worker refill");
+}
+
+#[test]
 fn threaded_bootstrap_accepted_before_worker_failure_does_not_return_message_authority() {
     let gate = Arc::new(FailureGate::default());
     let runtime = Arc::new(ThreadedRuntime::with_config(
@@ -588,6 +638,65 @@ fn threaded_multi_shard_register_with_capacity_and_bootstrap_on() {
     }
     assert!(first_was_bootstrap.load(Ordering::Acquire));
     let _ = runtime.shutdown();
+}
+
+#[test]
+fn threaded_multi_bootstrap_timeout_reports_unresponsive_and_may_register_late() {
+    let runtime = ThreadedMultiShardRuntime::with_config(
+        [TestShard(11), TestShard(22)],
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            control_call_timeout: Duration::from_millis(20),
+            ..Default::default()
+        },
+    );
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let gate = runtime
+        .register_with_capacity_on::<MsGate, Infallible>(
+            ShardId::new(22),
+            MsGate {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+            1,
+        )
+        .expect("register shard gate");
+    runtime.try_send(gate, MsMsg::Tick).expect("occupy shard");
+    while !entered.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+
+    let delivered = Arc::new(AtomicU32::new(0));
+    let service = MsService {
+        shard: TestShard(22),
+        delivered: Arc::clone(&delivered),
+        first_was_bootstrap: Arc::new(AtomicBool::new(false)),
+    };
+    assert!(matches!(
+        runtime.register_with_capacity_and_bootstrap_on::<_, Infallible>(
+            ShardId::new(22),
+            service,
+            4,
+            MsMsg::Bootstrap,
+        ),
+        Err(ThreadedRegisterBootstrapError::WorkerUnresponsive)
+    ));
+    assert_eq!(delivered.load(Ordering::Acquire), 0);
+
+    release.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while delivered.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        delivered.load(Ordering::Acquire),
+        1,
+        "accepted timed-out shard registration may execute after the host returns"
+    );
+    runtime
+        .shutdown()
+        .expect("clean multi shutdown after refill");
 }
 
 #[test]

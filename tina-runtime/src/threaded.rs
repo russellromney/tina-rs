@@ -1196,12 +1196,17 @@ where
             Err(RecoverableControlCallError::Accepted(ThreadedRuntimeError::WorkerStopped)) => {
                 Err(ThreadedRegisterBootstrapError::WorkerStopped)
             }
-            Err(RecoverableControlCallError::Accepted(_))
-            | Err(RecoverableControlCallError::NotAdmitted { .. }) => {
+            Err(RecoverableControlCallError::Accepted(
+                ThreadedRuntimeError::WorkerUnresponsive,
+            )) => Err(ThreadedRegisterBootstrapError::WorkerUnresponsive),
+            Err(RecoverableControlCallError::Accepted(_)) => {
                 // Once admitted, the worker may have consumed the message and
                 // registered the isolate before failing to answer. Authority
                 // cannot honestly be returned in that state.
-                Err(ThreadedRegisterBootstrapError::WorkerStopped)
+                unreachable!("control transport returned an impossible accepted error")
+            }
+            Err(RecoverableControlCallError::NotAdmitted { .. }) => {
+                unreachable!("control transport returned an impossible pre-admission error")
             }
         }
     }

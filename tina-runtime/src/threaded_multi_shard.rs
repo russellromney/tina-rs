@@ -671,9 +671,14 @@ where
             Err(RecoverableControlCallError::Accepted(ThreadedRuntimeError::WorkerStopped)) => {
                 Err(ThreadedRegisterBootstrapError::WorkerStopped)
             }
-            Err(RecoverableControlCallError::Accepted(_))
-            | Err(RecoverableControlCallError::NotAdmitted { .. }) => {
-                Err(ThreadedRegisterBootstrapError::WorkerStopped)
+            Err(RecoverableControlCallError::Accepted(
+                ThreadedRuntimeError::WorkerUnresponsive,
+            )) => Err(ThreadedRegisterBootstrapError::WorkerUnresponsive),
+            Err(RecoverableControlCallError::Accepted(_)) => {
+                unreachable!("control transport returned an impossible accepted error")
+            }
+            Err(RecoverableControlCallError::NotAdmitted { .. }) => {
+                unreachable!("control transport returned an impossible pre-admission error")
             }
         }
     }
