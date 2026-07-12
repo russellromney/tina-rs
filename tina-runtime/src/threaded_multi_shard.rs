@@ -745,7 +745,7 @@ where
         self.call_on(parent.shard(), move |runtime| {
             runtime.child_lifecycle_report(parent)
         })
-        .and_then(|report| report.map_err(|_| ThreadedRuntimeError::WorkerStopped))
+        .and_then(|report| report.map_err(ThreadedRuntimeError::from))
     }
 
     /// Registers a typed waiter for the next child restart reported on the
@@ -1172,11 +1172,8 @@ where
     ///
     /// Worker stopped -> `RuntimeStopped`.
     ///
-    /// # Panics
-    ///
-    /// Panics if `address.shard()` is not owned by this runtime — same
-    /// convention as [`Self::try_send`]. Passing an address from a
-    /// different runtime is a programmer error, not a runtime fault.
+    /// A foreign system or unowned shard is returned as a typed eager error;
+    /// no result authority is claimed.
     pub fn observe_result<T: Send + 'static, M: 'static, R: 'static>(
         &self,
         address: Address<M, R>,
@@ -1211,14 +1208,16 @@ where
         &self,
         address: Address<M, R>,
     ) -> Result<(), ThreadedRuntimeError> {
-        if address.system() == self.system_incarnation {
-            Ok(())
-        } else {
-            Err(ThreadedRuntimeError::ForeignSystem {
+        if address.system() != self.system_incarnation {
+            return Err(ThreadedRuntimeError::ForeignSystem {
                 expected: self.system_incarnation,
                 actual: address.system(),
-            })
+            });
         }
+        if !self.commands.contains_key(&address.shard()) {
+            return Err(ThreadedRuntimeError::UnknownShard(address.shard()));
+        }
+        Ok(())
     }
 
     /// Returns retained trace from shards still able to report.

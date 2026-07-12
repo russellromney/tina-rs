@@ -132,13 +132,20 @@ fn multi_shard_simulator_rejects_foreign_cross_shard_effect_at_source() {
     local.run_until_quiescent();
 
     assert!(local.trace().iter().any(|event| {
-        matches!(
-            event.kind(),
-            RuntimeEventKind::SendRejected {
-                reason: SendRejectedReason::ForeignSystem { expected, actual },
-                ..
-            } if expected == local_system && actual == foreign_system
-        )
+        event.shard() == ShardId::new(1)
+            && event.isolate() == relay.isolate()
+            && matches!(
+                event.kind(),
+                RuntimeEventKind::SendRejected {
+                    reason: SendRejectedReason::ForeignSystem { expected, actual },
+                    ..
+                } if expected == local_system && actual == foreign_system
+            )
+    }));
+    assert!(local.trace().iter().all(|event| {
+        !(event.shard() == ShardId::new(1)
+            && event.isolate() == relay.isolate()
+            && matches!(event.kind(), RuntimeEventKind::SendAccepted { .. }))
     }));
     assert!(local.trace().iter().all(|event| {
         !(event.shard() == ShardId::new(2)

@@ -1340,7 +1340,7 @@ where
     ) -> Result<ChildLifecycleReport, ThreadedRuntimeError> {
         self.ensure_local_system(parent_address)?;
         self.call(move |runtime| runtime.child_lifecycle_report(parent_address))
-            .and_then(|report| report.map_err(|_| ThreadedRuntimeError::WorkerStopped))
+            .and_then(|report| report.map_err(ThreadedRuntimeError::from))
     }
 
     /// Registers a typed result waiter for the isolate at `address` on the
@@ -1370,14 +1370,17 @@ where
         &self,
         address: Address<M, R>,
     ) -> Result<(), ThreadedRuntimeError> {
-        if address.system() == self.system_incarnation {
-            Ok(())
-        } else {
-            Err(ThreadedRuntimeError::ForeignSystem {
+        if address.system() != self.system_incarnation {
+            return Err(ThreadedRuntimeError::ForeignSystem {
                 expected: self.system_incarnation,
                 actual: address.system(),
-            })
+            });
         }
+        let owned_shard = self.dispatchers[0].shard();
+        if address.shard() != owned_shard {
+            return Err(ThreadedRuntimeError::UnknownShard(address.shard()));
+        }
+        Ok(())
     }
 
     /// Attempts one typed ingress handoff through the bounded worker queue.

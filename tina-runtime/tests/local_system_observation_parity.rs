@@ -324,9 +324,9 @@ fn local_system_child_restart_waiter_reports_replacement_truth() {
     let stale_waiter = app
         .observe_child_restarted(stale_parent)
         .expect("register restart observer");
-    let foreign_waiter = app
+    let foreign_error = app
         .observe_child_restarted(foreign_parent)
-        .expect("register restart observer");
+        .expect_err("foreign shard must be rejected eagerly");
     let waiter = app
         .observe_child_restarted(parent)
         .expect("register restart observer");
@@ -339,13 +339,13 @@ fn local_system_child_restart_waiter_reports_replacement_truth() {
     assert_ne!(restarted.new_isolate, original);
     assert_eq!(
         stale_waiter.wait(Duration::from_millis(10)),
-        Err(WaitError::Timeout),
-        "stale parent authority must not claim a restart"
+        Err(WaitError::AlreadyStopped),
+        "stale parent authority must be rejected before claiming a restart"
     );
     assert_eq!(
-        foreign_waiter.wait(Duration::from_millis(10)),
-        Err(WaitError::Timeout),
-        "same-id foreign parent authority must not claim a restart"
+        foreign_error,
+        ThreadedRuntimeError::UnknownShard(foreign_parent.shard()),
+        "same-id foreign parent authority must be rejected before claiming a restart"
     );
     assert_eq!(
         app.observe_child_restarted(parent)

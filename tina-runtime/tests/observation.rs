@@ -17,8 +17,8 @@ use tina::{AddressGeneration, Mailbox, TrySendError, prelude::*};
 use tina::{RestartBudget, RestartPolicy};
 use tina_runtime::{
     CallError, CallKind, ListenerId, MailboxFactory, ResultWaitError, RuntimeEventKind,
-    ThreadedRuntime, ThreadedRuntimeConfig, ThreadedSendObservedError, WaitError, sleep, tcp_bind,
-    tcp_close_listener,
+    ThreadedRuntime, ThreadedRuntimeConfig, ThreadedRuntimeError, ThreadedSendObservedError,
+    WaitError, sleep, tcp_bind, tcp_close_listener,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -536,9 +536,9 @@ fn child_restarted_waiter_resolves_after_panic_and_restart() {
     let stale_waiter = runtime
         .observe_child_restarted(stale_parent)
         .expect("register restart observer");
-    let foreign_waiter = runtime
+    let foreign_error = runtime
         .observe_child_restarted(foreign_parent)
-        .expect("register restart observer");
+        .expect_err("foreign shard must be rejected eagerly");
     let dropped_waiter = runtime
         .observe_child_restarted(parent)
         .expect("register restart observer");
@@ -555,12 +555,12 @@ fn child_restarted_waiter_resolves_after_panic_and_restart() {
         .expect("restart event resolves");
     assert_eq!(
         stale_waiter.wait(Duration::from_millis(10)),
-        Err(WaitError::Timeout),
-        "a stale generation must not claim the live parent's restart"
+        Err(WaitError::AlreadyStopped),
+        "a stale generation must be rejected before claiming a restart"
     );
     assert_eq!(
-        foreign_waiter.wait(Duration::from_millis(10)),
-        Err(WaitError::UnknownShard(foreign_parent.shard())),
+        foreign_error,
+        ThreadedRuntimeError::UnknownShard(foreign_parent.shard()),
         "a foreign shard must be rejected before it can claim the restart"
     );
     assert_eq!(
@@ -637,10 +637,12 @@ fn abandoned_child_restart_authorities_do_not_exhaust_observation_capacity() {
             tina::IsolateId::new(isolate),
             AddressGeneration::new(7),
         );
-        let waiter = runtime
-            .observe_child_restarted(forged)
-            .expect("register restart observer");
-        drop(waiter);
+        assert_eq!(
+            runtime.observe_child_restarted(forged).expect_err(
+                "foreign restart authority must be rejected before observer registration"
+            ),
+            ThreadedRuntimeError::UnknownShard(ShardId::new(99))
+        );
     }
 
     assert_eq!(

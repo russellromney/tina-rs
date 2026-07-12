@@ -235,6 +235,8 @@ pub enum ThreadedRuntimeError {
     },
     /// The worker thread stopped before it could accept or answer the command.
     WorkerStopped,
+    /// The addressed lifecycle parent is stopped, unknown, or stale.
+    ParentStopped,
     /// A multi-shard owner operation targeted a shard this local system does
     /// not own.
     UnknownShard(ShardId),
@@ -275,6 +277,7 @@ impl fmt::Display for ThreadedRuntimeError {
                     "worker thread stopped before it could process the command"
                 )
             }
+            Self::ParentStopped => write!(f, "parent is stopped or stale"),
             Self::UnknownShard(shard) => {
                 write!(
                     f,
@@ -307,6 +310,20 @@ impl fmt::Display for ThreadedRuntimeError {
                     "worker did not answer a host-control command within the control-call timeout"
                 )
             }
+        }
+    }
+}
+
+impl From<crate::ChildLifecycleReportError> for ThreadedRuntimeError {
+    fn from(error: crate::ChildLifecycleReportError) -> Self {
+        match error {
+            crate::ChildLifecycleReportError::ForeignSystem { expected, actual } => {
+                Self::ForeignSystem { expected, actual }
+            }
+            crate::ChildLifecycleReportError::ParentShardUnavailable(shard) => {
+                Self::UnknownShard(shard)
+            }
+            crate::ChildLifecycleReportError::ParentStopped => Self::ParentStopped,
         }
     }
 }

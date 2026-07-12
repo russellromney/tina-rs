@@ -1888,9 +1888,8 @@ where
     /// [`tina::stop_with`] on the shard carried by `address`.
     ///
     /// Routing, eager errors, and waiter outcomes match
-    /// [`ThreadedMultiShardRuntime::observe_result`]. In particular, an address
-    /// for a shard outside this local system remains a programmer error and
-    /// panics with the lower owner's unknown-shard diagnostic.
+    /// [`ThreadedMultiShardRuntime::observe_result`]. An address for a shard
+    /// outside this local system returns [`crate::ResultWaitError::UnknownShard`].
     pub fn observe_result<T: Send + 'static, M: 'static, R: 'static>(
         &self,
         address: Address<M, R>,

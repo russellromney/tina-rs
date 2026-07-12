@@ -43,6 +43,8 @@ pub enum WaitError {
     },
     /// The observed address targets a shard this runtime does not own.
     UnknownShard(ShardId),
+    /// The observed isolate is stopped, unknown, or at another generation.
+    AlreadyStopped,
     /// The waiter timed out before the runtime produced an outcome.
     Timeout,
     /// The runtime stopped (or was dropped) before the awaited fact happened.

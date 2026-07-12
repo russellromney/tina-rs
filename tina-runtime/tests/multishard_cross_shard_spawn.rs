@@ -601,13 +601,13 @@ fn cross_shard_restartable_child_restarts_on_remote_shard_and_reports_replacemen
     assert_ne!(restarted.new_isolate, old_child.address.isolate());
     assert_eq!(
         stale_waiter.wait(Duration::from_millis(10)),
-        Err(WaitError::Timeout),
-        "a stale owner generation must not claim a cross-shard restart"
+        Err(WaitError::AlreadyStopped),
+        "a stale owner generation must be rejected before claiming a cross-shard restart"
     );
     assert_eq!(
         foreign_waiter.wait(Duration::from_millis(10)),
         Err(WaitError::Timeout),
-        "the same isolate id on another owner shard must not claim the restart"
+        "the live same-id isolate on another owner shard must not claim the restart"
     );
     assert_eq!(
         collision_waiter.wait(Duration::from_millis(10)),

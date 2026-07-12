@@ -1410,7 +1410,11 @@ fn threaded_multishard_bad_remote_does_not_poison_good_remote_work() {
     let worker = runtime
         .register_with_capacity_on::<Worker, _>(ShardId::new(2), Worker, 8)
         .expect("worker register accepts");
-    let bad_worker = Address::new(ShardId::new(2), IsolateId::new(99));
+    let bad_worker = Address::new_in(
+        runtime.system_incarnation(),
+        ShardId::new(2),
+        IsolateId::new(99),
+    );
     let coordinator = runtime
         .register_with_capacity_on::<Coordinator, _>(
             ShardId::new(1),

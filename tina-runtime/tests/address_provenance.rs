@@ -284,13 +284,20 @@ fn cross_shard_effect_rejects_foreign_coincident_target_at_source() {
         "foreign send reached coincident local target"
     );
     assert!(local.trace().iter().any(|event| {
-        matches!(
-            event.kind(),
-            RuntimeEventKind::SendRejected {
-                reason: SendRejectedReason::ForeignSystem { expected, actual },
-                ..
-            } if expected == local_system && actual == foreign_system
-        )
+        event.shard() == ShardId::new(1)
+            && event.isolate() == relay.isolate()
+            && matches!(
+                event.kind(),
+                RuntimeEventKind::SendRejected {
+                    reason: SendRejectedReason::ForeignSystem { expected, actual },
+                    ..
+                } if expected == local_system && actual == foreign_system
+            )
+    }));
+    assert!(local.trace().iter().all(|event| {
+        !(event.shard() == ShardId::new(1)
+            && event.isolate() == relay.isolate()
+            && matches!(event.kind(), RuntimeEventKind::SendAccepted { .. }))
     }));
 }
 
@@ -404,6 +411,73 @@ fn explicit_observers_reject_foreign_shard_before_claiming_local_slots() {
 }
 
 #[test]
+fn stale_observer_addresses_do_not_consume_bounded_registry_capacity() {
+    let mut runtime = Runtime::new(TestShard(7), DefaultMailboxFactory);
+    let local = runtime.register_with_capacity::<Probe, Infallible>(
+        Probe {
+            value: 0,
+            observed: None,
+        },
+        4,
+    );
+    let stale = Address::<ProbeMsg, u32>::new_with_generation_in(
+        local.system(),
+        local.shard(),
+        local.isolate(),
+        AddressGeneration::new(local.generation().get() + 1),
+    );
+
+    // Exceed ObservationRegistry's default bound; eager failures must not
+    // occupy any slot.
+    for _ in 0..=1024 {
+        assert_eq!(
+            runtime.observe_isolate_complete(stale).wait(Duration::ZERO),
+            Err(WaitError::AlreadyStopped)
+        );
+        assert_eq!(
+            runtime
+                .observe_operation_done(stale, CallKind::Sleep)
+                .wait(Duration::ZERO),
+            Err(WaitError::AlreadyStopped)
+        );
+        assert_eq!(
+            runtime.observe_child_restarted(stale).wait(Duration::ZERO),
+            Err(WaitError::AlreadyStopped)
+        );
+    }
+
+    assert_eq!(
+        runtime.observe_isolate_complete(local).wait(Duration::ZERO),
+        Err(WaitError::Timeout),
+        "stale addresses exhausted observation capacity"
+    );
+}
+
+#[test]
+fn multi_shard_restart_observer_rejects_unowned_shard_without_panicking() {
+    let system = SystemIncarnation::new(0xc6);
+    let mut runtime = MultiShardRuntime::with_config_and_system(
+        [TestShard(7)],
+        DefaultMailboxFactory,
+        tina_runtime::MultiShardRuntimeConfig::default(),
+        system,
+    );
+    let unowned = Address::<ProbeMsg, u32>::new_with_generation_in(
+        system,
+        ShardId::new(8),
+        IsolateId::new(0),
+        AddressGeneration::new(0),
+    );
+
+    assert_eq!(
+        runtime
+            .observe_child_restarted(unowned)
+            .wait(Duration::ZERO),
+        Err(WaitError::UnknownShard(ShardId::new(8)))
+    );
+}
+
+#[test]
 fn threaded_multi_rejects_foreign_coincident_tuple_before_authority_claim() {
     let config = ThreadedRuntimeConfig {
         system_incarnation: Some(SystemIncarnation::new(100)),
@@ -508,6 +582,67 @@ fn threaded_observed_ingress_rejects_foreign_before_observer_registration() {
 
     owner.shutdown().expect("owner shutdown");
     foreign.shutdown().expect("foreign shutdown");
+}
+
+#[test]
+fn threaded_lifecycle_reports_preserve_unknown_shard_and_stale_parent() {
+    let system = SystemIncarnation::new(0x191);
+    let runtime = ThreadedRuntime::with_config(
+        TestShard(9),
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            system_incarnation: Some(system),
+            ..ThreadedRuntimeConfig::default()
+        },
+    );
+    let parent = runtime
+        .register_with_capacity::<DropProbe, Infallible>(DropProbe, 4)
+        .expect("parent registration");
+    let stale = Address::<DropMsg, ()>::new_with_generation_in(
+        system,
+        parent.shard(),
+        parent.isolate(),
+        AddressGeneration::new(parent.generation().get() + 1),
+    );
+    let wrong_shard = Address::<DropMsg, ()>::new_with_generation_in(
+        system,
+        ShardId::new(10),
+        parent.isolate(),
+        parent.generation(),
+    );
+
+    assert_eq!(
+        runtime.child_lifecycle_report(stale),
+        Err(ThreadedRuntimeError::ParentStopped)
+    );
+    assert_eq!(
+        runtime.child_lifecycle_report(wrong_shard),
+        Err(ThreadedRuntimeError::UnknownShard(ShardId::new(10)))
+    );
+    runtime.shutdown().expect("runtime shutdown");
+
+    let multi = ThreadedMultiShardRuntime::with_config(
+        [TestShard(9)],
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            system_incarnation: Some(system),
+            ..ThreadedRuntimeConfig::default()
+        },
+    );
+    let parent = multi
+        .register_with_capacity_on::<DropProbe, Infallible>(ShardId::new(9), DropProbe, 4)
+        .expect("multi parent registration");
+    let stale = Address::<DropMsg, ()>::new_with_generation_in(
+        system,
+        parent.shard(),
+        parent.isolate(),
+        AddressGeneration::new(parent.generation().get() + 1),
+    );
+    assert_eq!(
+        multi.child_lifecycle_report(stale),
+        Err(ThreadedRuntimeError::ParentStopped)
+    );
+    multi.shutdown().expect("multi runtime shutdown");
 }
 
 #[test]

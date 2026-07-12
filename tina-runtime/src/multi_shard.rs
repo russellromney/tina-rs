@@ -460,8 +460,12 @@ where
                 actual: parent.system(),
             });
         }
-        self.runtime_mut(parent.shard())
-            .observe_child_restarted(parent)
+        let Some(index) = self.shard_indexes.get(&parent.shard()).copied() else {
+            return ChildRestartedWaiter::with_error(crate::WaitError::UnknownShard(
+                parent.shard(),
+            ));
+        };
+        self.runtimes[index].observe_child_restarted(parent)
     }
 
     /// Attempts one typed global ingress send routed strictly by target shard.

@@ -2684,7 +2684,8 @@ fn cross_shard_unknown_isolate_rejects_on_destination_harvest() {
     let mut runtime =
         MultiShardRuntime::new([NumberedShard(11), NumberedShard(22)], TestMailboxFactory);
 
-    let unknown = Address::new_with_generation(
+    let unknown = Address::new_with_generation_in(
+        runtime.system_incarnation(),
         ShardId::new(22),
         IsolateId::new(999),
         AddressGeneration::new(0),
@@ -2728,7 +2729,8 @@ fn cross_shard_unknown_isolate_does_not_poison_destination_shard() {
     let mut runtime =
         MultiShardRuntime::new([NumberedShard(11), NumberedShard(22)], TestMailboxFactory);
 
-    let unknown = Address::new_with_generation(
+    let unknown = Address::new_with_generation_in(
+        runtime.system_incarnation(),
         ShardId::new(22),
         IsolateId::new(999),
         AddressGeneration::new(0),

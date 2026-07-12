@@ -125,6 +125,13 @@ where
                 address.shard(),
             ));
         }
+        if !self.entries.iter().any(|entry| {
+            entry.id == address.isolate()
+                && entry.generation == address.generation()
+                && !entry.stopped.get()
+        }) {
+            return IsolateCompleteWaiter::with_error(crate::WaitError::AlreadyStopped);
+        }
         self.observation
             .register_isolate_complete(address.isolate(), address.generation())
     }
@@ -153,6 +160,13 @@ where
                 address.shard(),
             ));
         }
+        if !self.entries.iter().any(|entry| {
+            entry.id == address.isolate()
+                && entry.generation == address.generation()
+                && !entry.stopped.get()
+        }) {
+            return OperationDoneWaiter::with_error(crate::WaitError::AlreadyStopped);
+        }
         self.observation
             .register_operation_done(address.isolate(), address.generation(), call_kind)
     }
@@ -180,6 +194,13 @@ where
             return ChildRestartedWaiter::with_error(crate::WaitError::UnknownShard(
                 parent_address.shard(),
             ));
+        }
+        if !self.entries.iter().any(|entry| {
+            entry.id == parent_address.isolate()
+                && entry.generation == parent_address.generation()
+                && !entry.stopped.get()
+        }) {
+            return ChildRestartedWaiter::with_error(crate::WaitError::AlreadyStopped);
         }
         self.observation.register_child_restarted(
             parent_address.shard(),
