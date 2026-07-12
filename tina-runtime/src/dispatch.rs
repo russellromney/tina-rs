@@ -602,7 +602,12 @@ where
                     },
                 );
 
-                let delivery = if target_shard == self.shard.id() {
+                let delivery = if send.target_system != self.system_incarnation {
+                    Err(SendRejectedReason::ForeignSystem {
+                        expected: self.system_incarnation,
+                        actual: send.target_system,
+                    })
+                } else if target_shard == self.shard.id() {
                     self.dispatch_local_send(send)
                 } else {
                     route_remote(
@@ -2081,11 +2086,13 @@ where
         match failure_reason {
             None => self.observation.notify_operation_completed(
                 head.requester.isolate,
+                head.requester.generation,
                 head.call_kind,
                 call_id,
             ),
             Some(error) => self.observation.notify_operation_failed(
                 head.requester.isolate,
+                head.requester.generation,
                 head.call_kind,
                 call_id,
                 error,

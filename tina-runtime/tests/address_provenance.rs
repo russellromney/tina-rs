@@ -8,9 +8,10 @@ use std::time::Duration;
 use tina::prelude::*;
 use tina::{AddressGeneration, SystemIncarnation};
 use tina_runtime::{
-    CallOutcome, DefaultMailboxFactory, DefaultThreadedMailboxFactory, LocalSystem,
-    MultiShardRuntime, ResultWaitError, Runtime, ThreadedMultiShardRuntime, ThreadedRuntime,
-    ThreadedRuntimeConfig, ThreadedRuntimeError, ThreadedTrySendError,
+    CallKind, CallOutcome, ChildLifecycleReportError, DefaultMailboxFactory,
+    DefaultThreadedMailboxFactory, LocalSystem, MultiShardRuntime, ResultWaitError, Runtime,
+    RuntimeEventKind, SendRejectedReason, ThreadedMultiShardRuntime, ThreadedRuntime,
+    ThreadedRuntimeConfig, ThreadedRuntimeError, ThreadedTrySendError, WaitError,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -80,6 +81,26 @@ impl DropProbe {
 
     fn handle_call(&mut self, _message: DropMsg, call: CallContext<'_, Self>) -> Effect<Self> {
         call.reply(())
+    }
+}
+
+#[derive(Debug)]
+enum RelayMsg {
+    Go,
+}
+
+struct Relay {
+    target: Address<ProbeMsg, u32>,
+}
+
+#[tina_runtime::isolate(message = RelayMsg, send = Outbound<ProbeMsg>, shard = TestShard)]
+impl Relay {
+    fn handle(
+        &mut self,
+        _message: RelayMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        send(self.target, ProbeMsg::Set(42))
     }
 }
 
@@ -208,6 +229,178 @@ fn one_multi_shard_owner_stamps_one_shared_provenance() {
     );
     assert_eq!(first.system(), runtime.system_incarnation());
     assert_eq!(first.system(), second.system());
+}
+
+#[test]
+fn cross_shard_effect_rejects_foreign_coincident_target_at_source() {
+    let local_system = SystemIncarnation::new(0xa1);
+    let foreign_system = SystemIncarnation::new(0xb2);
+    let observed = Rc::new(Cell::new(0));
+    let mut local = MultiShardRuntime::with_config_and_system(
+        [TestShard(1), TestShard(2)],
+        DefaultMailboxFactory,
+        tina_runtime::MultiShardRuntimeConfig::default(),
+        local_system,
+    );
+    let mut foreign = MultiShardRuntime::with_config_and_system(
+        [TestShard(1), TestShard(2)],
+        DefaultMailboxFactory,
+        tina_runtime::MultiShardRuntimeConfig::default(),
+        foreign_system,
+    );
+    let local_target = local.register_with_capacity_on::<Probe, Infallible>(
+        ShardId::new(2),
+        Probe {
+            value: 0,
+            observed: Some(Rc::clone(&observed)),
+        },
+        4,
+    );
+    let foreign_target = foreign.register_with_capacity_on::<Probe, Infallible>(
+        ShardId::new(2),
+        Probe {
+            value: 0,
+            observed: None,
+        },
+        4,
+    );
+    assert_eq!(local_target.isolate(), foreign_target.isolate());
+    let relay = local.register_with_capacity_on::<Relay, ProbeMsg>(
+        ShardId::new(1),
+        Relay {
+            target: foreign_target,
+        },
+        4,
+    );
+
+    local.try_send(relay, RelayMsg::Go).expect("kick relay");
+    for _ in 0..4 {
+        local.step();
+    }
+
+    assert_eq!(
+        observed.get(),
+        0,
+        "foreign send reached coincident local target"
+    );
+    assert!(local.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::SendRejected {
+                reason: SendRejectedReason::ForeignSystem { expected, actual },
+                ..
+            } if expected == local_system && actual == foreign_system
+        )
+    }));
+}
+
+#[test]
+fn explicit_observers_reject_foreign_system_before_claiming_local_slots() {
+    let local_system = SystemIncarnation::new(0xc3);
+    let foreign_system = SystemIncarnation::new(0xd4);
+    let mut local =
+        Runtime::new(TestShard(7), DefaultMailboxFactory).with_system_incarnation(local_system);
+    let mut foreign =
+        Runtime::new(TestShard(7), DefaultMailboxFactory).with_system_incarnation(foreign_system);
+    let local_address = local.register_with_capacity::<Probe, Infallible>(
+        Probe {
+            value: 0,
+            observed: None,
+        },
+        4,
+    );
+    let foreign_address = foreign.register_with_capacity::<Probe, Infallible>(
+        Probe {
+            value: 0,
+            observed: None,
+        },
+        4,
+    );
+    assert_eq!(local_address.isolate(), foreign_address.isolate());
+
+    let foreign_wait = WaitError::ForeignSystem {
+        expected: local_system,
+        actual: foreign_system,
+    };
+    assert_eq!(
+        local
+            .observe_isolate_complete(foreign_address)
+            .wait(Duration::ZERO),
+        Err(foreign_wait)
+    );
+    assert_eq!(
+        local
+            .observe_operation_done(foreign_address, CallKind::Sleep)
+            .wait(Duration::ZERO),
+        Err(foreign_wait)
+    );
+    assert_eq!(
+        local
+            .observe_child_restarted(foreign_address)
+            .wait(Duration::ZERO),
+        Err(foreign_wait)
+    );
+    assert!(matches!(
+        local.child_lifecycle_report(foreign_address),
+        Err(ChildLifecycleReportError::ForeignSystem { expected, actual })
+            if expected == local_system && actual == foreign_system
+    ));
+    assert!(matches!(
+        local.observe_result::<u32, _, _>(foreign_address),
+        Err(ResultWaitError::ForeignSystem { expected, actual })
+            if expected == local_system && actual == foreign_system
+    ));
+    assert!(
+        local.observe_result::<u32, _, _>(local_address).is_ok(),
+        "foreign result observation consumed the coincident local claim"
+    );
+}
+
+#[test]
+fn explicit_observers_reject_foreign_shard_before_claiming_local_slots() {
+    let system = SystemIncarnation::new(0xc5);
+    let mut runtime =
+        Runtime::new(TestShard(7), DefaultMailboxFactory).with_system_incarnation(system);
+    let local = runtime.register_with_capacity::<Probe, Infallible>(
+        Probe {
+            value: 0,
+            observed: None,
+        },
+        4,
+    );
+    let foreign_shard = Address::<ProbeMsg, u32>::new_with_generation_in(
+        system,
+        ShardId::new(8),
+        local.isolate(),
+        local.generation(),
+    );
+
+    assert_eq!(
+        runtime
+            .observe_isolate_complete(foreign_shard)
+            .wait(Duration::ZERO),
+        Err(WaitError::UnknownShard(ShardId::new(8)))
+    );
+    assert_eq!(
+        runtime
+            .observe_operation_done(foreign_shard, CallKind::Sleep)
+            .wait(Duration::ZERO),
+        Err(WaitError::UnknownShard(ShardId::new(8)))
+    );
+    assert_eq!(
+        runtime
+            .observe_child_restarted(foreign_shard)
+            .wait(Duration::ZERO),
+        Err(WaitError::UnknownShard(ShardId::new(8)))
+    );
+    assert!(matches!(
+        runtime.observe_result::<u32, _, _>(foreign_shard),
+        Err(ResultWaitError::UnknownShard(shard)) if shard == ShardId::new(8)
+    ));
+    assert!(
+        runtime.observe_result::<u32, _, _>(local).is_ok(),
+        "foreign-shard result observation consumed the local claim"
+    );
 }
 
 #[test]

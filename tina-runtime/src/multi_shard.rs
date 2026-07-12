@@ -432,6 +432,12 @@ where
         &self,
         parent: Address<M, R>,
     ) -> Result<crate::ChildLifecycleReport, crate::ChildLifecycleReportError> {
+        if parent.system() != self.system_incarnation {
+            return Err(crate::ChildLifecycleReportError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: parent.system(),
+            });
+        }
         let Some(index) = self.shard_indexes.get(&parent.shard()).copied() else {
             return Err(crate::ChildLifecycleReportError::ParentShardUnavailable(
                 parent.shard(),
@@ -448,6 +454,12 @@ where
         &mut self,
         parent: Address<M, R>,
     ) -> ChildRestartedWaiter {
+        if parent.system() != self.system_incarnation {
+            return ChildRestartedWaiter::with_error(crate::WaitError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: parent.system(),
+            });
+        }
         self.runtime_mut(parent.shard())
             .observe_child_restarted(parent)
     }

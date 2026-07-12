@@ -607,6 +607,29 @@ where
         // What we record here is destination-local harvest outcome, not a
         // retroactive change to the source-side send result.
         let send = queued.send;
+        if send.target_system != self.system_incarnation {
+            let reason = SendRejectedReason::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: send.target_system,
+            };
+            self.push_event(
+                send.target_isolate,
+                Some(queued.cause),
+                RuntimeEventKind::SendRejected {
+                    target_shard: send.target_shard,
+                    target_isolate: send.target_isolate,
+                    target_generation: send.target_generation,
+                    reason,
+                },
+            );
+            return remote_call_outcome_envelope(
+                queued.call_context,
+                RemoteCallOutcome::Rejected(CallRejectedReason::ForeignSystem {
+                    expected: self.system_incarnation,
+                    actual: send.target_system,
+                }),
+            );
+        }
         let Some(&entry_index) = self.entry_indexes.get(&send.target_isolate) else {
             self.push_event(
                 send.target_isolate,

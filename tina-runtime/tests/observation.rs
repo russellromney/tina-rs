@@ -560,8 +560,8 @@ fn child_restarted_waiter_resolves_after_panic_and_restart() {
     );
     assert_eq!(
         foreign_waiter.wait(Duration::from_millis(10)),
-        Err(WaitError::Timeout),
-        "a foreign shard with the same isolate id must not claim the restart"
+        Err(WaitError::UnknownShard(foreign_parent.shard())),
+        "a foreign shard must be rejected before it can claim the restart"
     );
     assert_eq!(
         runtime

@@ -34,6 +34,15 @@ use crate::trace::CallKind;
 /// Outcome of a `wait` call on any of this module's typed waiters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitError {
+    /// The observed address belongs to another runtime/system incarnation.
+    ForeignSystem {
+        /// Incarnation owned by this runtime.
+        expected: tina::SystemIncarnation,
+        /// Incarnation carried by the address.
+        actual: tina::SystemIncarnation,
+    },
+    /// The observed address targets a shard this runtime does not own.
+    UnknownShard(ShardId),
     /// The waiter timed out before the runtime produced an outcome.
     Timeout,
     /// The runtime stopped (or was dropped) before the awaited fact happened.
@@ -191,7 +200,7 @@ impl IsolateCompleteWaiter {
         )
     }
 
-    fn with_error(error: WaitError) -> Self {
+    pub(crate) fn with_error(error: WaitError) -> Self {
         let (_tx, rx) = mpsc::sync_channel(1);
         Self {
             rx,
@@ -232,7 +241,7 @@ impl OperationDoneWaiter {
         )
     }
 
-    fn with_error(error: WaitError) -> Self {
+    pub(crate) fn with_error(error: WaitError) -> Self {
         let (_tx, rx) = mpsc::sync_channel(1);
         Self {
             rx,
@@ -300,7 +309,7 @@ impl ChildRestartedWaiter {
         )
     }
 
-    fn with_error(error: WaitError) -> Self {
+    pub(crate) fn with_error(error: WaitError) -> Self {
         let (_tx, rx) = mpsc::sync_channel(1);
         Self {
             rx,
@@ -448,6 +457,7 @@ struct IsolateCompleteSlot {
 #[derive(Debug)]
 struct OperationDoneSlot {
     isolate: IsolateId,
+    generation: AddressGeneration,
     call_kind: CallKind,
     sender: SyncSender<OperationDoneOutcome>,
 }
@@ -560,6 +570,7 @@ impl ObservationRegistry {
     pub(crate) fn register_operation_done(
         &mut self,
         isolate: IsolateId,
+        generation: AddressGeneration,
         call_kind: CallKind,
     ) -> OperationDoneWaiter {
         if self.is_full() {
@@ -568,6 +579,7 @@ impl ObservationRegistry {
         let (waiter, sender) = OperationDoneWaiter::from_pair();
         self.pending_operation_done.push(OperationDoneSlot {
             isolate,
+            generation,
             call_kind,
             sender,
         });
@@ -661,14 +673,13 @@ impl ObservationRegistry {
     pub(crate) fn notify_operation_completed(
         &mut self,
         isolate: IsolateId,
+        generation: AddressGeneration,
         call_kind: CallKind,
         call_id: CallId,
     ) {
-        if let Some(index) = self
-            .pending_operation_done
-            .iter()
-            .position(|slot| slot.isolate == isolate && slot.call_kind == call_kind)
-        {
+        if let Some(index) = self.pending_operation_done.iter().position(|slot| {
+            slot.isolate == isolate && slot.generation == generation && slot.call_kind == call_kind
+        }) {
             // `remove` (not `swap_remove`) preserves registration order for
             // the remaining slots so a later wait for a different (isolate,
             // kind) sees a deterministic queue.
@@ -682,15 +693,14 @@ impl ObservationRegistry {
     pub(crate) fn notify_operation_failed(
         &mut self,
         isolate: IsolateId,
+        generation: AddressGeneration,
         call_kind: CallKind,
         call_id: CallId,
         error: CallError,
     ) {
-        if let Some(index) = self
-            .pending_operation_done
-            .iter()
-            .position(|slot| slot.isolate == isolate && slot.call_kind == call_kind)
-        {
+        if let Some(index) = self.pending_operation_done.iter().position(|slot| {
+            slot.isolate == isolate && slot.generation == generation && slot.call_kind == call_kind
+        }) {
             // `remove` (not `swap_remove`) preserves registration order for
             // the remaining slots so a later wait for a different (isolate,
             // kind) sees a deterministic queue.
@@ -804,5 +814,37 @@ impl ObservationRegistry {
                 Err(mpsc::TrySendError::Disconnected(_)) => continue,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tina::{AddressGeneration, IsolateId};
+
+    use super::{ObservationRegistry, WaitError};
+    use crate::{CallId, CallKind};
+
+    #[test]
+    fn operation_observer_matches_generation_not_just_isolate() {
+        let mut registry = ObservationRegistry::new();
+        let isolate = IsolateId::new(7);
+        let stale =
+            registry.register_operation_done(isolate, AddressGeneration::new(0), CallKind::Sleep);
+        let current =
+            registry.register_operation_done(isolate, AddressGeneration::new(1), CallKind::Sleep);
+
+        registry.notify_operation_completed(
+            isolate,
+            AddressGeneration::new(1),
+            CallKind::Sleep,
+            CallId::new(11),
+        );
+
+        current
+            .wait(Duration::ZERO)
+            .expect("current generation observes its completion");
+        assert_eq!(stale.wait(Duration::ZERO), Err(WaitError::Timeout));
     }
 }

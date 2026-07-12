@@ -114,6 +114,17 @@ where
         &mut self,
         address: Address<M, R>,
     ) -> IsolateCompleteWaiter {
+        if address.system() != self.system_incarnation {
+            return IsolateCompleteWaiter::with_error(crate::WaitError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
+        if address.shard() != self.shard.id() {
+            return IsolateCompleteWaiter::with_error(crate::WaitError::UnknownShard(
+                address.shard(),
+            ));
+        }
         self.observation
             .register_isolate_complete(address.isolate(), address.generation())
     }
@@ -131,8 +142,19 @@ where
         address: Address<M, R>,
         call_kind: CallKind,
     ) -> OperationDoneWaiter {
+        if address.system() != self.system_incarnation {
+            return OperationDoneWaiter::with_error(crate::WaitError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
+        if address.shard() != self.shard.id() {
+            return OperationDoneWaiter::with_error(crate::WaitError::UnknownShard(
+                address.shard(),
+            ));
+        }
         self.observation
-            .register_operation_done(address.isolate(), call_kind)
+            .register_operation_done(address.isolate(), address.generation(), call_kind)
     }
 
     /// Registers a typed waiter for the next supervised restart of any
@@ -148,6 +170,17 @@ where
         &mut self,
         parent_address: Address<M, R>,
     ) -> ChildRestartedWaiter {
+        if parent_address.system() != self.system_incarnation {
+            return ChildRestartedWaiter::with_error(crate::WaitError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: parent_address.system(),
+            });
+        }
+        if parent_address.shard() != self.shard.id() {
+            return ChildRestartedWaiter::with_error(crate::WaitError::UnknownShard(
+                parent_address.shard(),
+            ));
+        }
         self.observation.register_child_restarted(
             parent_address.shard(),
             parent_address.isolate(),
@@ -161,6 +194,12 @@ where
         &self,
         parent_address: Address<M, R>,
     ) -> Result<ChildLifecycleReport, ChildLifecycleReportError> {
+        if parent_address.system() != self.system_incarnation {
+            return Err(ChildLifecycleReportError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: parent_address.system(),
+            });
+        }
         if parent_address.shard() != self.shard.id() {
             return Err(ChildLifecycleReportError::ParentShardUnavailable(
                 parent_address.shard(),
@@ -197,6 +236,15 @@ where
     where
         T: Send + 'static,
     {
+        if address.system() != self.system_incarnation {
+            return Err(ResultWaitError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
+        if address.shard() != self.shard.id() {
+            return Err(ResultWaitError::UnknownShard(address.shard()));
+        }
         let isolate = address.isolate();
         let generation = address.generation();
         let alive = self.entries.iter().any(|entry| {
