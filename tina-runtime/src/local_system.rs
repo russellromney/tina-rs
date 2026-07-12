@@ -1006,6 +1006,20 @@ where
         self.runtime().send_and_observe(address, message)
     }
 
+    /// Registers a typed waiter for the terminal value produced by
+    /// [`tina::stop_with`] at `address`.
+    ///
+    /// Register the waiter before triggering the isolate. Eager registration
+    /// failures and waiter outcomes match [`ThreadedRuntime::observe_result`]
+    /// exactly; the local-system facade does not flatten result authority or
+    /// terminal failure reasons.
+    pub fn observe_result<T: Send + 'static, M: 'static, R: 'static>(
+        &self,
+        address: Address<M, R>,
+    ) -> Result<crate::IsolateResultWaiter<T>, crate::ResultWaitError> {
+        self.runtime().observe_result::<T, M, R>(address)
+    }
+
     /// Returns retained trace without failing the observability path.
     pub fn trace(&self) -> TraceSnapshot {
         self.runtime().trace()
@@ -1014,6 +1028,18 @@ where
     /// Returns complete trace, failing if the worker can no longer report.
     pub fn complete_trace(&self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
         self.runtime().complete_trace()
+    }
+
+    /// Returns cloneable runtime-level shutdown control without consuming the
+    /// local-system owner.
+    ///
+    /// This is the bounded shutdown path for a [`LocalSystem`] shared through
+    /// [`Arc`]. It preserves the same cached terminal report as consuming
+    /// [`Self::shutdown`], without requiring `Arc::try_unwrap` or exposing the
+    /// underlying threaded runtime. Service-level drain remains an application
+    /// protocol; this handle controls runtime shutdown only.
+    pub fn shutdown_handle(&self) -> crate::ThreadedShutdownHandle {
+        self.runtime().shutdown_handle()
     }
 
     /// Begins graceful shutdown.
@@ -1602,6 +1628,20 @@ where
             .call_blocking_request(address, request, timeout)
     }
 
+    /// Registers a typed waiter for the terminal value produced by
+    /// [`tina::stop_with`] on the shard carried by `address`.
+    ///
+    /// Routing, eager errors, and waiter outcomes match
+    /// [`ThreadedMultiShardRuntime::observe_result`]. In particular, an address
+    /// for a shard outside this local system remains a programmer error and
+    /// panics with the lower owner's unknown-shard diagnostic.
+    pub fn observe_result<T: Send + 'static, M: 'static, R: 'static>(
+        &self,
+        address: Address<M, R>,
+    ) -> Result<crate::IsolateResultWaiter<T>, crate::ResultWaitError> {
+        self.runtime().observe_result::<T, M, R>(address)
+    }
+
     /// Returns retained trace without failing the observability path.
     pub fn trace(&self) -> TraceSnapshot {
         self.runtime().trace()
@@ -1620,6 +1660,16 @@ where
     /// Returns the live runtime capability table for this app.
     pub fn capabilities(&self) -> RuntimeCapabilities {
         self.runtime().capabilities()
+    }
+
+    /// Returns cloneable runtime-level shutdown control for every owned shard
+    /// without consuming the local-system owner.
+    ///
+    /// Partial multi-shard admission progress, retry behavior, and the cached
+    /// terminal report are identical to
+    /// [`ThreadedMultiShardRuntime::shutdown_handle`].
+    pub fn shutdown_handle(&self) -> crate::ThreadedShutdownHandle {
+        self.runtime().shutdown_handle()
     }
 
     /// Begins graceful shutdown.
