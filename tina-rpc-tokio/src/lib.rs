@@ -275,6 +275,9 @@ fn fire_observer_err(
     err: ThreadedSendObservedError,
 ) {
     let mapped = match err {
+        ThreadedSendObservedError::UnknownShard(_) => {
+            ClientResult::IoError(tina_runtime::CallError::InvalidResource)
+        }
         ThreadedSendObservedError::MailboxFull => ClientResult::Full,
         ThreadedSendObservedError::MailboxClosed => ClientResult::ConnectionClosed,
         ThreadedSendObservedError::IngressFull | ThreadedSendObservedError::WorkerStopped => {
@@ -1150,6 +1153,34 @@ mod tests {
         assert_eq!(received, ClientResult::Full);
         // Pending entry cleaned up.
         assert!(pending.lock().unwrap().get(&7).is_none());
+    }
+
+    #[test]
+    fn observer_unknown_shard_is_typed_invalid_resource() {
+        let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let slots = Arc::new(Semaphore::new(0));
+        let (tx, mut rx) = oneshot::channel::<ClientResult>();
+        let (deadline_cancel, _deadline_cancel_rx) = oneshot::channel::<()>();
+        pending.lock().unwrap().insert(
+            17,
+            PendingCall {
+                tx,
+                deadline_cancel,
+            },
+        );
+
+        fire_observer_err(
+            &pending,
+            &slots,
+            17,
+            ThreadedSendObservedError::UnknownShard(tina::ShardId::new(23)),
+        );
+
+        assert_eq!(slots.available_permits(), 1);
+        assert_eq!(
+            rx.try_recv().expect("oneshot delivered"),
+            ClientResult::IoError(tina_runtime::CallError::InvalidResource)
+        );
     }
 
     #[test]

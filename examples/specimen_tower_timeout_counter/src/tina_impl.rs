@@ -193,7 +193,9 @@ fn classify(e: &BoxError) -> Outcome {
     if let Some(b) = e.downcast_ref::<BridgeError>() {
         return match b {
             BridgeError::Timeout => Outcome::GatewayTimeout,
-            BridgeError::Full | BridgeError::Closed => Outcome::ServiceUnavailable,
+            BridgeError::Full | BridgeError::Closed | BridgeError::UnknownShard(_) => {
+                Outcome::ServiceUnavailable
+            }
         };
     }
     Outcome::ServiceUnavailable

@@ -55,7 +55,9 @@ async fn brush(State(svc): State<CounterService>) -> Result<String, StatusCode> 
     let mut svc = svc;
     match svc.call(BrushRequest).await {
         Ok(reply) => Ok(format!("brushed {}\n", reply.brushes)),
-        Err(BridgeError::Full) | Err(BridgeError::Closed) => Err(StatusCode::SERVICE_UNAVAILABLE),
+        Err(BridgeError::Full) | Err(BridgeError::Closed) | Err(BridgeError::UnknownShard(_)) => {
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        }
         Err(BridgeError::Timeout) => Err(StatusCode::GATEWAY_TIMEOUT),
     }
 }
