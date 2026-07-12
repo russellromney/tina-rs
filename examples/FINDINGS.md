@@ -73,7 +73,9 @@ The simulator client records and classifies every `CallOutcome` instead of
 discarding non-reply terminals. Drain closes every waiter, clears the active
 batch, and makes the physically armed late timer harmless. No batch-specific
 framework helper was added: `SharedWork::reply_all_clone` and
-`drain_all_with` already produce the smaller, honest application form.
+`drain_all_with` already produce the smaller, honest application form. Its
+split-service declaration now uses `ServiceOutbound`, so the motivating
+example contains no direct service-envelope vocabulary.
 
 ### 2026-07-12 Request-aware raw flow prerequisite
 

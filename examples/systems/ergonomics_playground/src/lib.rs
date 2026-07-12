@@ -545,7 +545,7 @@ struct BatchClient {
 
 #[tina_runtime::isolate(
     message = BatchClientMsg,
-    send = tina::Outbound<tina::ServiceMessage<BatcherEvent, BatcherRequest>>
+    send = tina::ServiceOutbound<BatcherEvent, BatcherRequest>
 )]
 impl BatchClient {
     fn handle(
