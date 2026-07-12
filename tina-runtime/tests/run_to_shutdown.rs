@@ -135,6 +135,16 @@ fn app() -> LocalSystem<TestShard, DefaultThreadedMailboxFactory> {
     LocalSystem::single_shard(TestShard(1), DefaultThreadedMailboxFactory).build()
 }
 
+fn wait_for_gate_entry(entered: &AtomicBool, release: &AtomicBool) -> Result<(), WorkError> {
+    while !entered.load(Ordering::Acquire) {
+        if release.load(Ordering::Acquire) {
+            return Err(WorkError::Expected("gate entry cancelled by test watchdog"));
+        }
+        std::thread::yield_now();
+    }
+    Ok(())
+}
+
 #[test]
 fn clean_single_shard_run_returns_workload_value_and_settles_terminal_authority() {
     let result = app().run_to_shutdown(Duration::from_secs(2), |app| {
@@ -247,9 +257,7 @@ fn bounded_terminal_timeout_remains_distinct_from_unclean_truth() {
                 .map_err(WorkError::Runtime)?;
             app.try_send(gate, ProbeMsg::Block)
                 .map_err(|_| WorkError::Expected("block send failed"))?;
-            while !entered.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
+            wait_for_gate_entry(&entered, &release)?;
             ready_tx.send(()).expect("report held worker ready");
             Ok::<_, WorkError>(())
         });
@@ -324,9 +332,7 @@ fn admission_timeout_returns_before_blocking_drop_and_handle_can_retry() {
                 .map_err(WorkError::Runtime)?;
             app.try_send(gate, ProbeMsg::Block)
                 .map_err(|_| WorkError::Expected("gate send failed"))?;
-            while !entered.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
+            wait_for_gate_entry(&entered, &release)?;
             app.try_send(gate, ProbeMsg::Ping)
                 .map_err(|_| WorkError::Expected("queue fill failed"))?;
             ready_tx.send(()).expect("report full command queue");
@@ -392,9 +398,7 @@ fn admission_timeout_without_escaped_handle_disconnects_remaining_control() {
                 .map_err(WorkError::Runtime)?;
             app.try_send(gate, ProbeMsg::Block)
                 .map_err(|_| WorkError::Expected("gate send failed"))?;
-            while !entered.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
+            wait_for_gate_entry(&entered, &release)?;
             app.try_send(gate, ProbeMsg::Ping)
                 .map_err(|_| WorkError::Expected("queue fill failed"))?;
             ready_tx.send(()).expect("report full command queue");
@@ -467,9 +471,7 @@ fn multi_partial_admission_timeout_returns_and_retry_finishes_every_shard() {
                 .map_err(WorkError::Runtime)?;
             app.try_send(gate, ProbeMsg::Block)
                 .map_err(|_| WorkError::Expected("gate send failed"))?;
-            while !entered.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
+            wait_for_gate_entry(&entered, &release)?;
             app.try_send(gate, ProbeMsg::Ping)
                 .map_err(|_| WorkError::Expected("queue fill failed"))?;
             ready_tx.send(()).expect("report full shard command queue");
