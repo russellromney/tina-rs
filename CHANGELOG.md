@@ -4,6 +4,13 @@ This file records completed work.
 
 ## Unreleased
 
+### Keepalive drain timeout truth
+
+- Keepalive pool drain polling now classifies an exhausted host wait budget as
+  the typed `KeepalivePoolDrainOutcome::TimedOut` promised by the helper. A
+  delayed target-timeout delivery under scheduler pressure no longer escapes as
+  an unrelated runtime error while leases remain outstanding.
+
 ### TCP echo example
 
 - Added `examples/specimen_tcp_echo`, a canonical TCP echo server: one listener

@@ -1409,7 +1409,13 @@ where
             });
         }
 
-        match runtime.call_blocking(handles.pool, WorkerPoolMsg::PressureReport, remaining)? {
+        let pressure =
+            match runtime.call_blocking(handles.pool, WorkerPoolMsg::PressureReport, remaining) {
+                Ok(outcome) => outcome,
+                Err(error) => return classify_drain_host_error(error, last_leased),
+            };
+
+        match pressure {
             CallOutcome::Replied(WorkerPoolReply::Pressure(report)) => {
                 last_leased = report.leased;
                 if report.leased == 0 {
@@ -1434,12 +1440,43 @@ where
     }
 }
 
+fn classify_drain_host_error(
+    error: ThreadedRuntimeError,
+    last_leased: usize,
+) -> Result<KeepalivePoolDrainOutcome, ThreadedRuntimeError> {
+    match error {
+        // The pressure call's target deadline is the helper's remaining drain
+        // budget. `call_blocking` adds delivery grace to the host wait, so a
+        // HostWaitTimeout arrives only after that drain budget has elapsed.
+        ThreadedRuntimeError::HostWaitTimeout => Ok(KeepalivePoolDrainOutcome::TimedOut {
+            leased: last_leased,
+        }),
+        error => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tina::Isolate;
     use tina::IsolateId;
     use tina_runtime::StreamId;
+
+    #[test]
+    fn drain_host_timeout_maps_without_collapsing_control_errors() {
+        assert_eq!(
+            classify_drain_host_error(ThreadedRuntimeError::HostWaitTimeout, 3),
+            Ok(KeepalivePoolDrainOutcome::TimedOut { leased: 3 })
+        );
+        assert_eq!(
+            classify_drain_host_error(ThreadedRuntimeError::WorkerStopped, 3),
+            Err(ThreadedRuntimeError::WorkerStopped)
+        );
+        assert_eq!(
+            classify_drain_host_error(ThreadedRuntimeError::CommandFull, 3),
+            Err(ThreadedRuntimeError::CommandFull)
+        );
+    }
 
     #[derive(Debug, Default)]
     struct TestShard;
