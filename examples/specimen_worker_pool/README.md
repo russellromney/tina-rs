@@ -1,20 +1,22 @@
 # specimen_worker_pool
 
-Frontend captures a `DeferredReply` per client, dispatches to the
-next worker round-robin, replies through the matching slot when the
-worker finishes. Workers have varied work times so replies arrive
-out of order.
+The frontend dispatches each request to the next worker round-robin and moves
+the caller's typed `RequestContext` into that worker call's continuation.
+Workers have varied work times, so replies arrive out of order without an
+application-level request ID or correlation table.
 
 Primitives used:
 
-- `PendingReplies::park_request` — consume the original request
-  authority and capture its caller as a one-shot deferred slot.
-- `PendingReplies::take(qid)` — pull the slot back when the worker
-  reply matches.
-- `reply_to(slot, value)` — answer the original caller through the
-  captured slot.
+- `RequestCall::defer(call_request(...))` — move the original caller authority
+  into exactly one worker call.
+- `reply_service_event` — deliver the typed `RequestContext` and exhaustive
+  worker `CallOutcome` to the frontend continuation without exposing a
+  `ServiceMessage` envelope.
+- `reply_to(req, value)` — answer the original caller through that authority.
 - `BoundedItems::try_from_iter` / `bounded_batch` — cap the driver
   burst before per-item call effects exist.
+- `LocalSystem` — own registration, observation, typed ingress, and truthful
+  terminal shutdown through the public application facade.
 
 ## Run
 
@@ -28,24 +30,16 @@ worker each client mapped to.
 
 ## What feels good
 
-- One `PendingReplies::with_capacity(MAX_PENDING)` field is the
-  whole pending box. No `Arc<Mutex<HashMap>>`, no eviction logic.
-- Out-of-order completion is invisible at the call sites — the slot
-  carries the correlation, not the timing.
-- Pending-table pressure and every worker terminal outcome remain
-  distinct: `PendingFull`, `WorkerFull`, `WorkerClosed`,
-  `WorkerTimeout`, and `WorkerRejected(reason)` are not coalesced.
-- The driver workload passes through a producer-owned cap aligned with
-  the frontend pending cap before it becomes a call batch, so this
-  specimen does not teach a raw request-sized `Effect::Batch` as the
-  copied path.
+- Out-of-order completion is invisible at the call sites: the move-only caller
+  authority carries correlation, not an ID or sidecar map.
+- Every worker terminal outcome remains distinct: `WorkerFull`,
+  `WorkerClosed`, `WorkerTimeout`, and `WorkerRejected(reason)` are not
+  coalesced, and timer setup failures retain their typed `CallError`.
+- The driver workload passes through a producer-owned cap before it becomes a
+  call batch, so this specimen does not teach a raw request-sized
+  `Effect::Batch` as the copied path.
 
-## What feels worse
-
-- The frontend has to thread `qid` through a closure passed to
-  `call_request(worker, ..., timeout).then(move |outcome| FrontendEvent::WorkerDone(qid, outcome))`.
-  The closure-form `.then` is the price for stuffing a correlator into
-  the continuation event.
-- The `FrontendRequest::Submit` / `FrontendEvent::WorkerDone` enums
-  still carry the message shape; a sugar that hides "id-correlated
-  dispatch" behind one helper would help.
+The explicit `FrontendEvent::WorkerDone(RequestContext<_>, CallOutcome<_>)`
+still names the suspension point and all terminal outcomes, but it contains no
+authority-shaped workaround: `reply_service_event` constructs that typed
+continuation directly.
