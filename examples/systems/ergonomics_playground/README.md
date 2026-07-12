@@ -10,8 +10,9 @@ These are not product examples. They are small pressure points for API feel:
   waits for both unavailable replies before answering `Unavailable`.
 - `debounced_batch`: callers join one bounded `SharedWork` batch; a
   timer flush replies to the admitted callers as one batch while excess callers
-  get visible `Full`. A drain variant closes admission and replies `Closed` to
-  already parked callers.
+  get visible `Full`. Operation admission is capped separately from live waiter
+  occupancy, so timed-out callers cannot make a batch grow past its bound. A
+  drain variant closes admission and replies `Closed` to already parked callers.
 - `single_flight_cache`: several callers request the same missing key; one
   upstream fill runs, admitted waiters share the result, and overflow callers
   get visible `Full`.

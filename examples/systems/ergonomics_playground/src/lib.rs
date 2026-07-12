@@ -467,6 +467,16 @@ impl Batcher {
                 if self.closed {
                     return call.reply(BatchReply::Closed);
                 }
+                // SharedWork bounds live caller authority. The values are the
+                // actual operations, so keep their producer bounded even when
+                // an earlier caller times out and its waiter slot is reclaimed.
+                if self
+                    .active
+                    .as_ref()
+                    .is_some_and(|batch| batch.values.len() >= self.waiters.capacity())
+                {
+                    return call.reply(BatchReply::Full);
+                }
                 let batch_id = self
                     .active
                     .as_ref()
@@ -924,6 +934,86 @@ pub fn run_single_flight_cache_probe() -> anyhow::Result<CacheFillReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::Infallible;
+
+    use tina_runtime::{CallKind, DefaultThreadedMailboxFactory, LocalSystem, LocalSystemConfig};
+
+    #[derive(Debug)]
+    enum TimerHolderMsg {
+        Start,
+        Done(SleepReply),
+    }
+
+    struct TimerHolder;
+
+    #[tina_runtime::isolate(message = TimerHolderMsg)]
+    impl TimerHolder {
+        fn handle(
+            &mut self,
+            message: TimerHolderMsg,
+            _ctx: &mut Context<'_, SingleShard>,
+        ) -> Effect<Self> {
+            match message {
+                TimerHolderMsg::Start => sleep(Duration::from_secs(5)).then(TimerHolderMsg::Done),
+                TimerHolderMsg::Done(_outcome) => noop(),
+            }
+        }
+    }
+
+    enum TimeoutBatchClientMsg {
+        Begin(ServiceRequestAddress<BatcherEvent, BatcherRequest, BatchReply>),
+        FirstReturned(CallOutcome<BatchReply>),
+        SubmitSecond,
+        SecondReturned(CallOutcome<BatchReply>),
+        SubmitThird,
+        ThirdReturned(CallOutcome<BatchReply>),
+    }
+
+    struct TimeoutBatchClient {
+        batcher: Option<ServiceRequestAddress<BatcherEvent, BatcherRequest, BatchReply>>,
+        outcomes: Rc<RefCell<Vec<CallOutcome<BatchReply>>>>,
+    }
+
+    #[tina_runtime::isolate(message = TimeoutBatchClientMsg)]
+    impl TimeoutBatchClient {
+        fn handle(
+            &mut self,
+            message: TimeoutBatchClientMsg,
+            _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+        ) -> Effect<Self> {
+            match message {
+                TimeoutBatchClientMsg::Begin(batcher) => {
+                    self.batcher = Some(batcher);
+                    Effect::Batch(vec![
+                        call_request(batcher, BatcherRequest::Submit(2), Duration::from_millis(1))
+                            .then(TimeoutBatchClientMsg::FirstReturned),
+                        sleep(Duration::from_millis(2))
+                            .then(|_| TimeoutBatchClientMsg::SubmitSecond),
+                        sleep(Duration::from_millis(12))
+                            .then(|_| TimeoutBatchClientMsg::SubmitThird),
+                    ])
+                }
+                TimeoutBatchClientMsg::SubmitSecond => call_request(
+                    self.batcher.expect("begin stores batcher"),
+                    BatcherRequest::Submit(3),
+                    CALL_TIMEOUT,
+                )
+                .then(TimeoutBatchClientMsg::SecondReturned),
+                TimeoutBatchClientMsg::SubmitThird => call_request(
+                    self.batcher.expect("begin stores batcher"),
+                    BatcherRequest::Submit(5),
+                    CALL_TIMEOUT,
+                )
+                .then(TimeoutBatchClientMsg::ThirdReturned),
+                TimeoutBatchClientMsg::FirstReturned(outcome)
+                | TimeoutBatchClientMsg::SecondReturned(outcome)
+                | TimeoutBatchClientMsg::ThirdReturned(outcome) => {
+                    self.outcomes.borrow_mut().push(outcome);
+                    noop()
+                }
+            }
+        }
+    }
 
     #[test]
     fn quote_race_accepts_fast_provider_and_cancels_loser() {
@@ -1031,6 +1121,71 @@ mod tests {
     }
 
     #[test]
+    fn live_timer_pressure_is_a_timer_failure_not_application_full() {
+        let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+            .config(LocalSystemConfig {
+                timer_capacity: 1,
+                ..LocalSystemConfig::default()
+            })
+            .try_build()
+            .expect("start one-timer system");
+        let holder = app
+            .register_root::<TimerHolder, Infallible>(TimerHolder, 4)
+            .expect("register timer holder");
+        app.try_send(holder, TimerHolderMsg::Start)
+            .expect("start held timer");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let trace = app.complete_trace().expect("read timer-holder trace");
+            if trace.iter().any(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::CallDispatchAttempted {
+                        call_kind: CallKind::Sleep,
+                        ..
+                    }
+                )
+            }) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timer holder did not arm"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let batcher = app
+            .register_split_service::<Batcher, BatcherEvent, BatcherRequest, Infallible>(
+                Batcher {
+                    waiters: SharedWork::with_capacity(1),
+                    active: None,
+                    next_batch: 1,
+                    closed: false,
+                    window: Duration::from_millis(10),
+                },
+                4,
+            )
+            .expect("register timer-pressure batcher");
+        assert_eq!(
+            app.call_blocking_request(
+                batcher.requests,
+                BatcherRequest::Submit(7),
+                Duration::from_secs(1),
+            )
+            .expect("call timer-pressure batcher"),
+            CallOutcome::Replied(BatchReply::TimerFailed(CallError::TimerFull)),
+        );
+
+        app.shutdown()
+            .drain()
+            .join_report()
+            .ensure_clean()
+            .expect("clean timer-pressure shutdown");
+    }
+
+    #[test]
     fn debounced_batch_refills_on_the_same_service() {
         let mut sim = Simulator::new(SingleShard, SimulatorConfig::default());
         let batcher = sim.register_split_service::<
@@ -1058,7 +1213,9 @@ mod tests {
         for _ in 0..2 {
             match sim.try_send(client, BatchClientMsg::Begin(batcher)) {
                 Ok(()) => {}
-                Err(tina::TrySendError::Full(_)) => panic!("batch client mailbox unexpectedly full"),
+                Err(tina::TrySendError::Full(_)) => {
+                    panic!("batch client mailbox unexpectedly full")
+                }
                 Err(tina::TrySendError::Closed(_)) => panic!("batch client unexpectedly closed"),
             }
             sim.run_until_quiescent();
@@ -1070,6 +1227,72 @@ mod tests {
         assert_eq!(report.batch_ids, vec![1, 1, 2, 2]);
         assert_eq!(report.batch_sizes, vec![2, 2, 2, 2]);
         assert_eq!(report.sums, vec![5, 5, 5, 5]);
+    }
+
+    #[test]
+    fn timed_out_caller_cannot_make_the_operation_batch_exceed_its_cap() {
+        let mut sim = Simulator::new(SingleShard, SimulatorConfig::default());
+        let batcher = sim.register_split_service::<
+            Batcher,
+            BatcherEvent,
+            BatcherRequest,
+            std::convert::Infallible,
+        >(
+            Batcher {
+                waiters: SharedWork::with_capacity(1),
+                active: None,
+                next_batch: 1,
+                closed: false,
+                window: Duration::from_millis(10),
+            },
+            8,
+        );
+        let outcomes = Rc::new(RefCell::new(Vec::new()));
+        let client = sim.register(TimeoutBatchClient {
+            batcher: None,
+            outcomes: Rc::clone(&outcomes),
+        });
+
+        match sim.try_send(client, TimeoutBatchClientMsg::Begin(batcher.requests)) {
+            Ok(()) => {}
+            Err(tina::TrySendError::Full(_)) => panic!("timeout client mailbox unexpectedly full"),
+            Err(tina::TrySendError::Closed(_)) => panic!("timeout client unexpectedly closed"),
+        }
+        sim.run_until_quiescent();
+
+        let report = classify_batch_outcomes(&outcomes.borrow());
+        assert_eq!(report.call_timeout, 1);
+        assert_eq!(report.full, 1);
+        assert_eq!(report.admitted, 1);
+        assert_eq!(report.batch_ids, vec![2]);
+        assert_eq!(report.batch_sizes, vec![1]);
+        assert_eq!(report.sums, vec![5]);
+        assert_eq!(
+            report.admitted
+                + report.full
+                + report.closed
+                + report.timer_failed
+                + report.call_full
+                + report.call_closed
+                + report.call_timeout
+                + report.call_rejected,
+            3,
+            "every submitted request has exactly one terminal outcome",
+        );
+        assert_eq!(
+            sim.trace()
+                .iter()
+                .filter(|event| matches!(
+                    event.kind(),
+                    RuntimeEventKind::DeferredReplyRejected {
+                        reason: DeferredReplyRejectedReason::CallerTimedOut,
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "the late first-batch reply observes the timed-out caller once",
+        );
     }
 
     #[test]
