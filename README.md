@@ -194,11 +194,18 @@ echo: sent 38 bytes, got them back unchanged
 load shed: burst=32 cap=4 -> admitted=4 Full=28 (listener cap for reference: 8)
 ```
 
+The exact admitted/shed split on that second line shifts run to run — it is a
+race between the producer and the worker. What is guaranteed, and all the test
+pins, is that every one of the 32 records is accounted for and at least one is
+shed as a typed `Full`.
+
 <!-- TODO: tina_echo.gif -->
 
 The connection isolate is the whole story. Its checked-in source is
-[`examples/specimen_tcp_echo/src/lib.rs`](examples/specimen_tcp_echo/src/lib.rs),
-which normal all-target workspace checks compile.
+[`examples/specimen_tcp_echo/src/lib.rs`](examples/specimen_tcp_echo/src/lib.rs).
+The specimen is a separate workspace, excluded from the main gate, so
+`make verify-examples` (not `cargo check --workspace`) is what compiles and
+clippy-checks it.
 
 ```rust
 /// One connection's lifecycle, one message per I/O completion.

@@ -38,6 +38,14 @@ fn peer_addr(port: u16) -> SocketAddr {
 /// Registers the shared `EchoListener` into a simulator whose single
 /// scripted peer delivers `payload`, then runs to quiescence.
 fn run_echo_sim(payload: &[u8]) -> ReplayArtifact {
+    // Full-write peer: each write accepts the whole payload in one call.
+    run_echo_sim_with_write_cap(payload, payload.len())
+}
+
+/// Like [`run_echo_sim`] but caps how many bytes each simulated write
+/// accepts. A `write_cap` below `payload.len()` forces the connection
+/// isolate to drain one payload across several writes.
+fn run_echo_sim_with_write_cap(payload: &[u8], write_cap: usize) -> ReplayArtifact {
     let mut sim = Simulator::new(
         SingleShard,
         SimulatorConfig {
@@ -54,7 +62,7 @@ fn run_echo_sim(payload: &[u8]) -> ReplayArtifact {
                         inbound_capacity: payload.len(),
                         inbound_chunks: vec![payload.to_vec()],
                         read_chunk_cap: None,
-                        write_cap: payload.len(),
+                        write_cap,
                         output_capacity: 1024,
                     }],
                 }],
@@ -146,5 +154,29 @@ fn sim_echo_matches_golden_trace_hash() {
         stable_trace_hash(artifact.event_record().iter()),
         SAVED_TRACE_HASH,
         "trace shape drifted from the saved golden; review before refreshing",
+    );
+}
+
+#[test]
+fn sim_echo_retries_short_writes_without_truncating() {
+    // The peer accepts only 3 bytes per write, so the connection must
+    // drain this 10-byte payload across several writes. This exercises
+    // the `pending.drain(..count)` + re-write branch that a full-write
+    // peer never reaches.
+    let payload = b"abcdefghij".to_vec();
+    let write_cap = 3;
+    assert!(write_cap < payload.len(), "cap must force a short write");
+
+    let artifact = run_echo_sim_with_write_cap(&payload, write_cap);
+
+    assert_eq!(
+        peer_output(&artifact),
+        vec![payload.clone()],
+        "short writes must still deliver the full payload, not a truncated prefix",
+    );
+    // ceil(10 / 3) == 4 writes to drain one payload.
+    assert!(
+        count_call_completed(artifact.event_record(), CallKind::TcpWrite) >= 2,
+        "a capped write must produce more than one TcpWrite completion",
     );
 }

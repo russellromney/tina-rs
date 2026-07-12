@@ -139,7 +139,8 @@ pub enum EchoListenerMsg {
     Failed,
 }
 
-/// Supervised parent that owns the bound listener and spawns handlers.
+/// Parent that owns the bound listener and spawns one handler per
+/// accepted connection.
 ///
 /// A production server would accept forever; the demo bounds accepts by
 /// `target_accepts` so the runtime reaches a clean stop.
