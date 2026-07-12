@@ -265,6 +265,10 @@ published, so no message can arrive against partly initialized state. A
 constructor panic does not register the isolate and its allocated id is never
 reused. Keep expensive or fallible resource construction outside the closure;
 on threaded owners the closure runs synchronously on the shard worker.
+If an accepted threaded constructor exceeds the host control timeout, the
+caller receives `WorkerUnresponsive` but the constructor may still finish and
+publish the root later. Pre-admission `CommandFull`, `WorkerStopped`, and
+unknown-shard failures do not run the closure.
 
 ### Single-in-flight timer
 

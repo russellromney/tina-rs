@@ -94,8 +94,10 @@ let coordinator = app.register_root_using(capacity, |self_addr| Coordinator {
 threaded-multi-shard, single-simulator, and multi-shard-simulator mirrors use
 the same constructor-address contract. The entry is not published until the
 constructor returns. Panic consumes the monotonic id without registering an
-isolate; bounded threaded admission and unknown-shard rejection do not execute
-the closure. The motivating specimen migration remains in its example cohort,
+isolate; bounded threaded pre-admission and unknown-shard rejection do not
+execute the closure. An accepted threaded constructor may still publish after
+`WorkerUnresponsive`, so the returned error does not counterfeit address
+authority. The motivating specimen migration remains in its example cohort,
 not this framework prerequisite.
 
 ### 2026-07-12 Copied service path flow migration

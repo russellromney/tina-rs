@@ -1,13 +1,14 @@
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
+use tina::AddressGeneration;
 use tina::prelude::*;
-use tina::{AddressGeneration, TrySendError};
 use tina_runtime::{
-    CallOutcome, DefaultMailboxFactory, DefaultThreadedMailboxFactory, LocalSystem,
-    MultiShardRuntime, ThreadedRuntimeError,
+    CallOutcome, DefaultMailboxFactory, DefaultThreadedMailboxFactory, IngressSendError,
+    LocalSystem, MultiShardRuntime, ThreadedMultiShardRuntime, ThreadedRuntime,
+    ThreadedRuntimeConfig, ThreadedRuntimeError,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -64,11 +65,12 @@ fn local_system_register_root_using_supports_typed_host_calls() {
         .try_build()
         .expect("start local system");
     let address = app
-        .register_root_using::<WhoAmI, Infallible, _>(4, |address| WhoAmI {
+        .register_root_using(4, |address| WhoAmI {
             identity: identity(address),
         })
         .expect("register address-aware root");
 
+    assert_eq!(address.system(), app.system_incarnation());
     assert_eq!(
         app.call_blocking(address, WhoMsg::Who, Duration::from_secs(1)),
         Ok(CallOutcome::Replied(identity(address)))
@@ -88,11 +90,12 @@ fn local_multi_shard_register_root_using_on_preserves_owner_and_typed_call() {
         .try_build()
         .expect("start multi-shard local system");
     let address = app
-        .register_root_using_on::<WhoAmI, Infallible, _>(ShardId::new(9), 4, |address| WhoAmI {
+        .register_root_using_on(ShardId::new(9), 4, |address| WhoAmI {
             identity: identity(address),
         })
         .expect("register on chosen owner");
 
+    assert_eq!(address.system(), app.system_incarnation());
     assert_eq!(address.shard(), ShardId::new(9));
     assert_eq!(
         app.call_blocking(address, WhoMsg::Who, Duration::from_secs(1)),
@@ -140,7 +143,7 @@ fn explicit_multi_shard_constructor_panic_publishes_no_entry_and_does_not_reuse_
     assert_eq!(next.generation(), AddressGeneration::new(0));
     assert!(matches!(
         runtime.try_send(leaked, WhoMsg::Who),
-        Err(TrySendError::Closed(WhoMsg::Who))
+        Err(IngressSendError::Closed(WhoMsg::Who))
     ));
 }
 
@@ -197,6 +200,113 @@ fn local_system_closed_owner_does_not_run_constructor() {
         Err(ThreadedRuntimeError::WorkerStopped)
     ));
     assert_eq!(constructed.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn accepted_single_constructor_timeout_can_publish_later() {
+    let timeout = Duration::from_millis(30);
+    let runtime = ThreadedRuntime::with_config(
+        AppShard(7),
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            control_call_timeout: timeout,
+            ..ThreadedRuntimeConfig::default()
+        },
+    );
+    let leaked = Arc::new(std::sync::Mutex::new(None));
+    let leaked_in_ctor = Arc::clone(&leaked);
+    let release = Arc::new(AtomicBool::new(false));
+    let release_in_ctor = Arc::clone(&release);
+    let published = Arc::new(AtomicBool::new(false));
+    let published_in_ctor = Arc::clone(&published);
+
+    let started = Instant::now();
+    let result = runtime.register_with_capacity_using::<WhoAmI, Infallible, _>(4, move |address| {
+        *leaked_in_ctor.lock().expect("capture constructor address") = Some(address);
+        while !release_in_ctor.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        published_in_ctor.store(true, Ordering::Release);
+        WhoAmI {
+            identity: identity(address),
+        }
+    });
+    release.store(true, Ordering::Release);
+
+    assert!(matches!(
+        result,
+        Err(ThreadedRuntimeError::WorkerUnresponsive)
+    ));
+    assert!(started.elapsed() >= timeout);
+    let address = leaked
+        .lock()
+        .expect("read constructor address")
+        .expect("accepted constructor ran");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !published.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(published.load(Ordering::Acquire));
+    assert_eq!(address.system(), runtime.system_incarnation());
+    assert_eq!(
+        runtime.call_blocking(address, WhoMsg::Who, Duration::from_secs(1)),
+        Ok(CallOutcome::Replied(identity(address)))
+    );
+}
+
+#[test]
+fn accepted_multi_constructor_timeout_can_publish_later_on_selected_owner() {
+    let timeout = Duration::from_millis(30);
+    let runtime = ThreadedMultiShardRuntime::with_config(
+        [AppShard(3), AppShard(9)],
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            control_call_timeout: timeout,
+            ..ThreadedRuntimeConfig::default()
+        },
+    );
+    let leaked = Arc::new(std::sync::Mutex::new(None));
+    let leaked_in_ctor = Arc::clone(&leaked);
+    let release = Arc::new(AtomicBool::new(false));
+    let release_in_ctor = Arc::clone(&release);
+    let published = Arc::new(AtomicBool::new(false));
+    let published_in_ctor = Arc::clone(&published);
+
+    let result = runtime.register_with_capacity_using_on::<WhoAmI, Infallible, _>(
+        ShardId::new(9),
+        4,
+        move |address| {
+            *leaked_in_ctor.lock().expect("capture constructor address") = Some(address);
+            while !release_in_ctor.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            published_in_ctor.store(true, Ordering::Release);
+            WhoAmI {
+                identity: identity(address),
+            }
+        },
+    );
+    release.store(true, Ordering::Release);
+
+    assert!(matches!(
+        result,
+        Err(ThreadedRuntimeError::WorkerUnresponsive)
+    ));
+    let address = leaked
+        .lock()
+        .expect("read constructor address")
+        .expect("accepted constructor ran");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !published.load(Ordering::Acquire) && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(published.load(Ordering::Acquire));
+    assert_eq!(address.system(), runtime.system_incarnation());
+    assert_eq!(address.shard(), ShardId::new(9));
+    assert_eq!(
+        runtime.call_blocking(address, WhoMsg::Who, Duration::from_secs(1)),
+        Ok(CallOutcome::Replied(identity(address)))
+    );
 }
 
 #[test]

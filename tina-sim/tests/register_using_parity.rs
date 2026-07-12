@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::convert::Infallible;
 use std::rc::Rc;
 
-use tina::TrySendError;
 use tina::prelude::*;
+use tina_runtime::IngressSendError;
 use tina_sim::{MultiShardSimulator, Simulator, SimulatorConfig};
 
 #[derive(Debug, Clone, Copy)]
@@ -54,10 +54,11 @@ fn single_shard_constructor_address_routes_and_keeps_mailbox_bound() {
             observed: observed_in_ctor,
         });
 
+    assert_eq!(address.system(), sim.system_incarnation());
     sim.try_send(address, Msg::Record).expect("first admission");
     assert!(matches!(
         sim.try_send(address, Msg::Stop),
-        Err(TrySendError::Full(Msg::Stop))
+        Err(IngressSendError::Full(Msg::Stop))
     ));
     sim.run_until_quiescent();
     assert_eq!(observed.borrow().as_slice(), &[address]);
@@ -77,6 +78,7 @@ fn multi_shard_constructor_address_uses_requested_owner() {
         },
     );
 
+    assert_eq!(address.system(), sim.system_incarnation());
     assert_eq!(address.shard(), ShardId::new(9));
     sim.try_send(address, Msg::Record).expect("route to owner");
     sim.run_until_quiescent();
@@ -142,6 +144,7 @@ fn unknown_multi_shard_owner_does_not_run_constructor() {
 
 fn replay(seed: u64) -> (Address<Msg>, Vec<String>) {
     let config = SimulatorConfig {
+        system_incarnation: Some(tina::SystemIncarnation::new(0x51a7)),
         seed,
         ..SimulatorConfig::default()
     };

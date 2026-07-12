@@ -1502,6 +1502,7 @@ where
             inbox,
             handler: RefCell::new(Box::new(HandlerAdapter::<I, Outbound> {
                 isolate,
+                system_incarnation: self.system_incarnation,
                 marker: PhantomData,
             })),
         });

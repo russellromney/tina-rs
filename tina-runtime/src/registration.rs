@@ -923,6 +923,7 @@ where
             continuation_overflow: RefCell::new(VecDeque::new()),
             handler: RefCell::new(Box::new(SendableHandlerAdapter::<I, Outbound> {
                 isolate,
+                system_incarnation: self.system_incarnation,
                 marker: PhantomData,
             })),
         });
