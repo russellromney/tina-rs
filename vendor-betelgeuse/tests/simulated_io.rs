@@ -163,6 +163,23 @@ fn simulated_tcp_recv_waits_until_peer_provides_input_or_eof() -> io::Result<()>
 }
 
 #[test]
+fn simulated_tcp_connect_keeps_finite_input_eof_contract() -> io::Result<()> {
+    let io = SimulatedIO::new();
+    let (accepted, _peer) = connected_stream(&io, b"finite")?;
+
+    let mut input = RecvCompletion::new();
+    accepted.recv(&mut input, 32)?;
+    pump_until(&io, || input.has_result())?;
+    assert_eq!(input.take_result().unwrap()?, b"finite");
+
+    let mut eof = RecvCompletion::new();
+    accepted.recv(&mut eof, 32)?;
+    pump_until(&io, || eof.has_result())?;
+    assert!(eof.take_result().unwrap()?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn simulated_tcp_connect_open_never_publishes_transient_eof() -> io::Result<()> {
     let io = SimulatedIO::new();
     let loop_handle = io.loop_handle(Global);
@@ -188,6 +205,17 @@ fn simulated_tcp_connect_open_never_publishes_transient_eof() -> io::Result<()> 
     peer.push_input(b"later");
     pump_until(&io, || recv.has_result())?;
     assert_eq!(recv.take_result().unwrap()?, b"later");
+
+    let mut eof = RecvCompletion::new();
+    accepted.recv(&mut eof, 32)?;
+    assert!(!io.step()?);
+    assert!(
+        !eof.has_result(),
+        "open input must remain pending once drained"
+    );
+    peer.close_input();
+    pump_until(&io, || eof.has_result())?;
+    assert!(eof.take_result().unwrap()?.is_empty());
     Ok(())
 }
 
