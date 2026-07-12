@@ -373,15 +373,15 @@ fn pressure_covers_outbound_pool_full() {
 fn capacity_fields(line: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for field in line.split_whitespace() {
-        // `trace_pressure` is a nested diagnostic grammar whose groups may
-        // legitimately reuse field names. It is not part of the flat
-        // capacity record parsed by this helper.
-        if field.starts_with("trace_pressure=") {
-            break;
-        }
         let Some((key, value)) = field.split_once('=') else {
             continue;
         };
+        // `trace_pressure` is a nested diagnostic grammar whose groups may
+        // legitimately reuse field names. It is not part of the flat
+        // capacity record parsed by this helper.
+        if key == "trace_pressure" {
+            break;
+        }
         assert!(
             out.insert(key.to_owned(), value.trim_end_matches(',').to_owned())
                 .is_none(),
@@ -400,6 +400,14 @@ fn capacity_fields_keep_nested_trace_pressure_opaque() {
 
     assert_eq!(fields["db.closed"], "1");
     assert!(!fields.contains_key("foreign_system"));
+}
+
+#[test]
+fn capacity_fields_do_not_treat_similar_flat_keys_as_nested_grammar() {
+    let fields = capacity_fields("capacity trace_pressure_mode=summary db.closed=1");
+
+    assert_eq!(fields["trace_pressure_mode"], "summary");
+    assert_eq!(fields["db.closed"], "1");
 }
 
 fn assert_at_least(fields: &HashMap<String, String>, key: &str, expected: usize) {
