@@ -1371,6 +1371,10 @@ where
                 command(&mut runtime);
                 continue;
             }
+            Ok(ThreadedCommand::RunObserved(command)) => {
+                command.run(&mut runtime);
+                continue;
+            }
             Ok(ThreadedCommand::HostCall { dispatcher, begin }) => {
                 run_host_call(&mut runtime, dispatcher, begin);
                 continue;
@@ -1413,6 +1417,7 @@ where
         shard_metrics.record_park_wakeup();
         match park_result {
             Ok(ThreadedCommand::Run(command)) => command(&mut runtime),
+            Ok(ThreadedCommand::RunObserved(command)) => command.run(&mut runtime),
             Ok(ThreadedCommand::HostCall { dispatcher, begin }) => {
                 run_host_call(&mut runtime, dispatcher, begin)
             }
