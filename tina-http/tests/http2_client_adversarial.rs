@@ -306,6 +306,7 @@ fn client_uses_default_peer_frame_cap_before_server_settings() {
     const BODY_LEN: usize = 40_000;
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind raw peer");
     let addr = listener.local_addr().expect("peer addr");
+    let (client_observed_tx, client_observed_rx) = mpsc::channel();
     let peer = std::thread::spawn(move || {
         let (mut sock, _) = listener.accept().expect("accept client");
         sock.set_read_timeout(Some(Duration::from_secs(5)))
@@ -351,6 +352,9 @@ fn client_uses_default_peer_frame_cap_before_server_settings() {
         write_frame(&mut sock, FRAME_SETTINGS, 0, 0, &[]);
         write_frame(&mut sock, FRAME_SETTINGS, FLAG_ACK, 0, &[]);
         send_response(&mut sock, stream_id, "200", b"ok");
+        client_observed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("client observes response before raw peer closes");
     });
 
     let runtime = ThreadedRuntime::with_config(
@@ -387,13 +391,19 @@ fn client_uses_default_peer_frame_cap_before_server_settings() {
             Duration::from_secs(5),
         )
         .expect("client request returns");
-    assert!(matches!(
-        outcome,
-        CallOutcome::Replied(Http2ClientReply::Outcome {
-            outcome: Http2ClientOutcome::Replied(_),
-            ..
-        })
-    ));
+    client_observed_tx
+        .send(())
+        .expect("release raw peer after client response");
+    assert!(
+        matches!(
+            outcome,
+            CallOutcome::Replied(Http2ClientReply::Outcome {
+                outcome: Http2ClientOutcome::Replied(_),
+                ..
+            })
+        ),
+        "unexpected client outcome: {outcome:?}"
+    );
     let _ = runtime.try_send(client, Http2ClientMsg::Stop);
     let _ = runtime.shutdown();
     peer.join().expect("raw peer joins");
