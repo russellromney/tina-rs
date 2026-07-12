@@ -48,30 +48,31 @@ The coordinator is one isolate. Children are spawned via
 Each child's `Send` type is `Outbound<CoordMsg>` so it can post its
 partial back to the coordinator.
 
-The chicken-and-egg between "coord needs children's addresses to
-join" and "children need coord's address to send back" is resolved
-by giving the children the coord's `self_addr`. The coord doesn't
-know its own address until after `register`; the host injects it
-through the bootstrap `Begin { self_addr }` message:
+The children need the coordinator's address so they can send partials
+back. The lower threaded owner supplies that address to an
+address-aware constructor before registration completes:
 
 ```rust
-let coord_addr = runtime.register_with_capacity(coord, capacity)?;
-runtime.try_send(coord_addr, CoordMsg::Begin { self_addr: coord_addr })?;
+let coord_addr = runtime.register_with_capacity_using(capacity, |self_addr| {
+    Coordinator { self_addr, chunks, /* ... */ }
+})?;
+runtime.try_send(coord_addr, CoordMsg::Start)?;
 ```
 
-The coord's `Begin` arm constructs each child with `parent: self_addr`
-and a slice of work, then `batch(...)` of `spawn(...)` effects:
+The coordinator's `Start` arm constructs each child with
+`parent: self.self_addr` and one bounded slice of work, then builds a
+bounded batch of `spawn(...)` effects:
 
 ```rust
-CoordMsg::Begin { self_addr } => {
-    let mut effects = Vec::with_capacity(self.chunks.len());
-    for chunk in self.chunks.drain(..) {
-        effects.push(spawn(
-            ChildDefinition::new(Worker { parent: self_addr, chunk }, 4)
-                .with_initial_message(WorkerMsg::Compute),
-        ));
-    }
-    batch(effects)
+CoordMsg::Start => {
+    let chunks = BoundedItems::try_from_iter(self.expected as usize, self.chunks.drain(..))
+        .expect("worker chunks are capped by WORKER_COUNT");
+    bounded_batch(chunks.map_effects(|chunk| {
+        spawn(ChildDefinition::new(
+            Worker { parent: self.self_addr, chunk },
+            4,
+        ).with_initial_message(WorkerMsg::Compute))
+    }))
 }
 ```
 
@@ -125,6 +126,11 @@ What got better:
   constructor closure. The host kicks the work with a typed
   `CoordMsg::Start` that carries no address. (FINDINGS finding 3,
   self-address at registration.)
+- **Application-facade parity is still missing.** `LocalSystem` does
+  not yet expose this address-aware constructor, so this specimen
+  cannot honestly migrate its host without restoring the obsolete
+  bootstrap message. The live findings ledger records
+  `register_root_using` / `register_root_using_on` as the prerequisite.
 
 ## Partial-failure flavor
 

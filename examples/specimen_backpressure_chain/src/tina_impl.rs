@@ -25,12 +25,11 @@
 //! `Context::now()` from its virtual clock anchor.
 
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, call_request, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, SleepReply, call_request, sleep,
 };
 
 use crate::{FAST_C_MS, REQUEST_COUNT, Report, SLOW_C_MS, TOTAL_DEADLINE_MS, c_is_slow};
@@ -298,21 +297,24 @@ impl Driver {
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
-    let shutdown = runtime.shutdown_handle();
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    let result = run_application(&app);
+    let shutdown = app.shutdown().drain().join_report().ensure_clean();
+    finish_after_shutdown(result, shutdown)
+}
 
-    let c_addr = runtime
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+) -> anyhow::Result<Report> {
+    let c_addr = app
         .register_split_service::<ServiceC, CEvent, CRequest, Infallible>(ServiceC, 8)
         .map_err(|e| anyhow::anyhow!("register C: {e:?}"))?
         .requests;
-    let b_addr = runtime
+    let b_addr = app
         .register_split_service::<ServiceB, BEvent, BRequest, Infallible>(ServiceB { c_addr }, 8)
         .map_err(|e| anyhow::anyhow!("register B: {e:?}"))?
         .requests;
-    let a_addr = runtime
+    let a_addr = app
         .register_split_service::<ServiceA, AEvent, ARequest, Infallible>(
             ServiceA {
                 b_addr,
@@ -322,8 +324,8 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register A: {e:?}"))?
         .requests;
-    let driver_addr = runtime
-        .register_with_capacity::<_, Infallible>(
+    let driver_addr = app
+        .register_root::<_, Infallible>(
             Driver {
                 a_addr,
                 next_iteration: 0,
@@ -334,20 +336,30 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register driver: {e:?}"))?;
 
-    let waiter = runtime
+    let waiter = app
         .observe_result::<Report, _, _>(driver_addr)
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
 
-    runtime
-        .try_send(driver_addr, DriverMsg::Begin)
+    app.try_send(driver_addr, DriverMsg::Begin)
         .map_err(|e| anyhow::anyhow!("send Begin: {e:?}"))?;
 
     let report = waiter
         .wait(Duration::from_secs(5))
         .map_err(|e| anyhow::anyhow!("driver did not finish: {e:?}"))?;
 
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
     Ok(report)
+}
+
+fn finish_after_shutdown(
+    result: anyhow::Result<Report>,
+    shutdown: Result<(), tina_runtime::UncleanShutdownError>,
+) -> anyhow::Result<Report> {
+    match (result, shutdown) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Err(error), Err(shutdown_error)) => Err(anyhow::anyhow!(
+            "{error:#}; LocalSystem shutdown also failed: {shutdown_error}"
+        )),
+    }
 }

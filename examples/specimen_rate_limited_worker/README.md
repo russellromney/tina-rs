@@ -54,28 +54,41 @@ holds it together.
 
 The worker is one isolate with mailbox capacity `QUEUE_CAPACITY`.
 There is no separate queue; the mailbox *is* the queue. The rate
-limit lives in the worker's own state machine: each `Submit` returns
-`sleep(RATE_WINDOW).then(Tick)`. A `SingleCallGate` (the single-call gate invariant)
-keeps at most one `sleep` in flight; the matching `Tick` increments
-`processed`. The host closes the burst with a normal Tina message:
-`BurstClosed(admitted)`.
+limit is a `RateLimit<()>` token bucket in the worker's state. The
+worker asks `try_admit(&(), ctx.now())`; an admitted token processes
+one pending job, while `RateLimited { retry_after }` schedules exactly
+one `sleep(retry_after).then(Tick)`. Explicit `pending` and `pacing`
+state keeps one timer in flight. The host closes the burst with a
+normal Tina message: `BurstClosed(admitted)`.
 
 ```rust
 WorkerMsg::Submit(_) => {
     self.report.jobs_admitted += 1;
-    if self.gate.submit() { sleep(self.rate_window).then(WorkerMsg::Tick) }
-    else { noop() }
+    self.pending += 1;
+    if self.pacing { noop() } else { self.drive(ctx) }
 }
-WorkerMsg::Tick(_) => {
-    self.processed += 1;
-    let more_work = self.gate.complete();
-    if self.is_done() { stop_with(self.report) }
-    else if more_work { sleep(self.rate_window).then(WorkerMsg::Tick) }
-    else { noop() }
+WorkerMsg::Tick(reply) => {
+    if reply.is_err() {
+        self.report.exit_clean = false;
+        return stop_with(self.report);
+    }
+    self.pacing = false;
+    self.drive(ctx)
 }
-WorkerMsg::BurstClosed(admitted) => {
-    self.expected = Some(admitted);
-    if self.is_done() { stop_with(self.report) } else { noop() }
+match self.limiter.try_admit(&(), ctx.now()) {
+    AdmissionDecision::Admitted(_) => {
+        self.processed += 1;
+        self.pending -= 1;
+        // Loop and ask for the next pending job.
+    }
+    AdmissionDecision::RateLimited { retry_after, .. } => {
+        self.pacing = true;
+        sleep(retry_after).then(WorkerMsg::Tick)
+    }
+    _ => {
+        self.report.exit_clean = false;
+        return stop_with(self.report);
+    }
 }
 ```
 
@@ -87,7 +100,7 @@ preserves every typed outcome (admitted / mailbox_full / mailbox_closed
 ```rust
 let outcomes = HostBurstOutcomes::new();
 for n in 0..BURST_JOBS {
-    let _ = runtime.try_send_outcome(worker_addr, Submit(n), &outcomes);
+    let _ = app.try_send_outcome(worker_addr, Submit(n), &outcomes);
 }
 outcomes.wait_complete(deadline)?;
 let snap = outcomes.snapshot();
@@ -101,7 +114,7 @@ opens or the deadline elapses; the typed `Closed` / `Timeout` /
 sending" is app control state, so it travels as a message rather than
 an `Arc<AtomicU32>` side channel.
 
-The final `Report` comes back via `runtime.observe_result::<Report>` —
+The final `Report` comes back via `app.observe_result::<Report>` —
 no mpsc, no atomics for the value, no host-side accumulator.
 
 ## Discussion

@@ -9,7 +9,7 @@
 //!
 //! What we are looking at: how does overload show up at the
 //! producer? In Tokio, a bounded `mpsc` returns
-//! `TrySendError::Full`. In Tina, `runtime.try_send` returns
+//! `TrySendError::Full`. In Tina, `LocalSystem::try_send` returns
 //! `IngressFull` once the worker mailbox is at capacity. Both sides
 //! count admitted vs full and report structurally identical numbers.
 //!

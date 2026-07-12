@@ -8,13 +8,12 @@
 //! handler.
 
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
     CallGroup, CallGroupToken, CallOutcome, CallReplyRejectedReason, DefaultThreadedMailboxFactory,
-    DeferredReplyRejectedReason, RuntimeEventKind, SleepReply, ThreadedRuntime,
+    DeferredReplyRejectedReason, LocalSystem, RuntimeEventKind, SleepReply,
     call_cancelable_request, cancel_call, sleep,
 };
 
@@ -202,29 +201,31 @@ impl Driver {
 // --- Run ------------------------------------------------------------------
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
-    let shutdown = runtime.shutdown_handle();
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    let result = run_application(&app);
+    let shutdown = app.shutdown().drain().join_report().ensure_clean();
+    finish_after_shutdown(result, shutdown)
+}
 
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+) -> anyhow::Result<Report> {
     let mut workers = Vec::with_capacity(FANOUT as usize);
     for _ in 0..FANOUT {
         workers.push(
-            runtime
-                .register_split_service::<Worker, WorkerEvent, WorkerRequest, Infallible>(
-                    Worker {
-                        work: Duration::from_millis(WORK_MS),
-                    },
-                    8,
-                )
-                .map_err(|e| anyhow::anyhow!("register worker: {e:?}"))?
-                .requests,
+            app.register_split_service::<Worker, WorkerEvent, WorkerRequest, Infallible>(
+                Worker {
+                    work: Duration::from_millis(WORK_MS),
+                },
+                8,
+            )
+            .map_err(|e| anyhow::anyhow!("register worker: {e:?}"))?
+            .requests,
         );
     }
 
-    let driver = runtime
-        .register_with_capacity::<_, Infallible>(
+    let driver = app
+        .register_root::<_, Infallible>(
             Driver {
                 workers,
                 group: CallGroup::with_capacity(FANOUT as usize),
@@ -236,18 +237,16 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register driver: {e:?}"))?;
 
-    let result = runtime
+    let result = app
         .observe_result::<Report, _, _>(driver)
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
 
-    runtime
-        .try_send(driver, DriverMsg::Begin)
+    app.try_send(driver, DriverMsg::Begin)
         .map_err(|e| anyhow::anyhow!("send Begin: {e:?}"))?;
 
     std::thread::sleep(Duration::from_millis(CANCEL_AFTER_MS));
 
-    runtime
-        .try_send(driver, DriverMsg::Cancel)
+    app.try_send(driver, DriverMsg::Cancel)
         .map_err(|e| anyhow::anyhow!("send Cancel: {e:?}"))?;
 
     // Give the worker sleep timers a chance to elapse so any "late"
@@ -257,8 +256,7 @@ pub fn run() -> anyhow::Result<Report> {
     // delivered messages — which is the visible-truth invariant.
     std::thread::sleep(Duration::from_millis(WORK_MS + 50));
 
-    runtime
-        .try_send(driver, DriverMsg::Finish)
+    app.try_send(driver, DriverMsg::Finish)
         .map_err(|e| anyhow::anyhow!("send Finish: {e:?}"))?;
 
     let mut report = result
@@ -295,15 +293,26 @@ pub fn run() -> anyhow::Result<Report> {
     let target = FANOUT.saturating_sub(report.replies_before_cancel);
     let drain_deadline = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < drain_deadline {
-        if count_rejected(&runtime.trace()) >= target {
+        if count_rejected(&app.trace()) >= target {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    report.replies_after_cancel = count_rejected(&runtime.trace());
+    report.replies_after_cancel = count_rejected(&app.trace());
 
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
     Ok(report)
+}
+
+fn finish_after_shutdown(
+    result: anyhow::Result<Report>,
+    shutdown: Result<(), tina_runtime::UncleanShutdownError>,
+) -> anyhow::Result<Report> {
+    match (result, shutdown) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Err(error), Err(shutdown_error)) => Err(anyhow::anyhow!(
+            "{error:#}; LocalSystem shutdown also failed: {shutdown_error}"
+        )),
+    }
 }

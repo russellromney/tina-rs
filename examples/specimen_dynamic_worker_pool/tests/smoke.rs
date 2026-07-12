@@ -8,7 +8,10 @@ use tina_runtime::assert_service_owned_bound;
 
 #[test]
 fn tokio_smoke() {
-    assert_eq!(tokio_impl::run().expect("tokio side ran"), expected_report());
+    assert_eq!(
+        tokio_impl::run().expect("tokio side ran"),
+        expected_report()
+    );
 }
 
 #[test]

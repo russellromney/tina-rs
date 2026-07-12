@@ -1,11 +1,10 @@
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tina::prelude::*;
 use tina_runtime::{
-    DefaultThreadedMailboxFactory, FairnessReport, HostBurstOutcomes, SingleCallGate, SleepReply,
-    ThreadedRuntime, sleep, stable_trace_hash,
+    DefaultThreadedMailboxFactory, FairnessReport, HostBurstOutcomes, LocalSystem, SingleCallGate,
+    SleepReply, sleep, stable_trace_hash,
 };
 
 use crate::{COLD_WRITES_PER_SHARD, HOT_WRITES, PER_WRITE_MS, Report, SHARD_MAILBOX, SHARDS};
@@ -78,37 +77,39 @@ impl Store {
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
-    let shutdown = runtime.shutdown_handle();
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    let result = run_application(&app);
+    let shutdown = app.shutdown().drain().join_report().ensure_clean();
+    finish_after_shutdown(result, shutdown)
+}
 
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+) -> anyhow::Result<Report> {
     let mut stores = Vec::with_capacity(SHARDS as usize);
     for _ in 0..SHARDS {
         stores.push(
-            runtime
-                .register_with_capacity::<_, Infallible>(
-                    Store {
-                        work: Duration::from_millis(PER_WRITE_MS),
-                        gate: SingleCallGate::new(),
-                        processed: 0,
-                        expected: None,
-                    },
-                    SHARD_MAILBOX,
-                )
-                .map_err(|e| anyhow::anyhow!("register store: {e:?}"))?,
+            app.register_root::<_, Infallible>(
+                Store {
+                    work: Duration::from_millis(PER_WRITE_MS),
+                    gate: SingleCallGate::new(),
+                    processed: 0,
+                    expected: None,
+                },
+                SHARD_MAILBOX,
+            )
+            .map_err(|e| anyhow::anyhow!("register store: {e:?}"))?,
         );
     }
 
     let outcomes: Vec<HostBurstOutcomes> = (0..SHARDS).map(|_| HostBurstOutcomes::new()).collect();
 
     for _ in 0..HOT_WRITES {
-        let _ = runtime.try_send_outcome(stores[0], StoreMsg::Set, &outcomes[0]);
+        let _ = app.try_send_outcome(stores[0], StoreMsg::Set, &outcomes[0]);
     }
     for shard in 1..SHARDS as usize {
         for _ in 0..COLD_WRITES_PER_SHARD {
-            let _ = runtime.try_send_outcome(stores[shard], StoreMsg::Set, &outcomes[shard]);
+            let _ = app.try_send_outcome(stores[shard], StoreMsg::Set, &outcomes[shard]);
         }
     }
 
@@ -121,7 +122,7 @@ pub fn run() -> anyhow::Result<Report> {
     // stop before the waiter is in place.
     let waiters: Vec<_> = stores
         .iter()
-        .map(|s| runtime.observe_isolate_complete(*s))
+        .map(|s| app.observe_isolate_complete(*s))
         .collect::<Result<_, _>>()?;
 
     // Drain each store with the host-counted admitted total. The
@@ -130,8 +131,7 @@ pub fn run() -> anyhow::Result<Report> {
     let backoff = Duration::from_millis(2);
     for (idx, s) in stores.iter().enumerate() {
         let admitted_n = outcomes[idx].snapshot().admitted;
-        runtime
-            .send_observed_until(*s, drain_deadline, backoff, || StoreMsg::Drain(admitted_n))
+        app.send_observed_until(*s, drain_deadline, backoff, || StoreMsg::Drain(admitted_n))
             .map_err(|e| anyhow::anyhow!("drain send: {e:?}"))?;
     }
     for w in waiters {
@@ -150,7 +150,7 @@ pub fn run() -> anyhow::Result<Report> {
         cold_rejected += s.mailbox_full + s.ingress_full;
     }
 
-    let trace = runtime.trace();
+    let trace = app.trace();
     let fairness = FairnessReport::from_events(trace.events().iter());
     let hot_isolate = stores[0].isolate();
     let hot_turns = fairness.turns(hot_isolate);
@@ -190,9 +190,6 @@ pub fn run() -> anyhow::Result<Report> {
     );
     let trace_hash = stable_trace_hash(trace.events().iter());
 
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
     Ok(Report {
         hot_admitted,
         hot_rejected,
@@ -207,4 +204,18 @@ pub fn run() -> anyhow::Result<Report> {
         fairness_line,
         exit_clean: true,
     })
+}
+
+fn finish_after_shutdown(
+    result: anyhow::Result<Report>,
+    shutdown: Result<(), tina_runtime::UncleanShutdownError>,
+) -> anyhow::Result<Report> {
+    match (result, shutdown) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Err(error), Err(shutdown_error)) => Err(anyhow::anyhow!(
+            "{error:#}; LocalSystem shutdown also failed: {shutdown_error}"
+        )),
+    }
 }

@@ -53,15 +53,22 @@ their own `now`:
 
 ```rust
 // A → B
-let deadline = ctx.deadline_after(self.budget);
-call(self.b_addr, BMsg::Forward { iteration, deadline },
-     self.budget + Duration::from_millis(50))     // outer slack
-    .then(AMsg::BDone)
+let deadline = Deadline::from_instant(call.now(), self.budget);
+call.defer(call_request(
+    self.b_addr,
+    BRequest::Forward { iteration, deadline },
+    self.budget + Duration::from_millis(50), // outer slack
+))
+.reply_service_event(AEvent::BDone)
 
 // B → C, with whatever budget remains at B's now
-let timeout = deadline.remaining_or_zero(ctx.now());
-call(self.c_addr, CMsg::Compute { iteration }, timeout)
-    .then(BMsg::CDone)
+let timeout = deadline.remaining_or_zero(call.now());
+call.defer(call_request(
+    self.c_addr,
+    CRequest::Compute { iteration },
+    timeout,
+))
+.reply_service_event(BEvent::CDone)
 ```
 
 When C is too slow, B's `IsolateCall` to C resolves as
@@ -118,7 +125,7 @@ What feels worse:
   primitive — see `specimen_cancellation_chain`.
 - **Three isolates feel like overkill for a three-hop demo.** Each
   hop is its own struct with its own `enum`, its own `Reply`, and
-  its own `RuntimeCall` continuation. For a real production service
+  its own typed request continuation. For a real production service
   this is appropriate — the ratio of "boilerplate per hop" is high
   but each suspension point and each `Full` / `Closed` / `Timeout`
   edge stays named.

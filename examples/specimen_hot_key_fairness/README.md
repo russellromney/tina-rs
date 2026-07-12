@@ -18,7 +18,7 @@ Both sides:
   `try_send`.
 - Tina: `Store` isolate per shard, mailbox cap = `SHARD_MAILBOX`,
   rate-limited via `sleep().then(Tick)`. Producer uses one
-  `HostBurstOutcomes` per shard plus `runtime.try_send_outcome` —
+  `HostBurstOutcomes` per shard plus `app.try_send_outcome` —
   the typed snapshot reports `admitted` / `mailbox_full` /
   `ingress_full` per shard with no observer closure.
 

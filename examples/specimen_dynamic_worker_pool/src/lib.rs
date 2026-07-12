@@ -32,9 +32,7 @@ pub mod tokio_impl;
 pub const WORKER_COUNT: u32 = 4;
 
 /// Fixed workload. Length must be divisible by [`WORKER_COUNT`].
-pub const WORK_VALUES: [u64; 16] = [
-    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-];
+pub const WORK_VALUES: [u64; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 
 /// What each side observed end-to-end.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
