@@ -251,23 +251,37 @@ impl OperationDoneWaiter {
 /// A stale generation or same-id address on another shard cannot claim the
 /// replacement fact.
 ///
+/// Dropping the waiter, including when [`Self::wait`] consumes it on timeout,
+/// abandons the registration. Abandoned registrations do not retain capacity
+/// or consume a later matching restart fact.
+///
 /// Replaces the `Arc<Mutex<Option<Address<...>>>>` + `AtomicU64` generation
 /// pair in `specimen_supervised_worker`-style code.
 #[derive(Debug)]
 pub struct ChildRestartedWaiter {
     rx: mpsc::Receiver<ChildRestarted>,
     pre_error: Option<WaitError>,
+    alive: Arc<AtomicBool>,
+}
+
+impl Drop for ChildRestartedWaiter {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+    }
 }
 
 impl ChildRestartedWaiter {
-    pub(crate) fn from_pair() -> (Self, SyncSender<ChildRestarted>) {
+    pub(crate) fn from_pair() -> (Self, SyncSender<ChildRestarted>, Arc<AtomicBool>) {
         let (tx, rx) = mpsc::sync_channel(1);
+        let alive = Arc::new(AtomicBool::new(true));
         (
             Self {
                 rx,
                 pre_error: None,
+                alive: Arc::clone(&alive),
             },
             tx,
+            alive,
         )
     }
 
@@ -276,6 +290,7 @@ impl ChildRestartedWaiter {
         Self {
             rx,
             pre_error: Some(error),
+            alive: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -428,6 +443,13 @@ struct ChildRestartedSlot {
     parent_isolate: IsolateId,
     parent_generation: AddressGeneration,
     sender: SyncSender<ChildRestarted>,
+    waiter_alive: Arc<AtomicBool>,
+}
+
+impl ChildRestartedSlot {
+    fn is_abandoned(&self) -> bool {
+        !self.waiter_alive.load(Ordering::Acquire)
+    }
 }
 
 /// Internal observation state owned by a [`crate::Runtime`].
@@ -564,31 +586,29 @@ impl ObservationRegistry {
         if self.is_full() {
             return ChildRestartedWaiter::with_error(WaitError::ObservationFull);
         }
-        let (waiter, sender) = ChildRestartedWaiter::from_pair();
+        let (waiter, sender, waiter_alive) = ChildRestartedWaiter::from_pair();
         self.pending_child_restarted.push(ChildRestartedSlot {
             parent_shard,
             parent_isolate,
             parent_generation,
             sender,
+            waiter_alive,
         });
         waiter
     }
 
-    /// Drops any `pending_isolate_result` slot whose waiter has been
-    /// dropped/consumed. The other pending vectors hold typed
-    /// `SyncSender`s the runtime can probe via `try_send` at delivery
-    /// time, so they self-clean on first match attempt; result slots
-    /// only see their `(isolate, generation)` when the same address
-    /// re-registers, which left abandoned slots counting toward the
-    /// cap until that happened. Call before any cap check or
-    /// registration path.
-    fn prune_abandoned_result_slots(&mut self) {
+    /// Drops slots with waiters that were dropped or consumed. These
+    /// authority-keyed registrations may never see a matching fact, so they
+    /// cannot rely on delivery-time disconnection checks for reclamation.
+    fn prune_abandoned_claim_slots(&mut self) {
         self.pending_isolate_result
+            .retain(|slot| !slot.is_abandoned());
+        self.pending_child_restarted
             .retain(|slot| !slot.is_abandoned());
     }
 
     fn pending_count(&mut self) -> usize {
-        self.prune_abandoned_result_slots();
+        self.prune_abandoned_claim_slots();
         self.pending_bound.len()
             + self.pending_tls_bound.len()
             + self.pending_isolate_complete.len()
@@ -772,13 +792,20 @@ impl ObservationRegistry {
         parent_generation: AddressGeneration,
         restarted: ChildRestarted,
     ) {
-        if let Some(index) = self.pending_child_restarted.iter().position(|slot| {
+        while let Some(index) = self.pending_child_restarted.iter().position(|slot| {
             slot.parent_shard == parent_shard
                 && slot.parent_isolate == parent_isolate
                 && slot.parent_generation == parent_generation
         }) {
             let slot = self.pending_child_restarted.remove(index);
-            let _ = slot.sender.try_send(restarted);
+            if slot.is_abandoned() {
+                continue;
+            }
+            match slot.sender.try_send(restarted) {
+                Ok(()) => return,
+                Err(mpsc::TrySendError::Full(_)) => continue,
+                Err(mpsc::TrySendError::Disconnected(_)) => continue,
+            }
         }
     }
 }

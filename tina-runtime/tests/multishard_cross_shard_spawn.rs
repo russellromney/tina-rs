@@ -612,7 +612,11 @@ fn cross_shard_restartable_child_restarts_on_remote_shard_and_reports_replacemen
         "cross-shard restart facts are not replayed"
     );
 
-    let replacement = tina::Address::<CrossChildMsg>::new(ShardId::new(22), restarted.new_isolate);
+    let replacement = tina::Address::<CrossChildMsg>::new_with_generation(
+        restarted.new_shard,
+        restarted.new_isolate,
+        restarted.new_generation,
+    );
     assert_eq!(
         runtime.try_send(old_child.address, CrossChildMsg::Ping),
         Err(TrySendError::Closed(CrossChildMsg::Ping)),
@@ -630,6 +634,7 @@ fn cross_shard_restartable_child_restarts_on_remote_shard_and_reports_replacemen
     assert_eq!(report.children.len(), 1);
     assert_eq!(report.children[0].shard, ShardId::new(22));
     assert_eq!(report.children[0].isolate, restarted.new_isolate);
+    assert_eq!(report.children[0].generation, restarted.new_generation);
     assert!(matches!(
         report.children[0].state,
         tina_runtime::ChildLifecycleState::Restarted

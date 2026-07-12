@@ -10,7 +10,9 @@ This file records completed work.
   (shard, isolate id, and generation). Stale-generation and same-id
   foreign-shard addresses can no longer claim a live parent's replacement
   event; threaded and deterministic multi-shard owners retain the same typed
-  waiter API and replacement-address result.
+  waiter API and replacement-address result. Dropped or timed-out restart
+  waiters release their bounded observation slots and cannot consume a later
+  fact intended for a live waiter.
 
 ### LocalSystem host-control parity
 

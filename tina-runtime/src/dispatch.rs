@@ -2448,13 +2448,14 @@ where
         cause: CauseId,
         route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     ) {
+        let Some(parent_generation) = self.entry_by_isolate(parent).map(|entry| entry.generation)
+        else {
+            return;
+        };
         let owner = RegisteredAddress {
             shard: self.shard.id(),
             isolate: parent,
-            generation: self
-                .entry_by_isolate(parent)
-                .map(|entry| entry.generation)
-                .unwrap_or_else(|| AddressGeneration::new(0)),
+            generation: parent_generation,
         };
         let attempted = self.push_event(
             parent,

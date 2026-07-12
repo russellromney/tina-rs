@@ -537,6 +537,9 @@ where
     }
 
     pub(crate) fn harvest_remote_child_restarted(&mut self, restarted: RemoteChildRestarted) {
+        if self.entry_index(restarted.owner).is_none() {
+            return;
+        }
         let Some(record_index) = self.child_records.iter().position(|record| {
             record.parent == restarted.owner.isolate
                 && record.remote_owner.is_none()

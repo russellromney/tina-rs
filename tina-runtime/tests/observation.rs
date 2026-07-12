@@ -505,7 +505,9 @@ fn child_restarted_waiter_resolves_after_panic_and_restart() {
     );
     let stale_waiter = runtime.observe_child_restarted(stale_parent);
     let foreign_waiter = runtime.observe_child_restarted(foreign_parent);
+    let dropped_waiter = runtime.observe_child_restarted(parent);
     let restart_waiter = runtime.observe_child_restarted(parent);
+    drop(dropped_waiter);
     runtime
         .try_send(parent, ParentMsg::Spawn)
         .expect("ask parent to spawn");
@@ -573,6 +575,29 @@ fn child_restarted_waiter_reports_runtime_stopped() {
         waiter.wait(Duration::from_secs(1)),
         Err(WaitError::RuntimeStopped)
     );
+}
+
+#[test]
+fn abandoned_child_restart_authorities_do_not_exhaust_observation_capacity() {
+    let runtime = make_runtime();
+
+    for isolate in 1..=(2 * 1024) {
+        let forged = Address::<ParentMsg>::new_with_generation(
+            ShardId::new(99),
+            tina::IsolateId::new(isolate),
+            AddressGeneration::new(7),
+        );
+        let waiter = runtime.observe_child_restarted(forged);
+        drop(waiter);
+    }
+
+    assert_eq!(
+        runtime.observe_next_bound().wait(Duration::from_millis(10)),
+        Err(WaitError::Timeout),
+        "abandoned foreign restart authorities must release the shared cap"
+    );
+
+    let _ = runtime.shutdown();
 }
 
 // ---------------------------------------------------------------------------
