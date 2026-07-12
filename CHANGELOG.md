@@ -96,7 +96,9 @@ This file records completed work.
   host-burst outcome accounting plus raw-address and typed service-event
   deadline admission. Both facades preserve exact `Full`, `Closed`, timeout,
   worker-stop, and owning-shard behavior plus message-factory ownership and the
-  no-late-delivery contract without exposing service envelopes.
+  no-late-delivery contract without exposing service envelopes. Multi-shard
+  host sends now return the target shard through typed `UnknownShard` outcomes
+  instead of unwinding on a foreign address.
 
 ### Deadline-observed admission truth
 

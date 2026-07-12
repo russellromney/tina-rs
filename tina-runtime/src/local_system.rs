@@ -1020,6 +1020,20 @@ where
         self.runtime().send_and_observe(address, message)
     }
 
+    /// Sends one typed service event and observes the exact mailbox outcome
+    /// without exposing the private service envelope.
+    pub fn send_event_and_observe<Event, Request>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        event: Event,
+    ) -> Result<(), ThreadedSendObservedError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+    {
+        self.runtime().send_event_and_observe(address, event)
+    }
+
     /// Attempts one typed ingress send and records its eventual mailbox outcome.
     ///
     /// This is the [`LocalSystem`] facade for
@@ -1676,6 +1690,9 @@ where
     }
 
     /// Attempts one bounded ingress handoff to the owning worker shard.
+    ///
+    /// Returns [`ThreadedTrySendError::UnknownShard`] when the address targets
+    /// a shard not owned by this local system.
     pub fn try_send<M: Send + 'static, R: 'static>(
         &self,
         address: Address<M, R>,
@@ -1686,9 +1703,8 @@ where
 
     /// Attempts bounded ingress through a service event capability.
     ///
-    /// # Panics
-    ///
-    /// Panics when the address targets a shard not owned by this local system.
+    /// Returns [`ThreadedTrySendError::UnknownShard`] when the address targets
+    /// a shard not owned by this local system.
     pub fn try_send_event<Event, Request>(
         &self,
         address: tina::ServiceEventAddress<Event, Request>,
@@ -1701,16 +1717,44 @@ where
         self.runtime().try_send_event(address, event)
     }
 
+    /// Sends one raw typed message and observes the exact mailbox outcome on
+    /// its owning shard.
+    ///
+    /// Returns [`ThreadedSendObservedError::UnknownShard`] when the address
+    /// targets a shard not owned by this local system.
+    pub fn send_and_observe<M: Send + 'static, R: 'static>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+    ) -> Result<(), ThreadedSendObservedError> {
+        self.runtime().send_and_observe(address, message)
+    }
+
+    /// Sends one typed service event and observes the exact mailbox outcome on
+    /// its owning shard without exposing the private service envelope.
+    ///
+    /// Returns [`ThreadedSendObservedError::UnknownShard`] when the address
+    /// targets a shard not owned by this local system.
+    pub fn send_event_and_observe<Event, Request>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        event: Event,
+    ) -> Result<(), ThreadedSendObservedError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+    {
+        self.runtime().send_event_and_observe(address, event)
+    }
+
     /// Attempts one typed ingress send on the address's owning shard and
     /// records its eventual mailbox outcome.
     ///
     /// `message` is consumed on every host- and worker-side outcome. Accepted
     /// observations settle exactly once through `outcomes`.
     ///
-    /// # Panics
-    ///
-    /// Panics when `address` targets a shard outside this local system,
-    /// preserving [`ThreadedMultiShardRuntime::try_send_outcome`].
+    /// Returns [`ThreadedTrySendError::UnknownShard`] before registering a
+    /// burst submission when `address` targets another shard topology.
     pub fn try_send_outcome<M, R>(
         &self,
         address: Address<M, R>,
@@ -1730,9 +1774,8 @@ where
     /// A `Timeout` cannot deliver later, and `make_message` runs only for a real
     /// bounded attempt.
     ///
-    /// # Panics
-    ///
-    /// Panics when `address` targets a shard outside this local system.
+    /// Returns [`SendObservedUntilError::UnknownShard`] before invoking
+    /// `make_message` when `address` targets another shard topology.
     pub fn send_observed_until<M, R, MakeMessage>(
         &self,
         address: Address<M, R>,
@@ -1752,9 +1795,8 @@ where
     /// Retries typed split-service event admission on the owning shard without
     /// exposing the private service envelope.
     ///
-    /// # Panics
-    ///
-    /// Panics when `address` targets a shard outside this local system.
+    /// Returns [`SendObservedUntilError::UnknownShard`] before invoking
+    /// `make_event` when `address` targets another shard topology.
     pub fn send_event_observed_until<Event, Request, MakeEvent>(
         &self,
         address: tina::ServiceEventAddress<Event, Request>,

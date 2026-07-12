@@ -1651,6 +1651,9 @@ where
                 Err(ThreadedSendObservedError::WorkerStopped) => {
                     return Err(SendObservedUntilError::WorkerStopped);
                 }
+                Err(ThreadedSendObservedError::UnknownShard(shard)) => {
+                    return Err(SendObservedUntilError::UnknownShard(shard));
+                }
             }
         }
     }

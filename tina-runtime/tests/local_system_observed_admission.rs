@@ -489,6 +489,8 @@ fn local_system_typed_event_deadline_helper_needs_no_envelope() {
         )
         .expect("register event service");
 
+    app.send_event_and_observe(events, ServiceEvent::Count)
+        .expect("typed event admits immediately");
     app.send_event_observed_until(
         events,
         Instant::now() + Duration::from_secs(1),
@@ -496,7 +498,7 @@ fn local_system_typed_event_deadline_helper_needs_no_envelope() {
         || ServiceEvent::Count,
     )
     .expect("typed event admits");
-    wait_until(|| counted.load(Ordering::Acquire) == 1);
+    wait_until(|| counted.load(Ordering::Acquire) == 2);
 
     app.shutdown()
         .drain()
@@ -720,6 +722,8 @@ fn local_multi_deadline_refills_and_typed_event_needs_no_envelope() {
             4,
         )
         .expect("register typed event service");
+    app.send_event_and_observe(events, ServiceEvent::Count)
+        .expect("typed event admits immediately on owner");
     app.send_event_observed_until(
         events,
         Instant::now() + Duration::from_secs(1),
@@ -727,7 +731,7 @@ fn local_multi_deadline_refills_and_typed_event_needs_no_envelope() {
         || ServiceEvent::Count,
     )
     .expect("typed event admits on owner");
-    wait_until(|| event_counted.load(Ordering::Acquire) == 1);
+    wait_until(|| event_counted.load(Ordering::Acquire) == 2);
 
     app.shutdown()
         .drain()
@@ -853,7 +857,7 @@ fn local_multi_observed_admission_reports_worker_stopped_on_owner_only() {
 }
 
 #[test]
-fn local_multi_observed_admission_preserves_unknown_shard_contract() {
+fn local_multi_observed_admission_returns_typed_unknown_shard() {
     let owner = LocalSystem::multi_shard(DefaultThreadedMailboxFactory)
         .shard(TestShard(11))
         .try_build()
@@ -872,21 +876,31 @@ fn local_multi_observed_admission_preserves_unknown_shard_contract() {
         )
         .expect("register foreign target");
     let outcomes = HostBurstOutcomes::new();
+    let try_send_drops = Arc::new(AtomicU32::new(0));
+    assert_eq!(
+        owner.try_send(
+            address,
+            TestMsg::Owned(DropProbe(Arc::clone(&try_send_drops))),
+        ),
+        Err(ThreadedTrySendError::UnknownShard(ShardId::new(99)))
+    );
+    assert_eq!(try_send_drops.load(Ordering::Acquire), 1);
+
     let rejected_drops = Arc::new(AtomicU32::new(0));
-    let outcome_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    assert_eq!(
         owner.try_send_outcome(
             address,
             TestMsg::Owned(DropProbe(Arc::clone(&rejected_drops))),
             &outcomes,
-        )
-    }));
-    assert!(outcome_panic.is_err());
+        ),
+        Err(ThreadedTrySendError::UnknownShard(ShardId::new(99)))
+    );
     assert_eq!(rejected_drops.load(Ordering::Acquire), 1);
     assert_eq!(outcomes.snapshot().submitted, 0);
     assert_eq!(outcomes.snapshot().observed, 0);
 
     let factory_calls = Arc::new(AtomicU32::new(0));
-    let deadline_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    assert_eq!(
         owner.send_observed_until(
             address,
             Instant::now() + Duration::from_secs(1),
@@ -895,10 +909,41 @@ fn local_multi_observed_admission_preserves_unknown_shard_contract() {
                 factory_calls.fetch_add(1, Ordering::Release);
                 TestMsg::Count
             },
-        )
-    }));
-    assert!(deadline_panic.is_err());
+        ),
+        Err(SendObservedUntilError::UnknownShard(ShardId::new(99)))
+    );
     assert_eq!(factory_calls.load(Ordering::Acquire), 0);
+
+    let event_counted = Arc::new(AtomicU32::new(0));
+    let events = foreign
+        .register_event_service_on::<EventService, ServiceEvent, Infallible>(
+            ShardId::new(99),
+            EventService {
+                counted: Arc::clone(&event_counted),
+            },
+            4,
+        )
+        .expect("register foreign event target");
+    let event_factory_calls = Arc::new(AtomicU32::new(0));
+    assert_eq!(
+        owner.send_event_observed_until(
+            events,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(1),
+            || {
+                event_factory_calls.fetch_add(1, Ordering::Release);
+                ServiceEvent::Count
+            },
+        ),
+        Err(SendObservedUntilError::UnknownShard(ShardId::new(99)))
+    );
+    assert_eq!(event_factory_calls.load(Ordering::Acquire), 0);
+    assert_eq!(event_counted.load(Ordering::Acquire), 0);
+    assert_eq!(
+        owner.send_event_and_observe(events, ServiceEvent::Count),
+        Err(ThreadedSendObservedError::UnknownShard(ShardId::new(99)))
+    );
+    assert_eq!(event_counted.load(Ordering::Acquire), 0);
 
     owner
         .shutdown()

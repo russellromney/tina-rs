@@ -745,16 +745,16 @@ where
     }
 
     /// Attempts bounded ingress to the worker that owns `address`.
+    ///
+    /// Returns [`ThreadedTrySendError::UnknownShard`] without consuming any
+    /// runtime capacity when the address belongs to another shard topology.
     pub fn try_send<M: Send + 'static, R: 'static>(
         &self,
         address: Address<M, R>,
         message: M,
     ) -> Result<(), ThreadedTrySendError> {
         let Some(sender) = self.commands.get(&address.shard()) else {
-            panic!(
-                "ThreadedMultiShardRuntime targeted unknown shard {}",
-                address.shard().get()
-            );
+            return Err(ThreadedTrySendError::UnknownShard(address.shard()));
         };
         // Reject ingress to a quarantined shard
         // immediately, before the bounded sync_channel has observed
@@ -794,9 +794,8 @@ where
 
     /// Attempts bounded ingress through a service event capability.
     ///
-    /// # Panics
-    ///
-    /// Panics when the address targets a shard not owned by this runtime.
+    /// Returns [`ThreadedTrySendError::UnknownShard`] when the event address
+    /// targets a shard not owned by this runtime.
     pub fn try_send_event<Event, Request>(
         &self,
         address: tina::ServiceEventAddress<Event, Request>,
@@ -822,19 +821,15 @@ where
     /// indefinitely. Use [`Self::send_observed_until`] when the host needs a
     /// deadline and a no-late-delivery guarantee.
     ///
-    /// # Panics
-    ///
-    /// Panics when the address targets a shard not owned by this runtime.
+    /// Returns [`ThreadedSendObservedError::UnknownShard`] without enqueueing
+    /// the message when the address targets a shard not owned by this runtime.
     pub fn send_and_observe<M: Send + 'static, R: 'static>(
         &self,
         address: Address<M, R>,
         message: M,
     ) -> Result<(), ThreadedSendObservedError> {
         let Some(sender) = self.commands.get(&address.shard()) else {
-            panic!(
-                "ThreadedMultiShardRuntime::send_and_observe targeted unknown shard {}",
-                address.shard().get()
-            );
+            return Err(ThreadedSendObservedError::UnknownShard(address.shard()));
         };
         let metrics = self
             .shard_metrics
@@ -907,12 +902,6 @@ where
         R: 'static,
         O: FnOnce(Result<(), ThreadedSendObservedError>) + Send + 'static,
     {
-        if !self.commands.contains_key(&address.shard()) {
-            panic!(
-                "ThreadedMultiShardRuntime::try_send_and_observe_with targeted unknown shard {}",
-                address.shard().get()
-            );
-        }
         self.try_send_and_observe_with_preflight(address, message, |_| None, observer)
     }
 
@@ -925,9 +914,8 @@ where
     /// with `WorkerStopped`; an observer callback panic is contained after
     /// settlement.
     ///
-    /// # Panics
-    ///
-    /// Panics when the address targets a shard not owned by this runtime.
+    /// Returns [`ThreadedTrySendError::UnknownShard`] without invoking the
+    /// preflight or observer when the address is not owned by this runtime.
     pub fn try_send_and_observe_with_preflight<M, R, P, O>(
         &self,
         address: Address<M, R>,
@@ -942,10 +930,7 @@ where
         O: FnOnce(Result<(), ThreadedSendObservedError>) + Send + 'static,
     {
         let Some(sender) = self.commands.get(&address.shard()) else {
-            panic!(
-                "ThreadedMultiShardRuntime::try_send_and_observe_with_preflight targeted unknown shard {}",
-                address.shard().get()
-            );
+            return Err(ThreadedTrySendError::UnknownShard(address.shard()));
         };
         let metrics = self
             .shard_metrics
@@ -993,10 +978,7 @@ where
         R: 'static,
     {
         if !self.commands.contains_key(&address.shard()) {
-            panic!(
-                "ThreadedMultiShardRuntime::try_send_outcome targeted unknown shard {}",
-                address.shard().get()
-            );
+            return Err(ThreadedTrySendError::UnknownShard(address.shard()));
         }
         outcomes.note_submitted();
         let observer = outcomes.observer();
@@ -1013,9 +995,8 @@ where
     /// deadline expires. `Timeout` guarantees that no accepted attempt can
     /// deliver after this method returns.
     ///
-    /// # Panics
-    ///
-    /// Panics when the address targets a shard not owned by this runtime.
+    /// Returns [`SendObservedUntilError::UnknownShard`] before invoking
+    /// `make_message` when the address is not owned by this runtime.
     pub fn send_observed_until<M, R, MakeMessage>(
         &self,
         address: Address<M, R>,
@@ -1029,10 +1010,7 @@ where
         MakeMessage: FnMut() -> M,
     {
         let Some(sender) = self.commands.get(&address.shard()) else {
-            panic!(
-                "ThreadedMultiShardRuntime::send_observed_until targeted unknown shard {}",
-                address.shard().get()
-            );
+            return Err(SendObservedUntilError::UnknownShard(address.shard()));
         };
         let metrics = self
             .shard_metrics
@@ -1101,6 +1079,9 @@ where
                 }
                 Err(ThreadedSendObservedError::WorkerStopped) => {
                     return Err(SendObservedUntilError::WorkerStopped);
+                }
+                Err(ThreadedSendObservedError::UnknownShard(shard)) => {
+                    return Err(SendObservedUntilError::UnknownShard(shard));
                 }
             }
         }

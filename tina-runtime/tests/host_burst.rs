@@ -1179,6 +1179,10 @@ fn host_burst_wait_error_display_names_the_timeout() {
 #[test]
 fn send_observed_until_error_display_names_each_variant() {
     assert_eq!(
+        format!("{}", SendObservedUntilError::UnknownShard(ShardId::new(17))),
+        "target shard 17 is not owned by this runtime"
+    );
+    assert_eq!(
         format!("{}", SendObservedUntilError::Timeout),
         "deadline elapsed before mailbox accepted the message"
     );
