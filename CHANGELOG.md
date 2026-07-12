@@ -36,6 +36,13 @@ This file records completed work.
   callers trigger the observed side effect. Typed result observation preserves
   its single-result API with `ResultWaitError::CommandFull`.
 
+### SharedWork FIFO handoff
+
+- Added `SharedWork::take_next`, which transfers the oldest live caller's
+  one-shot reply authority for a key, skips cancelled callers, and immediately
+  releases global and per-key capacity. Lock and lease services no longer need
+  a parallel waiter-id queue beside their bounded pending-reply storage.
+
 ### Authoritative child-restart observation
 
 - Child-restart waiters now match the complete parent address identity

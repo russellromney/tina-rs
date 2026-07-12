@@ -10,6 +10,8 @@
 //!   (a cache key, a hostname lookup, a session id);
 //! - the service starts the upstream work once and replies every parked
 //!   waiter with one result, often a `Clone` of the value.
+//! - the service hands an exclusive resource to the oldest live caller for
+//!   a key, such as a lock lease.
 //!
 //! Use [`crate::PendingReplies`] when reply slots are owned by id and
 //! unrelated to each other (no per-key coalescing).
@@ -313,6 +315,28 @@ where
         self.inner.reply_one(ticket.inner, reply)
     }
 
+    /// Remove and return the oldest live caller under `key`.
+    ///
+    /// Use this for FIFO handoff when each completion belongs to one caller,
+    /// such as granting the next lock lease. Callers that closed or timed out
+    /// before their turn are reclaimed and skipped. The returned
+    /// [`tina::DeferredReply`] is one-shot reply authority; settle it with
+    /// [`tina::reply_to`] or intentionally drop it.
+    ///
+    /// Any [`SharedWorkTicket`] for a removed caller can no longer settle an
+    /// entry. Capacity is available for refill as soon as this method returns.
+    /// Selection performs one allocation-free scan bounded by the configured
+    /// global capacity, including cleanup of terminal callers under this key.
+    ///
+    /// `take_next` proves that the slot was open when selected, not that a
+    /// later reply reaches the caller. The caller or a cross-shard reply path
+    /// can still close before [`tina::reply_to`] executes. Services handing
+    /// off exclusive resources must retain their normal expiry or rollback
+    /// policy for that terminal rejection.
+    pub fn take_next(&mut self, key: &K) -> Option<tina::DeferredReply<R>> {
+        self.inner.take_next(key)
+    }
+
     /// Reply every parked caller under `key` with the same value
     /// (FIFO order). Requires `R: Clone`.
     pub fn reply_all_clone<I>(&mut self, key: &K, reply: R) -> Vec<Effect<I>>
@@ -421,6 +445,21 @@ mod tests {
             std::sync::Arc::new(DeferredSlotShared::new(id, std::any::TypeId::of::<u32>()));
         let deferred = deferred_from_handle(handle_from_shared(shared));
         tina::runtime_internal::request_context_from_deferred(deferred)
+    }
+
+    fn fake_request_with_shared(
+        id: u64,
+    ) -> (
+        tina::RequestContext<u32>,
+        std::sync::Arc<DeferredSlotShared>,
+    ) {
+        let shared =
+            std::sync::Arc::new(DeferredSlotShared::new(id, std::any::TypeId::of::<u32>()));
+        let deferred = deferred_from_handle(handle_from_shared(std::sync::Arc::clone(&shared)));
+        (
+            tina::runtime_internal::request_context_from_deferred(deferred),
+            shared,
+        )
     }
 
     #[derive(Debug)]
@@ -570,6 +609,71 @@ mod tests {
         let effects: Vec<Effect<TestIso>> = work.drain_all_with(|| 1u32);
         assert_eq!(effects.len(), 2);
         assert!(work.is_empty());
+    }
+
+    #[test]
+    fn take_next_transfers_fifo_reply_authority_and_invalidates_ticket() {
+        let mut work = SharedWork::<u32, u32>::with_capacity(3);
+        let first = work.admit_request_for_test(1, fake_request(10)).unwrap();
+        work.admit_request_for_test(2, fake_request(20)).unwrap();
+        work.admit_request_for_test(1, fake_request(11)).unwrap();
+
+        let slot = work.take_next(&1).expect("first key-1 waiter");
+        assert_eq!(slot.slot_id(), 10);
+        let effect: Effect<TestIso> = tina::reply_to(slot, 7);
+        match effect {
+            Effect::ReplyTo(slot, reply) => {
+                assert_eq!(slot.slot_id(), 10);
+                assert_eq!(reply, 7);
+            }
+            other => panic!("expected ReplyTo, got {other:?}"),
+        }
+
+        assert!(matches!(
+            work.reply_one::<TestIso>(first, 99),
+            Err(WaitReplyError::Missing { reply: 99, .. })
+        ));
+        assert_eq!(work.take_next(&1).unwrap().slot_id(), 11);
+        assert_eq!(work.take_next(&2).unwrap().slot_id(), 20);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn take_next_skips_cancelled_callers_and_refills_both_caps() {
+        let mut work = SharedWork::<u32, u32>::with_key_limit(3, 2);
+        let (cancelled, cancelled_state) = fake_request_with_shared(10);
+        work.admit_request_for_test(1, cancelled).unwrap();
+        work.admit_request_for_test(1, fake_request(11)).unwrap();
+        work.admit_request_for_test(2, fake_request(20)).unwrap();
+        cancelled_state.set_state(tina::DeferredSlotState::Closed);
+
+        assert_eq!(work.take_next(&1).unwrap().slot_id(), 11);
+        assert_eq!(work.reclaimed(), 1);
+        assert_eq!(work.len(), 1);
+
+        work.admit_request_for_test(1, fake_request(12))
+            .expect("global capacity refills after take");
+        work.admit_request_for_test(1, fake_request(13))
+            .expect("per-key capacity refills after take");
+        assert_eq!(work.len(), 3);
+        assert_eq!(work.take_next(&1).unwrap().slot_id(), 12);
+        assert_eq!(work.take_next(&1).unwrap().slot_id(), 13);
+        assert!(work.take_next(&1).is_none());
+    }
+
+    #[test]
+    fn take_next_ticket_is_stale_after_removed_slot_refills() {
+        let mut work = SharedWork::<u32, u32>::with_capacity(1);
+        let removed = work.admit_request_for_test(1, fake_request(10)).unwrap();
+        assert_eq!(work.take_next(&1).unwrap().slot_id(), 10);
+        work.admit_request_for_test(1, fake_request(11))
+            .expect("removed slot refills");
+
+        assert!(matches!(
+            work.reply_one::<TestIso>(removed, 99),
+            Err(WaitReplyError::StaleTicket { reply: 99, .. })
+        ));
+        assert_eq!(work.take_next(&1).unwrap().slot_id(), 11);
     }
 
     #[test]

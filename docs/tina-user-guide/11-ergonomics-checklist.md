@@ -816,6 +816,13 @@ that produces a `RequestEffect` after the caller is parked. The ticket
 is move-only and its fields are crate-private, so a `RequestEffect` from
 `noop()` cannot escape admission. Lower-level name: `SharedWork`.
 
+For one-at-a-time FIFO handoff, `shared.take_next(&key)` returns the oldest
+live caller's `DeferredReply` and skips cancelled or timed-out callers. This
+replaces a parallel `VecDeque<waiter_id>` plus `PendingReplies` table while
+leaving the domain reply and follow-up effects visible. It proves the caller
+was open at selection, not that the later reply was delivered; exclusive
+resource handoff still needs its normal expiry or rollback path.
+
 ### Bounded pending replies
 
 Use `tina_runtime::PendingReplies::<K, R>::with_capacity(n)` as the
