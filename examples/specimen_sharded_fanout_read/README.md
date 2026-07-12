@@ -44,43 +44,25 @@ Three first-class pieces from `tina_runtime::sharded`:
 
 - **`ShardPlacement`** — typed name + ordered shard list. Names the
   hash scheme version so a future placement change fails loudly.
-- **`ShardServiceTable<ShardCounterMsg>`** — typed `ShardId ->
-  Address` map. Built directly from the placement via
+- **`ShardRequestServiceTable<ShardCounterRequest, ShardCounterReply>`** —
+  typed `ShardId -> ServiceRequestAddress` map. Built from placement via
   `try_from_placement(...)`.
-- **`ScatterGatherConfig` / `ScatterGatherReport<u64>`** — partial-
-  aggregate report shape. Covers `Replied`, `Full`, `Closed`,
-  `Timeout`, `AggregateTimeout`, `MissingShard`. The happy-path
-  specimen here only fills `Replied`, but the typed slots are
-  reserved.
+- **`ScatterGatherOperations` / `ScatterGatherEvent`** — one bounded owner for
+  caller authority, child calls, cancellation, aggregate timeout, ordering,
+  and retirement.
 
 The fanout itself is small:
 
 ```rust
-ScatterCoordMsg::Start => {
-    for shard in placement.shards() {
-        effects.push(send(table.address_for(shard), ShardCounterMsg::Get { reply_to: bridge }));
-    }
-    batch(effects)
-}
-ScatterCoordMsg::Reply(ShardCounterReply { shard, value }) => {
-    self.outcomes.push((shard, ScatterGatherTargetOutcome::Replied(value)));
-    if self.pending_targets.is_empty() {
-        publish_report(ScatterGatherReport { config, outcomes });
-        stop()
-    } else { noop() }
-}
+operations.start_service(request, config, targets, |counter, timeout| {
+    call_cancelable_request(counter, ShardCounterRequest::Get, timeout)
+}, CoordEvent::Scatter)
 ```
 
-Replies translate through `ReplyAdapter<ShardCounterReply,
-ScatterCoordMsg, AppShard>`. The user provides one
-`impl From<ShardCounterReply> for ScatterCoordMsg`; the adapter is
-the shipped primitive that takes care of the address translation.
-Registration uses `runtime.register_reply_adapter_on(shard,
-target, capacity)`, which exists on the multi-shard runtimes
-(threaded, explicit-step, and the sim). The adapter still lives
-in its own bounded mailbox; the helper just removes the doubled
-turbofish — the adapter type and the outbound payload type —
-that registering by hand required.
+Replies, timeouts, cancellation acknowledgements, and late events use the one
+`ScatterGatherEvent` vocabulary. The host calls the coordinator through its
+request capability and exhaustively distinguishes coordinator Full, Closed,
+Timeout, Rejected, start rejection, and partial target reports.
 
 ## Discussion
 
@@ -98,29 +80,19 @@ What feels better:
   helper makes that a typed `WrongShard`).
 - **Outcomes are typed for the bad case.** The happy-path here
   fills `Replied`; the typed report still reserves slots for
-  `Full`, `Closed`, `Timeout`, `AggregateTimeout`,
+  `Full`, `Closed`, `Timeout`, `Rejected`, `AggregateTimeout`,
   `MissingShard`. The user can't accidentally smuggle "a slow shard
   is the same as a missing shard" into the aggregate.
 
-What feels worse:
+What remains explicit:
 
-- **`ScatterCoord` is a lot of state.** `table`, `bridge`,
-  `targets_in_order`, `pending_targets`, `outcomes`, `report_into`,
-  plus a bind/start/reply variant trio. For a three-shard happy-path
-  read, that's heavier than `[shard.lock()? for shard in shards]`.
-  The richer pressure form (with `send_observed`, per-target timer,
-  aggregate timer) lives in `tina-runtime/tests/sharded_primitives.rs`
-  and is heavier still.
-- **`ReplyAdapter` is one isolate per fanout.** It's small and the
-  `From` impl is one line, but every fanout site registers an
-  adapter alongside the coord. A "use this address as the reply
-  channel and translate replies through `From`" sugar at registration
-  time would shrink the setup.
-- **`Bind` then `Start` is two messages.** The coord needs the
-  reply-adapter address, and the adapter needs the coord's address
-  — chicken-and-egg. The current shape sends `Bind { bridge }`
-  first, then `Start`. A `register_with_self_address` hook would
-  remove one variant.
+- **Targets and time budgets are visible.** The coordinator still builds a
+  bounded target list and names per-target plus aggregate deadlines. This is
+  intentional pressure policy rather than reply-correlation plumbing.
+
+The same scatter owner and continuation vocabulary is covered across live,
+threaded, multi-shard, and simulator backends by the repository parity suite;
+this specimen exercises the production-shaped threaded multi-shard facade.
 
 ## What this is not
 

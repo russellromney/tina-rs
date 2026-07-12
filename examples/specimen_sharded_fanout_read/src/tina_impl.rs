@@ -1,38 +1,25 @@
-//! Tina side. One `ShardCounter` isolate per shard owns its own
-//! `u64`. A `ScatterCoord` on shard 0 fans `Get` out to every shard
-//! through the `ShardServiceTable`. Replies flow through a
-//! `ReplyAdapter` that translates each shard's typed
-//! `ShardCounterReply` into the coord's own `ScatterCoordMsg::Reply`
-//! variant. When every target has either replied or been ruled out,
-//! the coord builds a `ScatterGatherReport<u64>` and publishes it.
-//!
-//! What this teaches:
-//!
-//! - **Placement is structural.** `ShardPlacement` and
-//!   `ShardServiceTable` make "which shard owns what" a typed thing.
-//!   The coord does not see raw indices.
-//! - **Per-target outcomes are typed.** Even when every reply lands
-//!   on the happy path, the report names the four overload outcomes
-//!   the runtime *would* surface
-//!   (`Full` / `Closed` / `Timeout` / `AggregateTimeout`) and the one
-//!   placement outcome (`MissingShard`). The richer pressure forms
-//!   live in `tina-runtime/tests/sharded_primitives.rs`.
-//! - **`ReplyAdapter` is shipped.** No hand-written translator
-//!   isolate. The user provides `impl From<ShardCounterReply> for
-//!   ScatterCoordMsg` and the adapter does the routing.
+//! Tina side. Request-only shard services live behind a typed placement table;
+//! one bounded scatter/gather owner drives the fanout and returns the complete
+//! ordered report to the host caller.
 
+use std::convert::Infallible;
 use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::sharded::{
     ScatterGatherConfig, ScatterGatherReport, ScatterGatherTargetOutcome, ShardPlacement,
-    ShardServiceTable,
+    ShardRequestServiceTable,
 };
 use tina_runtime::{
-    BoundedItems, DefaultThreadedMailboxFactory, ThreadedMultiShardRuntime, bounded_batch,
+    BoundedItems, CallOutcome, DefaultThreadedMailboxFactory, ScatterGatherEvent,
+    ScatterGatherOperations, ScatterGatherOperationsStart, ScatterGatherStartError,
+    ThreadedMultiShardRuntime, call_cancelable_request,
 };
 
 use crate::{Report, SEED_VALUES, SHARD_RAW_IDS};
+
+const TARGET_TIMEOUT: Duration = Duration::from_millis(200);
+const AGGREGATE_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy)]
 struct AppShard(u32);
@@ -43,146 +30,147 @@ impl Shard for AppShard {
     }
 }
 
-// ---------- Per-shard counter ----------
+// ---------- Per-shard counter --------------------------------------------
 
-#[derive(Debug, Clone)]
-enum ShardCounterMsg {
-    Get {
-        reply_to: Address<ShardCounterReply>,
-    },
+#[derive(Debug, Clone, Copy)]
+enum ShardCounterRequest {
+    Get,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct ShardCounterReply {
     shard: ShardId,
     value: u64,
 }
 
 struct ShardCounter {
+    shard: ShardId,
     value: u64,
 }
 
 #[tina_runtime::isolate(
-    message = ShardCounterMsg,
-    send = Outbound<ShardCounterReply>,
+    request = ShardCounterRequest,
+    reply = ShardCounterReply,
     shard = AppShard
 )]
 impl ShardCounter {
-    fn handle(
+    fn handle_request(
         &mut self,
-        msg: ShardCounterMsg,
-        ctx: &mut Context<'_, AppShard, Self::Reply>,
-    ) -> Effect<Self> {
-        match msg {
-            ShardCounterMsg::Get { reply_to } => send(
-                reply_to,
-                ShardCounterReply {
-                    shard: ctx.shard_id(),
-                    value: self.value,
-                },
-            ),
+        request: ShardCounterRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            ShardCounterRequest::Get => call.reply(ShardCounterReply {
+                shard: self.shard,
+                value: self.value,
+            }),
         }
     }
 }
 
-// ---------- ScatterCoord (lives on the first shard) ----------
+// ---------- Coordinator ---------------------------------------------------
 
-#[derive(Debug, Clone)]
-enum ScatterCoordMsg {
-    Bind { bridge: Address<ShardCounterReply> },
-    Start,
-    Reply(ShardCounterReply),
+#[derive(Debug)]
+enum CoordEvent {
+    Scatter(ScatterGatherEvent<ShardId, ShardCounterReply>),
 }
 
-// `ReplyAdapter<ShardCounterReply, ScatterCoordMsg, AppShard>` does
-// the translation; the user only provides this `From` impl.
-impl From<ShardCounterReply> for ScatterCoordMsg {
-    fn from(msg: ShardCounterReply) -> Self {
-        ScatterCoordMsg::Reply(msg)
-    }
+#[derive(Debug, Clone, Copy)]
+enum CoordRequest {
+    ReadAll,
+}
+
+#[derive(Debug)]
+enum AggregateReply {
+    Complete(ScatterGatherReport<ShardCounterReply, ShardId>),
+    Full,
+    StartRejected(ScatterGatherStartError<ShardId>),
 }
 
 struct ScatterCoord {
-    table: ShardServiceTable<ShardCounterMsg>,
-    bridge: Option<Address<ShardCounterReply>>,
+    table: ShardRequestServiceTable<ShardCounterRequest, ShardCounterReply>,
     config: ScatterGatherConfig,
-    targets_in_order: Vec<ShardId>,
-    pending_targets: Vec<ShardId>,
-    outcomes: Vec<(ShardId, ScatterGatherTargetOutcome<u64>)>,
+    operations: ScatterGatherOperations<ShardId, ShardCounterReply, AggregateReply>,
 }
 
-// `io = Infallible`: the coord only does outbound sends + stop_with; no
-// runtime I/O rail. Use `tina::isolate` so Io stays Infallible.
-#[tina::isolate(
-    message = ScatterCoordMsg,
-    send = Outbound<ShardCounterMsg>,
-    shard = AppShard
-)]
+#[tina_runtime::isolate(event = CoordEvent, request = CoordRequest, reply = AggregateReply, shard = AppShard)]
 impl ScatterCoord {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: ScatterCoordMsg,
+        event: CoordEvent,
         _ctx: &mut Context<'_, AppShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            ScatterCoordMsg::Bind { bridge } => {
-                self.bridge = Some(bridge);
-                noop()
-            }
-            ScatterCoordMsg::Start => {
-                let bridge = self.bridge.expect("Bind must arrive before Start");
+        let CoordEvent::Scatter(event) = event;
+        let Some(advance) = self
+            .operations
+            .advance_service::<Self, _, _, _>(event, CoordEvent::Scatter)
+            .unwrap_or_else(|error| panic!("scatter continuation violated authority: {error:?}"))
+        else {
+            return noop();
+        };
+        match advance.completed {
+            Some(completed) => Effect::Batch(vec![
+                advance.effect,
+                reply_to(
+                    completed.request,
+                    AggregateReply::Complete(completed.report),
+                ),
+            ]),
+            None => advance.effect,
+        }
+    }
+
+    fn handle_request(
+        &mut self,
+        request: CoordRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            CoordRequest::ReadAll => call.capture(|request| {
                 let targets = BoundedItems::try_from_iter(
                     self.config.max_targets,
-                    self.table.placement().shards().iter().copied(),
+                    self.table
+                        .placement()
+                        .shards()
+                        .iter()
+                        .copied()
+                        .map(|shard| {
+                            let address = self
+                                .table
+                                .address_for(shard)
+                                .expect("placement shard has a request capability");
+                            (shard, Some(address))
+                        }),
                 )
-                .expect("placement target list is capped by ScatterGatherConfig");
-                self.targets_in_order = targets.as_slice().to_vec();
-                self.pending_targets = targets.as_slice().to_vec();
-                let effects = targets.map_effects(|shard| {
-                    let address = self
-                        .table
-                        .address_for(shard)
-                        .expect("shard came from placement.shards()");
-                    send(address, ShardCounterMsg::Get { reply_to: bridge })
-                });
-                bounded_batch(effects)
-            }
-            ScatterCoordMsg::Reply(reply) => {
-                let ShardCounterReply { shard, value } = reply;
-                if let Some(pos) = self.pending_targets.iter().position(|s| *s == shard) {
-                    self.pending_targets.swap_remove(pos);
-                    self.outcomes
-                        .push((shard, ScatterGatherTargetOutcome::Replied(value)));
+                .expect("placement target list is bounded by scatter config");
+
+                match self.operations.start_service::<Self, _, _, _, _, _, _>(
+                    request,
+                    self.config,
+                    targets,
+                    |address, timeout| {
+                        call_cancelable_request(address, ShardCounterRequest::Get, timeout)
+                    },
+                    CoordEvent::Scatter,
+                ) {
+                    Ok(ScatterGatherOperationsStart::Running(effect)) => effect,
+                    Ok(ScatterGatherOperationsStart::Ready(completed)) => reply_to(
+                        completed.request,
+                        AggregateReply::Complete(completed.report),
+                    ),
+                    Err(failure) => match failure.error {
+                        ScatterGatherStartError::OperationsFull { .. } => {
+                            reply_to(failure.request, AggregateReply::Full)
+                        }
+                        error => reply_to(failure.request, AggregateReply::StartRejected(error)),
+                    },
                 }
-                if self.pending_targets.is_empty() {
-                    let outcomes = sort_outcomes_by_target_list(
-                        std::mem::take(&mut self.outcomes),
-                        &self.targets_in_order,
-                    );
-                    let report = ScatterGatherReport {
-                        config: self.config,
-                        outcomes,
-                    };
-                    // Host reads the typed `ScatterGatherReport<u64>` via
-                    // `runtime.observe_result::<...>` instead of polling an
-                    // `Arc<Mutex<Option<_>>>` slot.
-                    return stop_with(report);
-                }
-                noop()
-            }
+            }),
         }
     }
 }
 
-fn sort_outcomes_by_target_list<T>(
-    mut outcomes: Vec<(ShardId, ScatterGatherTargetOutcome<T>)>,
-    targets: &[ShardId],
-) -> Vec<(ShardId, ScatterGatherTargetOutcome<T>)> {
-    outcomes.sort_by_key(|(s, _)| targets.iter().position(|t| *t == *s).unwrap_or(usize::MAX));
-    outcomes
-}
-
-// ---------- Run ----------
+// ---------- Run -----------------------------------------------------------
 
 pub fn run() -> anyhow::Result<Report> {
     let runtime = ThreadedMultiShardRuntime::try_new(
@@ -194,75 +182,63 @@ pub fn run() -> anyhow::Result<Report> {
         "specimen-sharded-fanout-read",
         SHARD_RAW_IDS.iter().copied().map(ShardId::new).collect(),
     )
-    .map_err(|e| anyhow::anyhow!("placement: {e}"))?;
+    .map_err(|error| anyhow::anyhow!("placement: {error}"))?;
 
-    // One ShardCounter per shard, seeded in placement order.
-    let table = ShardServiceTable::try_from_placement(placement.clone(), |shard| {
+    let table = ShardRequestServiceTable::try_from_placement(placement.clone(), |shard| {
         let value = SEED_VALUES[placement
             .shards()
             .iter()
-            .position(|s| *s == shard)
-            .expect("shard came from placement.shards()")];
-        runtime.register_with_capacity_on::<ShardCounter, ShardCounterReply>(
-            shard,
-            ShardCounter { value },
-            8,
-        )
+            .position(|candidate| *candidate == shard)
+            .expect("registration shard came from placement")];
+        runtime.register_request_service_on(shard, ShardCounter { shard, value }, 8)
     })
-    .map_err(|e| anyhow::anyhow!("register shard counters: {e}"))?;
+    .map_err(|error| anyhow::anyhow!("register shard counters: {error}"))?;
 
-    let coord_shard = ShardId::new(SHARD_RAW_IDS[0]);
     let config = ScatterGatherConfig {
         max_targets: SHARD_RAW_IDS.len(),
         collector_capacity: SHARD_RAW_IDS.len(),
-        per_target_timeout: Duration::from_millis(200),
-        aggregate_timeout: Duration::from_millis(500),
+        per_target_timeout: TARGET_TIMEOUT,
+        aggregate_timeout: AGGREGATE_TIMEOUT,
     };
     config
         .validate()
-        .map_err(|e| anyhow::anyhow!("scatter/gather config: {e}"))?;
+        .map_err(|error| anyhow::anyhow!("scatter/gather config: {error}"))?;
 
     let coord = runtime
-        .register_with_capacity_on::<ScatterCoord, ShardCounterMsg>(
-            coord_shard,
+        .register_split_service_on::<ScatterCoord, CoordEvent, CoordRequest, Infallible>(
+            ShardId::new(SHARD_RAW_IDS[0]),
             ScatterCoord {
-                table: table.clone(),
-                bridge: None,
+                table,
                 config,
-                targets_in_order: Vec::new(),
-                pending_targets: Vec::new(),
-                outcomes: Vec::with_capacity(config.max_targets),
+                operations: ScatterGatherOperations::with_capacity(1),
             },
-            config.collector_capacity,
+            config.collector_capacity + 2,
         )
-        .map_err(|e| anyhow::anyhow!("register coord: {e:?}"))?;
+        .map_err(|error| anyhow::anyhow!("register coordinator: {error:?}"))?;
 
-    let bridge = runtime
-        .register_reply_adapter_on::<ShardCounterReply, ScatterCoordMsg>(
-            coord_shard,
-            coord,
-            config.collector_capacity,
+    let outcome = runtime
+        .call_blocking_request(
+            coord.requests,
+            CoordRequest::ReadAll,
+            Duration::from_secs(2),
         )
-        .map_err(|e| anyhow::anyhow!("register reply adapter: {e:?}"))?;
+        .map_err(|error| anyhow::anyhow!("drive scatter request: {error}"))?;
 
-    // Typed result waiter on the multi-shard runtime. The coord publishes its
-    // `ScatterGatherReport<u64>` via `stop_with(report)`; no shared mutex.
-    let waiter = runtime
-        .observe_result::<ScatterGatherReport<u64>, _, _>(coord)
-        .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
+    let report = match outcome {
+        CallOutcome::Replied(AggregateReply::Complete(report)) => report,
+        CallOutcome::Replied(AggregateReply::Full) => {
+            anyhow::bail!("single scatter operation was unexpectedly full")
+        }
+        CallOutcome::Replied(AggregateReply::StartRejected(error)) => {
+            anyhow::bail!("scatter start rejected: {error:?}")
+        }
+        CallOutcome::Full => anyhow::bail!("coordinator mailbox was full"),
+        CallOutcome::Closed => anyhow::bail!("coordinator closed before replying"),
+        CallOutcome::Timeout => anyhow::bail!("coordinator call timed out"),
+        CallOutcome::Rejected(reason) => anyhow::bail!("coordinator rejected request: {reason:?}"),
+    };
 
-    runtime
-        .try_send(coord, ScatterCoordMsg::Bind { bridge })
-        .map_err(|e| anyhow::anyhow!("send Bind: {e:?}"))?;
-    runtime
-        .try_send(coord, ScatterCoordMsg::Start)
-        .map_err(|e| anyhow::anyhow!("send Start: {e:?}"))?;
-
-    let report = waiter
-        .wait(Duration::from_secs(2))
-        .map_err(|e| anyhow::anyhow!("scatter coord did not produce a report: {e:?}"))?;
-
-    let total_sum: u64 = report.replied().map(|(_, v)| *v).sum();
+    let total_sum = validated_total(&report)?;
     let shards_replied = report.replied_count() as u32;
 
     runtime.shutdown_report().ensure_clean()?;
@@ -271,4 +247,96 @@ pub fn run() -> anyhow::Result<Report> {
         shards_replied,
         exit_clean: true,
     })
+}
+
+fn validated_total(
+    report: &ScatterGatherReport<ShardCounterReply, ShardId>,
+) -> anyhow::Result<u64> {
+    if report.outcomes.len() != SHARD_RAW_IDS.len() {
+        anyhow::bail!(
+            "scatter report had {} rows for {} targets",
+            report.outcomes.len(),
+            SHARD_RAW_IDS.len()
+        );
+    }
+    report
+        .outcomes
+        .iter()
+        .zip(SHARD_RAW_IDS.iter().zip(SEED_VALUES))
+        .try_fold(
+            0u64,
+            |sum, ((target, outcome), (expected_shard, expected_value))| match outcome {
+                ScatterGatherTargetOutcome::Replied(reply)
+                    if target.get() == *expected_shard
+                        && reply.shard == *target
+                        && reply.value == expected_value =>
+                {
+                    Some(sum + reply.value)
+                }
+                ScatterGatherTargetOutcome::Replied(_)
+                | ScatterGatherTargetOutcome::Full
+                | ScatterGatherTargetOutcome::Closed
+                | ScatterGatherTargetOutcome::Timeout
+                | ScatterGatherTargetOutcome::Rejected(_)
+                | ScatterGatherTargetOutcome::AggregateTimeout
+                | ScatterGatherTargetOutcome::MissingShard => None,
+            },
+        )
+        .ok_or_else(|| anyhow::anyhow!("scatter report was partial or misrouted: {report:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn complete_report() -> ScatterGatherReport<ShardCounterReply, ShardId> {
+        ScatterGatherReport {
+            config: ScatterGatherConfig {
+                max_targets: SHARD_RAW_IDS.len(),
+                collector_capacity: SHARD_RAW_IDS.len(),
+                per_target_timeout: TARGET_TIMEOUT,
+                aggregate_timeout: AGGREGATE_TIMEOUT,
+            },
+            outcomes: SHARD_RAW_IDS
+                .iter()
+                .copied()
+                .zip(SEED_VALUES)
+                .map(|(shard, value)| {
+                    let shard = ShardId::new(shard);
+                    (
+                        shard,
+                        ScatterGatherTargetOutcome::Replied(ShardCounterReply { shard, value }),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn report_validation_rejects_reordering_misrouting_and_wrong_values() {
+        let report = complete_report();
+        assert_eq!(validated_total(&report).unwrap(), SEED_VALUES.iter().sum());
+
+        let mut reordered = complete_report();
+        reordered.outcomes.swap(0, 1);
+        assert!(validated_total(&reordered).is_err());
+
+        let mut misrouted = complete_report();
+        let ScatterGatherTargetOutcome::Replied(reply) = &mut misrouted.outcomes[0].1 else {
+            unreachable!()
+        };
+        reply.shard = ShardId::new(SHARD_RAW_IDS[1]);
+        assert!(validated_total(&misrouted).is_err());
+
+        let mut wrong_value = complete_report();
+        let ScatterGatherTargetOutcome::Replied(reply) = &mut wrong_value.outcomes[0].1 else {
+            unreachable!()
+        };
+        reply.value += 1;
+        assert!(validated_total(&wrong_value).is_err());
+
+        let mut partial = complete_report();
+        partial.outcomes[0].1 = ScatterGatherTargetOutcome::AggregateTimeout;
+        assert!(validated_total(&partial).is_err());
+    }
 }

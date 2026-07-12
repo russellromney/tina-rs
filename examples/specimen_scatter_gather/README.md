@@ -1,11 +1,9 @@
 # specimen_scatter_gather
 
-A coordinator service that receives client queries, fans each query
-out to N workers in parallel, gathers the per-worker results, and
-replies to the original client with the aggregate. Workers reply
-out of order. Tokio uses `tokio::spawn` + `mpsc` + `oneshot`. Tina
-uses one `Coordinator` isolate with `PendingReplies` +
-`DeferredReply` and an `Effect::Batch` of runtime calls per query.
+A coordinator receives concurrent client queries, fans each one out to four
+workers, retains exhaustive per-worker outcomes, and replies to the original
+caller. Tokio uses spawned tasks, channels, and per-query oneshots. Tina uses a
+bounded `ScatterGatherOperations` owner.
 
 ## Run
 
@@ -17,109 +15,85 @@ cargo run --manifest-path examples/specimen_scatter_gather/Cargo.toml -- tina
 
 Both sides report:
 
-```
+```text
 side=tokio clients=6 workers=4 ok=6 wrong=0 failed=0 exit_clean=true
 side=tina  clients=6 workers=4 ok=6 wrong=0 failed=0 exit_clean=true
 ```
 
-## Read
-
-- [`src/tokio_impl.rs`](src/tokio_impl.rs) — workers as tasks behind
-  `mpsc`, coordinator task that spawns one fan-out sub-task per
-  query, oneshot per query for the aggregate.
-- [`src/tina_impl.rs`](src/tina_impl.rs) — `Coordinator` isolate with
-  `PendingReplies<u64, AggregateReply>::with_capacity(MAX_IN_FLIGHT)`,
-  one `DeferredReply` captured per query, `Effect::Batch` of N
-  runtime calls per fan-out, gather via `WorkerDone` continuations.
+Read [`src/tokio_impl.rs`](src/tokio_impl.rs) and
+[`src/tina_impl.rs`](src/tina_impl.rs) top to bottom.
 
 ## Tokio shape
 
-The coordinator owns one `mpsc::Receiver<CoordReq>`. For each
-admitted query it spawns a sub-task that fans out to every worker
-and joins the per-worker oneshots. The query's own `oneshot::Sender`
-travels with the request, so there is no `HashMap<RequestId,
-oneshot::Sender>` — a small win against the most obvious anti-pattern.
+The coordinator owns one bounded `mpsc::Receiver`. Each admitted query spawns
+a task that sends to every worker and joins per-worker oneshots. The query's
+reply oneshot travels with it, so there is no global request-id map.
 
-What is *not* bounded:
-
-- Spawned sub-tasks per query — there is no named cap. The
-  coordinator's `mpsc` inbox bounds incoming queries, but once a
-  query is admitted the sub-task lives until `join_all` finishes.
-- Total parallelism is whatever the Tokio runtime + FD limits + per-
-  worker `mpsc(8)` happen to allow. None of those numbers appear in
-  the coordinator's API.
+The inbox is bounded, but admitted fanout tasks and their total parallelism do
+not have a named cap in the coordinator's state.
 
 ## Tina shape
 
-The coordinator accepts external requests through `handle_call`.
-It parks the caller with `PendingReplies::park_call(qid, call_ctx)`.
-On admission failure (`Full`) it answers the caller immediately with
-`call.reply(AggregateReply::Full)`; the slot ceremony is conditional
-on capacity and never strands the caller. The successful aggregate is
-`AggregateReply::Ok(sum)`.
-
-Each admitted query becomes:
+The coordinator owns the worker addresses and one bounded operation owner:
 
 ```rust
-Effect::Batch(workers.iter().map(|w| {
-    Effect::Io(RuntimeCall::isolate_call(
-        *w,
-        WorkerMsg::Do(payload),
-        QUERY_TIMEOUT,
-        move |outcome| CoordMsg::WorkerDone(qid, outcome),
-    ))
-}).collect())
+struct Coordinator {
+    workers: Vec<Address<WorkerMsg, WorkerReply>>,
+    operations: ScatterGatherOperations<usize, WorkerReply, AggregateReply>,
+}
 ```
 
-Worker replies arrive interleaved across queries. `WorkerDone(qid,
-outcome)` looks up the partial entry, accumulates the sum, and when
-the last per-query reply lands:
+Each request supplies a bounded target list and typed cancelable call factory:
 
 ```rust
-let slot = self.pending.take(&qid).unwrap();
-return reply_to(slot, AggregateReply::Ok(done.sum));
+self.operations.start_service(
+    request,
+    config,
+    targets,
+    move |worker, timeout| call_cancelable(worker, WorkerMsg::Do(payload), timeout),
+    CoordEvent::Scatter,
+)
 ```
 
-What is bounded by name:
+Replies, aggregate expiry, and cancellation settlement all use the same event
+variant:
 
-- `MAX_IN_FLIGHT` is the named cap on captured callers.
-- Each worker isolate has its own mailbox capacity.
-- Each runtime call has an explicit `QUERY_TIMEOUT`.
+```rust
+let advance = self.operations.advance_service(event, CoordEvent::Scatter)?;
+if let Some(done) = advance.completed {
+    reply_to(done.request, AggregateReply::Complete(done.report))
+}
+```
+
+`MAX_IN_FLIGHT` bounds concurrent aggregates. `ScatterGatherConfig` bounds
+targets and names per-target and aggregate deadlines. Each operation owns the
+original `RequestContext`, child cancellation authority, caller target order,
+and terminal rows. Admission past the operation cap returns the untouched
+caller and becomes `AggregateReply::Full`.
+
+The completed report keeps `Replied`, `Full`, `Closed`, `Timeout`, `Rejected`,
+`AggregateTimeout`, and `MissingShard` distinct. Only the driver decides
+whether those exhaustive rows form a successful aggregate.
 
 ## Discussion
 
-What feels different:
+What improves over manual coordination:
 
-- **The cap has a name.** Tokio's bound is "however many sub-tasks
-  the runtime can hold up", which is fine until it isn't. Tina's
-  pending box is `MAX_IN_FLIGHT`; admission past the cap turns into
-  a typed `Full` reply the caller sees.
-- **Slot ceremony rides with the policy decision.** Tokio splits
-  "should we admit this?" (mpsc backpressure) from "where does the
-  reply go?" (oneshot in the request). They happen to compose, but
-  there is no single place that says "I am storing this caller's
-  promise." Tina's `try_capture` makes that explicit and fails
-  visibly when the box is full.
-- **Out-of-order is the same on both sides.** Tokio handles it via
-  per-query oneshots and `join_all`; Tina handles it via
-  `qid` correlation in `WorkerDone`. Same idea, different shapes.
+- There is no application qid, pending-reply table, partial-row vector, or
+  lookup/removal protocol to keep synchronized.
+- Opaque operation and branch tokens route out-of-order replies and reject
+  stale continuations.
+- Aggregate expiry marks only unfinished rows and withholds caller authority
+  until emitted cancellation work settles.
+- A capacity-one live test proves excess callers receive typed `Full`, the
+  retired slot admits a refill, and no caller remains stranded at shutdown.
 
-What Tina costs you here:
+Tina still spells domain messages and reply types that Tokio can leave inside
+task-local channel types. In return, the concurrency cap, authority ownership,
+timeouts, cancellation, and terminal outcomes are all visible in the service
+contract.
 
-- **More message types.** `WorkerMsg`, `CoordMsg`, `DriverMsg` plus
-  three reply types are explicit. Tokio's
-  `Vec<oneshot::Receiver<u64>>` skips the message-type ceremony.
-- **The `qid` is yours to manage.** Tokio's per-query oneshot lives
-  on the query's stack frame. Tina's per-query state lives in the
-  isolate, keyed by an integer you assigned. Plenty of room for
-  off-by-one if the partial-state vec and the pending box drift.
-
-What Tina closes here:
-
-- **No `Arc<Mutex<HashMap<RequestId, OneShot>>>`.** The pending box
-  is a single named container with a hard cap, sweep, and visible
-  counters (`high_water`, `full_rejects`, `reclaimed`,
-  `duplicate_keys`).
-- **Caller liveness is a runtime fact.** A timed-out caller's slot
-  closes with a terminal `DeferredReplyRejected{CallerClosed}`
-  trace event before the next admission check sweeps it.
+The coordinator API is backend-neutral. The repository parity suite runs this
+same `start_service` / `advance_service` authoring form on the live, threaded,
+multi-shard, and simulator owners; this specimen stays focused on the live
+application path instead of duplicating that matrix.

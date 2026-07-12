@@ -1,8 +1,7 @@
-//! Tina: a `Coordinator` isolate that captures one
-//! [`tina::DeferredReply`] per inbound client query, dispatches a
-//! runtime call to each worker, gathers per-target replies, and
-//! answers the client through the captured slot. The pending box
-//! has a named cap (`MAX_IN_FLIGHT`) and visible counters.
+//! Tina: a `Coordinator` isolate owns a bounded collection of typed
+//! scatter/gather operations. Each operation owns its original caller,
+//! child cancellation authority, ordered target outcomes, and aggregate
+//! deadline. The application supplies targets and folds the completed report.
 //!
 //! Driver: one `Driver` isolate batches `CLIENTS` parallel calls
 //! against the coordinator, accumulates outcomes, and `stop_with`s
@@ -13,9 +12,11 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use tina::prelude::*;
+use tina_runtime::sharded::{ScatterGatherConfig, ScatterGatherReport, ScatterGatherTargetOutcome};
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ParkError, PendingReplies, ThreadedRuntime,
-    call_request, request_effect_after_park,
+    BoundedItems, CallOutcome, DefaultThreadedMailboxFactory, ScatterGatherEvent,
+    ScatterGatherOperations, ScatterGatherOperationsStart, ScatterGatherStartError,
+    ThreadedRuntime, call_cancelable, call_request,
 };
 
 use crate::{CLIENTS, MAX_IN_FLIGHT, Report, WORKERS, expected_aggregate};
@@ -30,7 +31,10 @@ enum WorkerMsg {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct WorkerReply(u64);
+struct WorkerReply {
+    worker: usize,
+    value: u64,
+}
 
 struct Worker {
     id: u64,
@@ -54,17 +58,19 @@ impl Worker {
 impl Worker {
     fn apply(&self, msg: WorkerMsg) -> WorkerReply {
         match msg {
-            WorkerMsg::Do(payload) => WorkerReply(payload.wrapping_add(self.id)),
+            WorkerMsg::Do(payload) => WorkerReply {
+                worker: self.id as usize,
+                value: payload.wrapping_add(self.id),
+            },
         }
     }
 }
 
 // --- Coordinator ----------------------------------------------------------
 
-/// Internal event: one worker's per-query reply, never caller authority.
 #[derive(Debug)]
 enum CoordEvent {
-    WorkerDone(u64, CallOutcome<WorkerReply>),
+    Scatter(ScatterGatherEvent<usize, WorkerReply>),
 }
 
 /// Caller-authority request: the only thing an outside caller can ask.
@@ -73,26 +79,16 @@ enum CoordRequest {
     Query(u64),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AggregateReply {
-    /// Sum of per-worker contributions for this query.
-    Ok(u64),
-    /// Coordinator's pending box was full; query was not admitted.
-    Full,
-}
-
 #[derive(Debug)]
-struct PartialQuery {
-    qid: u64,
-    sum: u64,
-    remaining: usize,
+enum AggregateReply {
+    Complete(ScatterGatherReport<WorkerReply, usize>),
+    Full,
+    StartRejected(ScatterGatherStartError<usize>),
 }
 
 struct Coordinator {
     workers: Vec<Address<WorkerMsg, WorkerReply>>,
-    pending: PendingReplies<u64, AggregateReply>,
-    next_qid: u64,
-    partials: Vec<PartialQuery>,
+    operations: ScatterGatherOperations<usize, WorkerReply, AggregateReply>,
 }
 
 #[tina_runtime::isolate(event = CoordEvent, request = CoordRequest, reply = AggregateReply)]
@@ -102,24 +98,23 @@ impl Coordinator {
         event: CoordEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match event {
-            CoordEvent::WorkerDone(qid, outcome) => {
-                let Some(idx) = self.partials.iter().position(|p| p.qid == qid) else {
-                    return noop();
-                };
-                let partial = &mut self.partials[idx];
-                if let CallOutcome::Replied(WorkerReply(v)) = outcome {
-                    partial.sum = partial.sum.wrapping_add(v);
-                }
-                partial.remaining -= 1;
-                if partial.remaining == 0 {
-                    let done = self.partials.remove(idx);
-                    if let Some(slot) = self.pending.take(&qid) {
-                        return reply_to(slot, AggregateReply::Ok(done.sum));
-                    }
-                }
-                noop()
-            }
+        let CoordEvent::Scatter(event) = event;
+        let Some(advance) = self
+            .operations
+            .advance_service::<Self, _, _, _>(event, CoordEvent::Scatter)
+            .unwrap_or_else(|error| panic!("scatter continuation violated authority: {error:?}"))
+        else {
+            return noop();
+        };
+        match advance.completed {
+            Some(completed) => Effect::Batch(vec![
+                advance.effect,
+                reply_to(
+                    completed.request,
+                    AggregateReply::Complete(completed.report),
+                ),
+            ]),
+            None => advance.effect,
         }
     }
 
@@ -129,35 +124,42 @@ impl Coordinator {
         call: RequestCall<'_, Self>,
     ) -> RequestEffect<Self> {
         match request {
-            CoordRequest::Query(payload) => {
-                let qid = self.next_qid;
-                self.next_qid += 1;
-                match self.pending.park_request(qid, call) {
-                    Ok((_ticket, permit)) => {
-                        self.partials.push(PartialQuery {
-                            qid,
-                            sum: 0,
-                            remaining: self.workers.len(),
-                        });
-                        let calls: Vec<_> = self
-                            .workers
-                            .iter()
-                            .map(|w| {
-                                tina_runtime::call(*w, WorkerMsg::Do(payload), QUERY_TIMEOUT)
-                                    .then_service_event(move |outcome| {
-                                        CoordEvent::WorkerDone(qid, outcome)
-                                    })
-                            })
-                            .collect();
-                        request_effect_after_park(permit, Effect::Batch(calls))
-                    }
-                    // Pending box full: reply Full to the caller
-                    // without capturing. The caller observes a typed
-                    // overload distinct from a successful aggregate.
-                    Err(ParkError::Full { call, .. }) => call.reply(AggregateReply::Full),
-                    Err(ParkError::DuplicateKey { call, .. }) => call.reply(AggregateReply::Full),
+            CoordRequest::Query(payload) => call.capture(|request| {
+                let config = ScatterGatherConfig {
+                    max_targets: self.workers.len(),
+                    collector_capacity: self.workers.len(),
+                    per_target_timeout: QUERY_TIMEOUT,
+                    aggregate_timeout: QUERY_TIMEOUT,
+                };
+                let targets = BoundedItems::try_from_iter(
+                    config.max_targets,
+                    self.workers
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .map(|(key, worker)| (key, Some(worker))),
+                )
+                .expect("worker list defines the scatter target cap");
+                match self.operations.start_service::<Self, _, _, _, _, _, _>(
+                    request,
+                    config,
+                    targets,
+                    move |worker, timeout| call_cancelable(worker, WorkerMsg::Do(payload), timeout),
+                    CoordEvent::Scatter,
+                ) {
+                    Ok(ScatterGatherOperationsStart::Running(effect)) => effect,
+                    Ok(ScatterGatherOperationsStart::Ready(completed)) => reply_to(
+                        completed.request,
+                        AggregateReply::Complete(completed.report),
+                    ),
+                    Err(failure) => match failure.error {
+                        ScatterGatherStartError::OperationsFull { .. } => {
+                            reply_to(failure.request, AggregateReply::Full)
+                        }
+                        error => reply_to(failure.request, AggregateReply::StartRejected(error)),
+                    },
                 }
-            }
+            }),
         }
     }
 }
@@ -169,12 +171,20 @@ struct DriverOutcome {
     correct: usize,
     wrong: usize,
     failed: usize,
+    coordinator_full: usize,
+    coordinator_mailbox_full: usize,
+    coordinator_closed: usize,
+    coordinator_timeout: usize,
+    coordinator_rejected: usize,
+    start_rejected: usize,
+    refill_correct: usize,
 }
 
 #[derive(Debug)]
 enum DriverMsg {
     Begin,
     Returned(usize, CallOutcome<AggregateReply>),
+    RefillReturned(u64, CallOutcome<AggregateReply>),
 }
 
 struct Driver {
@@ -182,6 +192,7 @@ struct Driver {
     payloads: Vec<u64>,
     remaining: usize,
     outcome: DriverOutcome,
+    refill_payload: Option<u64>,
 }
 
 #[tina_runtime::isolate(message = DriverMsg)]
@@ -209,29 +220,125 @@ impl Driver {
             DriverMsg::Returned(i, outcome) => {
                 let payload = self.payloads[i];
                 match outcome {
-                    CallOutcome::Replied(AggregateReply::Ok(sum))
-                        if sum == expected_aggregate(payload) =>
+                    CallOutcome::Replied(AggregateReply::Complete(report))
+                        if aggregate_sum(&report, payload) == Some(expected_aggregate(payload)) =>
                     {
                         self.outcome.correct += 1;
                     }
-                    CallOutcome::Replied(AggregateReply::Ok(_)) => self.outcome.wrong += 1,
-                    CallOutcome::Replied(AggregateReply::Full) => self.outcome.failed += 1,
-                    _ => self.outcome.failed += 1,
+                    CallOutcome::Replied(AggregateReply::Complete(_)) => self.outcome.wrong += 1,
+                    CallOutcome::Replied(AggregateReply::Full) => {
+                        self.outcome.coordinator_full += 1;
+                        self.outcome.failed += 1;
+                    }
+                    CallOutcome::Replied(AggregateReply::StartRejected(error)) => {
+                        let _ = error;
+                        self.outcome.start_rejected += 1;
+                        self.outcome.failed += 1;
+                    }
+                    CallOutcome::Full => {
+                        self.outcome.coordinator_mailbox_full += 1;
+                        self.outcome.failed += 1;
+                    }
+                    CallOutcome::Closed => {
+                        self.outcome.coordinator_closed += 1;
+                        self.outcome.failed += 1;
+                    }
+                    CallOutcome::Timeout => {
+                        self.outcome.coordinator_timeout += 1;
+                        self.outcome.failed += 1;
+                    }
+                    CallOutcome::Rejected(_) => {
+                        self.outcome.coordinator_rejected += 1;
+                        self.outcome.failed += 1;
+                    }
                 }
                 self.remaining -= 1;
                 if self.remaining == 0 {
-                    stop_with(self.outcome)
+                    if let Some(payload) = self.refill_payload.take() {
+                        call_request(self.coord, CoordRequest::Query(payload), QUERY_TIMEOUT)
+                            .then(move |outcome| DriverMsg::RefillReturned(payload, outcome))
+                    } else {
+                        stop_with(self.outcome)
+                    }
                 } else {
                     noop()
                 }
+            }
+            DriverMsg::RefillReturned(payload, outcome) => {
+                match outcome {
+                    CallOutcome::Replied(AggregateReply::Complete(report))
+                        if aggregate_sum(&report, payload) == Some(expected_aggregate(payload)) =>
+                    {
+                        self.outcome.refill_correct += 1;
+                    }
+                    CallOutcome::Replied(AggregateReply::Complete(_)) => self.outcome.wrong += 1,
+                    CallOutcome::Replied(AggregateReply::Full) => {
+                        self.outcome.coordinator_full += 1;
+                        self.outcome.failed += 1;
+                    }
+                    CallOutcome::Replied(AggregateReply::StartRejected(error)) => {
+                        let _ = error;
+                        self.outcome.start_rejected += 1;
+                        self.outcome.failed += 1;
+                    }
+                    CallOutcome::Full => {
+                        self.outcome.coordinator_mailbox_full += 1;
+                        self.outcome.failed += 1;
+                    }
+                    CallOutcome::Closed => {
+                        self.outcome.coordinator_closed += 1;
+                        self.outcome.failed += 1;
+                    }
+                    CallOutcome::Timeout => {
+                        self.outcome.coordinator_timeout += 1;
+                        self.outcome.failed += 1;
+                    }
+                    CallOutcome::Rejected(_) => {
+                        self.outcome.coordinator_rejected += 1;
+                        self.outcome.failed += 1;
+                    }
+                }
+                stop_with(self.outcome)
             }
         }
     }
 }
 
+fn aggregate_sum(report: &ScatterGatherReport<WorkerReply, usize>, payload: u64) -> Option<u64> {
+    if report.outcomes.len() != WORKERS {
+        return None;
+    }
+    report.outcomes.iter().enumerate().try_fold(
+        0u64,
+        |sum, (expected_worker, (target, outcome))| match outcome {
+            ScatterGatherTargetOutcome::Replied(reply)
+                if *target == expected_worker
+                    && reply.worker == expected_worker
+                    && reply.value == payload.wrapping_add(expected_worker as u64) =>
+            {
+                Some(sum.wrapping_add(reply.value))
+            }
+            ScatterGatherTargetOutcome::Replied(_)
+            | ScatterGatherTargetOutcome::Full
+            | ScatterGatherTargetOutcome::Closed
+            | ScatterGatherTargetOutcome::Timeout
+            | ScatterGatherTargetOutcome::Rejected(_)
+            | ScatterGatherTargetOutcome::AggregateTimeout
+            | ScatterGatherTargetOutcome::MissingShard => None,
+        },
+    )
+}
+
 // --- Run ------------------------------------------------------------------
 
 pub fn run() -> anyhow::Result<Report> {
+    run_with_max_in_flight(MAX_IN_FLIGHT, false).map(|(report, _)| report)
+}
+
+fn run_with_max_in_flight(
+    max_in_flight: usize,
+    prove_refill: bool,
+) -> anyhow::Result<(Report, DriverOutcome)> {
     let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
 
     let mut workers = Vec::with_capacity(WORKERS);
@@ -246,9 +353,7 @@ pub fn run() -> anyhow::Result<Report> {
         .register_split_service::<Coordinator, CoordEvent, CoordRequest, Infallible>(
             Coordinator {
                 workers,
-                pending: PendingReplies::with_capacity(MAX_IN_FLIGHT),
-                next_qid: 1,
-                partials: Vec::with_capacity(MAX_IN_FLIGHT),
+                operations: ScatterGatherOperations::with_capacity(max_in_flight),
             },
             32,
         )
@@ -265,6 +370,7 @@ pub fn run() -> anyhow::Result<Report> {
                 payloads,
                 remaining: CLIENTS,
                 outcome: DriverOutcome::default(),
+                refill_payload: prove_refill.then_some(CLIENTS as u64 * 7 + 11),
             },
             32,
         )
@@ -282,12 +388,92 @@ pub fn run() -> anyhow::Result<Report> {
 
     runtime.shutdown_report().ensure_clean()?;
 
-    Ok(Report {
-        clients: CLIENTS,
-        workers: WORKERS,
-        aggregates_correct: outcome.correct,
-        aggregates_wrong: outcome.wrong,
-        failed: outcome.failed,
-        exit_clean: true,
-    })
+    Ok((
+        Report {
+            clients: CLIENTS,
+            workers: WORKERS,
+            aggregates_correct: outcome.correct,
+            aggregates_wrong: outcome.wrong,
+            failed: outcome.failed,
+            exit_clean: true,
+        },
+        outcome,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn complete_report(payload: u64) -> ScatterGatherReport<WorkerReply, usize> {
+        ScatterGatherReport {
+            config: ScatterGatherConfig {
+                max_targets: WORKERS,
+                collector_capacity: WORKERS,
+                per_target_timeout: QUERY_TIMEOUT,
+                aggregate_timeout: QUERY_TIMEOUT,
+            },
+            outcomes: (0..WORKERS)
+                .map(|worker| {
+                    (
+                        worker,
+                        ScatterGatherTargetOutcome::Replied(WorkerReply {
+                            worker,
+                            value: payload + worker as u64,
+                        }),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn aggregate_validation_rejects_reordering_misrouting_and_wrong_values() {
+        let payload = 11;
+        let report = complete_report(payload);
+        assert_eq!(
+            aggregate_sum(&report, payload),
+            Some(expected_aggregate(payload))
+        );
+
+        let mut reordered = complete_report(payload);
+        reordered.outcomes.swap(0, 1);
+        assert_eq!(aggregate_sum(&reordered, payload), None);
+
+        let mut misrouted = complete_report(payload);
+        let ScatterGatherTargetOutcome::Replied(reply) = &mut misrouted.outcomes[0].1 else {
+            unreachable!()
+        };
+        reply.worker = 1;
+        assert_eq!(aggregate_sum(&misrouted, payload), None);
+
+        let mut wrong_value = complete_report(payload);
+        let ScatterGatherTargetOutcome::Replied(reply) = &mut wrong_value.outcomes[0].1 else {
+            unreachable!()
+        };
+        reply.value += 1;
+        assert_eq!(aggregate_sum(&wrong_value, payload), None);
+
+        let mut partial = complete_report(payload);
+        partial.outcomes[0].1 = ScatterGatherTargetOutcome::Timeout;
+        assert_eq!(aggregate_sum(&partial, payload), None);
+    }
+
+    #[test]
+    fn operation_capacity_returns_typed_full_without_stranding_callers() {
+        let (report, outcome) =
+            run_with_max_in_flight(1, true).expect("capacity-one run completed");
+        assert_eq!(report.aggregates_correct, 1);
+        assert_eq!(report.aggregates_wrong, 0);
+        assert_eq!(report.failed, CLIENTS - 1);
+        assert_eq!(outcome.coordinator_full, CLIENTS - 1);
+        assert_eq!(outcome.refill_correct, 1);
+        assert_eq!(outcome.coordinator_mailbox_full, 0);
+        assert_eq!(outcome.coordinator_closed, 0);
+        assert_eq!(outcome.coordinator_timeout, 0);
+        assert_eq!(outcome.coordinator_rejected, 0);
+        assert_eq!(outcome.start_rejected, 0);
+        assert_eq!(outcome.correct + outcome.wrong + outcome.failed, CLIENTS);
+        assert!(report.exit_clean);
+    }
 }

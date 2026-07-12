@@ -7,11 +7,9 @@
 //! - Tokio: `Vec<Arc<Mutex<u64>>>`. The reader iterates the array and
 //!   sums under each lock. Placement is "the array index"; nothing
 //!   structurally prevents wrong-shard access.
-//! - Tina: per-shard `ShardCounter` isolate, `ShardPlacement` +
-//!   `ShardServiceTable`, a `ScatterCoord` that fans `Get` out to
-//!   every shard via `send` (with a `ReplyAdapter` translating the
-//!   shard's typed reply into the coord's own message), accumulates
-//!   into a `ScatterGatherReport<u64>`, and ends with `stop_with(report)`.
+//! - Tina: request-only per-shard `ShardCounter` services behind a
+//!   `ShardRequestServiceTable`, plus one bounded `ScatterGatherOperations`
+//!   owner that preserves target order and every terminal outcome.
 //!
 //! Both sides produce the same [`Report`].
 
