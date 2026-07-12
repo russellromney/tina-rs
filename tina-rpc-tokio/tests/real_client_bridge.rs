@@ -127,7 +127,9 @@ async fn bridge_drives_real_client_against_real_server_over_tcp() {
         )
         .expect("register listener");
 
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register listener bind observer");
     runtime
         .try_send(listener, ListenerMsg::Start)
         .expect("start listener");

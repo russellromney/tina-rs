@@ -332,7 +332,9 @@ fn service_call_timeout_returns_504_on_the_wire() {
             8,
         )
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime
         .try_send(listener, HttpListenerMsg::Start)
         .expect("send Start");

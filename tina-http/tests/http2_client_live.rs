@@ -75,7 +75,9 @@ fn start_server() -> (
             config.listener_mailbox_capacity,
         )
         .expect("register http2 listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime
         .try_send(listener, Http2ListenerMsg::Start)
         .expect("start listener");
@@ -316,7 +318,9 @@ fn h2c_post_in_window_body_round_trips_against_real_server() {
             config.listener_mailbox_capacity,
         )
         .expect("register http2 listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime
         .try_send(listener, Http2ListenerMsg::Start)
         .expect("start listener");
@@ -582,7 +586,9 @@ fn h2c_open_stream_reassembles_multi_frame_response_body() {
             config.listener_mailbox_capacity,
         )
         .expect("register http2 listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime
         .try_send(listener, Http2ListenerMsg::Start)
         .expect("start listener");

@@ -302,18 +302,29 @@ impl<M: fmt::Debug> Error for RegisterBootstrapError<M> {}
 
 /// Threaded mirror of [`RegisterBootstrapError`].
 ///
-/// Adds [`Self::WorkerStopped`] so the threaded runtime surface can report a
-/// command-channel failure separately from a typed mailbox-prefill refusal.
+/// Adds host-control admission and worker-lifecycle outcomes to the typed
+/// mailbox-prefill refusals. Every failure before command admission returns the
+/// untouched bootstrap message. [`Self::WorkerStopped`] is message-less only
+/// after admission, when the worker may already have consumed the authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThreadedRegisterBootstrapError<M> {
     /// The mailbox refused the bootstrap message because it was already full.
     Full(M),
     /// The mailbox refused the bootstrap message because it had been closed.
     Closed(M),
-    /// The worker thread stopped before it could process the command.
+    /// The bounded worker command queue was full. No registration command was
+    /// admitted and the bootstrap message is returned untouched.
+    CommandFull(M),
+    /// The worker command channel was disconnected before enqueue. No
+    /// registration command was admitted and the bootstrap message is
+    /// returned untouched.
+    CommandClosed(M),
+    /// The worker stopped after command admission but before the host received
+    /// a reply. The command may already have consumed the isolate and
+    /// bootstrap message, so no message authority can be returned.
     WorkerStopped,
     /// A multi-shard operation targeted a shard this runtime does not own.
-    UnknownShard(ShardId),
+    UnknownShard(ShardId, M),
 }
 
 impl<M> fmt::Display for ThreadedRegisterBootstrapError<M> {
@@ -327,11 +338,19 @@ impl<M> fmt::Display for ThreadedRegisterBootstrapError<M> {
                 f,
                 "bootstrap prefill refused: mailbox already closed before registration"
             ),
+            Self::CommandFull(_) => write!(
+                f,
+                "worker command queue full before register-and-bootstrap admission"
+            ),
+            Self::CommandClosed(_) => write!(
+                f,
+                "worker command channel closed before register-and-bootstrap admission"
+            ),
             Self::WorkerStopped => write!(
                 f,
                 "worker thread stopped before it could process register-and-bootstrap"
             ),
-            Self::UnknownShard(shard) => write!(
+            Self::UnknownShard(shard, _) => write!(
                 f,
                 "shard {} is not owned by this multi-shard runtime",
                 shard.get()

@@ -161,7 +161,9 @@ fn proxy_service_forwards_to_upstream_and_replies() {
     let upstream_listener = upstream_runtime
         .register_with_capacity::<HttpListener<TestShard>, _>(upstream_listener_isolate, 8)
         .expect("register upstream listener");
-    let upstream_bound = upstream_runtime.observe_next_bound();
+    let upstream_bound = upstream_runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     upstream_runtime
         .try_send(upstream_listener, HttpListenerMsg::Start)
         .expect("send Start upstream");
@@ -205,7 +207,9 @@ fn proxy_service_forwards_to_upstream_and_replies() {
     let proxy_listener = proxy_runtime
         .register_with_capacity::<HttpListener<TestShard, ProxyMsg>, _>(proxy_listener_isolate, 8)
         .expect("register proxy listener");
-    let proxy_bound = proxy_runtime.observe_next_bound();
+    let proxy_bound = proxy_runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     proxy_runtime
         .try_send(proxy_listener, HttpListenerMsg::Start)
         .expect("send Start proxy");
@@ -296,7 +300,9 @@ fn proxy_service_returns_503_when_outbound_client_is_busy() {
     let proxy_listener = proxy_runtime
         .register_with_capacity::<HttpListener<TestShard, ProxyMsg>, _>(proxy_listener_isolate, 8)
         .expect("register proxy listener");
-    let proxy_bound = proxy_runtime.observe_next_bound();
+    let proxy_bound = proxy_runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     proxy_runtime
         .try_send(proxy_listener, HttpListenerMsg::Start)
         .expect("send Start");

@@ -80,7 +80,7 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
             notify_listener_config.listener_mailbox_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register notify listener: {e:?}"))?;
-    let notify_bound = runtime.observe_next_bound();
+    let notify_bound = runtime.observe_next_bound()?;
     runtime
         .try_send(notify_listener, HttpListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start notify listener: {e:?}"))?;
@@ -133,7 +133,7 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
             main_listener_config.listener_mailbox_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register main listener: {e:?}"))?;
-    let main_bound = runtime.observe_next_bound();
+    let main_bound = runtime.observe_next_bound()?;
     runtime
         .try_send(main_listener, HttpListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start main listener: {e:?}"))?;
@@ -419,7 +419,7 @@ pub fn prove_drain_cancels_active_scope() -> anyhow::Result<crate::DrainActiveRe
             notify_listener_config.listener_mailbox_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register notify listener: {e:?}"))?;
-    let notify_bound = runtime.observe_next_bound();
+    let notify_bound = runtime.observe_next_bound()?;
     runtime
         .try_send(notify_listener, HttpListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start notify listener: {e:?}"))?;
@@ -466,7 +466,7 @@ pub fn prove_drain_cancels_active_scope() -> anyhow::Result<crate::DrainActiveRe
             main_listener_config.listener_mailbox_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register main listener: {e:?}"))?;
-    let main_bound = runtime.observe_next_bound();
+    let main_bound = runtime.observe_next_bound()?;
     runtime
         .try_send(main_listener, HttpListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start main listener: {e:?}"))?;
@@ -860,7 +860,7 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
             notify_listener_config.listener_mailbox_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register notify listener: {e:?}"))?;
-    let notify_bound = runtime.observe_next_bound();
+    let notify_bound = runtime.observe_next_bound()?;
     runtime
         .try_send(notify_listener, HttpListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start notify listener: {e:?}"))?;
@@ -911,7 +911,7 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
             main_listener_config.listener_mailbox_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register main listener: {e:?}"))?;
-    let main_bound = runtime.observe_next_bound();
+    let main_bound = runtime.observe_next_bound()?;
     runtime
         .try_send(main_listener, HttpListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start main listener: {e:?}"))?;

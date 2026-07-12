@@ -716,7 +716,7 @@ impl RoomServer {
             )
             .map_err(|error| anyhow::anyhow!("register listener: {error:?}"))?;
 
-        let bound = runtime.observe_next_bound();
+        let bound = runtime.observe_next_bound()?;
         runtime
             .try_send(listener, HttpListenerMsg::Start)
             .map_err(|error| anyhow::anyhow!("start listener: {error:?}"))?;

@@ -531,7 +531,7 @@ pub fn run() -> anyhow::Result<ScopedTreeReport> {
             8,
         )
         .map_err(|e| anyhow::anyhow!("register listener: {e:?}"))?;
-    let bound = runtime.observe_next_bound();
+    let bound = runtime.observe_next_bound()?;
     runtime
         .try_send(listener, HttpListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start listener: {e:?}"))?;

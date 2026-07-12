@@ -277,7 +277,9 @@ fn main() {
     println!("listening on {local_addr}");
 
     // Register the stop waiter before the listener can close itself.
-    let listener_stopped = runtime.observe_isolate_complete(listener);
+    let listener_stopped = runtime
+        .observe_isolate_complete(listener)
+        .expect("register listener completion observer");
 
     let echoed: Vec<Vec<u8>> = payloads
         .iter()

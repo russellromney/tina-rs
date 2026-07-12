@@ -122,7 +122,7 @@ pub fn run() -> anyhow::Result<Report> {
     let waiters: Vec<_> = stores
         .iter()
         .map(|s| runtime.observe_isolate_complete(*s))
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     // Drain each store with the host-counted admitted total. The
     // mailbox may still hold queued Sets, so retry until accepted.

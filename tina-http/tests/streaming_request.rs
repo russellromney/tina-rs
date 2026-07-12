@@ -186,7 +186,9 @@ fn streaming_request_consumed_chunk_by_chunk() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard, ConsumerMsg>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime
         .try_send(listener, HttpListenerMsg::Start)
         .expect("send Start");
@@ -270,7 +272,9 @@ fn streaming_request_accepts_chunked_encoding() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard, ConsumerMsg>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime
         .try_send(listener, HttpListenerMsg::Start)
         .expect("send Start");
@@ -359,7 +363,9 @@ fn chunked_request_rejected_when_streaming_disabled() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard, ConsumerMsg>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime
         .try_send(listener, HttpListenerMsg::Start)
         .expect("send Start");
@@ -441,7 +447,9 @@ fn streaming_request_dispatches_before_full_body_arrives() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard, NotifyingMsg>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime
         .try_send(listener, HttpListenerMsg::Start)
         .expect("send Start");

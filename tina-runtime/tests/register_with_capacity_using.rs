@@ -269,7 +269,9 @@ fn helpers_compose_self_address_plus_drain_replies_into_stop() {
         })
         .expect("register");
 
-    let stopped = runtime.observe_isolate_complete(front);
+    let stopped = runtime
+        .observe_isolate_complete(front)
+        .expect("register completion observer");
 
     runtime.try_send(front, FrontMsg::Submit(1)).unwrap();
     runtime.try_send(front, FrontMsg::Submit(2)).unwrap();

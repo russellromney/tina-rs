@@ -151,7 +151,9 @@ fn single_shard_macro_default_works_in_threaded_runtime() {
     let sleeper = runtime
         .register_with_capacity::<Sleeper, Infallible>(Sleeper, 8)
         .expect("register sleeper");
-    let done = runtime.observe_isolate_complete(sleeper);
+    let done = runtime
+        .observe_isolate_complete(sleeper)
+        .expect("register completion observer");
     runtime
         .try_send(sleeper, SleeperMsg::Start)
         .expect("kick sleeper");

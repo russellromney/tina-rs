@@ -96,7 +96,9 @@ fn buffered_request_charges_and_releases_resident_body() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
     let addr = bound.wait(Duration::from_secs(2)).expect("bound");
 
@@ -174,7 +176,9 @@ fn oversized_request_increments_body_full_count() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
     let addr = bound.wait(Duration::from_secs(2)).expect("bound");
 
@@ -240,7 +244,9 @@ fn weighted_request_cap_rejects_live_http_before_service_dispatch() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
     let addr = bound.wait(Duration::from_secs(2)).expect("bound");
 
@@ -358,7 +364,9 @@ fn weighted_response_cap_truncates_live_http_and_reports_weight_full() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
     let addr = bound.wait(Duration::from_secs(2)).expect("bound");
 
@@ -574,7 +582,9 @@ fn streaming_request_charges_per_chunk_and_releases_per_pull() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard, StreamMsg>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
     let addr = bound.wait(Duration::from_secs(2)).expect("bound");
 
@@ -669,7 +679,9 @@ fn streaming_request_caps_resident_bytes_at_chunk_size_when_head_and_body_split(
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard, StreamMsg>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
     let addr = bound.wait(Duration::from_secs(2)).expect("bound");
 
@@ -868,7 +880,9 @@ fn streaming_response_charges_per_chunk_and_releases_after_write() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
     let addr = bound.wait(Duration::from_secs(2)).expect("bound");
 
@@ -959,7 +973,9 @@ fn chunked_request_charges_decoded_bytes_and_drains() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard, StreamMsg>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
     let addr = bound.wait(Duration::from_secs(2)).expect("bound");
 
@@ -1061,7 +1077,9 @@ fn streaming_response_under_produces_records_io_error() {
     let listener = runtime
         .register_with_capacity::<HttpListener<TestShard>, _>(listener_isolate, 8)
         .expect("register listener");
-    let bound = runtime.observe_next_bound();
+    let bound = runtime
+        .observe_next_bound()
+        .expect("register bind observer");
     runtime.try_send(listener, HttpListenerMsg::Start).unwrap();
     let addr = bound.wait(Duration::from_secs(2)).expect("bound");
 

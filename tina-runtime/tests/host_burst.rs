@@ -300,7 +300,9 @@ fn try_send_outcome_marks_mailbox_closed_after_stop() {
         )
         .expect("register slow");
 
-    let stopped = runtime.observe_isolate_complete(worker);
+    let stopped = runtime
+        .observe_isolate_complete(worker)
+        .expect("register completion observer");
     runtime.try_send(worker, SlowMsg::Stop).expect("kick stop");
     stopped.wait(Duration::from_secs(3)).expect("worker stops");
 
@@ -567,7 +569,9 @@ fn send_observed_until_returns_closed_when_target_stopped() {
         )
         .expect("register slow");
 
-    let stopped = runtime.observe_isolate_complete(worker);
+    let stopped = runtime
+        .observe_isolate_complete(worker)
+        .expect("register completion observer");
     runtime.try_send(worker, SlowMsg::Stop).expect("stop");
     stopped.wait(Duration::from_secs(3)).expect("worker stops");
 
@@ -684,7 +688,9 @@ fn send_observed_until_does_not_retry_closed() {
         )
         .expect("register slow");
 
-    let stopped = runtime.observe_isolate_complete(worker);
+    let stopped = runtime
+        .observe_isolate_complete(worker)
+        .expect("register completion observer");
     runtime.try_send(worker, SlowMsg::Stop).expect("kick stop");
     stopped.wait(Duration::from_secs(3)).expect("worker stops");
 
