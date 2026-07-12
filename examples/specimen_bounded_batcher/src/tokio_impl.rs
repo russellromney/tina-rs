@@ -4,7 +4,7 @@ use tokio::runtime::Builder;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
-use crate::{BATCH_SIZE, BATCH_TIMEOUT_MS, CALLERS, Report};
+use crate::{BATCH_SIZE, BATCH_TIMEOUT_MS, CALLERS, Report, SUBMISSION_CAPACITY};
 
 type Job = (u64, oneshot::Sender<u64>);
 
@@ -14,7 +14,7 @@ pub fn run() -> anyhow::Result<Report> {
         .enable_all()
         .build()?;
     rt.block_on(async {
-        let (tx, mut rx) = mpsc::channel::<Job>(64);
+        let (tx, mut rx) = mpsc::channel::<Job>(SUBMISSION_CAPACITY);
 
         let batcher = tokio::spawn(async move {
             let mut items: Vec<u64> = Vec::with_capacity(BATCH_SIZE);

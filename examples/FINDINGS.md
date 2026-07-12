@@ -965,6 +965,28 @@ collapsing every timer failure into one flag, and uses `LocalSystem` for
 startup, registration, result observation, typed ingress, and terminal
 shutdown. No framework prerequisite was needed.
 
+### 2026-07-12 Bounded batcher synthetic reply correlation
+
+`specimen_bounded_batcher` now uses `SharedWork<u64, BatcherReply>` keyed by
+the honest batch generation. `SharedWork::wait` owns each `RequestCall`, and
+`reply_all_clone` settles every live waiter for a flushed generation. This
+removes the monotonic `qid`, `PendingReplies<qid, _>`, and parallel `qids`
+vector without replacing them with example-local glue. The item vector is the
+only batch payload state; caller timeout reclaims reply capacity without
+silently retracting accepted work.
+
+The specimen also moved from a driver isolate over raw `ThreadedRuntime` to
+typed host requests through fallibly built `LocalSystem`, exhaustive
+`CallOutcome` and outer host-control accounting, and bounded terminal-report shutdown. Direct tests
+cover size/timer flushes, global `Full`, caller-gone reclamation and refill,
+post-`Full` refill, stale success/error invalidation, typed timer-failure settlement and refill, exact
+capacity counters, and clean shutdown. This also closes the old timer-error
+`noop` path that abandoned accepted callers until their individual deadlines.
+
+**Framework result:** the current `SharedWork` FIFO/all-waiter API is
+sufficient. No new batch-specific abstraction or example-local adapter is
+needed.
+
 ### 13. Tina-owned database client (`tina-sqlx-bridge`) — closed
 
 **Surfaced by:** `specimen_sqlite_counter`.
