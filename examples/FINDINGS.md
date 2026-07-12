@@ -11,6 +11,24 @@ valid; the long-form history lives in
 
 ## Active
 
+### 2026-07-12 Copied service path flow migration
+
+The canonical `system_copied_service_path` now uses `LocalSystem` and a
+request-aware raw flow for its held work. The flow carries the original
+`RequestContext`, durable record id, `SharedLease`, and exhaustive `SleepReply`
+without qids, `GuardedPendingReplies`, a redundant pending-capacity knob,
+take/reinsert logic, or manual service envelopes. The shared scope remains the
+honest bound on parked requests. Closed callers release before arming work;
+caller loss, timer failure, and owner stop all settle the move-only lease.
+
+Load callers and the Stats host call distinguish every `CallOutcome`; typed
+work failures retain their `CallError` class, including `TimerFull`, and outer
+host errors remain separate. The application facade is fallible. Registration,
+reporting, and proof failures cannot bypass terminal shutdown, and the final
+scope snapshot proves admitted equals released with zero current authority.
+This applies the request-aware flow to the first service new users are told to
+copy.
+
 ### 2026-07-12 Request-aware raw flow prerequisite
 
 `flow!` now accepts `-> raw request T` for typed timer and runtime-I/O

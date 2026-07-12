@@ -65,3 +65,70 @@ fn copied_service_path_smoke() {
         report.summary_line
     );
 }
+
+#[test]
+fn caller_timeout_still_settles_linear_authority() {
+    let config = RunConfig {
+        capacity: 1,
+        work_ms: 30,
+        callers: 1,
+        call_timeout_ms: 1,
+        ..RunConfig::default()
+    };
+    let report = run(config).expect("timeout run must drain and shut down cleanly");
+
+    assert_eq!(report.load.ops_timeout, 1, "report={report:?}");
+    assert_eq!(report.admitted, 1, "report={report:?}");
+    assert_eq!(
+        report.ledger_final_len,
+        report.ledger_seed_len + report.admitted,
+        "durable admission remains committed after caller loss: {report:?}",
+    );
+    assert_eq!(report.scope_current_at_drain, 0, "report={report:?}");
+    assert_eq!(report.scope_admitted, report.scope_released);
+}
+
+#[test]
+fn timer_pressure_is_typed_and_every_admission_settles() {
+    let config = RunConfig {
+        capacity: 4,
+        work_ms: 50,
+        callers: 4,
+        timer_capacity: 1,
+        ..RunConfig::default()
+    };
+    let report = run(config).expect("timer pressure run");
+    let timer_full = report
+        .load
+        .err_kinds
+        .iter()
+        .find(|(kind, _)| kind == "work_timer_full")
+        .map_or(0, |(_, count)| *count);
+
+    assert!(
+        timer_full > 0,
+        "timer pressure was not observed: {report:?}"
+    );
+    assert_eq!(report.admitted, config.callers, "report={report:?}");
+    assert_eq!(
+        report.ledger_final_len,
+        report.ledger_seed_len + report.admitted,
+        "every admitted record is durable even if work admission fails: {report:?}",
+    );
+    assert_eq!(report.scope_current_at_drain, 0, "report={report:?}");
+    assert_eq!(report.scope_admitted, report.scope_released);
+}
+
+#[test]
+fn invalid_runtime_capacity_is_a_startup_error() {
+    let error = run(RunConfig {
+        timer_capacity: 0,
+        ..RunConfig::default()
+    })
+    .expect_err("zero timer capacity must fail startup");
+
+    assert!(
+        error.to_string().contains("timer_capacity"),
+        "unexpected startup error: {error:#}"
+    );
+}

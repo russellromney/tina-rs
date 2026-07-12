@@ -4,7 +4,7 @@
 //! specimen that is still real end to end:
 //!
 //! - one `#[tina_runtime::isolate(event = .. request = .. reply = ..)]`
-//!   isolate registered on a real `ThreadedRuntime`;
+//!   isolate registered behind a fallible `LocalSystem` application facade;
 //! - bounded admission via `SharedCapacityScope` — over-capacity callers
 //!   get a visible `Full`, not a silent queue;
 //! - a durable-state step: the isolate is seeded with "recovered" records
@@ -15,8 +15,8 @@
 //! - real concurrent callers driven through `tina-proof-harness`'s load
 //!   runner against the real runtime, not synthesized numbers;
 //! - graceful shutdown whose leak check only passes because the isolate
-//!   actually releases every charge it holds — comment out the
-//!   `drop(lease)` in `Gateway::hold_done` and `assert_no_leaked_capacity_at_shutdown`
+//!   actually releases every charge it holds — comment out the lease release
+//!   in `Gateway::hold_done` and `assert_no_leaked_capacity_at_shutdown`
 //!   fails for a real reason.
 //!
 //! What this specimen deliberately leaves out (see `mini_saas_api` for a
@@ -26,7 +26,8 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use tina::capacity::CapacityMode;
 use tina::prelude::*;
@@ -35,9 +36,8 @@ use tina_proof_harness::{
     assert_cold_work_made_progress, assert_no_leaked_capacity_at_shutdown,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, GuardedInsertError, GuardedPendingReplies,
-    ServicePressureReport, SharedCapacityScope, SharedLease, SleepReply, SplitServiceHandle,
-    ThreadedRuntime, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, LocalSystemConfig,
+    ServicePressureReport, SharedCapacityScope, SharedLease, SleepReply, SplitServiceHandle, sleep,
 };
 
 /// Tunables for one run.
@@ -52,6 +52,9 @@ pub struct RunConfig {
     /// Concurrent callers. Set above `capacity` to exercise `Full`.
     pub callers: usize,
     pub call_timeout_ms: u64,
+    /// Maximum concurrently armed runtime timers. Exposed so the specimen can
+    /// prove the typed `WorkFailed(TimerFull)` path without hidden config.
+    pub timer_capacity: usize,
 }
 
 impl Default for RunConfig {
@@ -62,6 +65,7 @@ impl Default for RunConfig {
             work_ms: 40,
             callers: 6,
             call_timeout_ms: 2_000,
+            timer_capacity: LocalSystemConfig::default().timer_capacity,
         }
     }
 }
@@ -92,33 +96,42 @@ pub struct RunReport {
     pub load: LoadReport,
 }
 
-#[derive(Debug)]
-pub enum GatewayEvent {
-    HoldDone { id: u64, result: SleepReply },
+enum GatewayEvent {
+    Flow(GatewayFlow),
 }
 
 #[derive(Debug)]
-pub enum GatewayRequest {
+enum GatewayRequest {
     Submit(u32),
     Stats,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GatewayReply {
+enum GatewayReply {
     Accepted { id: u64, ledger_len: usize },
     Full { current: usize, max: usize },
+    WorkFailed(tina_runtime::CallError),
     Stats { ledger_len: usize },
 }
 
 struct Gateway {
     scope: SharedCapacityScope,
-    pending: GuardedPendingReplies<u64, GatewayReply, SharedLease>,
     /// Durable-state stand-in: committed record ids. Seeded from
     /// "recovered" state before the isolate takes traffic; every
     /// admitted request appends one entry before it is held for work.
     ledger: Vec<u64>,
     next_id: u64,
     hold: Duration,
+}
+
+tina::flow! {
+    flow GatewayFlow for Gateway {
+        reply GatewayReply;
+
+        step HoldDone(id: u64, lease: SharedLease) -> raw request SleepReply {
+            self.hold_done(req, id, lease, outcome)
+        }
+    }
 }
 
 #[tina_runtime::isolate(event = GatewayEvent, request = GatewayRequest, reply = GatewayReply)]
@@ -129,7 +142,7 @@ impl Gateway {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match event {
-            GatewayEvent::HoldDone { id, result } => self.hold_done(id, result),
+            GatewayEvent::Flow(flow) => self.handle_gateway_flow(flow),
         }
     }
 
@@ -148,16 +161,9 @@ impl Gateway {
 }
 
 impl Gateway {
-    fn new(
-        scope: SharedCapacityScope,
-        seed_ledger: Vec<u64>,
-        pending_capacity: usize,
-        hold: Duration,
-    ) -> Self {
+    fn new(scope: SharedCapacityScope, seed_ledger: Vec<u64>, hold: Duration) -> Self {
         Self {
             scope,
-            pending: GuardedPendingReplies::with_capacity(pending_capacity)
-                .named("system_copied_service_path.pending"),
             ledger: seed_ledger,
             next_id: 1,
             hold,
@@ -181,43 +187,35 @@ impl Gateway {
         let hold = self.hold;
 
         call.capture(|request| {
-            match self
-                .pending
-                .insert_deferred_guarded(id, request.into_deferred(), lease)
-            {
-                Ok(_ticket) => {
-                    // Durable-state step: commit the record before the
-                    // (simulated) work runs. A real service would
-                    // fsync/INSERT here instead of pushing to a `Vec`.
-                    self.ledger.push(id);
-                    self.next_id = id + 1;
-                    sleep(hold)
-                        .then_service_event(move |result| GatewayEvent::HoldDone { id, result })
-                }
-                // Pending capacity == scope capacity, and every pending
-                // entry holds exactly one scope charge, so pending can
-                // never be full while the scope just admitted this
-                // charge — accounting bug if either arm below runs.
-                Err(GuardedInsertError::Full { .. }) => {
-                    panic!("pending full right after scope admission — accounting bug")
-                }
-                Err(GuardedInsertError::DuplicateKey { .. }) => {
-                    panic!("duplicate id {id} — monotonic id accounting bug")
-                }
+            if !request.is_open() {
+                drop(lease);
+                return noop();
             }
+            // Durable-state step: commit before simulated work starts.
+            self.ledger.push(id);
+            self.next_id = id + 1;
+            sleep(hold).then_service_event_with_request(request, move |request, outcome| {
+                GatewayEvent::Flow(GatewayFlow::HoldDone(request, id, lease, outcome))
+            })
         })
     }
 
-    fn hold_done(&mut self, id: u64, _result: SleepReply) -> Effect<Self> {
-        let Some((slot, lease)) = self.pending.take_by_key(&id) else {
-            return noop();
-        };
-        let ledger_len = self.ledger.len();
-        let effect = reply_to(slot, GatewayReply::Accepted { id, ledger_len });
-        // Load-bearing: comment this out and `assert_no_leaked_capacity_at_shutdown`
-        // in `run()` fails with a real leak, not a placeholder.
+    fn hold_done(
+        &mut self,
+        request: RequestContext<GatewayReply>,
+        id: u64,
+        lease: SharedLease,
+        result: SleepReply,
+    ) -> Effect<Self> {
         drop(lease);
-        effect
+        if !request.is_open() {
+            return noop();
+        }
+        if let Err(error) = result {
+            return reply_to(request, GatewayReply::WorkFailed(error));
+        }
+        let ledger_len = self.ledger.len();
+        reply_to(request, GatewayReply::Accepted { id, ledger_len })
     }
 }
 
@@ -225,10 +223,15 @@ impl Gateway {
 /// `ThreadedRuntime`, drive real concurrent callers through it, prove
 /// progress and a clean shutdown, then report what actually happened.
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
+    let local_config = LocalSystemConfig {
+        timer_capacity: config.timer_capacity,
+        ..LocalSystemConfig::default()
+    };
+    let runtime = Arc::new(
+        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+            .config(local_config)
+            .try_build()?,
+    );
     let shutdown = runtime.shutdown_handle();
     let scope =
         SharedCapacityScope::new("copied_service_path.in_flight", "requests", config.capacity);
@@ -237,22 +240,33 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     let seed_ledger: Vec<u64> = vec![0];
     let ledger_seed_len = seed_ledger.len();
 
-    let gateway: SplitServiceHandle<GatewayEvent, GatewayRequest, GatewayReply> = runtime
-        .register_split_service::<Gateway, GatewayEvent, GatewayRequest, Infallible>(
+    let gateway_result: Result<SplitServiceHandle<GatewayEvent, GatewayRequest, GatewayReply>, _> =
+        runtime.register_split_service::<Gateway, GatewayEvent, GatewayRequest, Infallible>(
             Gateway::new(
                 scope.clone(),
                 seed_ledger,
-                config.capacity,
                 Duration::from_millis(config.work_ms),
             ),
             config.mailbox,
-        )
-        .map_err(|e| anyhow::anyhow!("register gateway: {e:?}"))?;
+        );
+    let gateway = match gateway_result {
+        Ok(gateway) => gateway,
+        Err(error) => {
+            let shutdown_result = shutdown_runtime(shutdown, runtime);
+            return match shutdown_result {
+                Ok(()) => Err(anyhow::anyhow!("register gateway: {error:?}")),
+                Err(shutdown_error) => Err(anyhow::anyhow!(
+                    "register gateway: {error:?}; shutdown also failed: {shutdown_error}"
+                )),
+            };
+        }
+    };
     let requests = gateway.requests;
 
     let call_timeout = Duration::from_millis(config.call_timeout_ms);
     let rt_for_ops = Arc::clone(&runtime);
     let scope_for_check = scope.clone();
+    let drain_timeout = Duration::from_millis(config.work_ms.saturating_add(1_000));
 
     let load = tina_proof_harness::load::run_with_observation(
         LoadRun {
@@ -267,16 +281,25 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         ) {
             Ok(CallOutcome::Replied(GatewayReply::Accepted { .. })) => OpOutcome::Ok,
             Ok(CallOutcome::Replied(GatewayReply::Full { .. })) => OpOutcome::Err { kind: "full" },
+            Ok(CallOutcome::Replied(GatewayReply::WorkFailed(error))) => OpOutcome::Err {
+                kind: call_error_kind(error),
+            },
+            Ok(CallOutcome::Replied(GatewayReply::Stats { .. })) => OpOutcome::Err {
+                kind: "unexpected_reply",
+            },
+            Ok(CallOutcome::Full) => OpOutcome::Err {
+                kind: "mailbox_full",
+            },
+            Ok(CallOutcome::Closed) => OpOutcome::Err { kind: "closed" },
             Ok(CallOutcome::Timeout) => OpOutcome::Timeout,
-            Ok(other) => panic!("unexpected submit outcome: {other:?}"),
-            Err(error) => {
-                let _ = error;
-                OpOutcome::Err { kind: "call_error" }
-            }
+            Ok(CallOutcome::Rejected(_)) => OpOutcome::Err { kind: "rejected" },
+            Err(_) => OpOutcome::Err { kind: "host_error" },
         },
         Some(move || {
             // Fires once, after every caller thread has joined: the real
-            // end-of-run leak check, not a default placeholder.
+            // end-of-run leak check. A caller may have timed out while its
+            // linear flow is still settling, so observe the bounded drain.
+            wait_for_scope_drain(&scope_for_check, drain_timeout);
             let mut pressure = ServicePressureReport::new("system_copied_service_path");
             pressure.add_measured("scope", scope_for_check.surface_report(CapacityMode::Fixed));
             LoadObservation {
@@ -288,30 +311,79 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         }),
     );
 
-    assert_cold_work_made_progress(&load);
-    assert_no_leaked_capacity_at_shutdown(&load);
+    let stats_timeout = Duration::from_millis(
+        config
+            .work_ms
+            .saturating_add(1_000)
+            .max(config.call_timeout_ms),
+    );
+    let report_result = (|| -> anyhow::Result<_> {
+        let ledger_final_len =
+            match runtime.call_blocking_request(requests, GatewayRequest::Stats, stats_timeout) {
+                Ok(CallOutcome::Replied(GatewayReply::Stats { ledger_len })) => ledger_len,
+                Ok(CallOutcome::Replied(GatewayReply::Accepted { .. })) => {
+                    anyhow::bail!("stats returned an Accepted reply")
+                }
+                Ok(CallOutcome::Replied(GatewayReply::Full { .. })) => {
+                    anyhow::bail!("stats returned a Full reply")
+                }
+                Ok(CallOutcome::Replied(GatewayReply::WorkFailed(error))) => {
+                    anyhow::bail!("stats returned a work failure: {error:?}")
+                }
+                Ok(CallOutcome::Full) => anyhow::bail!("stats mailbox was full"),
+                Ok(CallOutcome::Closed) => anyhow::bail!("stats service was closed"),
+                Ok(CallOutcome::Timeout) => anyhow::bail!("stats call timed out"),
+                Ok(CallOutcome::Rejected(reason)) => anyhow::bail!("stats rejected: {reason:?}"),
+                Err(error) => anyhow::bail!("stats host call failed: {error}"),
+            };
 
-    let ledger_final_len =
-        match runtime.call_blocking_request(requests, GatewayRequest::Stats, call_timeout)? {
-            CallOutcome::Replied(GatewayReply::Stats { ledger_len }) => ledger_len,
-            other => anyhow::bail!("unexpected stats outcome: {other:?}"),
-        };
-
-    let admitted = load.ops_ok as usize;
-    let full = load
-        .err_kinds
-        .iter()
-        .find(|(kind, _)| kind.as_str() == "full")
-        .map(|(_, count)| *count as usize)
-        .unwrap_or(0);
-
-    let discovery_line = scope.discovery_line();
-    let pre_shutdown_snap = scope.snapshot();
+        let discovery_line = scope.discovery_line();
+        let pre_shutdown_snap = scope.snapshot();
+        let admitted = pre_shutdown_snap.admitted as usize;
+        let full = load
+            .err_kinds
+            .iter()
+            .find(|(kind, _)| kind.as_str() == "full")
+            .map(|(_, count)| *count as usize)
+            .unwrap_or(0);
+        Ok((
+            admitted,
+            full,
+            ledger_final_len,
+            discovery_line,
+            pre_shutdown_snap,
+        ))
+    })();
 
     // Graceful shutdown: owner stop must release every held charge. The
     // post-shutdown snapshot is the load-bearing proof of that claim.
-    shutdown_runtime(shutdown, runtime)?;
+    let shutdown_result = shutdown_runtime(shutdown, runtime);
     let post_shutdown_snap = scope.snapshot();
+    let settlement_result = if post_shutdown_snap.current == 0
+        && post_shutdown_snap.admitted == post_shutdown_snap.released
+    {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "shutdown leaked scope authority: current={} admitted={} released={}",
+            post_shutdown_snap.current,
+            post_shutdown_snap.admitted,
+            post_shutdown_snap.released
+        ))
+    };
+
+    shutdown_result?;
+    settlement_result?;
+    let (admitted, full, ledger_final_len, discovery_line, pre_shutdown_snap) = report_result?;
+
+    // Proof assertions run only after the runtime is terminal, so a failed
+    // assertion cannot strand the worker or its linear authority.
+    if load.ops_ok > 0 {
+        assert_cold_work_made_progress(&load);
+    } else if admitted == 0 {
+        anyhow::bail!("load made no progress: no request reached admission");
+    }
+    assert_no_leaked_capacity_at_shutdown(&load);
 
     let summary_line = format!(
         "system=system_copied_service_path admitted={} full={} ledger_seed_len={} ledger_final_len={} scope_high_water={} scope_full_count={} scope_current_at_drain={}",
@@ -340,9 +412,51 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     })
 }
 
+fn wait_for_scope_drain(scope: &SharedCapacityScope, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while scope.snapshot().current != 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn call_error_kind(error: tina_runtime::CallError) -> &'static str {
+    use tina_runtime::CallError;
+
+    match error {
+        CallError::InvariantViolation => "work_invariant_violation",
+        CallError::InvalidResource => "work_invalid_resource",
+        CallError::NotFound => "work_not_found",
+        CallError::Io => "work_io",
+        CallError::Unsupported => "work_unsupported",
+        CallError::ResourceBusy => "work_resource_busy",
+        CallError::CorruptRecord => "work_corrupt_record",
+        CallError::CommitUncertain => "work_commit_uncertain",
+        CallError::StorageFull => "work_storage_full",
+        CallError::StorageClosed => "work_storage_closed",
+        CallError::TargetFull => "work_target_full",
+        CallError::TargetClosed => "work_target_closed",
+        CallError::Timeout => "work_timeout",
+        CallError::Rejected(_) => "work_rejected",
+        CallError::DnsFull => "work_dns_full",
+        CallError::DnsClosed => "work_dns_closed",
+        CallError::TlsFull => "work_tls_full",
+        CallError::TlsClosed => "work_tls_closed",
+        CallError::TlsCertificate => "work_tls_certificate",
+        CallError::TlsName => "work_tls_name",
+        CallError::TlsHandshake => "work_tls_handshake",
+        CallError::TlsAlpnMismatch => "work_tls_alpn_mismatch",
+        CallError::SignalFull => "work_signal_full",
+        CallError::SignalClosed => "work_signal_closed",
+        CallError::ProcessFull => "work_process_full",
+        CallError::ProcessClosed => "work_process_closed",
+        CallError::KillUncertain => "work_kill_uncertain",
+        CallError::TimerFull => "work_timer_full",
+    }
+}
+
 fn shutdown_runtime(
     shutdown: tina_runtime::ThreadedShutdownHandle,
-    runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
+    runtime: Arc<LocalSystem<SingleShard, DefaultThreadedMailboxFactory>>,
 ) -> anyhow::Result<()> {
     let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
     drop(runtime);

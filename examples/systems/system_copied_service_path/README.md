@@ -3,10 +3,10 @@
 Canonical copied Tina service skeleton. Copy this shape when starting a
 normal service.
 
-One `Gateway` isolate runs on a real `ThreadedRuntime`:
+One `Gateway` isolate runs behind the `LocalSystem` application facade:
 
 - **Request entry** — `GatewayRequest::Submit` is a real caller-authority
-  call through `ThreadedRuntime::call_blocking_request`, not a canned
+  call through `LocalSystem::call_blocking_request`, not a canned
   reply.
 - **Bounded admission** — `SharedCapacityScope` charges one weight unit
   per in-flight request. Over-capacity callers get a typed `Full { current,
@@ -18,10 +18,16 @@ One `Gateway` isolate runs on a real `ThreadedRuntime`:
   WAL/database write; swap `Gateway::ledger` for your real store.
 - **Reply** — once the (simulated) work finishes, the isolate releases the
   admission charge and replies `Accepted { id, ledger_len }`.
-- **Graceful shutdown** — `run()` shuts the runtime down and re-reads the
+- **Linear held work** — request-aware `flow!` carries the caller and
+  move-only `SharedLease` through the typed `SleepReply`; there is no qid,
+  pending map, take/reinsert cycle, or service envelope.
+- **Typed timer pressure** — the bounded timer lane is part of `RunConfig`,
+  and refusal is reported as `WorkFailed(TimerFull)` rather than folded into
+  application `Full` or a timeout.
+- **Graceful shutdown** — `run()` shuts the app down and re-reads the
   scope: `scope_current_at_drain` must be `0`. Owner stop drops every
-  parked guarded reply, which drops its `SharedLease`, which releases the
-  charge — no separate cleanup path to forget.
+  captured flow authority, which drops its `SharedLease` and releases the
+  charge.
 
 Concurrent callers are driven through `tina_proof_harness::load`'s real
 load runner against the real runtime, and the run asserts
@@ -58,13 +64,9 @@ cargo test --manifest-path examples/systems/system_copied_service_path/Cargo.tom
   check: it lives outside the isolate, so the caller can read
   `scope.snapshot()` after the runtime — and the isolate holding every
   `SharedLease` — is gone.
-- `GuardedPendingReplies<K, R, SharedLease>` pairs the parked caller
-  with the charge it is holding, so there is no separate
-  `HashMap<K, SharedLease>` to keep in sync by hand.
-- Pending capacity is set equal to scope capacity, so
-  `insert_deferred_guarded` can never see `Full`/`DuplicateKey` in
-  practice; those arms panic loudly instead of pretending to handle an
-  unreachable accounting bug (same reasoning as `system_job_queue`).
+- The request-aware flow is the right shape for one linear hold: the shared
+  scope is the honest bound on parked work, and caller loss or owner stop
+  settles the lease by ownership rather than a second correlation table.
 
 Verdict:
 
