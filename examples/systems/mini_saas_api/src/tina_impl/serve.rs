@@ -431,23 +431,19 @@ impl ServiceInstance {
         );
 
         let t_runtime = Instant::now();
-        let trace = self
-            .runtime
-            .shutdown()
-            .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
+        let terminal = self.runtime.shutdown_report();
+        terminal.ensure_clean()?;
         choreo.record(
             ShutdownStep::StopOwner,
             "shutdown_runtime",
             t_runtime.elapsed(),
             StepOutcome::Clean,
         );
-        let pressure = tina_runtime::pressure::PressureSummary::from_events(&trace);
+        let pressure = tina_runtime::pressure::PressureSummary::from_events(terminal.trace());
 
         let shutdown_report = choreo.finish();
-        let shutdown_clean = matches!(
-            outbound_shutdown.drain,
-            KeepalivePoolDrainOutcome::Drained
-        ) && outbound_shutdown.requested == outbound_shutdown.stopped
+        let shutdown_clean = matches!(outbound_shutdown.drain, KeepalivePoolDrainOutcome::Drained)
+            && outbound_shutdown.requested == outbound_shutdown.stopped
             && outbound_shutdown.timed_out == 0
             && outbound_shutdown.rejected == 0
             && outbound_shutdown.already_closed == 0
@@ -529,9 +525,7 @@ pub fn serve(addr: SocketAddr) -> anyhow::Result<()> {
     if !report.shutdown_clean {
         // Non-zero exit: a straggler outlived the drain deadline and its
         // resources did not close cleanly. The orchestrator should see this.
-        anyhow::bail!(
-            "graceful drain did not complete cleanly within {SERVE_DRAIN_DEADLINE:?}"
-        );
+        anyhow::bail!("graceful drain did not complete cleanly within {SERVE_DRAIN_DEADLINE:?}");
     }
     Ok(())
 }

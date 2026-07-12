@@ -291,6 +291,6 @@ pub fn run() -> anyhow::Result<Report> {
     let report = waiter
         .wait(Duration::from_secs(5))
         .map_err(|e| anyhow::anyhow!("driver did not produce a report: {e:?}"))?;
-    let _ = runtime.shutdown();
+    runtime.shutdown_report().ensure_clean()?;
     Ok(report)
 }

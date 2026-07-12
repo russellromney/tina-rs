@@ -137,9 +137,7 @@ impl ObjectLane {
                         self.completed += 1;
                         reply_to(request, LaneReply::Stored(key))
                     }
-                    Err(error) => {
-                        reply_to(request, LaneReply::Failed(format!("{error:?}")))
-                    }
+                    Err(error) => reply_to(request, LaneReply::Failed(format!("{error:?}"))),
                 }
             }
         }
@@ -163,16 +161,14 @@ impl ObjectLane {
                 Ok(permit) => {
                     self.accepted += 1;
                     match &self.backend {
-                        WorkBackend::FakeSleep { work } => {
-                            call.defer(sleep(*work)).reply_service_event(move |request, result| {
-                                LaneEvent::PutFinished {
-                                    request,
-                                    key,
-                                    permit,
-                                    result: sleep_to_work_result(result),
-                                }
-                            })
-                        }
+                        WorkBackend::FakeSleep { work } => call
+                            .defer(sleep(*work))
+                            .reply_service_event(move |request, result| LaneEvent::PutFinished {
+                                request,
+                                key,
+                                permit,
+                                result: sleep_to_work_result(result),
+                            }),
                         WorkBackend::AwsS3 {
                             address,
                             bucket,
@@ -192,14 +188,15 @@ impl ObjectLane {
                                 ),
                                 *timeout,
                             );
-                            call.defer(issued).reply_service_event(move |request, outcome| {
-                                LaneEvent::PutFinished {
-                                    request,
-                                    key,
-                                    permit,
-                                    result: s3_outcome_to_work_result(outcome),
-                                }
-                            })
+                            call.defer(issued)
+                                .reply_service_event(move |request, outcome| {
+                                    LaneEvent::PutFinished {
+                                        request,
+                                        key,
+                                        permit,
+                                        result: s3_outcome_to_work_result(outcome),
+                                    }
+                                })
                         }
                     }
                 }
@@ -240,6 +237,7 @@ pub fn run_against_s3(
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
     let lane = runtime
         .register_split_service::<ObjectLane, LaneEvent, LaneRequest, std::convert::Infallible>(
             ObjectLane {
@@ -261,9 +259,9 @@ pub fn run_against_s3(
 
     let report = drive_callers(&runtime, lane.requests, config)?;
 
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
 
     Ok(report)
 }
@@ -273,6 +271,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
     let lane = runtime
         .register_split_service::<ObjectLane, LaneEvent, LaneRequest, std::convert::Infallible>(
             ObjectLane {
@@ -291,9 +290,9 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
 
     let report = drive_callers(&runtime, lane.requests, config)?;
 
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
 
     Ok(report)
 }
@@ -341,10 +340,11 @@ fn drive_callers(
         }
     }
 
-    let stats = match runtime.call_blocking_request(lane, LaneRequest::Stats, Duration::from_secs(1))? {
-        CallOutcome::Replied(LaneReply::Stats(stats)) => stats,
-        other => anyhow::bail!("stats call failed: {other:?}"),
-    };
+    let stats =
+        match runtime.call_blocking_request(lane, LaneRequest::Stats, Duration::from_secs(1))? {
+            CallOutcome::Replied(LaneReply::Stats(stats)) => stats,
+            other => anyhow::bail!("stats call failed: {other:?}"),
+        };
 
     Ok(RunReport {
         callers: config.callers,

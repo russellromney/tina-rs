@@ -99,12 +99,8 @@ enum CacheEvent {
 
 #[derive(Debug)]
 enum CacheRequest {
-    Get {
-        key: String,
-    },
-    Invalidate {
-        key: String,
-    },
+    Get { key: String },
+    Invalidate { key: String },
     Stats,
 }
 
@@ -198,13 +194,12 @@ impl Cache {
                 let generation = entry.generation;
                 entry.filling = Some(FillState { generation });
                 self.fills_started += 1;
-                let fill_effect = sleep(self.fill_delay).then_service_event(move |result| {
-                    CacheEvent::FillDone {
+                let fill_effect =
+                    sleep(self.fill_delay).then_service_event(move |result| CacheEvent::FillDone {
                         key,
                         generation,
                         result,
-                    }
-                });
+                    });
                 request_effect_after_shared_wait(permit, fill_effect)
             }
             Err(SharedWorkError::Full { call, .. }) => {
@@ -229,7 +224,9 @@ impl Cache {
         };
 
         call.capture(|request| {
-            let mut effects = self.waiters.close_all_clone::<Self>(&key, CacheReply::Stale);
+            let mut effects = self
+                .waiters
+                .close_all_clone::<Self>(&key, CacheReply::Stale);
             self.stale_replies += effects.len();
             effects.push(reply_to::<Self>(request, CacheReply::Invalidated));
             Effect::Batch(effects)
@@ -257,13 +254,14 @@ impl Cache {
                 let value = format!("value:{key}:g{generation}");
                 entry.value = Some(value.clone());
                 self.fills_completed += 1;
-                Effect::Batch(self.waiters.reply_all_with::<Self, _>(&key, || {
-                    CacheReply::Value {
-                        key: key.clone(),
-                        value: value.clone(),
-                        source: ValueSource::Fill,
-                    }
-                }))
+                Effect::Batch(
+                    self.waiters
+                        .reply_all_with::<Self, _>(&key, || CacheReply::Value {
+                            key: key.clone(),
+                            value: value.clone(),
+                            source: ValueSource::Fill,
+                        }),
+                )
             }
             Err(error) => {
                 let message = format!("{error:?}");
@@ -307,6 +305,7 @@ pub fn run_single_flight(config: RunConfig) -> anyhow::Result<SingleFlightReport
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
     let cache = register_cache(&runtime, config)?;
 
     let barrier = Arc::new(Barrier::new(config.callers + 1));
@@ -364,7 +363,7 @@ pub fn run_single_flight(config: RunConfig) -> anyhow::Result<SingleFlightReport
         })
     );
     let stats = stats(&runtime, cache.requests)?;
-    shutdown(runtime);
+    shutdown_runtime(shutdown, runtime)?;
 
     Ok(SingleFlightReport {
         callers: config.callers,
@@ -381,6 +380,7 @@ pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalida
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
     let cache = register_cache(&runtime, config)?;
     let timeout = Duration::from_millis(config.call_timeout_ms);
 
@@ -425,7 +425,7 @@ pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalida
         })
     );
     let stats = stats(&runtime, cache.requests)?;
-    shutdown(runtime);
+    shutdown_runtime(shutdown, runtime)?;
 
     Ok(StaleInvalidationReport {
         first_get_stale,
@@ -459,8 +459,12 @@ fn stats(
     }
 }
 
-fn shutdown(runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>) {
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+fn shutdown_runtime(
+    shutdown: tina_runtime::ThreadedShutdownHandle,
+    runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
+) -> anyhow::Result<()> {
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
+    Ok(())
 }

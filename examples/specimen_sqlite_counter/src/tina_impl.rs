@@ -12,9 +12,7 @@ use std::time::Duration;
 use rusqlite::{Connection, params};
 use tina::prelude::*;
 use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime};
-use tina_sqlite_bridge::{
-    SqliteConfig, SqliteMsg, SqliteRequest, SqliteResponse, SqliteWorker,
-};
+use tina_sqlite_bridge::{SqliteConfig, SqliteMsg, SqliteRequest, SqliteResponse, SqliteWorker};
 
 use crate::{INCREMENTS, Report};
 
@@ -29,6 +27,7 @@ pub fn run() -> anyhow::Result<Report> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
 
     let cfg = SqliteConfig::path(&path)
         .with_default_timeout(Duration::from_secs(5))
@@ -66,9 +65,9 @@ pub fn run() -> anyhow::Result<Report> {
         snap.in_flight_high_water,
     );
 
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
     drop(dir);
     Ok(report)
 }

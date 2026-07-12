@@ -10,7 +10,7 @@ use crate::{Report, WebhookServer};
 
 const REQUESTS: usize = 3;
 
-pub fn run() -> Report {
+pub fn run() -> anyhow::Result<Report> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -45,6 +45,6 @@ pub fn run() -> Report {
     std::thread::sleep(Duration::from_millis(20));
 
     let bodies = webhook.snapshot();
-    webhook.stop();
-    Report { bodies }
+    webhook.stop()?;
+    Ok(Report { bodies })
 }

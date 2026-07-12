@@ -177,9 +177,7 @@ pub fn run() -> anyhow::Result<Report> {
     runtime
         .try_send(listener, HttpsListenerMsg::Stop)
         .map_err(|e| anyhow::anyhow!("send Stop: {e:?}"))?;
-    runtime
-        .shutdown()
-        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
+    runtime.shutdown_report().ensure_clean()?;
 
     Ok(report)
 }

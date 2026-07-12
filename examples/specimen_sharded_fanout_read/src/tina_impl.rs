@@ -29,8 +29,7 @@ use tina_runtime::sharded::{
     ShardServiceTable,
 };
 use tina_runtime::{
-    BoundedItems, DefaultThreadedMailboxFactory, ThreadedMultiShardRuntime,
-    bounded_batch,
+    BoundedItems, DefaultThreadedMailboxFactory, ThreadedMultiShardRuntime, bounded_batch,
 };
 
 use crate::{Report, SEED_VALUES, SHARD_RAW_IDS};
@@ -48,7 +47,9 @@ impl Shard for AppShard {
 
 #[derive(Debug, Clone)]
 enum ShardCounterMsg {
-    Get { reply_to: Address<ShardCounterReply> },
+    Get {
+        reply_to: Address<ShardCounterReply>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -88,9 +89,7 @@ impl ShardCounter {
 
 #[derive(Debug, Clone)]
 enum ScatterCoordMsg {
-    Bind {
-        bridge: Address<ShardCounterReply>,
-    },
+    Bind { bridge: Address<ShardCounterReply> },
     Start,
     Reply(ShardCounterReply),
 }
@@ -179,12 +178,7 @@ fn sort_outcomes_by_target_list<T>(
     mut outcomes: Vec<(ShardId, ScatterGatherTargetOutcome<T>)>,
     targets: &[ShardId],
 ) -> Vec<(ShardId, ScatterGatherTargetOutcome<T>)> {
-    outcomes.sort_by_key(|(s, _)| {
-        targets
-            .iter()
-            .position(|t| *t == *s)
-            .unwrap_or(usize::MAX)
-    });
+    outcomes.sort_by_key(|(s, _)| targets.iter().position(|t| *t == *s).unwrap_or(usize::MAX));
     outcomes
 }
 
@@ -209,8 +203,11 @@ pub fn run() -> anyhow::Result<Report> {
             .iter()
             .position(|s| *s == shard)
             .expect("shard came from placement.shards()")];
-        runtime
-            .register_with_capacity_on::<ShardCounter, ShardCounterReply>(shard, ShardCounter { value }, 8)
+        runtime.register_with_capacity_on::<ShardCounter, ShardCounterReply>(
+            shard,
+            ShardCounter { value },
+            8,
+        )
     })
     .map_err(|e| anyhow::anyhow!("register shard counters: {e}"))?;
 
@@ -268,7 +265,7 @@ pub fn run() -> anyhow::Result<Report> {
     let total_sum: u64 = report.replied().map(|(_, v)| *v).sum();
     let shards_replied = report.replied_count() as u32;
 
-    let _ = runtime.shutdown();
+    runtime.shutdown_report().ensure_clean()?;
     Ok(Report {
         total_sum,
         shards_replied,

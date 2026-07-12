@@ -12,8 +12,7 @@ use std::time::{Duration, Instant};
 
 use tina::prelude::*;
 use tina_runtime::{
-    DefaultThreadedMailboxFactory, SignalWaitReply, SleepReply, ThreadedRuntime, signal_wait,
-    sleep,
+    DefaultThreadedMailboxFactory, SignalWaitReply, SleepReply, ThreadedRuntime, signal_wait, sleep,
 };
 
 use crate::{ITEM_INTERVAL_MS, Report, SIGNAL_AFTER_MS, TOTAL_PLANNED_ITEMS};
@@ -42,7 +41,11 @@ struct Consumer {
 
 #[tina_runtime::isolate(message = ConsumerMsg)]
 impl Consumer {
-    fn handle(&mut self, msg: ConsumerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ConsumerMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ConsumerMsg::Item(_) => sleep(Duration::from_millis(1)).then(ConsumerMsg::Done),
             ConsumerMsg::Done(Ok(())) => {
@@ -75,7 +78,11 @@ struct Producer {
     send = Outbound<ConsumerMsg>,
 )]
 impl Producer {
-    fn handle(&mut self, msg: ProducerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ProducerMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ProducerMsg::Tick(n) => {
                 if self.stopped || n >= self.target {
@@ -126,7 +133,11 @@ struct SignalWatcher {
     send = Outbound<ProducerMsg>,
 )]
 impl SignalWatcher {
-    fn handle(&mut self, msg: SignalMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: SignalMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             SignalMsg::Begin => {
                 signal_wait("sigint", Duration::from_secs(10)).then(SignalMsg::Received)
@@ -216,7 +227,7 @@ pub fn run() -> anyhow::Result<Report> {
         thread::yield_now();
     }
 
-    let _ = runtime.shutdown();
+    runtime.shutdown_report().ensure_clean()?;
 
     Ok(Report {
         items_produced: telemetry.produced.load(Ordering::Relaxed),

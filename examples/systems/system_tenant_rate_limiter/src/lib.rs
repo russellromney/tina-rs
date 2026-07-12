@@ -208,6 +208,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
 
     let rate = RateLimit::<TenantId>::new(
         "tenant.rate",
@@ -277,9 +278,9 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         other => anyhow::bail!("snapshot outcome: {other:?}"),
     };
 
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
 
     let summary_line = format!(
         "system=system_tenant_rate_limiter hot_admitted={hot_admitted} hot_limited={hot_limited} \

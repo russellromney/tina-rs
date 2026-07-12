@@ -84,8 +84,15 @@ impl Dispatcher {
 pub fn run() -> anyhow::Result<Report> {
     let upstream = upstream::spawn(&upstream::workload())?;
     let result = run_inner(&upstream);
-    upstream.stop();
-    result
+    let shutdown = upstream.stop();
+    match (result, shutdown) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(run), Ok(())) => Err(run),
+        (Ok(_), Err(shutdown)) => Err(shutdown),
+        (Err(run), Err(shutdown)) => Err(anyhow::anyhow!(
+            "run failed: {run:#}; shutdown also failed: {shutdown:#}"
+        )),
+    }
 }
 
 fn run_inner(upstream: &Upstream) -> anyhow::Result<Report> {
@@ -93,6 +100,7 @@ fn run_inner(upstream: &Upstream) -> anyhow::Result<Report> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
 
     let bridge = ReqwestWorker::<SingleShard>::install(&runtime, ReqwestConfig::default())
         .map_err(|e| anyhow::anyhow!("install reqwest bridge: {e}"))?;
@@ -128,9 +136,9 @@ fn run_inner(upstream: &Upstream) -> anyhow::Result<Report> {
         .map_err(|e| anyhow::anyhow!("dispatcher did not finish: {e:?}"))?;
 
     bridge.closer.close();
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
     Ok(Report {
         delivered: counts.delivered,
         server_unavailable: counts.server_unavailable,

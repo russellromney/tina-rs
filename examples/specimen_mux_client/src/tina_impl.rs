@@ -45,7 +45,11 @@ struct MuxClient {
 
 #[tina_runtime::isolate(message = MuxMsg)]
 impl MuxClient {
-    fn handle(&mut self, msg: MuxMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: MuxMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             MuxMsg::Begin => tcp_connect(self.target).then(MuxMsg::Connected),
             MuxMsg::Connected(Ok((stream, _local, _peer))) => {
@@ -130,9 +134,16 @@ pub fn run() -> anyhow::Result<Report> {
         .wait(Duration::from_secs(3))
         .map_err(|e| anyhow::anyhow!("mux client finishes with arrivals: {e:?}"))?;
 
-    let _ = runtime.shutdown();
-    let _ = server_done_tx.send(());
-    let _ = server_thread.join();
+    let runtime_shutdown = runtime.shutdown_report().ensure_clean();
+    let server_stop = server_done_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("mux server stop receiver dropped"));
+    let server_join = server_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("mux server thread panicked"));
+    runtime_shutdown?;
+    server_stop?;
+    server_join?;
 
     Ok(Report { arrival_order })
 }

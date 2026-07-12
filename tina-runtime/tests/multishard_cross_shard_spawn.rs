@@ -11,12 +11,12 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::{
-    ChildDefinition, ChildRef, CrossShardRestartableChildDefinition, SpawnObservedError,
-    SpawnObservedRemote, TrySendError, prelude::*,
+    AddressGeneration, ChildDefinition, ChildRef, CrossShardRestartableChildDefinition,
+    SpawnObservedError, SpawnObservedRemote, TrySendError, prelude::*,
 };
 use tina_runtime::{
     DefaultMailboxFactory, MultiShardRuntime, MultiShardRuntimeConfig, RuntimeCall,
-    RuntimeEventKind,
+    RuntimeEventKind, WaitError,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -538,6 +538,18 @@ fn cross_shard_restartable_child_restarts_on_remote_shard_and_reports_replacemen
         },
         8,
     );
+    let collision_parent = runtime.register_with_capacity_on::<RestartParent, CrossChildMsg>(
+        ShardId::new(22),
+        RestartParent {
+            learned: Rc::new(RefCell::new(None)),
+        },
+        8,
+    );
+    assert_eq!(
+        parent.isolate(),
+        collision_parent.isolate(),
+        "the fixture must exercise equal isolate ids on different shards"
+    );
 
     runtime
         .try_send(
@@ -549,6 +561,19 @@ fn cross_shard_restartable_child_restarts_on_remote_shard_and_reports_replacemen
         runtime.step();
     }
     let old_child = learned.borrow().expect("remote child address learned");
+    let stale_parent = Address::<RestartParentMsg>::new_with_generation(
+        parent.shard(),
+        parent.isolate(),
+        AddressGeneration::new(parent.generation().get() + 1),
+    );
+    let foreign_parent = Address::<RestartParentMsg>::new_with_generation(
+        ShardId::new(22),
+        parent.isolate(),
+        parent.generation(),
+    );
+    let stale_waiter = runtime.observe_child_restarted(stale_parent);
+    let foreign_waiter = runtime.observe_child_restarted(foreign_parent);
+    let collision_waiter = runtime.observe_child_restarted(collision_parent);
     let restart_waiter = runtime.observe_child_restarted(parent);
 
     runtime
@@ -564,8 +589,34 @@ fn cross_shard_restartable_child_restarts_on_remote_shard_and_reports_replacemen
     assert_eq!(restarted.child_ordinal, 0);
     assert_eq!(restarted.new_shard, ShardId::new(22));
     assert_ne!(restarted.new_isolate, old_child.address.isolate());
+    assert_eq!(
+        stale_waiter.wait(Duration::from_millis(10)),
+        Err(WaitError::Timeout),
+        "a stale owner generation must not claim a cross-shard restart"
+    );
+    assert_eq!(
+        foreign_waiter.wait(Duration::from_millis(10)),
+        Err(WaitError::Timeout),
+        "the same isolate id on another owner shard must not claim the restart"
+    );
+    assert_eq!(
+        collision_waiter.wait(Duration::from_millis(10)),
+        Err(WaitError::Timeout),
+        "another live parent with the same isolate id must retain its waiter"
+    );
+    assert_eq!(
+        runtime
+            .observe_child_restarted(parent)
+            .wait(Duration::from_millis(10)),
+        Err(WaitError::Timeout),
+        "cross-shard restart facts are not replayed"
+    );
 
-    let replacement = tina::Address::<CrossChildMsg>::new(ShardId::new(22), restarted.new_isolate);
+    let replacement = tina::Address::<CrossChildMsg>::new_with_generation(
+        restarted.new_shard,
+        restarted.new_isolate,
+        restarted.new_generation,
+    );
     assert_eq!(
         runtime.try_send(old_child.address, CrossChildMsg::Ping),
         Err(TrySendError::Closed(CrossChildMsg::Ping)),
@@ -583,6 +634,7 @@ fn cross_shard_restartable_child_restarts_on_remote_shard_and_reports_replacemen
     assert_eq!(report.children.len(), 1);
     assert_eq!(report.children[0].shard, ShardId::new(22));
     assert_eq!(report.children[0].isolate, restarted.new_isolate);
+    assert_eq!(report.children[0].generation, restarted.new_generation);
     assert!(matches!(
         report.children[0].state,
         tina_runtime::ChildLifecycleState::Restarted

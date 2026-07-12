@@ -77,9 +77,13 @@ pub struct LockHandle {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LockReply {
-    Granted { handle: LockHandle },
+    Granted {
+        handle: LockHandle,
+    },
     Released,
-    Renewed { holder_id: u64 },
+    Renewed {
+        holder_id: u64,
+    },
     /// Wait queue rejected the caller (per-key cap or pending box full).
     Busy,
     /// Release/renew arrived for a holder that no longer owns the key.
@@ -261,22 +265,17 @@ impl LockManager {
         let lease = self.lease;
         call.reply_and(
             LockReply::Renewed { holder_id },
-            vec![sleep(lease).then_service_event(move |_| {
-                LockEvent::LeaseExpired {
+            vec![
+                sleep(lease).then_service_event(move |_| LockEvent::LeaseExpired {
                     key: key_for_msg,
                     holder_id,
                     expiry_token: token,
-                }
-            })],
+                }),
+            ],
         )
     }
 
-    fn lease_expired(
-        &mut self,
-        key: String,
-        holder_id: u64,
-        expiry_token: u64,
-    ) -> Effect<Self> {
+    fn lease_expired(&mut self, key: String, holder_id: u64, expiry_token: u64) -> Effect<Self> {
         let Some(entry) = self.locks.get(&key) else {
             self.stats.stale_expiries_ignored += 1;
             return noop();
@@ -328,12 +327,10 @@ impl LockManager {
                         },
                     },
                 ),
-                sleep(lease).then_service_event(move |_| {
-                    LockEvent::LeaseExpired {
-                        key: key_for_msg,
-                        holder_id: new_holder_id,
-                        expiry_token: token,
-                    }
+                sleep(lease).then_service_event(move |_| LockEvent::LeaseExpired {
+                    key: key_for_msg,
+                    holder_id: new_holder_id,
+                    expiry_token: token,
                 }),
             ];
         }
@@ -357,13 +354,13 @@ impl LockManager {
             LockReply::Granted {
                 handle: LockHandle { key, holder_id },
             },
-            vec![sleep(lease).then_service_event(move |_| {
-                LockEvent::LeaseExpired {
+            vec![
+                sleep(lease).then_service_event(move |_| LockEvent::LeaseExpired {
                     key: key_for_msg,
                     holder_id,
                     expiry_token: 1,
-                }
-            })],
+                }),
+            ],
         )
     }
 
@@ -451,6 +448,7 @@ pub fn run_fifo(config: RunConfig) -> anyhow::Result<FifoReport> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
 
@@ -460,11 +458,8 @@ pub fn run_fifo(config: RunConfig) -> anyhow::Result<FifoReport> {
 
     // Hold the lock from the host first so every contender parks before
     // any of them can be granted.
-    let CallOutcome::Replied(LockReply::Granted { handle: holder }) = runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Acquire { key: key.clone() },
-        timeout,
-    )?
+    let CallOutcome::Replied(LockReply::Granted { handle: holder }) = runtime
+        .call_blocking_request(lockmgr, LockRequest::Acquire { key: key.clone() }, timeout)?
     else {
         anyhow::bail!("primary acquire did not return Granted");
     };
@@ -524,18 +519,15 @@ pub fn run_fifo(config: RunConfig) -> anyhow::Result<FifoReport> {
     // primary holder. Otherwise the first releaser's grant could race
     // the slowest contender's Acquire.
     wait_for_waiters(&runtime, lockmgr, contenders as usize, timeout)?;
-    let _ = runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Release { handle: holder },
-        timeout,
-    )?;
+    let _ =
+        runtime.call_blocking_request(lockmgr, LockRequest::Release { handle: holder }, timeout)?;
 
     for t in threads {
         t.join().expect("contender thread")?;
     }
 
     let stats = stats(&runtime, lockmgr, timeout)?;
-    shutdown(runtime);
+    shutdown_runtime(shutdown, runtime)?;
     Ok(FifoReport {
         admitted_order: admitted_order.lock().expect("admitted").clone(),
         grant_order: grant_order.lock().expect("granted").clone(),
@@ -555,15 +547,13 @@ pub fn run_expiry_handoff(config: RunConfig) -> anyhow::Result<ExpiryHandoffRepo
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
     let key = "expire-key".to_string();
 
-    let CallOutcome::Replied(LockReply::Granted { handle: original }) = runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Acquire { key: key.clone() },
-        timeout,
-    )?
+    let CallOutcome::Replied(LockReply::Granted { handle: original }) = runtime
+        .call_blocking_request(lockmgr, LockRequest::Acquire { key: key.clone() }, timeout)?
     else {
         anyhow::bail!("first acquire did not return Granted");
     };
@@ -598,10 +588,8 @@ pub fn run_expiry_handoff(config: RunConfig) -> anyhow::Result<ExpiryHandoffRepo
         LockRequest::Release { handle: original },
         timeout,
     )?;
-    let original_release_was_stale = matches!(
-        stale_outcome,
-        CallOutcome::Replied(LockReply::StaleHandle)
-    );
+    let original_release_was_stale =
+        matches!(stale_outcome, CallOutcome::Replied(LockReply::StaleHandle));
 
     // Tidy up: release the new holder. We still want to confirm normal
     // release works after a hand-off chain.
@@ -614,7 +602,7 @@ pub fn run_expiry_handoff(config: RunConfig) -> anyhow::Result<ExpiryHandoffRepo
     )?;
 
     let stats = stats(&runtime, lockmgr, timeout)?;
-    shutdown(runtime);
+    shutdown_runtime(shutdown, runtime)?;
     Ok(ExpiryHandoffReport {
         waiter_received_grant,
         original_release_was_stale,
@@ -633,6 +621,7 @@ pub fn run_renewal(config: RunConfig) -> anyhow::Result<RenewalReport> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
     let key = "renew-key".to_string();
@@ -700,7 +689,7 @@ pub fn run_renewal(config: RunConfig) -> anyhow::Result<RenewalReport> {
     )?;
 
     let stats = stats(&runtime, lockmgr, timeout)?;
-    shutdown(runtime);
+    shutdown_runtime(shutdown, runtime)?;
     Ok(RenewalReport {
         still_held_after_original_lease,
         final_release_ok,
@@ -719,6 +708,7 @@ pub fn run_stale_release(config: RunConfig) -> anyhow::Result<StaleReleaseReport
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
     let key = "stale-key".to_string();
@@ -732,23 +722,13 @@ pub fn run_stale_release(config: RunConfig) -> anyhow::Result<StaleReleaseReport
         anyhow::bail!("acquire did not return Granted");
     };
     let saved = handle.clone();
-    let _ = runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Release { handle },
-        timeout,
-    )?;
-    let second = runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Release { handle: saved },
-        timeout,
-    )?;
-    let second_release_was_stale = matches!(
-        second,
-        CallOutcome::Replied(LockReply::StaleHandle)
-    );
+    let _ = runtime.call_blocking_request(lockmgr, LockRequest::Release { handle }, timeout)?;
+    let second =
+        runtime.call_blocking_request(lockmgr, LockRequest::Release { handle: saved }, timeout)?;
+    let second_release_was_stale = matches!(second, CallOutcome::Replied(LockReply::StaleHandle));
 
     let stats = stats(&runtime, lockmgr, timeout)?;
-    shutdown(runtime);
+    shutdown_runtime(shutdown, runtime)?;
     Ok(StaleReleaseReport {
         second_release_was_stale,
         stats,
@@ -767,15 +747,13 @@ pub fn run_busy_overflow(config: RunConfig) -> anyhow::Result<BusyOverflowReport
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
     let key = "busy-key".to_string();
 
-    let CallOutcome::Replied(LockReply::Granted { handle: holder }) = runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Acquire { key: key.clone() },
-        timeout,
-    )?
+    let CallOutcome::Replied(LockReply::Granted { handle: holder }) = runtime
+        .call_blocking_request(lockmgr, LockRequest::Acquire { key: key.clone() }, timeout)?
     else {
         anyhow::bail!("primary acquire did not return Granted");
     };
@@ -829,11 +807,8 @@ pub fn run_busy_overflow(config: RunConfig) -> anyhow::Result<BusyOverflowReport
     )?;
 
     // Release the holder so admitted waiters can drain.
-    let _ = runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Release { handle: holder },
-        timeout,
-    )?;
+    let _ =
+        runtime.call_blocking_request(lockmgr, LockRequest::Release { handle: holder }, timeout)?;
 
     for t in threads {
         t.join().expect("contender");
@@ -851,7 +826,7 @@ pub fn run_busy_overflow(config: RunConfig) -> anyhow::Result<BusyOverflowReport
     }
 
     let stats = stats(&runtime, lockmgr, timeout)?;
-    shutdown(runtime);
+    shutdown_runtime(shutdown, runtime)?;
     Ok(BusyOverflowReport { busy, stats })
 }
 
@@ -927,8 +902,12 @@ fn wait_for_busy_settlement(
     }
 }
 
-fn shutdown(runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>) {
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+fn shutdown_runtime(
+    shutdown: tina_runtime::ThreadedShutdownHandle,
+    runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
+) -> anyhow::Result<()> {
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
+    Ok(())
 }

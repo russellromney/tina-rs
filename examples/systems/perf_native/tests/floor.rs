@@ -93,11 +93,11 @@ fn raw_tcp_localhost_floor_close_request() {
         "raw TCP localhost floor regressed beyond 500us p50: {p50}ns"
     );
 
-    let _ = stop_tx.send(());
+    stop_tx.send(()).expect("raw TCP stop receiver is live");
     // Best-effort: kick the listener with a connect so the accept loop
     // notices the stop signal.
     let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(100));
-    let _ = server.join();
+    server.join().expect("raw TCP server joins");
 }
 
 fn one_request(addr: SocketAddr) {

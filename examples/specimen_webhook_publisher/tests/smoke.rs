@@ -2,7 +2,9 @@ use specimen_webhook_publisher::{tina_impl, tokio_impl};
 
 #[test]
 fn tokio_side_records_three_increments() {
-    tokio_impl::run().assert_expected();
+    tokio_impl::run()
+        .expect("run Tokio specimen")
+        .assert_expected();
 }
 
 #[test]

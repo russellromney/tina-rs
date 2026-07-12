@@ -19,7 +19,8 @@ pub fn run() -> anyhow::Result<Report> {
     let identity_bundle = tls_identity::generate();
     let cert_der = identity_bundle.cert_der.clone();
 
-    let server_cert = rustls::pki_types::CertificateDer::from(identity_bundle.cert_chain_der[0].clone());
+    let server_cert =
+        rustls::pki_types::CertificateDer::from(identity_bundle.cert_chain_der[0].clone());
     let server_key = rustls::pki_types::PrivateKeyDer::Pkcs8(
         rustls::pki_types::PrivatePkcs8KeyDer::from(identity_bundle.private_key_der.clone()),
     );
@@ -79,9 +80,13 @@ pub fn run() -> anyhow::Result<Report> {
                                 }
                                 _ => http_not_found(),
                             };
-                            let _ = stream.write_all(&response).await;
-                            let _ = stream.flush().await;
-                            let _ = stream.shutdown().await;
+                            if stream.write_all(&response).await.is_err() {
+                                return;
+                            }
+                            if stream.flush().await.is_err() {
+                                return;
+                            }
+                            drop(stream);
                         });
                     }
                 }
@@ -91,16 +96,20 @@ pub fn run() -> anyhow::Result<Report> {
 
     let server_addr = addr_rx.recv_timeout(Duration::from_secs(5))?;
     let report = scripted_client(server_addr, cert_der);
-    let _ = shutdown_tx.send(());
+    let shutdown = shutdown_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("HTTPS server stop receiver dropped"));
 
     let deadline = Instant::now() + Duration::from_secs(2);
     while !server_handle.is_finished() && Instant::now() < deadline {
         thread::yield_now();
     }
-    server_handle
+    let joined = server_handle
         .join()
-        .map_err(|_| anyhow::anyhow!("server thread panicked"))?;
+        .map_err(|_| anyhow::anyhow!("server thread panicked"));
 
+    shutdown?;
+    joined?;
     Ok(report)
 }
 

@@ -97,7 +97,11 @@ async fn handle_socket(socket: WebSocket, svc: RoomService) {
     }
 
     writer.abort();
-    let _ = writer.await;
+    match writer.await {
+        Err(error) if error.is_cancelled() => {}
+        Ok(()) => {}
+        Err(error) => panic!("room writer task failed: {error}"),
+    }
 }
 
 pub fn run() -> Result<Report, Box<dyn std::error::Error>> {
@@ -125,14 +129,17 @@ pub fn run() -> Result<Report, Box<dyn std::error::Error>> {
 
         let app = Router::new().route("/ws", get(ws_upgrade)).with_state(svc);
 
-        let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
 
         let report = run_room_clients(addr).await;
 
         server.abort();
-        let _ = server.await;
+        match server.await {
+            Err(error) if error.is_cancelled() => {}
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error.into()),
+            Err(error) => return Err(error.into()),
+        }
         Ok(report)
     });
     let report = report?;

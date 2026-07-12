@@ -11,8 +11,15 @@ const PER_CALL_TIMEOUT: Duration = Duration::from_millis(150);
 pub fn run() -> anyhow::Result<Report> {
     let upstream = upstream::spawn(&upstream::workload())?;
     let result = run_inner(&upstream);
-    upstream.stop();
-    result
+    let shutdown = upstream.stop();
+    match (result, shutdown) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(run), Ok(())) => Err(run),
+        (Ok(_), Err(shutdown)) => Err(shutdown),
+        (Err(run), Err(shutdown)) => Err(anyhow::anyhow!(
+            "run failed: {run:#}; shutdown also failed: {shutdown:#}"
+        )),
+    }
 }
 
 fn run_inner(upstream: &Upstream) -> anyhow::Result<Report> {

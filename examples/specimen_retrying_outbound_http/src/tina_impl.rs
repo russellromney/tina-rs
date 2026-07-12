@@ -59,12 +59,19 @@ struct UpstreamHandle {
 }
 
 impl UpstreamHandle {
-    fn stop(mut self) {
-        if let Some(tx) = self.shutdown.take() {
-            let _ = tx.send(());
-        }
-        if let Some(handle) = self.thread.take() {
-            let _ = handle.join();
+    fn stop(mut self) -> anyhow::Result<()> {
+        let send_failed = self.shutdown.take().is_some_and(|tx| tx.send(()).is_err());
+        let join_failed = self
+            .thread
+            .take()
+            .is_some_and(|handle| handle.join().is_err());
+        match (send_failed, join_failed) {
+            (false, false) => Ok(()),
+            (true, false) => anyhow::bail!("upstream shutdown receiver closed"),
+            (false, true) => anyhow::bail!("upstream thread panicked during shutdown"),
+            (true, true) => {
+                anyhow::bail!("upstream shutdown receiver closed and upstream thread panicked")
+            }
         }
     }
 }
@@ -120,7 +127,11 @@ struct Caller {
 
 #[tina_runtime::isolate(message = CallerMsg)]
 impl Caller {
-    fn handle(&mut self, msg: CallerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: CallerMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CallerMsg::Begin => self.send_attempt(),
             CallerMsg::HttpReturned(outcome) => self.absorb(outcome),
@@ -187,6 +198,7 @@ pub fn run() -> anyhow::Result<Report> {
             ..Default::default()
         },
     )?);
+    let shutdown = runtime.shutdown_handle();
 
     let bridge = ReqwestWorker::<SingleShard>::install(&runtime, ReqwestConfig::default())
         .map_err(|e| anyhow::anyhow!("install reqwest bridge: {e}"))?;
@@ -213,9 +225,19 @@ pub fn run() -> anyhow::Result<Report> {
         .map_err(|e| anyhow::anyhow!("caller did not finish: {e:?}"))?;
 
     bridge.closer.close();
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
+    let runtime_shutdown: anyhow::Result<()> = (|| {
+        let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+        terminal.ensure_clean()?;
+        Ok(())
+    })();
+    drop(runtime);
+    let upstream_shutdown = upstream.stop();
+    match (runtime_shutdown, upstream_shutdown) {
+        (Ok(()), Ok(())) => Ok(report),
+        (Err(runtime), Ok(())) => Err(runtime),
+        (Ok(()), Err(upstream)) => Err(upstream),
+        (Err(runtime), Err(upstream)) => Err(anyhow::anyhow!(
+            "Tina runtime shutdown failed: {runtime:#}; upstream shutdown also failed: {upstream:#}"
+        )),
     }
-    upstream.stop();
-    Ok(report)
 }

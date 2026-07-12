@@ -82,6 +82,7 @@ pub fn run() -> anyhow::Result<Report> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
 
     let mut stores = Vec::with_capacity(SHARDS as usize);
     for _ in 0..SHARDS {
@@ -189,9 +190,9 @@ pub fn run() -> anyhow::Result<Report> {
     );
     let trace_hash = stable_trace_hash(trace.events().iter());
 
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
     Ok(Report {
         hot_admitted,
         hot_rejected,

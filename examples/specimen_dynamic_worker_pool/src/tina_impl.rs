@@ -9,11 +9,9 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tina::prelude::*;
 use tina::ChildDefinition;
-use tina_runtime::{
-    BoundedItems, DefaultThreadedMailboxFactory, ThreadedRuntime, bounded_batch,
-};
+use tina::prelude::*;
+use tina_runtime::{BoundedItems, DefaultThreadedMailboxFactory, ThreadedRuntime, bounded_batch};
 
 use crate::{Report, WORK_VALUES, WORKER_COUNT};
 
@@ -106,6 +104,7 @@ pub fn run() -> anyhow::Result<Report> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
 
     let chunk_size = WORK_VALUES.len() / WORKER_COUNT as usize;
     let chunks: Vec<Vec<u64>> = (0..WORKER_COUNT as usize)
@@ -139,8 +138,8 @@ pub fn run() -> anyhow::Result<Report> {
         .wait(Duration::from_secs(5))
         .map_err(|e| anyhow::anyhow!("coord did not finish: {e:?}"))?;
 
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
     Ok(report)
 }

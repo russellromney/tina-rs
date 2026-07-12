@@ -71,15 +71,19 @@ pub fn run() -> anyhow::Result<Report> {
 
     let server_addr = addr_rx.recv_timeout(Duration::from_secs(2))?;
     let report = scripted_client(server_addr);
-    let _ = shutdown_tx.send(());
+    let shutdown = shutdown_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("HTTP server stop receiver dropped"));
 
     let deadline = Instant::now() + Duration::from_secs(2);
     while !server_handle.is_finished() && Instant::now() < deadline {
         thread::yield_now();
     }
-    server_handle
+    let joined = server_handle
         .join()
-        .map_err(|_| anyhow::anyhow!("server thread panicked"))?;
+        .map_err(|_| anyhow::anyhow!("server thread panicked"));
+    shutdown?;
+    joined?;
 
     Ok(report)
 }

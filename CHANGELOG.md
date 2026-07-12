@@ -14,6 +14,23 @@ This file records completed work.
   load-shed tests. Documented in a new README section after "Bounded By
   Construction".
 
+### Authoritative child-restart observation
+
+- Child-restart waiters now match the complete parent address identity
+  (shard, isolate id, and generation). Stale-generation and same-id
+  foreign-shard addresses can no longer claim a live parent's replacement
+  event; threaded and deterministic multi-shard owners retain the same typed
+  waiter API and replacement-address result. Dropped or timed-out restart
+  waiters release their bounded observation slots and cannot consume a later
+  fact intended for a live waiter.
+
+### LocalSystem observation parity
+
+- `LocalSystem` now forwards TCP-bind, isolate-completion, child-restart, and
+  pressure-summary observation plus fallible supervisor registration.
+  `LocalMultiShardSystem` forwards address-routed child-restart observation.
+  Each facade preserves the lower threaded owner's waiter and error contracts.
+
 ### LocalSystem host-control parity
 
 - `LocalSystem` and `LocalMultiShardSystem` now forward typed terminal-result
