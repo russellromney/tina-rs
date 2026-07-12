@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::convert::Infallible;
 use std::rc::Rc;
 
@@ -24,6 +24,14 @@ enum Msg {
 struct SelfAware {
     me: Address<Msg>,
     observed: Rc<RefCell<Vec<Address<Msg>>>>,
+}
+
+struct DropAuthority(Rc<Cell<u32>>);
+
+impl Drop for DropAuthority {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+    }
 }
 
 #[tina_runtime::isolate(message = Msg, shard = SimShard)]
@@ -65,6 +73,25 @@ fn single_shard_constructor_address_routes_and_keeps_mailbox_bound() {
 }
 
 #[test]
+fn zero_capacity_constructor_runs_but_first_ingress_is_full() {
+    let mut sim = Simulator::new(SimShard(7), SimulatorConfig::default());
+    let constructed = Rc::new(Cell::new(0));
+    let constructed_in_ctor = Rc::clone(&constructed);
+    let address = sim.register_with_capacity_using::<SelfAware, Msg, Infallible, _>(0, move |me| {
+        constructed_in_ctor.set(constructed_in_ctor.get() + 1);
+        SelfAware {
+            me,
+            observed: Rc::new(RefCell::new(Vec::new())),
+        }
+    });
+    assert_eq!(constructed.get(), 1);
+    assert!(matches!(
+        sim.try_send(address, Msg::Record),
+        Err(IngressSendError::Full(Msg::Record))
+    ));
+}
+
+#[test]
 fn multi_shard_constructor_address_uses_requested_owner() {
     let mut sim = MultiShardSimulator::new([SimShard(3), SimShard(9)], SimulatorConfig::default());
     let observed = Rc::new(RefCell::new(Vec::new()));
@@ -90,16 +117,20 @@ fn constructor_panic_publishes_no_entry_and_consumes_id() {
     let mut sim = Simulator::new(SimShard(7), SimulatorConfig::default());
     let leaked = Rc::new(RefCell::new(None));
     let leaked_in_ctor = Rc::clone(&leaked);
+    let drops = Rc::new(Cell::new(0));
+    let authority = DropAuthority(Rc::clone(&drops));
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         sim.register_with_capacity_using::<SelfAware, Msg, Infallible, _>(
             2,
             move |address| -> SelfAware {
+                let _authority = authority;
                 *leaked_in_ctor.borrow_mut() = Some(address);
                 panic!("constructor failed")
             },
         )
     }));
     assert!(panicked.is_err());
+    assert_eq!(drops.get(), 1);
 
     let leaked = leaked.borrow().expect("constructor saw address");
     let next =
@@ -125,11 +156,14 @@ fn unknown_multi_shard_owner_does_not_run_constructor() {
     let mut sim = MultiShardSimulator::new([SimShard(3)], SimulatorConfig::default());
     let constructed = Rc::new(RefCell::new(0_u32));
     let constructed_in_ctor = Rc::clone(&constructed);
+    let drops = Rc::new(Cell::new(0));
+    let authority = DropAuthority(Rc::clone(&drops));
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         sim.register_with_capacity_using_on::<SelfAware, Msg, Infallible, _>(
             ShardId::new(99),
             2,
             move |me| {
+                let _authority = authority;
                 *constructed_in_ctor.borrow_mut() += 1;
                 SelfAware {
                     me,
@@ -140,6 +174,7 @@ fn unknown_multi_shard_owner_does_not_run_constructor() {
     }));
     assert!(panicked.is_err());
     assert_eq!(*constructed.borrow(), 0);
+    assert_eq!(drops.get(), 1);
 }
 
 fn replay(seed: u64) -> (Address<Msg>, Vec<String>) {

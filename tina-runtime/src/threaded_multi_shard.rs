@@ -535,10 +535,11 @@ where
     /// Registers one root on a chosen shard; its constructor receives the
     /// final typed address before the entry is published.
     ///
-    /// The constructor runs on the chosen worker. Command admission preserves
+    /// The constructor runs on the chosen worker. Pre-admission
     /// [`ThreadedRuntimeError::CommandFull`], `WorkerStopped`, and
-    /// `UnknownShard`; a constructor panic terminates that worker and returns
-    /// `WorkerStopped`.
+    /// `UnknownShard` drop the constructor without executing it. Once admitted,
+    /// `WorkerUnresponsive` may still finish and publish later. A constructor
+    /// panic terminates only the chosen worker and returns `WorkerStopped`.
     #[allow(private_bounds)]
     pub fn register_with_capacity_using_on<I, Outbound, Ctor>(
         &self,

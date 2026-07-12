@@ -14,7 +14,8 @@ This file records completed work.
 - Construction remains atomic with respect to publication: a panic consumes a
   monotonic isolate id but creates no entry. Threaded command admission keeps
   `CommandFull`, `WorkerStopped`, and `UnknownShard` outcomes and never runs a
-  constructor rejected before admission.
+  constructor rejected before admission. An accepted `WorkerUnresponsive`
+  constructor may still finish and publish later.
 
 ### Deterministic application shutdown proof
 

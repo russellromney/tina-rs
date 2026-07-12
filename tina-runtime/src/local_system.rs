@@ -1026,7 +1026,9 @@ where
     }
 
     /// Registers one root whose constructor receives its final typed address.
-    /// The entry is not published until construction succeeds.
+    /// The entry is not published until construction succeeds. Pre-admission
+    /// failure drops the constructor without running it; an accepted
+    /// `WorkerUnresponsive` constructor may still publish later.
     #[allow(private_bounds)]
     pub fn register_root_using<I, Outbound, Ctor>(
         &self,
@@ -1858,7 +1860,9 @@ where
     }
 
     /// Registers one root on the chosen shard whose constructor receives its
-    /// final typed address before the entry is published.
+    /// final typed address before the entry is published. Pre-admission failure
+    /// drops the constructor without running it; an accepted
+    /// `WorkerUnresponsive` constructor may still publish later on that shard.
     #[allow(private_bounds)]
     pub fn register_root_using_on<I, Outbound, Ctor>(
         &self,

@@ -3,7 +3,7 @@
 //! `register_with_capacity_using(cap, |self_addr| ...)` lets the
 //! constructor receive its own typed `Address`. Tests pin: same
 //! generation as plain registration, address routes correctly,
-//! panic semantics (no entry, id leaked, address dies loud), and
+//! panic semantics (no entry, id consumed, leaked address is closed), and
 //! the threaded form actually handles messages (not just accepts
 //! them).
 
@@ -65,6 +65,7 @@ fn constructor_receives_typed_self_address() {
     });
 
     let captured = captured.expect("constructor saw self_addr");
+    assert_eq!(captured.system(), addr.system());
     assert_eq!(captured.shard(), addr.shard());
     assert_eq!(captured.isolate(), addr.isolate());
     assert_eq!(captured.generation(), addr.generation());
