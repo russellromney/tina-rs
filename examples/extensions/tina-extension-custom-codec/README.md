@@ -8,7 +8,7 @@ a tiny socket service — with only public APIs.
 `SyncCodec` is the open sync-codec extension trait:
 
 ```rust
-fn feed(&mut self, bytes: &[u8]);
+fn feed(&mut self, bytes: &[u8]) -> usize;
 fn next_frame(&mut self) -> FrameDecision<Self::Frame, Self::Malformed>;
 ```
 
@@ -30,6 +30,21 @@ frame length and rejects an embedded NUL.
 
 The service runs over `tina_sim`'s deterministic Unix-domain rails, so the test
 is reproducible.
+
+## Authoring status
+
+The codec hook and both actors use the canonical public surface. Server and
+client are event-only services registered through `register_event_service` and
+started through `try_send_event`. One-shot Unix calls use
+`then_service_event`; `UnixWriteAll` uses `next_service_event` and
+`advance_service_event`. Application code never constructs a service envelope.
+
+Bind, accept, connect, read, write, and close failures retain the exact
+`CallError` and endpoint/stage in `CodecIoFailure`. Codec policy rejection
+remains a typed `CodecRejection::Full` or
+`CodecRejection::Malformed(reason)`, distinct from transport failure.
+The one-shot server settles both its accepted stream and listener before it
+stops, including failure teardown.
 
 ## Run the smoke test
 

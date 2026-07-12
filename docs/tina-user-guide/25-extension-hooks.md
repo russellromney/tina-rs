@@ -71,7 +71,7 @@ otherwise bounded service. There is no third drop synonym.
 `SyncCodec` is the open codec seam:
 
 ```rust
-fn feed(&mut self, bytes: &[u8]);
+fn feed(&mut self, bytes: &[u8]) -> usize;
 fn next_frame(&mut self) -> FrameDecision<Self::Frame, Self::Malformed>;
 ```
 

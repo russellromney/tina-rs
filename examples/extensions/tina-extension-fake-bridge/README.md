@@ -22,7 +22,8 @@ observes worker-terminal truth; it cannot always stop the outside work. The
 
 ## What it proves
 
-- **Bounded setup.** A submit past the queue capacity is
+- **Bounded setup.** The installed cap covers queued plus active work. A submit
+  past that capacity is
   `Retryable(BridgeFull)`; after close it is `Unavailable(BridgeClosed)`. No
   unbounded buffer.
 - **Caller-timeout honesty.** When the caller's deadline fires first, the bridge
@@ -35,11 +36,12 @@ observes worker-terminal truth; it cannot always stop the outside work. The
 
 This crate captures completions through a result channel so the smoke test stays
 deterministic. A bridge feeding a live Tina service delivers each completion as a
-message to an isolate instead — `runtime.try_send(address, Msg::Completed { .. })`
-with an address from `ThreadedRuntime::register_with_capacity`, then
-`reply_to(..)` to the original caller. That path is entirely public; the
-bounded admission, worker-terminal accounting, and caller warning shown here are
-exactly what such a bridge surfaces.
+domain event instead: register with `ThreadedRuntime::register_event_service`,
+retain its typed `EventServiceHandle<BridgeEvent>`, and call
+`runtime.try_send_event(events, BridgeEvent::Completed { .. })`, then
+`reply_to(..)` to the original caller. That path is entirely public; the bounded
+admission, worker-terminal accounting, and caller warning shown here are exactly
+what such a bridge surfaces.
 
 ## Run the smoke test
 

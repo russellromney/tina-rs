@@ -64,8 +64,7 @@ advance calls with `InvariantViolation`, and leave genuine in-flight work armed
 when a stale reply is rejected.
 
 This closes the framework prerequisite found by
-`tina-extension-custom-codec`. Migrating that extension to event-only service
-registration and exhaustive Unix outcomes remains a separate example commit.
+`tina-extension-custom-codec`; the extension migration is recorded below.
 
 ### 2026-07-12 Typed sharded request-service table prerequisite
 
@@ -111,6 +110,35 @@ timeout in both the HTTP and DB stages, timer-lane Full as an exact
 `TimerFailed(TimerFull)`, gateway mailbox Full, completion-only slow events,
 concurrent workers, and zero HTTP/DB authority after shutdown. Unit accounting
 keeps every call terminal and every outer threaded-host error distinct.
+
+### 2026-07-12 Extension corpus canonicalization ledger
+
+Every crate under `examples/extensions` was read by hand and run with
+`--all-targets`. Four extension proofs needed no isolate-authoring migration;
+adversarial review still corrected pressure and validation defects rather than
+declaring their existing shapes canonical by inspection:
+
+| Example | Current friction | Desired form | API sufficient | Framework prerequisite | Example branch | Tests | Status |
+|---|---|---|---|---|---|---|---|
+| `tina-extension-capacity-surface` | None; owned report data joins `CapacitySummary` directly. | Current `CapacitySurfaceReport` constructors and typed assertions. | yes | none | `agent/extensions-canonical` | 1 unit test | canonical |
+| `tina-extension-compile-fail` | None; public/private ownership boundaries are compile-fail doctests. | Current public constructors with unforgeable private state. | yes | none | `agent/extensions-canonical` | 4 doctests + count guard | canonical |
+| `tina-extension-fake-bridge` | Closed: in-flight accounting happened after enqueue, so a fast worker could underflow the counter and the queue admitted one more job than the reported installed cap. | Reserve total queued-plus-active capacity before dispatch; roll back failed dispatch exactly. | yes | none | `agent/extensions-canonical` | 3 unit tests, including 100 fast-worker iterations | canonical; docs migrated to event handle vocabulary |
+| `tina-extension-service-policy` | Closed: a zero limit still admitted the first request for a new key; a zero window had no stable retry contract. | Fallible configuration before policy use, then exhaustive decisions from caller-supplied time. | yes | none | `agent/extensions-canonical` | 2 unit tests | canonical |
+| `tina-extension-custom-codec` | Closed: both actors were event-only but used generic message authoring and collapsed Unix errors. | Event-only isolates/registration/sends, envelope-free typed continuations, and exact staged Unix failures. | yes | `UnixWriteAll::next_service_event` and `advance_service_event` (PR #331). | `agent/extensions-canonical` | 8 unit/simulator tests | canonical |
+
+The custom codec README and extension user guide now show the correct public
+`SyncCodec::feed` signature (`-> usize`). Fake-bridge documentation now teaches
+typed event-only registration and `try_send_event` rather than a generic
+message address. No example-local envelope adapter or duplicate write loop was
+added. After PR #331, the custom codec resumed and now uses event-only service
+handles throughout. `CodecIoFailure` preserves endpoint, bind/accept/connect/
+read/write/close stage, and exact `CallError`; codec Full/Malformed policy
+outcomes remain separate from transport failure. Adversarial failure probes
+exercise every staged rail outcome on both endpoints where applicable, and the
+one-shot server now closes both its stream and listener instead of relying on
+simulator teardown to hide the listener. The fake bridge now reserves its
+installed in-flight cap before dispatch, and the custom policy rejects
+self-contradictory zero configurations. The extension sweep is now complete.
 
 ### 2026-07-12 Lock-manager keyed FIFO canonicalization
 

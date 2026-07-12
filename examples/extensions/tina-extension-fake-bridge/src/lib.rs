@@ -9,9 +9,9 @@
 //!
 //! What it proves:
 //!
-//! - **Bounded setup.** The job queue is a bounded `sync_channel`; a
-//!   submit past capacity is [`BridgeOutcomeClass::Retryable`]`(BridgeFull)`,
-//!   never an unbounded buffer.
+//! - **Bounded setup.** A fixed admission cap covers queued plus active work,
+//!   backed by a bounded `sync_channel`; a submit past capacity is
+//!   [`BridgeOutcomeClass::Retryable`]`(BridgeFull)`, never an unbounded buffer.
 //! - **Closer.** [`FakeBridgeCloser`] implements [`BridgeCloser`]:
 //!   idempotent `close()` plus visible `is_closed()`. After close, submit
 //!   is [`BridgeOutcomeClass::Unavailable`]`(BridgeClosed)`.
@@ -37,10 +37,10 @@
 //!
 //! ```ignore
 //! // From the worker thread, deliver the completion into the isolate
-//! // that is waiting on it. `address` comes from
-//! // `ThreadedRuntime::register_with_capacity`; the isolate then
+//! // that is waiting on it. `events` is an `EventServiceHandle<BridgeEvent>`
+//! // from `ThreadedRuntime::register_event_service`; the isolate then
 //! // replies to the original caller with `reply_to(..)`.
-//! runtime.try_send(address, Msg::Completed { id, output })?;
+//! runtime.try_send_event(events, BridgeEvent::Completed { id, output })?;
 //! ```
 //!
 //! Nothing in that path is private. The bounded admission, the worker
@@ -81,7 +81,7 @@ struct Job {
 pub struct FakeBridgeConfig {
     /// Stable, validated surface name (e.g. `"fake.worker"`).
     pub name: String,
-    /// Bounded admission capacity (the job queue depth).
+    /// Bounded admission capacity across queued plus active work.
     pub capacity: usize,
 }
 
@@ -89,10 +89,12 @@ pub struct FakeBridgeConfig {
 #[derive(Clone)]
 pub struct FakeBridgeCloser {
     closed: Arc<AtomicBool>,
+    admission: Arc<Mutex<()>>,
 }
 
 impl BridgeCloser for FakeBridgeCloser {
     fn close(&self) {
+        let _admission = self.admission.lock().unwrap();
         self.closed.store(true, Ordering::Release);
     }
 
@@ -227,12 +229,13 @@ where
 {
     let state = Arc::new(State::default());
     let closed = Arc::new(AtomicBool::new(false));
+    let admission = Arc::new(Mutex::new(()));
     let (tx, rx) = sync_channel::<Job>(config.capacity);
     let worker_state = Arc::clone(&state);
     let worker = thread::spawn(move || worker_loop(rx, work, worker_state));
 
     FakeBridgeInstall {
-        closer: FakeBridgeCloser { closed },
+        closer: FakeBridgeCloser { closed, admission },
         metrics: FakeBridgeMetrics {
             name: config.name,
             capacity: config.capacity,
@@ -265,6 +268,7 @@ impl FakeBridgeInstall {
     /// Submit one job. Bounded: a full queue is `Retryable(BridgeFull)`;
     /// a closed bridge is `Unavailable(BridgeClosed)`.
     pub fn submit(&self, input: u64) -> SubmitOutcome {
+        let _admission = self.closer.admission.lock().unwrap();
         if self.closer.is_closed() {
             self.metrics
                 .state
@@ -274,6 +278,32 @@ impl FakeBridgeInstall {
                 BridgeUnavailable::BridgeClosed,
             ));
         }
+        let reserved = loop {
+            let current = self.metrics.state.current.load(Ordering::Acquire);
+            if current >= self.metrics.capacity as u64 {
+                self.metrics.state.full_count.fetch_add(1, Ordering::AcqRel);
+                break false;
+            }
+            if self
+                .metrics
+                .state
+                .current
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.metrics
+                    .state
+                    .high_water
+                    .fetch_max(current + 1, Ordering::AcqRel);
+                break true;
+            }
+        };
+        if !reserved {
+            return SubmitOutcome::Rejected(BridgeOutcomeClass::Retryable(
+                BridgeRetryable::BridgeFull,
+            ));
+        }
+
         let abandoned = Arc::new(AtomicBool::new(false));
         let (result_tx, result_rx) = sync_channel::<u64>(1);
         let job = Job {
@@ -283,25 +313,26 @@ impl FakeBridgeInstall {
         };
         let tx = self.tx.as_ref().expect("bridge open");
         match tx.try_send(job) {
-            Ok(()) => {
-                let now = self.metrics.state.current.fetch_add(1, Ordering::AcqRel) + 1;
-                self.metrics
-                    .state
-                    .high_water
-                    .fetch_max(now, Ordering::AcqRel);
-                SubmitOutcome::Admitted(CallTicket {
-                    result_rx,
-                    abandoned,
-                    state: Arc::clone(&self.metrics.state),
-                })
-            }
+            Ok(()) => SubmitOutcome::Admitted(CallTicket {
+                result_rx,
+                abandoned,
+                state: Arc::clone(&self.metrics.state),
+            }),
             Err(TrySendError::Full(_)) => {
+                self.metrics.state.current.fetch_sub(1, Ordering::AcqRel);
                 self.metrics.state.full_count.fetch_add(1, Ordering::AcqRel);
                 SubmitOutcome::Rejected(BridgeOutcomeClass::Retryable(BridgeRetryable::BridgeFull))
             }
-            Err(TrySendError::Disconnected(_)) => SubmitOutcome::Rejected(
-                BridgeOutcomeClass::Unavailable(BridgeUnavailable::BridgeClosed),
-            ),
+            Err(TrySendError::Disconnected(_)) => {
+                self.metrics.state.current.fetch_sub(1, Ordering::AcqRel);
+                self.metrics
+                    .state
+                    .closed_count
+                    .fetch_add(1, Ordering::AcqRel);
+                SubmitOutcome::Rejected(BridgeOutcomeClass::Unavailable(
+                    BridgeUnavailable::BridgeClosed,
+                ))
+            }
         }
     }
 
@@ -497,11 +528,11 @@ fn run_full() -> bool {
         },
     );
 
-    // A: worker picks it up and blocks. B: fills the cap-1 queue. C: Full.
+    // A reserves the one installed in-flight slot. B is Full whether A is
+    // active or still queued.
     let _a = bridge.submit(1);
-    let _b = bridge.submit(2);
     let saw_full = matches!(
-        bridge.submit(3),
+        bridge.submit(2),
         SubmitOutcome::Rejected(BridgeOutcomeClass::Retryable(BridgeRetryable::BridgeFull))
     );
 
@@ -575,5 +606,31 @@ mod tests {
         bridge.closer().close(); // idempotent
         assert!(bridge.closer().is_closed());
         assert!(bridge.close_and_drain(Duration::from_secs(1)).drained());
+    }
+
+    #[test]
+    fn installed_capacity_bounds_total_in_flight_without_counter_underflow() {
+        for _ in 0..100 {
+            let bridge = install(
+                FakeBridgeConfig {
+                    name: "fake.fast".to_string(),
+                    capacity: 1,
+                },
+                |x| x,
+            );
+            let ticket = match bridge.submit(1) {
+                SubmitOutcome::Admitted(ticket) => ticket,
+                SubmitOutcome::Rejected(error) => panic!("first submit rejected: {error:?}"),
+            };
+            assert!(matches!(
+                ticket.wait(Duration::from_secs(1)),
+                CallObserved::Completed { output: 1, .. }
+            ));
+            let pressure = bridge.pressure();
+            assert_eq!(pressure.capacity(), 1);
+            assert_eq!(pressure.current(), 0);
+            assert_eq!(pressure.high_water(), 1);
+            assert!(bridge.close_and_drain(Duration::from_secs(1)).drained());
+        }
     }
 }
