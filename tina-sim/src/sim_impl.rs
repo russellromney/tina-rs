@@ -223,7 +223,8 @@ where
                     }
                 }
             })?;
-        Ok(Address::new_with_generation(
+        Ok(Address::new_with_generation_in(
+            self.system_incarnation,
             address.shard,
             address.isolate,
             address.generation,

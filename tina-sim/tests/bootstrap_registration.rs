@@ -4,9 +4,8 @@ use std::cell::Cell;
 use std::convert::Infallible;
 use std::rc::Rc;
 
-use tina::TrySendError;
 use tina::prelude::*;
-use tina_runtime::RegisterBootstrapError;
+use tina_runtime::{IngressSendError, RegisterBootstrapError};
 use tina_sim::{MultiShardSimulator, Simulator, SimulatorConfig};
 
 #[derive(Debug, Clone, Copy)]
@@ -87,9 +86,10 @@ fn simulator_bootstrap_is_admitted_before_address_publication() {
         )
         .expect("bootstrap admitted");
 
+    assert_eq!(address.system(), simulator.system_incarnation());
     assert!(matches!(
         simulator.try_send(address, Msg::Inspect),
-        Err(TrySendError::Full(Msg::Inspect))
+        Err(IngressSendError::Full(Msg::Inspect))
     ));
     assert!(simulator.trace().is_empty());
     simulator.run_until_quiescent();
@@ -179,6 +179,7 @@ fn multi_shard_simulator_has_the_same_bootstrap_shape() {
             Msg::Bootstrap(DropProbe(Rc::clone(&message_drops))),
         )
         .expect("bootstrap admitted on owned shard");
+    assert_eq!(address.system(), simulator.system_incarnation());
     assert_eq!(address.shard(), ShardId::new(20));
     simulator.run_until_quiescent();
     assert_eq!(delivered.get(), 1);

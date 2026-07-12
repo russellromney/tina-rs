@@ -143,6 +143,7 @@ fn local_system_bootstrap_is_first_and_supports_typed_host_calls() {
             Msg::Bootstrap(DropProbe(Arc::clone(&message_drops))),
         )
         .expect("atomic root bootstrap");
+    assert_eq!(address.system(), app.system_incarnation());
 
     let outcome = app
         .call_blocking(address, Msg::Inspect, Duration::from_secs(2))
@@ -298,7 +299,7 @@ fn local_multi_shard_bootstrap_routes_and_unknown_shard_returns_authority() {
         .expect("fallible startup");
     let (service, _, deliveries) = fresh_service();
     let successful_drops = Arc::new(AtomicU32::new(0));
-    let _address = app
+    let address = app
         .register_root_with_bootstrap_on::<Service, Infallible>(
             ShardId::new(20),
             service,
@@ -306,6 +307,8 @@ fn local_multi_shard_bootstrap_routes_and_unknown_shard_returns_authority() {
             Msg::Bootstrap(DropProbe(Arc::clone(&successful_drops))),
         )
         .expect("bootstrap on owned shard");
+    assert_eq!(address.system(), app.system_incarnation());
+    assert_eq!(address.shard(), ShardId::new(20));
     let deadline = Instant::now() + Duration::from_secs(2);
     while deliveries.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
         std::thread::yield_now();
