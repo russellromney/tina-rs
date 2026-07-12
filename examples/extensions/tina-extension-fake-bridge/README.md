@@ -22,7 +22,8 @@ observes worker-terminal truth; it cannot always stop the outside work. The
 
 ## What it proves
 
-- **Bounded setup.** A submit past the queue capacity is
+- **Bounded setup.** The installed cap covers queued plus active work. A submit
+  past that capacity is
   `Retryable(BridgeFull)`; after close it is `Unavailable(BridgeClosed)`. No
   unbounded buffer.
 - **Caller-timeout honesty.** When the caller's deadline fires first, the bridge

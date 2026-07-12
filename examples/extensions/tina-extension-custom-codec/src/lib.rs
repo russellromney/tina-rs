@@ -27,9 +27,10 @@ use std::sync::{Arc, Mutex};
 use tina::{Effect, Shard, ShardId};
 use tina_codec::{DecodeStatus, FrameDecision, SyncCodec, decode_chunk};
 use tina_runtime::{
-    CallError, LoopStep, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerId,
-    UnixReadReply, UnixStreamCloseReply, UnixStreamId, UnixWriteAll, UnixWriteOwnedReply,
-    unix_accept, unix_bind, unix_close_stream, unix_connect, unix_read,
+    CallError, LoopStep, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerCloseReply,
+    UnixListenerId, UnixReadReply, UnixStreamCloseReply, UnixStreamId, UnixWriteAll,
+    UnixWriteOwnedReply, unix_accept, unix_bind, unix_close_listener, unix_close_stream,
+    unix_connect, unix_read,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -127,7 +128,8 @@ enum ServerMsg {
     Accepted(UnixAcceptReply),
     Read(UnixReadReply),
     Wrote(UnixWriteOwnedReply),
-    Closed(UnixStreamCloseReply),
+    StreamClosed(UnixStreamCloseReply),
+    ListenerClosed(UnixListenerCloseReply),
 }
 
 struct CodecServer {
@@ -140,7 +142,7 @@ struct CodecServer {
     /// frame was seen). Flush first, then close, so the echoes land.
     closing: bool,
     seen: Arc<Mutex<Vec<Vec<u8>>>>,
-    rejected: Arc<Mutex<bool>>,
+    rejection: Arc<Mutex<Option<CodecRejection>>>,
     failures: Arc<Mutex<Vec<CodecIoFailure>>>,
 }
 
@@ -184,12 +186,17 @@ impl CodecServer {
                         }
                     }
                 });
-                if !self.closing
-                    && matches!(status, DecodeStatus::Malformed(_) | DecodeStatus::Full)
-                {
-                    // Bad stream: tear down now, discard partial reply.
-                    *self.rejected.lock().unwrap() = true;
-                    tear_down = true;
+                if !self.closing {
+                    let rejection = match status {
+                        DecodeStatus::Malformed(reason) => Some(CodecRejection::Malformed(reason)),
+                        DecodeStatus::Full => Some(CodecRejection::Full),
+                        DecodeStatus::NeedMore => None,
+                    };
+                    if let Some(rejection) = rejection {
+                        // Bad stream: tear down now, discard partial reply.
+                        *self.rejection.lock().unwrap() = Some(rejection);
+                        tear_down = true;
+                    }
                 }
                 if tear_down {
                     return self.close();
@@ -225,30 +232,48 @@ impl CodecServer {
                     LoopStep::Failed(error) => self.fail(CodecIoStage::Write, error),
                 }
             }
-            ServerMsg::Closed(Ok(())) => Effect::Stop,
-            ServerMsg::Closed(Err(error)) => self.fail(CodecIoStage::Close, error),
+            ServerMsg::StreamClosed(result) => {
+                if let Err(error) = result {
+                    self.record_failure(CodecIoStage::Close, error);
+                }
+                self.close_listener()
+            }
+            ServerMsg::ListenerClosed(Ok(())) => Effect::Stop,
+            ServerMsg::ListenerClosed(Err(error)) => self.fail(CodecIoStage::Close, error),
         }
     }
 
     fn close(&mut self) -> Effect<Self> {
         if let Some(stream) = self.stream.take() {
-            unix_close_stream(stream).then_service_event(ServerMsg::Closed)
+            unix_close_stream(stream).then_service_event(ServerMsg::StreamClosed)
+        } else {
+            self.close_listener()
+        }
+    }
+
+    fn close_listener(&mut self) -> Effect<Self> {
+        if let Some(listener) = self.listener.take() {
+            unix_close_listener(listener).then_service_event(ServerMsg::ListenerClosed)
         } else {
             Effect::Stop
         }
     }
 
     fn fail(&mut self, stage: CodecIoStage, error: CallError) -> Effect<Self> {
+        self.record_failure(stage, error);
+        match stage {
+            CodecIoStage::Accept => self.close_listener(),
+            CodecIoStage::Read | CodecIoStage::Write => self.close(),
+            CodecIoStage::Bind | CodecIoStage::Connect | CodecIoStage::Close => Effect::Stop,
+        }
+    }
+
+    fn record_failure(&mut self, stage: CodecIoStage, error: CallError) {
         self.failures.lock().unwrap().push(CodecIoFailure {
             endpoint: CodecEndpoint::Server,
             stage,
             error,
         });
-        if matches!(stage, CodecIoStage::Read | CodecIoStage::Write) {
-            self.close()
-        } else {
-            Effect::Stop
-        }
     }
 }
 
@@ -365,6 +390,15 @@ pub struct CodecIoFailure {
     pub error: CallError,
 }
 
+/// Typed codec-policy rejection, distinct from Unix transport failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecRejection {
+    /// The current frame exceeded the configured bound.
+    Full,
+    /// The codec rejected a complete frame with its typed reason.
+    Malformed(SemicolonMalformed),
+}
+
 /// One exchange's observations.
 #[derive(Debug, Clone)]
 pub struct CodecRun {
@@ -372,8 +406,8 @@ pub struct CodecRun {
     pub server_saw: Vec<Vec<u8>>,
     /// Bytes the client received.
     pub client_received: Vec<u8>,
-    /// True if the codec rejected the stream (`Malformed` or `Full`).
-    pub rejected: bool,
+    /// Typed codec-policy rejection, if any.
+    pub rejection: Option<CodecRejection>,
     /// Exhaustive terminal Unix rail failures, if any.
     pub io_failures: Vec<CodecIoFailure>,
 }
@@ -382,7 +416,7 @@ pub struct CodecRun {
 pub fn run_codec_service(path: PathBuf, payload: Vec<u8>, max_frame: usize) -> CodecRun {
     let mut sim = Simulator::new(CodecShard, SimulatorConfig::default());
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let rejected = Arc::new(Mutex::new(false));
+    let rejection = Arc::new(Mutex::new(None));
     let received = Arc::new(Mutex::new(Vec::new()));
     let failures = Arc::new(Mutex::new(Vec::new()));
 
@@ -394,7 +428,7 @@ pub fn run_codec_service(path: PathBuf, payload: Vec<u8>, max_frame: usize) -> C
         write_all: None,
         closing: false,
         seen: Arc::clone(&seen),
-        rejected: Arc::clone(&rejected),
+        rejection: Arc::clone(&rejection),
         failures: Arc::clone(&failures),
     };
     let server_addr = sim.register_event_service(server, 8);
@@ -416,7 +450,7 @@ pub fn run_codec_service(path: PathBuf, payload: Vec<u8>, max_frame: usize) -> C
     CodecRun {
         server_saw: seen.lock().unwrap().clone(),
         client_received: received.lock().unwrap().clone(),
-        rejected: *rejected.lock().unwrap(),
+        rejection: *rejection.lock().unwrap(),
         io_failures: failures.lock().unwrap().clone(),
     }
 }
@@ -459,8 +493,9 @@ pub fn run() -> Report {
     Report {
         frames: happy.server_saw.len() as u64,
         echoed_bytes: happy.client_received.len() as u64,
-        oversize_rejected: big.rejected,
-        malformed_rejected: bad.rejected,
+        oversize_rejected: big.rejection == Some(CodecRejection::Full),
+        malformed_rejected: bad.rejection
+            == Some(CodecRejection::Malformed(SemicolonMalformed::EmbeddedNul)),
         io_failures: happy
             .io_failures
             .into_iter()
@@ -473,6 +508,61 @@ pub fn run() -> Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn server(path: PathBuf, failures: Arc<Mutex<Vec<CodecIoFailure>>>) -> CodecServer {
+        CodecServer {
+            path,
+            listener: None,
+            stream: None,
+            codec: SemicolonCodec::new(64),
+            write_all: None,
+            closing: false,
+            seen: Arc::new(Mutex::new(Vec::new())),
+            rejection: Arc::new(Mutex::new(None)),
+            failures,
+        }
+    }
+
+    fn client(path: PathBuf, failures: Arc<Mutex<Vec<CodecIoFailure>>>) -> CodecClient {
+        CodecClient {
+            path,
+            stream: None,
+            outbound: b"quit;".to_vec(),
+            write_all: None,
+            received: Arc::new(Mutex::new(Vec::new())),
+            failures,
+        }
+    }
+
+    fn run_server_event(event: ServerMsg) -> Vec<CodecIoFailure> {
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        let mut sim = Simulator::new(CodecShard, SimulatorConfig::default());
+        let actor = sim.register_event_service(
+            server(
+                PathBuf::from("/tmp/tina_ext_codec_probe.sock"),
+                Arc::clone(&failures),
+            ),
+            8,
+        );
+        sim.try_send_event(actor, event).unwrap();
+        sim.run_until_quiescent();
+        failures.lock().unwrap().clone()
+    }
+
+    fn run_client_event(event: ClientMsg) -> Vec<CodecIoFailure> {
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        let mut sim = Simulator::new(CodecShard, SimulatorConfig::default());
+        let actor = sim.register_event_service(
+            client(
+                PathBuf::from("/tmp/tina_ext_codec_probe.sock"),
+                Arc::clone(&failures),
+            ),
+            8,
+        );
+        sim.try_send_event(actor, event).unwrap();
+        sim.run_until_quiescent();
+        failures.lock().unwrap().clone()
+    }
 
     #[test]
     fn custom_codec_drives_a_service_and_bounds_input() {
@@ -494,6 +584,187 @@ mod tests {
     }
 
     #[test]
+    fn codec_policy_full_and_malformed_remain_distinct() {
+        let full = run_codec_service(
+            PathBuf::from("/tmp/tina_ext_codec_typed_full.sock"),
+            b"abcdef;".to_vec(),
+            2,
+        );
+        assert_eq!(full.rejection, Some(CodecRejection::Full));
+        assert!(full.io_failures.is_empty());
+
+        let malformed = run_codec_service(
+            PathBuf::from("/tmp/tina_ext_codec_typed_malformed.sock"),
+            b"a\0b;".to_vec(),
+            8,
+        );
+        assert_eq!(
+            malformed.rejection,
+            Some(CodecRejection::Malformed(SemicolonMalformed::EmbeddedNul))
+        );
+        assert!(malformed.io_failures.is_empty());
+    }
+
+    #[test]
+    fn server_failure_ledger_preserves_bind_accept_read_write_and_close() {
+        let path = PathBuf::from("/tmp/tina_ext_codec_duplicate_bind.sock");
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        let mut sim = Simulator::new(CodecShard, SimulatorConfig::default());
+        let first = sim.register_event_service(server(path.clone(), Arc::clone(&failures)), 8);
+        let second = sim.register_event_service(server(path.clone(), Arc::clone(&failures)), 8);
+        let peer = sim.register_event_service(client(path, Arc::clone(&failures)), 8);
+        sim.try_send_event(first, ServerMsg::Start).unwrap();
+        sim.try_send_event(second, ServerMsg::Start).unwrap();
+        sim.try_send_event(peer, ClientMsg::Start).unwrap();
+        sim.run_until_quiescent();
+        assert_eq!(
+            *failures.lock().unwrap(),
+            [CodecIoFailure {
+                endpoint: CodecEndpoint::Server,
+                stage: CodecIoStage::Bind,
+                error: CallError::Io,
+            }]
+        );
+
+        assert_eq!(
+            run_server_event(ServerMsg::Bound(Ok((
+                UnixListenerId::new(9999),
+                PathBuf::from("/tmp/tina_ext_codec_invalid_listener.sock"),
+            )))),
+            [
+                CodecIoFailure {
+                    endpoint: CodecEndpoint::Server,
+                    stage: CodecIoStage::Accept,
+                    error: CallError::InvalidResource,
+                },
+                CodecIoFailure {
+                    endpoint: CodecEndpoint::Server,
+                    stage: CodecIoStage::Close,
+                    error: CallError::InvalidResource,
+                },
+            ]
+        );
+
+        assert_eq!(
+            run_server_event(ServerMsg::Accepted(Ok(UnixStreamId::new(9999)))),
+            [
+                CodecIoFailure {
+                    endpoint: CodecEndpoint::Server,
+                    stage: CodecIoStage::Read,
+                    error: CallError::InvalidResource,
+                },
+                CodecIoFailure {
+                    endpoint: CodecEndpoint::Server,
+                    stage: CodecIoStage::Close,
+                    error: CallError::InvalidResource,
+                },
+            ]
+        );
+
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        let mut actor_state = server(
+            PathBuf::from("/tmp/tina_ext_codec_invalid_write.sock"),
+            Arc::clone(&failures),
+        );
+        actor_state.stream = Some(UnixStreamId::new(9999));
+        let mut sim = Simulator::new(CodecShard, SimulatorConfig::default());
+        let actor = sim.register_event_service(actor_state, 8);
+        sim.try_send_event(actor, ServerMsg::Read(Ok(b"x;".to_vec())))
+            .unwrap();
+        sim.run_until_quiescent();
+        assert_eq!(
+            *failures.lock().unwrap(),
+            [
+                CodecIoFailure {
+                    endpoint: CodecEndpoint::Server,
+                    stage: CodecIoStage::Write,
+                    error: CallError::InvalidResource,
+                },
+                CodecIoFailure {
+                    endpoint: CodecEndpoint::Server,
+                    stage: CodecIoStage::Close,
+                    error: CallError::InvalidResource,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn client_failure_ledger_preserves_connect_read_write_and_close() {
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        let mut sim = Simulator::new(CodecShard, SimulatorConfig::default());
+        let actor = sim.register_event_service(
+            client(
+                PathBuf::from("/tmp/tina_ext_codec_missing_listener.sock"),
+                Arc::clone(&failures),
+            ),
+            8,
+        );
+        sim.try_send_event(actor, ClientMsg::Start).unwrap();
+        sim.run_until_quiescent();
+        assert_eq!(
+            *failures.lock().unwrap(),
+            [CodecIoFailure {
+                endpoint: CodecEndpoint::Client,
+                stage: CodecIoStage::Connect,
+                error: CallError::NotFound,
+            }]
+        );
+
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        let mut actor_state = client(
+            PathBuf::from("/tmp/tina_ext_codec_invalid_client_read.sock"),
+            Arc::clone(&failures),
+        );
+        actor_state.stream = Some(UnixStreamId::new(9999));
+        let mut sim = Simulator::new(CodecShard, SimulatorConfig::default());
+        let actor = sim.register_event_service(actor_state, 8);
+        sim.try_send_event(actor, ClientMsg::Read(Err(CallError::Io)))
+            .unwrap();
+        sim.run_until_quiescent();
+        assert_eq!(
+            *failures.lock().unwrap(),
+            [
+                CodecIoFailure {
+                    endpoint: CodecEndpoint::Client,
+                    stage: CodecIoStage::Read,
+                    error: CallError::Io,
+                },
+                CodecIoFailure {
+                    endpoint: CodecEndpoint::Client,
+                    stage: CodecIoStage::Close,
+                    error: CallError::InvalidResource,
+                },
+            ]
+        );
+
+        assert_eq!(
+            run_client_event(ClientMsg::Connected(Ok(UnixStreamId::new(9999)))),
+            [
+                CodecIoFailure {
+                    endpoint: CodecEndpoint::Client,
+                    stage: CodecIoStage::Write,
+                    error: CallError::InvalidResource,
+                },
+                CodecIoFailure {
+                    endpoint: CodecEndpoint::Client,
+                    stage: CodecIoStage::Close,
+                    error: CallError::InvalidResource,
+                },
+            ]
+        );
+
+        assert_eq!(
+            run_client_event(ClientMsg::Closed(Err(CallError::Io))),
+            [CodecIoFailure {
+                endpoint: CodecEndpoint::Client,
+                stage: CodecIoStage::Close,
+                error: CallError::Io,
+            }]
+        );
+    }
+
+    #[test]
     fn codec_is_replayable() {
         // Same bytes in, same frames out — independent of any clock. The
         // `quit;` frame closes the connection so the run quiesces.
@@ -509,6 +780,7 @@ mod tests {
         );
         assert_eq!(a.server_saw, b.server_saw);
         assert_eq!(a.client_received, b.client_received);
+        assert_eq!(a.rejection, b.rejection);
         assert_eq!(a.io_failures, b.io_failures);
     }
 
@@ -542,7 +814,7 @@ mod tests {
         );
         assert_eq!(result.server_saw, [b"quit".to_vec()]);
         assert!(
-            !result.rejected,
+            result.rejection.is_none(),
             "quit is an intentional close, not bad input"
         );
     }

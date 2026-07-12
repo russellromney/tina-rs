@@ -47,18 +47,44 @@ pub struct PerTenantWindow {
     admitted_count: u64,
 }
 
+/// Invalid fixed-window policy configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyConfigError {
+    /// A zero request limit would make first-key admission contradict the cap.
+    ZeroLimit,
+    /// A zero window has no stable retry interval.
+    ZeroWindow,
+}
+
+impl std::fmt::Display for PolicyConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroLimit => f.write_str("per-tenant limit must be greater than zero"),
+            Self::ZeroWindow => f.write_str("policy window must be greater than zero"),
+        }
+    }
+}
+
+impl std::error::Error for PolicyConfigError {}
+
 impl PerTenantWindow {
     /// Build a policy that admits `limit` requests per `window` per key,
     /// across at most `max_keys` distinct keys.
-    pub fn new(
+    pub fn try_new(
         surface: impl Into<SurfaceName>,
         max_keys: usize,
         limit: u32,
         window: Duration,
-    ) -> Self {
+    ) -> Result<Self, PolicyConfigError> {
+        if limit == 0 {
+            return Err(PolicyConfigError::ZeroLimit);
+        }
+        if window.is_zero() {
+            return Err(PolicyConfigError::ZeroWindow);
+        }
         let mut slots = Vec::with_capacity(max_keys);
         slots.resize_with(max_keys, || None);
-        Self {
+        Ok(Self {
             surface: surface.into(),
             limit,
             window,
@@ -67,7 +93,7 @@ impl PerTenantWindow {
             full_count: 0,
             rate_limited_count: 0,
             admitted_count: 0,
-        }
+        })
     }
 
     /// Number of distinct keys currently tracked.
@@ -202,7 +228,8 @@ pub fn run() -> Report {
     ];
 
     let drive = |base: Instant| -> Vec<&'static str> {
-        let mut policy = PerTenantWindow::new("ext.per_tenant", 2, 2, Duration::from_secs(1));
+        let mut policy = PerTenantWindow::try_new("ext.per_tenant", 2, 2, Duration::from_secs(1))
+            .expect("scripted policy config is valid");
         script
             .iter()
             .map(|(tenant, off)| {
@@ -217,7 +244,8 @@ pub fn run() -> Report {
     let second = drive(base);
 
     // Also keep one policy to read its accumulated report.
-    let mut counted = PerTenantWindow::new("ext.per_tenant", 2, 2, Duration::from_secs(1));
+    let mut counted = PerTenantWindow::try_new("ext.per_tenant", 2, 2, Duration::from_secs(1))
+        .expect("scripted policy config is valid");
     for (tenant, off) in script {
         let _ = counted.decide(tenant, base + Duration::from_millis(*off));
     }
@@ -248,5 +276,17 @@ mod tests {
         );
         assert_eq!(report.rate_limited, 1);
         assert_eq!(report.table_full, 1);
+    }
+
+    #[test]
+    fn invalid_policy_configuration_is_rejected_before_first_admission() {
+        assert!(matches!(
+            PerTenantWindow::try_new("ext.zero-limit", 1, 0, Duration::from_secs(1)),
+            Err(PolicyConfigError::ZeroLimit)
+        ));
+        assert!(matches!(
+            PerTenantWindow::try_new("ext.zero-window", 1, 1, Duration::ZERO),
+            Err(PolicyConfigError::ZeroWindow)
+        ));
     }
 }

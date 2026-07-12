@@ -41,7 +41,10 @@ started through `try_send_event`. One-shot Unix calls use
 
 Bind, accept, connect, read, write, and close failures retain the exact
 `CallError` and endpoint/stage in `CodecIoFailure`. Codec policy rejection
-(`Full` or `Malformed`) remains distinct from transport failure.
+remains a typed `CodecRejection::Full` or
+`CodecRejection::Malformed(reason)`, distinct from transport failure.
+The one-shot server settles both its accepted stream and listener before it
+stops, including failure teardown.
 
 ## Run the smoke test
 

@@ -13,7 +13,8 @@ fn report(&self) -> AdmissionReport;
 ```
 
 This crate's `PerTenantWindow` is a per-tenant fixed-window rate limiter keyed
-by an external natural key (a tenant id).
+by an external natural key (a tenant id). Its fallible `try_new` rejects a zero
+limit or zero-length window before the policy can contradict its own cap.
 
 ## What it proves
 
