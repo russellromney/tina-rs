@@ -15,7 +15,7 @@ use std::time::Duration;
 use tina::prelude::*;
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, ParkError, PendingReplies,
-    request_effect_after_park, RuntimeCall, ThreadedRuntime, call_request,
+    request_effect_after_park, ThreadedRuntime, call_request,
 };
 
 use crate::{CLIENTS, MAX_IN_FLIGHT, Report, WORKERS, expected_aggregate};
@@ -133,7 +133,7 @@ impl Coordinator {
                 let qid = self.next_qid;
                 self.next_qid += 1;
                 match self.pending.park_request(qid, call) {
-                    Ok(ticket) => {
+                    Ok((_ticket, permit)) => {
                         self.partials.push(PartialQuery {
                             qid,
                             sum: 0,
@@ -143,19 +143,13 @@ impl Coordinator {
                             .workers
                             .iter()
                             .map(|w| {
-                                Effect::Io(RuntimeCall::isolate_call(
-                                    *w,
-                                    WorkerMsg::Do(payload),
-                                    QUERY_TIMEOUT,
-                                    move |outcome| {
-                                        tina::ServiceMessage::Event(CoordEvent::WorkerDone(
-                                            qid, outcome,
-                                        ))
-                                    },
-                                ))
+                                tina_runtime::call(*w, WorkerMsg::Do(payload), QUERY_TIMEOUT)
+                                    .then_service_event(move |outcome| {
+                                        CoordEvent::WorkerDone(qid, outcome)
+                                    })
                             })
                             .collect();
-                        request_effect_after_park(&ticket, Effect::Batch(calls))
+                        request_effect_after_park(permit, Effect::Batch(calls))
                     }
                     // Pending box full: reply Full to the caller
                     // without capturing. The caller observes a typed

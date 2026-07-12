@@ -1684,7 +1684,7 @@ fn start_h2_server(
     let config = Http2ServerConfig::dev();
     let listener = runtime
         .register_with_capacity::<Http2Listener<SingleShard>, _>(
-            Http2Listener::<SingleShard>::new("127.0.0.1:0".parse()?, service, config),
+            Http2Listener::<SingleShard>::new("127.0.0.1:0".parse()?, service, config)?,
             config.listener_mailbox_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register tina http2 listener: {e:?}"))?;
@@ -1991,7 +1991,7 @@ fn start_h2_client(
     };
     let client = runtime
         .register_with_capacity_and_bootstrap::<Http2ClientConnection<SingleShard>, _>(
-            Http2ClientConnection::new(target, Http2ClientLimits::default()),
+            Http2ClientConnection::new(target, Http2ClientLimits::default())?,
             CAPACITY,
             Http2ClientMsg::Begin,
         )
@@ -2138,7 +2138,7 @@ fn start_grpc_server_with_router(
                 "127.0.0.1:0".parse()?,
                 service,
                 config,
-            ),
+            )?,
             config.listener_mailbox_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register tina grpc listener: {e:?}"))?;
@@ -2378,7 +2378,7 @@ pub fn http2_steady_state_turn_report() -> anyhow::Result<ProtocolTurnReport> {
     let config = Http2ServerConfig::dev();
     let listener = runtime
         .register_with_capacity::<Http2Listener<SingleShard>, _>(
-            Http2Listener::<SingleShard>::new("127.0.0.1:0".parse()?, service, config),
+            Http2Listener::<SingleShard>::new("127.0.0.1:0".parse()?, service, config)?,
             config.listener_mailbox_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register tina http2 listener: {e:?}"))?;

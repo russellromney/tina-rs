@@ -20,7 +20,7 @@ use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRunti
 use crate::grpc_client::GrpcUnaryOutcome;
 use crate::http2::{
     Http2ClientConnection, Http2ClientLimits, Http2ClientMsg, Http2ClientOutcome, Http2ClientReply,
-    Http2Target,
+    Http2ConfigError, Http2Target,
 };
 
 /// What a transport outcome says about one endpoint's health.
@@ -191,6 +191,26 @@ pub enum FixedEndpointPoolError {
         connections: usize,
     },
 }
+
+impl std::fmt::Display for FixedEndpointPoolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroStreams => f.write_str("max_in_flight_per_conn must be positive"),
+            Self::ZeroPreConnectQueueCap => f.write_str("pre_connect_queue_cap must be positive"),
+            Self::ZeroRetainedReports => f.write_str("retained_reports must be positive"),
+            Self::NoEndpoints => f.write_str("at least one endpoint is required"),
+            Self::MismatchedConnections {
+                targets,
+                connections,
+            } => write!(
+                f,
+                "target and connection counts differ ({targets} targets, {connections} connections)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FixedEndpointPoolError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EndpointSlot {
@@ -613,9 +633,23 @@ pub fn build_http2_client_pool<S>(
 where
     S: Shard + Send + 'static,
 {
+    limits.validate().map_err(Http2PoolBuildError::Config)?;
+    if connection_mailbox_capacity == 0 {
+        return Err(Http2PoolBuildError::Config(
+            Http2ConfigError::ZeroConnectionMailboxCapacity,
+        ));
+    }
+    config.validate().map_err(Http2PoolBuildError::Pool)?;
+    if targets.is_empty() {
+        return Err(Http2PoolBuildError::Pool(
+            FixedEndpointPoolError::NoEndpoints,
+        ));
+    }
+
     let mut connections = Vec::with_capacity(targets.len());
     for target in &targets {
-        let conn = Http2ClientConnection::<S>::new(target.clone(), limits);
+        let conn = Http2ClientConnection::<S>::new(target.clone(), limits)
+            .map_err(Http2PoolBuildError::Config)?;
         let address = runtime
             .register_with_capacity::<Http2ClientConnection<S>, std::convert::Infallible>(
                 conn,
@@ -628,8 +662,11 @@ where
 }
 
 /// Why building an HTTP/2 pool failed.
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum Http2PoolBuildError {
+    /// The shared HTTP/2 connection limits were invalid.
+    Config(Http2ConfigError),
     /// The runtime failed to register a connection isolate.
     Runtime(ThreadedRuntimeError),
     /// The pool config or endpoint list was invalid.
@@ -639,13 +676,22 @@ pub enum Http2PoolBuildError {
 impl std::fmt::Display for Http2PoolBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Runtime(e) => write!(f, "runtime register failed: {e:?}"),
-            Self::Pool(e) => write!(f, "pool config invalid: {e:?}"),
+            Self::Config(e) => write!(f, "HTTP/2 config invalid: {e}"),
+            Self::Runtime(e) => write!(f, "runtime register failed: {e}"),
+            Self::Pool(e) => write!(f, "pool config invalid: {e}"),
         }
     }
 }
 
-impl std::error::Error for Http2PoolBuildError {}
+impl std::error::Error for Http2PoolBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(error) => Some(error),
+            Self::Runtime(error) => Some(error),
+            Self::Pool(error) => Some(error),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -677,6 +723,58 @@ mod tests {
             .collect();
         let conns: Vec<_> = (0..n).map(|i| dummy_conn(i as u64 + 1)).collect();
         Http2ClientPool::new(&targets, conns, FixedEndpointPoolConfig::balanced()).unwrap()
+    }
+
+    #[test]
+    fn pool_builder_rejects_configuration_before_registration() {
+        let runtime = ThreadedRuntime::new(tina::SingleShard, DefaultThreadedMailboxFactory);
+        let targets = vec![h2c_target("svc", 50_000)];
+
+        let error = build_http2_client_pool(
+            &runtime,
+            targets.clone(),
+            Http2ClientLimits {
+                max_frame_size: 1,
+                ..Http2ClientLimits::default()
+            },
+            FixedEndpointPoolConfig::balanced(),
+            1,
+        )
+        .err()
+        .expect("invalid connection limits are rejected");
+        assert!(matches!(
+            error,
+            Http2PoolBuildError::Config(Http2ConfigError::FrameSizeOutOfRange { .. })
+        ));
+
+        let error = build_http2_client_pool(
+            &runtime,
+            targets,
+            Http2ClientLimits::default(),
+            FixedEndpointPoolConfig::balanced(),
+            0,
+        )
+        .err()
+        .expect("zero connection mailbox is rejected");
+        assert!(matches!(
+            error,
+            Http2PoolBuildError::Config(Http2ConfigError::ZeroConnectionMailboxCapacity)
+        ));
+        runtime.shutdown().expect("runtime shuts down");
+    }
+
+    #[test]
+    fn pool_build_error_preserves_typed_source() {
+        let error = Http2PoolBuildError::Config(Http2ConfigError::ZeroOutboundQueueCapacity);
+        let source = std::error::Error::source(&error).expect("config source is retained");
+        assert_eq!(
+            source.to_string(),
+            "connection_outbound_queue_capacity must be positive"
+        );
+
+        let error = Http2PoolBuildError::Pool(FixedEndpointPoolError::NoEndpoints);
+        let source = std::error::Error::source(&error).expect("pool source is retained");
+        assert_eq!(source.to_string(), "at least one endpoint is required");
     }
 
     fn picked_index(outcome: Http2PickOutcome) -> usize {

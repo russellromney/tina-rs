@@ -14,8 +14,8 @@ use std::time::Duration;
 use tina::prelude::*;
 use tina_runtime::{
     CallGroup, CallGroupToken, CallOutcome, CallReplyRejectedReason, DefaultThreadedMailboxFactory,
-    DeferredReplyRejectedReason, RuntimeEventKind, SleepReply, ThreadedRuntime, call_cancelable,
-    cancel_call, sleep,
+    DeferredReplyRejectedReason, RuntimeEventKind, SleepReply, ThreadedRuntime,
+    call_cancelable_request, cancel_call, sleep,
 };
 
 use crate::{CANCEL_AFTER_MS, FANOUT, Report, WORK_MS};
@@ -66,9 +66,9 @@ impl Worker {
         call: RequestCall<'_, Self>,
     ) -> RequestEffect<Self> {
         match request {
-            WorkerRequest::Do => call.defer(sleep(self.work)).reply(|req, result| {
-                tina::ServiceMessage::Event(WorkerEvent::DoneForCall(req, result))
-            }),
+            WorkerRequest::Do => call
+                .defer(sleep(self.work))
+                .reply_service_event(WorkerEvent::DoneForCall),
         }
     }
 }
@@ -124,19 +124,11 @@ impl Driver {
                 let mut effects = Vec::with_capacity(self.workers.len());
                 for (idx, worker) in self.workers.iter().enumerate() {
                     let key = idx as u32;
-                    // No `call_request_cancelable` helper exists for split-
-                    // service request addresses, so the request is wrapped
-                    // through the documented `CallAddress`/`Address` escape
-                    // hatch rather than a bespoke translator.
                     let effect = self
                         .group
                         .start_cancelable(
                             key,
-                            call_cancelable(
-                                worker.address().address(),
-                                tina::ServiceMessage::Request(WorkerRequest::Do),
-                                CALL_TIMEOUT,
-                            ),
+                            call_cancelable_request(*worker, WorkerRequest::Do, CALL_TIMEOUT),
                             |worker, token, outcome| DriverMsg::Returned {
                                 worker,
                                 token,

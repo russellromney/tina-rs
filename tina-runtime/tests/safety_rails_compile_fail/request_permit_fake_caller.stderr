@@ -1,0 +1,9 @@
+error[E0133]: call to unsafe function `tina::Context::<'a, S, R>::with_caller` is unsafe and requires unsafe block
+  --> tests/safety_rails_compile_fail/request_permit_fake_caller.rs:16:16
+   |
+16 |       let _ctx = tina::Context::<_, ()>::new_typed(&mut shard, tina::IsolateId::new(1))
+   |  ________________^
+17 | |         .with_caller(caller);
+   | |____________________________^ call to unsafe function
+   |
+   = note: consult the function's documentation for information on how to avoid undefined behavior

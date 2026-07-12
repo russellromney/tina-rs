@@ -72,8 +72,7 @@ impl ServiceC {
                 } else {
                     Duration::from_millis(FAST_C_MS)
                 };
-                call.defer(sleep(work))
-                    .reply(|req, result| tina::ServiceMessage::Event(CEvent::Done(req, result)))
+                call.defer(sleep(work)).reply_service_event(CEvent::Done)
             }
         }
     }
@@ -136,7 +135,7 @@ impl ServiceB {
                 // surfaces as `CallOutcome::Timeout`.
                 let timeout = deadline.remaining_or_zero(call.now());
                 call.defer(call_request(self.c_addr, CRequest::Compute { iteration }, timeout))
-                    .reply(|req, outcome| tina::ServiceMessage::Event(BEvent::CDone(req, outcome)))
+                    .reply_service_event(BEvent::CDone)
             }
         }
     }
@@ -211,7 +210,7 @@ impl ServiceA {
                     // specimen exists to teach.
                     self.budget + Duration::from_millis(50),
                 ))
-                .reply(|req, outcome| tina::ServiceMessage::Event(AEvent::BDone(req, outcome)))
+                .reply_service_event(AEvent::BDone)
             }
         }
     }

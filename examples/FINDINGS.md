@@ -11,8 +11,88 @@ valid; the long-form history lives in
 
 ## Active
 
+### 2026-07-12 Remaining raw Isolate → macro (rooms / fanout / grpc / mini_saas)
+
+Converted the last hand-rolled `impl Isolate` / `isolate_types!` blocks:
+
+- `specimen_sharded_fanout_read` ShardCounter (`send` + `AppShard`) + ScatterCoord (`tina::isolate`, `Io=Infallible`)
+- `specimen_grpc_counter` StreamingEchoSource
+- `specimen_websocket_room` Gateway + Room
+- `system_realtime_rooms` Room + Gateway (dropped manual `CallableIsolate` stamps; macro now owns them)
+- `mini_saas_api` NotifySink + Controller
+
+**Still open (not raw Isolate):**
+- Bind/Start paired-registration ceremony in scatter fanout (finding 3)
+- LocalSystem / fallible startup migration for production-shaped hosts
+- event-only / request-only form sweep where placeholders remain
+
+
+### 2026-07-11 Raw `impl Isolate` → macro cohort (local I/O + sqlite + cross-shard)
+
+- `specimen_local_io_codec_ipc` — Ingest/Seeder/CopyPump, AdminServer/Client,
+  KeyspaceServer/Client, live Unix Probe all on `#[tina_runtime::isolate]`
+- `specimen_sqlite_counter` Caller/QueryCaller
+- `specimen_cross_shard_child_ownership` Worker
+
+Still raw: websocket/realtime rooms, mini_saas Controller/NotifySink,
+sharded_fanout_read, grpc StreamingEchoSource (specialized Io/Send/protocol
+shapes).
+
+
 Finding numbers are stable across phases — when a finding closes it
 moves to the [Closed](#closed) section below with the same number.
+
+### 2026-07-11 Raw `impl Isolate` → macro cohort (partial)
+
+Converted remaining mechanical raw/`isolate_types!` blocks onto
+`#[tina::isolate]` / `#[tina_runtime::isolate]`:
+
+- `tina-extension-custom-codec` CodecServer + CodecClient (`shard = CodecShard`)
+- `specimen_http_body_streaming` StreamingService
+- `specimen_webhook_publisher` Driver
+- `ergonomics_playground` QuoteClient / BatchClient / CacheClient
+
+**Still raw (next slice):** `specimen_local_io_codec_ipc/*`,
+`specimen_sharded_fanout_read`, `specimen_sqlite_counter`,
+`specimen_grpc_counter`, `specimen_cross_shard_child_ownership`,
+`specimen_websocket_room`, `system_realtime_rooms`, `mini_saas_api`
+Controller/NotifySink. Some of these own non-default `Io`/`Send`/shard
+shapes and need careful macro attributes rather than a rename.
+
+### 2026-07-11 Envelope-free continuation cohort
+
+Closed the remaining application-level `ServiceMessage::Event` /
+`ServiceMessage::Request` construction in the examples corpus by
+migrating onto the landed helpers (`then_service_event`,
+`reply_service_event`, `call_request`, `call_cancelable_request`,
+`send_event`, `register_split_service`) and two small missing set/scope
+helpers:
+
+- `CallGroup` / `CallJoinSet` / `CallSelectSet::start_cancelable_service_event`
+- `RequestScope::cancel_into_service_event_effect`
+
+**Migrated (no remaining envelope construction in effect/call sites):**
+
+- specimens: `backpressure_chain`, `cancellation_chain`,
+  `multi_turn_request_context`, `request_scope_fanout`, `scatter_gather`,
+  `two_stage_pipeline` (comment only), `worker_pool`
+- systems: `api_gateway_limits`, `bounded_object_lane`, `cache_with_fill`,
+  `copied_service_path`, `job_queue`, `lock_manager`, `metrics_shipper`,
+  `scoped_request_tree`, `soak_http_db`, `webhook_relay`,
+  `ergonomics_playground` (also switched races/batch/cache probes onto
+  typed `ServiceRequestAddress` + `register_split_service`)
+
+**Still open after this cohort (not envelope construction):**
+
+- Raw `impl Isolate` blocks (extensions custom-codec, local I/O specimens,
+  websocket/room gateways, driver clients in ergonomics_playground) —
+  next cohort: macro/`#[isolate]` form where lanes allow.
+- Production-shaped hosts still on bare `ThreadedRuntime::new` rather
+  than `LocalSystem` + fallible startup — next cohort.
+- `specimen_sharded_fanout_read` Bind/Start paired-registration ceremony
+  (finding 3) — still a framework gap.
+- Type aliases like `SoakMsg = ServiceMessage<…>` remain only where an
+  `HttpListener` (or similar rail) needs the envelope type parameter.
 
 ### 2026-07-09 Examples Canonicalization Pass
 
@@ -154,11 +234,13 @@ together.
 
 What is still active after reading the specimens and systems:
 
-- **Admission across parked work.** `system_api_gateway_limits` and
-  `system_soak_http_db` still show "park this caller while holding this
-  charge" ceremony. The multi-scope charge/rollback half now has
-  `SharedCapacityReservation`; the remaining gap is a park-friendly local
-  concurrency charge.
+- **Admission across parked work.** Closed for local concurrency by
+  `ConcurrencyPendingReplies`: one bounded owner holds the local
+  `ConcurrencyLimit`, parked caller, and optional auxiliary RAII guard.
+  `system_api_gateway_limits` uses it with `SharedCapacityReservation`, so
+  owner-stop and caller-gone cleanup no longer depend on dropping an explicit
+  local permit. Multi-stage guard replacement in `system_soak_http_db` remains
+  intentionally explicit because it changes which external budget is held.
 - **Race / cancel / retry ceremony.** `ergonomics_playground` and
   `system_job_queue` show the model is correct. `CallGroup::start_cancelable`
   now removes the branch-start token/handle ceremony, and Phase 120 added
@@ -220,16 +302,15 @@ What felt good:
 
 What felt rough:
 
-- **`ConcurrencyPermit` is not drop-to-release, but shared capacity is**, and
-  the mismatch fights the deferred-reply pattern. `GuardedPendingReplies`
-  releases its guard by *dropping* it; a dropped `ConcurrencyPermit`
-  leaks the inner `LocalPermitGate` permit (loudly, but still a leak),
-  while `SharedCapacityReservation` releases clean. This is why
-  `system_api_gateway_limits` stays on `SharedCapacityScope` instead of
-  migrating to `ConcurrencyLimit`. **Build:** a park-friendly
-  concurrency charge that releases on drop (or a guarded pending box
-  that calls an explicit releaser), so the local-gate path composes with
-  multi-turn parking the way shared capacity already does.
+- **Closed: local concurrency across parked work.**
+  `ConcurrencyPendingReplies` owns both the `ConcurrencyLimit` and guarded
+  pending slots, rather than changing `ConcurrencyPermit`'s deliberately loud
+  drop semantics. Reply releases as completed; caller-gone sweep, drain,
+  rollback, and owner drop retire without completion. Because permits never
+  leave the owner, wrong-gate release is unrepresentable and no `Arc`/atomic
+  back-reference is required. Its report exposes policy current, parked
+  current, completion/retirement, duplicate, reclaim, and both Full counters;
+  `counts_agree()` makes ownership drift directly testable.
 - **Charging two shared budgets per request used to be manual two-phase with
   rollback.** Closed by `SharedCapacityReservation::try_reserve([...])`, which
   admits every charge or drops earlier leases before returning the full scope.
@@ -1082,6 +1163,14 @@ from shard A into target shard B" and has a remote-path proof.
 `tina-runtime/src/threaded_multi_shard.rs` (multi-shard), each routed
 by `addr.shard()`; no `call_blocking_on` exists anywhere in
 `tina-runtime/src`, matching the "no host-to-shard variant" claim.
+
+The preferred `LocalSystem` and `LocalMultiShardSystem` facades now forward
+only the two host-call shapes justified by their public registrations:
+`call_blocking` for `register_root[_on]` and `call_blocking_request` for
+request/split service handles. The multi-shard facade keeps address-owned
+routing and the same unknown-shard panic convention. Separate host-wait
+budgeting remains a lower-level threaded-runtime control rather than widening
+the app facade.
 
 ### 24. Register-and-bootstrap helper for start-up effects — closed
 

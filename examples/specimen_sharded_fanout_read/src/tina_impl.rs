@@ -21,7 +21,6 @@
 //!   isolate. The user provides `impl From<ShardCounterReply> for
 //!   ScatterCoordMsg` and the adapter does the routing.
 
-use std::convert::Infallible;
 use std::time::Duration;
 
 use tina::prelude::*;
@@ -30,7 +29,7 @@ use tina_runtime::sharded::{
     ShardServiceTable,
 };
 use tina_runtime::{
-    BoundedItems, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedMultiShardRuntime,
+    BoundedItems, DefaultThreadedMailboxFactory, ThreadedMultiShardRuntime,
     bounded_batch,
 };
 
@@ -62,17 +61,17 @@ struct ShardCounter {
     value: u64,
 }
 
-impl Isolate for ShardCounter {
-    tina::isolate_types! {
-        message: ShardCounterMsg,
-        reply: (),
-        send: Outbound<ShardCounterReply>,
-        spawn: Infallible,
-        io: RuntimeCall<ShardCounterMsg>,
-        shard: AppShard,
-    }
-
-    fn handle(&mut self, msg: ShardCounterMsg, ctx: &mut Context<'_, AppShard, Self::Reply>) -> Effect<Self> {
+#[tina_runtime::isolate(
+    message = ShardCounterMsg,
+    send = Outbound<ShardCounterReply>,
+    shard = AppShard
+)]
+impl ShardCounter {
+    fn handle(
+        &mut self,
+        msg: ShardCounterMsg,
+        ctx: &mut Context<'_, AppShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ShardCounterMsg::Get { reply_to } => send(
                 reply_to,
@@ -113,16 +112,14 @@ struct ScatterCoord {
     outcomes: Vec<(ShardId, ScatterGatherTargetOutcome<u64>)>,
 }
 
-impl Isolate for ScatterCoord {
-    tina::isolate_types! {
-        message: ScatterCoordMsg,
-        reply: (),
-        send: Outbound<ShardCounterMsg>,
-        spawn: Infallible,
-        io: Infallible,
-        shard: AppShard,
-    }
-
+// `io = Infallible`: the coord only does outbound sends + stop_with; no
+// runtime I/O rail. Use `tina::isolate` so Io stays Infallible.
+#[tina::isolate(
+    message = ScatterCoordMsg,
+    send = Outbound<ShardCounterMsg>,
+    shard = AppShard
+)]
+impl ScatterCoord {
     fn handle(
         &mut self,
         msg: ScatterCoordMsg,

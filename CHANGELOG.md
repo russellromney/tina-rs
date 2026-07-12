@@ -4,6 +4,72 @@ This file records completed work.
 
 ## Unreleased
 
+### Split-service set / scope event helpers
+
+- `CallGroup::start_cancelable_service_event`,
+  `CallJoinSet::start_cancelable_service_event`, and
+  `CallSelectSet::start_cancelable_service_event` take a domain-event
+  translator and wrap the split-service envelope internally — the same
+  shape as `then_service_event` for ordinary calls.
+- `RequestScope::cancel_into_service_event_effect` is the cancel twin:
+  translators return domain events, not `ServiceMessage::Event(...)`.
+
+### Envelope-free example cohort
+
+Migrated remaining example call sites off manual `ServiceMessage`
+construction onto `then_service_event` / `reply_service_event` /
+`call_request` / `call_cancelable_request` / `send_event` /
+`register_split_service` and the set/scope helpers above. Specimens and
+systems that still name `ServiceMessage` only do so in type aliases for
+HTTP listener wiring (`HttpListener<…, ServiceMessage<…>>`), not in
+application effect construction.
+
+### Single-lane service authoring
+
+- `#[tina_runtime::isolate(event = Event)]` defines an event-only service
+  without a placeholder request type or request handler.
+- `#[tina_runtime::isolate(request = Request, reply = Reply)]` defines a
+  request-only service without a placeholder event type or event handler.
+- Runtime, threaded-runtime, and simulator registration return only the usable
+  `EventServiceHandle` or `RequestServiceHandle`; application call sites do not
+  name the internal `ServiceMessage` envelope or `Infallible` lane.
+- Multi-shard runtime, threaded, and simulator owners now mirror those service
+  shapes with `register_{split,event,request}_service_on`. `LocalSystem` and
+  `LocalMultiShardSystem` delegate the same capability-typed registrations,
+  and all five multi-owner/facade surfaces expose `try_send_event` without a
+  public `ServiceMessage` envelope.
+- `LocalSystem` and `LocalMultiShardSystem` now expose the two host-call shapes
+  that their registration APIs require: `call_blocking` for ordinary roots and
+  `call_blocking_request` for request/split service capabilities. Both preserve
+  `CallOutcome` terminal truth; backend-specific host-wait tuning remains on
+  the lower threaded owners.
+
+### Concurrency-charged parked callers
+
+- Added `ConcurrencyPendingReplies`, a bounded owner that composes
+  `ConcurrencyLimit` with deferred reply slots. Local permits stay private and
+  move-only: intentional replies count as completions; caller-gone sweeps,
+  drains, admission rollbacks, and owner drop retire them exactly once.
+- Added optional auxiliary RAII guards for multi-budget requests without a
+  sidecar table. `system_api_gateway_limits` now uses the combined owner for
+  its local parked-work cap while retaining its atomic multi-scope capacity
+  reservation.
+- Added one combined pressure/lifecycle report and simulator coverage for
+  completion, duplicate-key refusal, and concurrency `Full` behavior.
+
+### Split-service continuation events
+
+Added focused continuation helpers that keep split-service domain code out of
+the raw `ServiceMessage` envelope. `TypedCall`, `SleepCall`, `IsolateCall`,
+`CancelableCall`, and `CancelCallBuilder` now expose `then_service_event`;
+`IsolateCall` also exposes `then_service_event_with_request` for an
+already-captured `RequestContext`.
+The request-deferred typed-call and isolate-call adapters expose
+`reply_service_event`, preserving their must-answer authority while wrapping
+the resulting domain event internally. Representative applied examples and a
+live runtime test cover timer, typed I/O, isolate-call, cancelable-call,
+cancel-acknowledgement, and deferred-reply delivery.
+
 ### Four split-service API helpers (#292)
 
 The 2026-07-09 examples-canonicalization sweep left four small gaps where
@@ -14,11 +80,12 @@ the exact call-site that surfaced it:
 - `tina_sim::Simulator::register_split_service` mirrors
   `tina_runtime::Runtime::register_split_service`; `specimen_multi_turn_request_context`'s
   sim path no longer hand-wraps `SplitServiceHandle::from_address(sim.register(...))`.
-- `tina_runtime::PendingCancelableCall::reply_request` turns a
-  `Full`/`DuplicateKey` admission-rejected token into a `RequestEffect`, so a
-  split-service `handle_request` arm can answer typed instead of panicking.
-  `system_job_queue`'s `Queue::submit` drops its `is_full()` pre-check +
-  panic; the Full path now replies `QueueReply::Busy`.
+- `tina_runtime::RequestPendingCancelableInsertError::reply` consumes the
+  matching one-use request-effect permit returned with a `Full`/`DuplicateKey`
+  admission rejection, so a split-service `handle_request` arm can answer
+  typed without reopening the generic request-effect escape. `system_job_queue`'s
+  `Queue::submit` drops its `is_full()` pre-check + panic; the Full path now
+  replies `QueueReply::Busy`.
 - `tina_runtime::call_cancelable_request` is the request-lane sibling of
   `call_cancelable`. Migrates the hand-wrapped `WorkerMsg::Request(...)`
   dispatch sites in `specimen_request_scope_fanout` and `system_job_queue`.

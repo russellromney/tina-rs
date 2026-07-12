@@ -173,13 +173,15 @@ fn run_pass(
     };
     let server_config = Http2ServerConfig {
         limits: Http2Limits {
+            initial_connection_window: 100_000,
             max_response_body_bytes: BODY_LEN,
             ..Http2Limits::default()
         },
         ..Http2ServerConfig::default()
     };
     let listener = sim.register_with_mailbox_capacity(
-        Http2Listener::<SimShard>::new(bind_addr, service, server_config),
+        Http2Listener::<SimShard>::new(bind_addr, service, server_config)
+            .expect("valid HTTP/2 server config"),
         server_config.listener_mailbox_capacity,
     );
     sim.try_send(listener, Http2ListenerMsg::Start)
@@ -369,6 +371,29 @@ fn response_data(output: &[u8]) -> (Vec<u8>, usize) {
     (body, terminal_data_frames)
 }
 
+fn initial_connection_credit(output: &[u8]) -> Option<u32> {
+    let mut cursor = 0;
+    while cursor + 9 <= output.len() {
+        let len = (usize::from(output[cursor]) << 16)
+            | (usize::from(output[cursor + 1]) << 8)
+            | usize::from(output[cursor + 2]);
+        let end = cursor + 9 + len;
+        if end > output.len() {
+            return None;
+        }
+        let ty = output[cursor + 3];
+        let stream_id =
+            u32::from_be_bytes(output[cursor + 5..cursor + 9].try_into().ok()?) & 0x7fff_ffff;
+        if ty == FRAME_WINDOW_UPDATE && stream_id == 0 && len == 4 {
+            return Some(
+                u32::from_be_bytes(output[cursor + 9..end].try_into().ok()?) & 0x7fff_ffff,
+            );
+        }
+        cursor = end;
+    }
+    None
+}
+
 #[test]
 fn buffered_response_pressure_is_deterministic_and_bounded_to_initial_credit() {
     let first = run_pass(0xB0D1_5EED, false, false, ResponseMode::Buffered);
@@ -377,6 +402,7 @@ fn buffered_response_pressure_is_deterministic_and_bounded_to_initial_credit() {
     assert_eq!(first.trace_hash, replay.trace_hash);
     assert_eq!(first.trace_len, replay.trace_len);
     assert_eq!(first.peer_output, replay.peer_output);
+    assert_eq!(initial_connection_credit(&first.peer_output), Some(34_465));
     let (body, terminal_frames) = response_data(&first.peer_output);
     assert!(
         first.flow_control_facts > 0,

@@ -1,0 +1,26 @@
+error[E0308]: mismatched types
+  --> tests/safety_rails_compile_fail/request_permit_cross_isolate.rs:27:60
+   |
+27 |     let _wrong: tina::RequestEffect<Second> = permit.apply(tina::noop::<Second>());
+   |                                                      ----- ^^^^^^^^^^^^^^^^^^^^^^ expected `Effect<First>`, found `Effect<Second>`
+   |                                                      |
+   |                                                      arguments to this method are incorrect
+   |
+   = note: expected enum `Effect<First>`
+              found enum `Effect<Second>`
+note: method defined here
+  --> $WORKSPACE/tina/src/effect.rs
+   |
+   |     pub fn apply(self, effect: Effect<I>) -> RequestEffect<I> {
+   |            ^^^^^
+
+error[E0308]: mismatched types
+  --> tests/safety_rails_compile_fail/request_permit_cross_isolate.rs:27:47
+   |
+27 |     let _wrong: tina::RequestEffect<Second> = permit.apply(tina::noop::<Second>());
+   |                 ---------------------------   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `RequestEffect<Second>`, found `RequestEffect<First>`
+   |                 |
+   |                 expected due to this
+   |
+   = note: expected struct `RequestEffect<Second>`
+              found struct `RequestEffect<First>`

@@ -75,7 +75,7 @@ impl Batcher {
                 let qid = self.next_qid;
                 self.next_qid += 1;
                 match self.pending.park_request(qid, call) {
-                    Ok(ticket) => {
+                    Ok((_ticket, permit)) => {
                         self.items.push(item);
                         self.qids.push(qid);
                         if self.items.len() >= BATCH_SIZE {
@@ -83,18 +83,17 @@ impl Batcher {
                             self.timer_gen += 1;
                             self.pending_timer_gen = None;
                             let flush_effect = self.flush();
-                            return request_effect_after_park(&ticket, flush_effect);
+                            return request_effect_after_park(permit, flush_effect);
                         }
                         if self.pending_timer_gen.is_none() {
                             self.timer_gen += 1;
                             let g = self.timer_gen;
                             self.pending_timer_gen = Some(g);
-                            let tick_effect = sleep(self.interval).then(move |reply| {
-                                tina::ServiceMessage::Event(BatcherEvent::Tick(g, reply))
-                            });
-                            return request_effect_after_park(&ticket, tick_effect);
+                            let tick_effect = sleep(self.interval)
+                                .then_service_event(move |reply| BatcherEvent::Tick(g, reply));
+                            return request_effect_after_park(permit, tick_effect);
                         }
-                        request_effect_after_park(&ticket, noop())
+                        request_effect_after_park(permit, noop())
                     }
                     Err(ParkError::Full { call, .. }) => call.reply(BatcherReply::Full),
                     Err(ParkError::DuplicateKey { call, .. }) => call.reply(BatcherReply::Full),

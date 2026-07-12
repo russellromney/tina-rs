@@ -80,7 +80,7 @@ use tina_http::{GrpcClient, GrpcLimits, GrpcUnaryOutcome,
 // 1. Register a connection isolate to the target authority and Begin it.
 let target = Http2Target::H2c { authority: "svc".into(), addr };
 let conn = runtime.register_with_capacity::<Http2ClientConnection<S>, _>(
-    Http2ClientConnection::new(target, Default::default()), 32)?;
+    Http2ClientConnection::new(target, Default::default())?, 32)?;
 runtime.try_send(conn, Http2ClientMsg::Begin)?;
 
 // 2. A GrpcClient is a thin wrapper over that connection.

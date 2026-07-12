@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `RequestEffectPermit<'request, I>` in the current scope
+  --> tests/safety_rails_compile_fail/request_permit_clone.rs:15:24
+   |
+15 |     let _copy = permit.clone();
+   |                        ^^^^^ method not found in `RequestEffectPermit<'_, Demo>`

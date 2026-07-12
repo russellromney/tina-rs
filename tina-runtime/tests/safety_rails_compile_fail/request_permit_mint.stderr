@@ -1,0 +1,10 @@
+error[E0624]: associated function `new` is private
+  --> tests/safety_rails_compile_fail/request_permit_mint.rs:15:32
+   |
+15 |     tina::RequestEffectPermit::new()
+   |                                ^^^ private associated function
+   |
+  ::: $WORKSPACE/tina/src/effect.rs
+   |
+   |     pub(crate) fn new() -> Self {
+   |     --------------------------- private associated function defined here

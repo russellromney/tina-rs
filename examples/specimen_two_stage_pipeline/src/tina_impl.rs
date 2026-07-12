@@ -150,8 +150,8 @@ struct Pipeline {
 // crate used to hand-roll as `PipelineMsg::{Parsed,Validated,Executed}` plus
 // a `qid`-keyed `PendingReplies` table. The caller's `RequestContext` now
 // threads through `req` directly, so the qid indirection is gone too.
-// Continuations land as `ServiceMessage::Event(PipelineEvent::Stage(...))`
-// so the split-service form can drop the hand-written reject arm.
+// Continuations land as domain events via `then_service_event*` helpers
+// so the split-service form never names the envelope.
 tina::flow! {
     flow PipelineFlow for Pipeline {
         reply PipelineReply;
@@ -160,10 +160,8 @@ tina::flow! {
             match outcome {
                 CallOutcome::Replied(ParseReply::Ok(v)) => {
                     call(self.validate, ValidateInput(v), STAGE_TIMEOUT)
-                        .then_with_request(req, move |req, outcome| {
-                            tina::ServiceMessage::Event(PipelineEvent::Stage(
-                                PipelineFlow::Validated(req, outcome),
-                            ))
+                        .then_service_event_with_request(req, move |req, outcome| {
+                            PipelineEvent::Stage(PipelineFlow::Validated(req, outcome))
                         })
                 }
                 CallOutcome::Replied(ParseReply::Failed) => {
@@ -177,10 +175,8 @@ tina::flow! {
             match outcome {
                 CallOutcome::Replied(ValidateReply::Ok(v)) => {
                     call(self.execute, ExecuteInput(v), STAGE_TIMEOUT)
-                        .then_with_request(req, move |req, outcome| {
-                            tina::ServiceMessage::Event(PipelineEvent::Stage(
-                                PipelineFlow::Executed(req, outcome),
-                            ))
+                        .then_service_event_with_request(req, move |req, outcome| {
+                            PipelineEvent::Stage(PipelineFlow::Executed(req, outcome))
                         })
                 }
                 CallOutcome::Replied(ValidateReply::Failed) => {
@@ -240,10 +236,8 @@ impl Pipeline {
         match request {
             PipelineRequest::Submit(input) => req_call
                 .defer(call(self.parse, ParseInput(input), STAGE_TIMEOUT))
-                .reply(move |req, outcome| {
-                    tina::ServiceMessage::Event(PipelineEvent::Stage(PipelineFlow::Parsed(
-                        req, outcome,
-                    )))
+                .reply_service_event(move |req, outcome| {
+                    PipelineEvent::Stage(PipelineFlow::Parsed(req, outcome))
                 }),
         }
     }

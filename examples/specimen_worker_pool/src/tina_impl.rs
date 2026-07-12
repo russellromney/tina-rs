@@ -1,10 +1,11 @@
 use std::convert::Infallible;
 use std::time::Duration;
 
+use tina::CallRejectedReason;
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ParkError, PendingReplies,
-    request_effect_after_park, SleepReply, ThreadedRuntime, call_request, sleep,
+    BoundedItems, CallOutcome, DefaultThreadedMailboxFactory, ParkError, PendingReplies,
+    SleepReply, ThreadedRuntime, bounded_batch, call_request, request_effect_after_park, sleep,
 };
 
 use crate::{CLIENTS, MAX_PENDING, Report, WORKERS, expected_for};
@@ -58,8 +59,8 @@ impl Worker {
             // Vary the wait by id so replies arrive out of dispatch order.
             WorkerRequest::Do(payload) => {
                 let id = self.id;
-                call.defer(sleep(self.work)).reply(move |req, reply| {
-                    tina::ServiceMessage::Event(WorkerEvent::Done(req, reply, payload + id))
+                call.defer(sleep(self.work)).reply_service_event(move |req, reply| {
+                    WorkerEvent::Done(req, reply, payload + id)
                 })
             }
         }
@@ -83,8 +84,13 @@ enum FrontendEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrontendReply {
     Result(u64),
-    Full,
-    Failed,
+    PendingFull,
+    DuplicateRequest,
+    WorkerTimerFailed,
+    WorkerFull,
+    WorkerClosed,
+    WorkerTimeout,
+    WorkerRejected(CallRejectedReason),
 }
 
 struct Frontend {
@@ -116,17 +122,23 @@ impl Frontend {
                 let qid = self.next_qid;
                 self.next_qid += 1;
                 match self.pending.park_request(qid, call) {
-                    Ok(ticket) => {
+                    Ok((_ticket, permit)) => {
                         let worker = self.workers[self.next_worker];
                         self.next_worker = (self.next_worker + 1) % self.workers.len();
-                        let dispatch_effect = call_request(worker, WorkerRequest::Do(payload), CALL_TIMEOUT)
-                            .then(move |outcome| {
-                                tina::ServiceMessage::Event(FrontendEvent::WorkerDone(qid, outcome))
-                            });
-                        request_effect_after_park(&ticket, dispatch_effect)
+                        let dispatch_effect = call_request(
+                            worker,
+                            WorkerRequest::Do(payload),
+                            CALL_TIMEOUT,
+                        )
+                        .then_service_event(move |outcome| {
+                            FrontendEvent::WorkerDone(qid, outcome)
+                        });
+                        request_effect_after_park(permit, dispatch_effect)
                     }
-                    Err(ParkError::Full { call, .. }) => call.reply(FrontendReply::Full),
-                    Err(ParkError::DuplicateKey { call, .. }) => call.reply(FrontendReply::Full),
+                    Err(ParkError::Full { call, .. }) => call.reply(FrontendReply::PendingFull),
+                    Err(ParkError::DuplicateKey { call, .. }) => {
+                        call.reply(FrontendReply::DuplicateRequest)
+                    }
                 }
             }
         }
@@ -138,13 +150,18 @@ impl Frontend {
         let Some(slot) = self.pending.take(&qid) else {
             return noop();
         };
-        match outcome {
-            CallOutcome::Replied(WorkerReply::Result(v)) => {
-                reply_to(slot, FrontendReply::Result(v))
-            }
-            CallOutcome::Replied(WorkerReply::TimerFailed) => reply_to(slot, FrontendReply::Failed),
-            _ => reply_to(slot, FrontendReply::Full),
-        }
+        reply_to(slot, frontend_reply_from_worker(outcome))
+    }
+}
+
+fn frontend_reply_from_worker(outcome: CallOutcome<WorkerReply>) -> FrontendReply {
+    match outcome {
+        CallOutcome::Replied(WorkerReply::Result(value)) => FrontendReply::Result(value),
+        CallOutcome::Replied(WorkerReply::TimerFailed) => FrontendReply::WorkerTimerFailed,
+        CallOutcome::Full => FrontendReply::WorkerFull,
+        CallOutcome::Closed => FrontendReply::WorkerClosed,
+        CallOutcome::Timeout => FrontendReply::WorkerTimeout,
+        CallOutcome::Rejected(reason) => FrontendReply::WorkerRejected(reason),
     }
 }
 
@@ -180,17 +197,16 @@ impl Driver {
         match msg {
             DriverMsg::Begin => {
                 let frontend = self.frontend;
-                let calls: Vec<_> = self
-                    .payloads
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .map(|(i, payload)| {
-                        call_request(frontend, FrontendRequest::Submit(payload), CALL_TIMEOUT)
-                            .then(move |outcome| DriverMsg::Returned(i, outcome))
-                    })
-                    .collect();
-                Effect::Batch(calls)
+                let payloads = BoundedItems::try_from_iter(
+                    MAX_PENDING,
+                    self.payloads.iter().copied().enumerate(),
+                )
+                .expect("driver workload must fit the frontend pending bound");
+                let calls = payloads.map_effects(|(i, payload)| {
+                    call_request(frontend, FrontendRequest::Submit(payload), CALL_TIMEOUT)
+                        .then(move |outcome| DriverMsg::Returned(i, outcome))
+                });
+                bounded_batch(calls)
             }
             DriverMsg::Returned(i, outcome) => {
                 let payload = self.payloads[i];
@@ -202,7 +218,19 @@ impl Driver {
                         self.outcome.correct += 1;
                     }
                     CallOutcome::Replied(FrontendReply::Result(_)) => self.outcome.wrong += 1,
-                    _ => self.outcome.failed += 1,
+                    CallOutcome::Replied(
+                        FrontendReply::PendingFull
+                        | FrontendReply::DuplicateRequest
+                        | FrontendReply::WorkerTimerFailed
+                        | FrontendReply::WorkerFull
+                        | FrontendReply::WorkerClosed
+                        | FrontendReply::WorkerTimeout
+                        | FrontendReply::WorkerRejected(_),
+                    )
+                    | CallOutcome::Full
+                    | CallOutcome::Closed
+                    | CallOutcome::Timeout
+                    | CallOutcome::Rejected(_) => self.outcome.failed += 1,
                 }
                 self.remaining -= 1;
                 if self.remaining == 0 {
@@ -271,7 +299,9 @@ pub fn run() -> anyhow::Result<Report> {
         .wait(Duration::from_secs(10))
         .map_err(|e| anyhow::anyhow!("driver finishes: {e:?}"))?;
 
-    let _ = runtime.shutdown();
+    runtime
+        .shutdown()
+        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e}"))?;
 
     Ok(Report {
         clients: CLIENTS,
@@ -280,4 +310,44 @@ pub fn run() -> anyhow::Result<Report> {
         failed: outcome.failed,
         exit_clean: true,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_terminal_outcomes_remain_distinct_frontend_replies() {
+        assert_eq!(
+            frontend_reply_from_worker(CallOutcome::Replied(WorkerReply::Result(42))),
+            FrontendReply::Result(42)
+        );
+        assert_eq!(
+            frontend_reply_from_worker(CallOutcome::Replied(WorkerReply::TimerFailed)),
+            FrontendReply::WorkerTimerFailed
+        );
+        assert_eq!(
+            frontend_reply_from_worker(CallOutcome::Full),
+            FrontendReply::WorkerFull
+        );
+        assert_eq!(
+            frontend_reply_from_worker(CallOutcome::Closed),
+            FrontendReply::WorkerClosed
+        );
+        assert_eq!(
+            frontend_reply_from_worker(CallOutcome::Timeout),
+            FrontendReply::WorkerTimeout
+        );
+        for reason in [
+            CallRejectedReason::ReplyAbandoned,
+            CallRejectedReason::HandlerPanicked,
+            CallRejectedReason::UnsupportedMessage,
+        ] {
+            assert_eq!(
+                frontend_reply_from_worker(CallOutcome::Rejected(reason)),
+                FrontendReply::WorkerRejected(reason)
+            );
+        }
+        assert_ne!(FrontendReply::PendingFull, FrontendReply::WorkerFull);
+    }
 }

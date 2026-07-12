@@ -47,14 +47,16 @@ fn mint_guarded_seq() -> u64 {
 /// };
 /// ```
 pub struct GuardedParkTicket<K> {
+    owner_id: u64,
     slot: usize,
     generation: u64,
     _key: PhantomData<fn(K) -> K>,
 }
 
 impl<K> GuardedParkTicket<K> {
-    fn new(slot: usize, generation: u64) -> Self {
+    fn new(owner_id: u64, slot: usize, generation: u64) -> Self {
         Self {
+            owner_id,
             slot,
             generation,
             _key: PhantomData,
@@ -65,6 +67,7 @@ impl<K> GuardedParkTicket<K> {
 impl<K> std::fmt::Debug for GuardedParkTicket<K> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GuardedParkTicket")
+            .field("owner_id", &self.owner_id)
             .field("slot", &self.slot)
             .field("generation", &self.generation)
             .finish()
@@ -80,6 +83,7 @@ struct GuardedEntry<K, R, G> {
 /// Bounded fixed-capacity slot table that pairs a parked caller with one
 /// RAII `G` guard. See module docs for the invariants the helper keeps.
 pub struct GuardedPendingReplies<K, R, G> {
+    owner_id: u64,
     capacity: usize,
     slots: Vec<Option<GuardedEntry<K, R, G>>>,
     generations: Vec<u64>,
@@ -283,6 +287,7 @@ where
         }
         let seq = mint_guarded_seq();
         Self {
+            owner_id: seq,
             capacity,
             slots,
             generations,
@@ -372,6 +377,26 @@ where
         self.duplicate_keys
     }
 
+    /// Check and record a duplicate-key rejection without changing slots.
+    pub(crate) fn reject_duplicate_key(&mut self, key: &K) -> bool
+    where
+        K: PartialEq,
+    {
+        let duplicate = self
+            .slots
+            .iter()
+            .any(|slot| slot.as_ref().is_some_and(|entry| &entry.key == key));
+        if duplicate {
+            self.duplicate_keys = self.duplicate_keys.saturating_add(1);
+        }
+        duplicate
+    }
+
+    /// Record a caller-gone slot removed through an explicit settlement path.
+    pub(crate) fn record_reclaimed(&mut self) {
+        self.reclaimed = self.reclaimed.saturating_add(1);
+    }
+
     /// Reclaim slots whose deferred reply is no longer Open. The guard
     /// for each reclaimed slot is dropped here.
     pub fn sweep(&mut self) -> usize {
@@ -389,6 +414,27 @@ where
         reclaimed
     }
 
+    /// Reclaim closed caller slots and return their keys and guards.
+    ///
+    /// This is the explicit-settlement sibling of [`Self::sweep`]. It is
+    /// useful when dropping `G` is not itself the correct release operation,
+    /// such as a move-only local permit that must be retired against its
+    /// owning gate. Reply slots are closed already and are dropped here.
+    pub fn reclaim_closed(&mut self) -> Vec<(K, G)> {
+        let mut reclaimed = Vec::new();
+        for idx in 0..self.slots.len() {
+            let take = matches!(
+                self.slots[idx].as_ref().map(|entry| entry.reply.state()),
+                Some(DeferredSlotState::Closed)
+            );
+            if take && let Some(entry) = self.remove_slot(idx) {
+                self.reclaimed = self.reclaimed.saturating_add(1);
+                reclaimed.push((entry.key, entry.guard));
+            }
+        }
+        reclaimed
+    }
+
     /// Lower-level insert: store an already-captured `DeferredReply` and
     /// guard. Use when the service already speaks `DeferredReply`.
     pub fn insert_deferred_guarded(
@@ -401,6 +447,20 @@ where
             self.sweep();
         }
 
+        self.insert_deferred_guarded_without_sweep(key, reply, guard)
+    }
+
+    /// Insert without reclaiming closed entries.
+    ///
+    /// Owners that require explicit guard settlement must reclaim first and
+    /// then use this primitive so a caller closing between those operations
+    /// cannot cause `G` to be dropped implicitly.
+    pub(crate) fn insert_deferred_guarded_without_sweep(
+        &mut self,
+        key: K,
+        reply: DeferredReply<R>,
+        guard: G,
+    ) -> Result<GuardedParkTicket<K>, GuardedInsertError<K, R, G>> {
         if self
             .slots
             .iter()
@@ -418,12 +478,16 @@ where
     }
 
     /// Park the current request-call caller along with a guard.
+    #[allow(clippy::type_complexity)]
     pub fn park_request_guarded<'a, I>(
         &mut self,
         key: K,
         call: RequestCall<'a, I>,
         guard: G,
-    ) -> Result<GuardedParkTicket<K>, GuardedParkError<'a, K, I, G>>
+    ) -> Result<
+        (GuardedParkTicket<K>, tina::RequestEffectPermit<'a, I>),
+        GuardedParkError<'a, K, I, G>,
+    >
     where
         I: Isolate<Reply = R>,
         R: 'static,
@@ -432,6 +496,27 @@ where
             self.sweep();
         }
 
+        self.park_request_guarded_without_sweep(key, call, guard)
+    }
+
+    /// Park without reclaiming closed entries.
+    ///
+    /// This is the request-authority sibling of
+    /// [`Self::insert_deferred_guarded_without_sweep`].
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn park_request_guarded_without_sweep<'a, I>(
+        &mut self,
+        key: K,
+        call: RequestCall<'a, I>,
+        guard: G,
+    ) -> Result<
+        (GuardedParkTicket<K>, tina::RequestEffectPermit<'a, I>),
+        GuardedParkError<'a, K, I, G>,
+    >
+    where
+        I: Isolate<Reply = R>,
+        R: 'static,
+    {
         if self
             .slots
             .iter()
@@ -445,8 +530,8 @@ where
             return Err(GuardedParkError::Full { key, call, guard });
         }
 
-        let req = call.into_call_context().into_request_context();
-        Ok(self.store_entry(key, req.into_deferred(), guard))
+        let (req, permit) = call.into_request_context_with_permit();
+        Ok((self.store_entry(key, req.into_deferred(), guard), permit))
     }
 
     /// Park the current call-context caller along with a guard.
@@ -495,7 +580,7 @@ where
         &mut self,
         ticket: GuardedParkTicket<K>,
     ) -> Result<(DeferredReply<R>, G), GuardedTakeError<K>> {
-        if ticket.slot >= self.slots.len() {
+        if ticket.owner_id != self.owner_id || ticket.slot >= self.slots.len() {
             return Err(GuardedTakeError::StaleTicket);
         }
         if self.generations[ticket.slot] != ticket.generation {
@@ -580,7 +665,7 @@ where
         if self.current > self.high_water {
             self.high_water = self.current;
         }
-        GuardedParkTicket::new(idx, generation)
+        GuardedParkTicket::new(self.owner_id, idx, generation)
     }
 
     fn remove_slot(&mut self, idx: usize) -> Option<GuardedEntry<K, R, G>> {
@@ -673,6 +758,48 @@ mod tests {
         assert_eq!(count.get(), 0, "guard alive while parked");
         let _: Effect<TestIso> = box_.reply_ticket(ticket, 7).unwrap();
         assert_eq!(count.get(), 1, "guard drops on reply");
+    }
+
+    #[test]
+    fn no_sweep_insert_returns_guard_when_closed_entry_fills_table() {
+        let (count, mint) = counter();
+        let mut box_ = GuardedPendingReplies::<u32, u32, DropCounter>::with_capacity(1);
+        box_.insert_deferred_guarded(1, fake_slot_closed(10), mint())
+            .unwrap();
+
+        let err = box_
+            .insert_deferred_guarded_without_sweep(2, fake_slot(11), mint())
+            .expect_err("explicit-settlement insertion must not sweep guards");
+        let GuardedInsertError::Full { guard, .. } = err else {
+            panic!("a distinct key in a full table must report Full");
+        };
+        assert_eq!(box_.len(), 1);
+        assert_eq!(box_.reclaimed(), 0);
+        assert_eq!(count.get(), 0, "neither guard was dropped implicitly");
+
+        drop(guard);
+        assert_eq!(count.get(), 1, "the rejected guard remains caller-owned");
+        assert_eq!(box_.sweep(), 1);
+        assert_eq!(count.get(), 2, "the original guard follows explicit sweep");
+    }
+
+    #[test]
+    fn ticket_from_another_owner_cannot_remove_same_slot_and_generation() {
+        let (_count, mint) = counter();
+        let mut left = GuardedPendingReplies::<u32, u32, DropCounter>::with_capacity(1);
+        let mut right = GuardedPendingReplies::<u32, u32, DropCounter>::with_capacity(1);
+        let left_ticket = left
+            .insert_deferred_guarded(1, fake_slot(10), mint())
+            .unwrap();
+        right
+            .insert_deferred_guarded(2, fake_slot(11), mint())
+            .unwrap();
+
+        assert!(matches!(
+            right.take_ticket(left_ticket),
+            Err(GuardedTakeError::StaleTicket)
+        ));
+        assert_eq!(right.len(), 1, "wrong-owner ticket must not remove entry");
     }
 
     #[test]

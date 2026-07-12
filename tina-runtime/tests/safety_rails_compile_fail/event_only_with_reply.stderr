@@ -1,0 +1,5 @@
+error: `reply = ...` requires a `request = ...` service lane
+ --> tests/safety_rails_compile_fail/event_only_with_reply.rs:7:48
+  |
+7 | #[tina_runtime::isolate(event = Event, reply = u32)]
+  |                                                ^^^

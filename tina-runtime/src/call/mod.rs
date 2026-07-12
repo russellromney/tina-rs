@@ -93,25 +93,6 @@ use std::time::Duration;
 
 use tina::{Address, AddressGeneration, CallHandleShared, CancelOutcome, IsolateId, ShardId};
 
-/// Safe in-runtime wrapper over tina's `unsafe` must-answer-rail escape hatch.
-///
-/// Every runtime adapter that re-wraps a finished effect into a
-/// `RequestEffect` routes through here so the `unsafe` is discharged once,
-/// centrally. The hole stays `unsafe` to foreign app crates (which cannot name
-/// this `pub(crate)` wrapper); they would have to call the `unsafe`
-/// `tina::runtime_internal` form, which the must-answer rail forbids outside an
-/// explicit `unsafe` block.
-#[allow(unsafe_code)]
-pub(crate) fn request_effect_from_consumed_effect<I: tina::Isolate>(
-    effect: tina::Effect<I>,
-) -> tina::RequestEffect<I> {
-    // SAFETY: every caller that reaches this wrapper has already consumed the
-    // matching `RequestCall` authority (via `RequestContext`) before producing
-    // `effect`, so the manufactured `RequestEffect` settles exactly that one
-    // caller — the precondition tina's escape hatch documents.
-    unsafe { tina::runtime_internal::request_effect_from_consumed_effect(effect) }
-}
-
 type ErasedReply = Box<dyn Any>;
 type ErasedCallOutcome = CallOutcome<ErasedReply>;
 type IsolateCallTranslator<M> = Box<dyn FnOnce(ErasedCallOutcome) -> M>;
@@ -1410,8 +1391,9 @@ pub struct DeferredObservedSend<T, Q> {
 
 /// Request-effect wrapper for [`DeferredObservedSend`].
 #[doc(hidden)]
-pub struct RequestDeferredObservedSend<T, Q> {
-    inner: DeferredObservedSend<T, Q>,
+pub struct RequestDeferredObservedSend<'request, T, I: tina::Isolate> {
+    inner: DeferredObservedSend<T, I::Reply>,
+    permit: tina::RequestEffectPermit<'request, I>,
 }
 
 /// Prepared isolate-call helper returned by [`call`].
@@ -1432,8 +1414,9 @@ pub struct DeferredIsolateCall<T, R, Q> {
 
 /// Request-effect wrapper for [`DeferredIsolateCall`].
 #[doc(hidden)]
-pub struct RequestDeferredIsolateCall<T, R, Q> {
-    inner: DeferredIsolateCall<T, R, Q>,
+pub struct RequestDeferredIsolateCall<'request, T, R, I: tina::Isolate> {
+    inner: DeferredIsolateCall<T, R, I::Reply>,
+    permit: tina::RequestEffectPermit<'request, I>,
 }
 
 /// Prepared typed runtime-call continuation after caller authority was
@@ -1446,8 +1429,9 @@ pub struct DeferredTypedCall<T, Q, E = CallError> {
 
 /// Request-effect wrapper for [`DeferredTypedCall`].
 #[doc(hidden)]
-pub struct RequestDeferredTypedCall<T, Q, E = CallError> {
-    inner: DeferredTypedCall<T, Q, E>,
+pub struct RequestDeferredTypedCall<'request, T, I: tina::Isolate, E = CallError> {
+    inner: DeferredTypedCall<T, I::Reply, E>,
+    permit: tina::RequestEffectPermit<'request, I>,
 }
 
 impl<T> ObservedSend<T>
@@ -1552,19 +1536,20 @@ where
     }
 }
 
-impl<T, Q> RequestDeferredObservedSend<T, Q>
+impl<'request, T, I> RequestDeferredObservedSend<'request, T, I>
 where
     T: Send + 'static,
-    Q: 'static,
+    I: tina::Isolate,
+    I::Reply: 'static,
 {
     /// Builds a request effect whose continuation carries caller authority.
-    pub fn reply<I, F, M>(self, translator: F) -> tina::RequestEffect<I>
+    pub fn reply<F, M>(self, translator: F) -> tina::RequestEffect<I>
     where
-        I: tina::Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
-        F: FnOnce(tina::RequestContext<Q>, SendOutcome) -> M + 'static,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
+        F: FnOnce(tina::RequestContext<I::Reply>, SendOutcome) -> M + 'static,
         M: 'static,
     {
-        crate::call::request_effect_from_consumed_effect(self.inner.reply(translator))
+        self.permit.apply(self.inner.reply(translator))
     }
 }
 
@@ -1590,11 +1575,22 @@ where
     I: tina::Isolate,
     I::Reply: 'static,
 {
-    type RequestDeferred = RequestDeferredObservedSend<T, I::Reply>;
+    type RequestDeferred<'request>
+        = RequestDeferredObservedSend<'request, T, I>
+    where
+        I: 'request;
 
-    fn defer_request_through(self, call: tina::RequestCall<'_, I>) -> Self::RequestDeferred {
+    fn defer_request_through<'request>(
+        self,
+        call: tina::RequestCall<'request, I>,
+    ) -> Self::RequestDeferred<'request> {
+        let (request, permit) = call.into_request_context_with_permit();
         RequestDeferredObservedSend {
-            inner: <Self as tina::DeferThrough<I>>::defer_through(self, call.into_call_context()),
+            inner: DeferredObservedSend {
+                inner: self,
+                request,
+            },
+            permit,
         }
     }
 }
@@ -1656,6 +1652,23 @@ where
         ))
     }
 
+    /// Turns this prepared call into a split service's later event.
+    ///
+    /// The translator works only with the domain event. The split-service
+    /// envelope is an implementation detail of this continuation.
+    pub fn then_service_event<I, F, E, Q>(self, translator: F) -> tina::Effect<I>
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<E, Q>,
+                Io = RuntimeCall<tina::ServiceMessage<E, Q>>,
+            >,
+        F: FnOnce(CallOutcome<R>) -> E + 'static,
+        E: 'static,
+        Q: 'static,
+    {
+        self.then(move |outcome| tina::ServiceMessage::Event(translator(outcome)))
+    }
+
     /// Like [`reply`](Self::reply), but also carries the caller's
     /// [`RequestContext`] into the continuation message so a multi-turn
     /// service can still answer the original caller after the child call
@@ -1698,6 +1711,30 @@ where
             move |outcome| translator(req, outcome),
         ))
     }
+
+    /// Carries caller authority into a split service's later event.
+    ///
+    /// This is the service-envelope sibling of [`Self::then_with_request`];
+    /// it preserves the same explicit [`tina::RequestContext`] flow.
+    pub fn then_service_event_with_request<I, F, E, S, Q>(
+        self,
+        req: tina::RequestContext<Q>,
+        translator: F,
+    ) -> tina::Effect<I>
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<E, S>,
+                Io = RuntimeCall<tina::ServiceMessage<E, S>>,
+            >,
+        F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> E + 'static,
+        E: 'static,
+        S: 'static,
+        Q: 'static,
+    {
+        self.then_with_request(req, move |req, outcome| {
+            tina::ServiceMessage::Event(translator(req, outcome))
+        })
+    }
 }
 
 impl<T, R, Q> DeferredIsolateCall<T, R, Q>
@@ -1721,20 +1758,38 @@ where
     }
 }
 
-impl<T, R, Q> RequestDeferredIsolateCall<T, R, Q>
+impl<'request, T, R, I> RequestDeferredIsolateCall<'request, T, R, I>
 where
     T: Send + 'static,
     R: 'static,
-    Q: 'static,
+    I: tina::Isolate,
+    I::Reply: 'static,
 {
     /// Builds a request effect whose continuation carries caller authority.
-    pub fn reply<I, F, M>(self, translator: F) -> tina::RequestEffect<I>
+    pub fn reply<F, M>(self, translator: F) -> tina::RequestEffect<I>
     where
-        I: tina::Isolate<Message = M, Reply = Q, Io = RuntimeCall<M>>,
-        F: FnOnce(tina::RequestContext<Q>, CallOutcome<R>) -> M + 'static,
+        I: tina::Isolate<Message = M, Io = RuntimeCall<M>>,
+        F: FnOnce(tina::RequestContext<I::Reply>, CallOutcome<R>) -> M + 'static,
         M: 'static,
     {
-        crate::call::request_effect_from_consumed_effect(self.inner.reply(translator))
+        self.permit.apply(self.inner.reply(translator))
+    }
+
+    /// Builds a request effect whose continuation is a split service event.
+    pub fn reply_service_event<F, E, S>(self, translator: F) -> tina::RequestEffect<I>
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<E, S>,
+                Io = RuntimeCall<tina::ServiceMessage<E, S>>,
+            >,
+        F: FnOnce(tina::RequestContext<I::Reply>, CallOutcome<R>) -> E + 'static,
+        E: 'static,
+        S: 'static,
+    {
+        self.permit.apply(
+            self.inner
+                .reply(move |req, outcome| tina::ServiceMessage::Event(translator(req, outcome))),
+        )
     }
 }
 
@@ -1762,11 +1817,22 @@ where
     I: tina::Isolate,
     I::Reply: 'static,
 {
-    type RequestDeferred = RequestDeferredIsolateCall<T, R, I::Reply>;
+    type RequestDeferred<'request>
+        = RequestDeferredIsolateCall<'request, T, R, I>
+    where
+        I: 'request;
 
-    fn defer_request_through(self, call: tina::RequestCall<'_, I>) -> Self::RequestDeferred {
+    fn defer_request_through<'request>(
+        self,
+        call: tina::RequestCall<'request, I>,
+    ) -> Self::RequestDeferred<'request> {
+        let (request, permit) = call.into_request_context_with_permit();
         RequestDeferredIsolateCall {
-            inner: <Self as tina::DeferThrough<I>>::defer_through(self, call.into_call_context()),
+            inner: DeferredIsolateCall {
+                inner: self,
+                request,
+            },
+            permit,
         }
     }
 }
@@ -2273,56 +2339,5 @@ mod pending_cancelable_call_set_tests {
     fn pending_call_set_cancelable_zero_capacity_panics() {
         let _set: PendingCancelableCallSet<u64, (), ()> =
             PendingCancelableCallSet::with_capacity(0);
-    }
-
-    #[derive(Debug)]
-    struct ReplyRequestTestIsolate;
-
-    impl tina::Isolate for ReplyRequestTestIsolate {
-        type Message = ();
-        type Reply = &'static str;
-        type Send = tina::Outbound<std::convert::Infallible>;
-        type Spawn = std::convert::Infallible;
-        type SpawnObserved = std::convert::Infallible;
-        type Io = std::convert::Infallible;
-        type Fact = std::convert::Infallible;
-        type Shard = tina::SingleShard;
-
-        fn handle(
-            &mut self,
-            _msg: Self::Message,
-            _ctx: &mut tina::Context<'_, Self::Shard, Self::Reply>,
-        ) -> tina::Effect<Self> {
-            tina::noop()
-        }
-    }
-
-    #[test]
-    fn full_admission_error_reply_request_settles_the_captured_caller() {
-        // Proves `PendingCancelableCall::reply_request` (the split-service
-        // `handle_request` recovery path for `Full`/`DuplicateKey`): the
-        // resulting `RequestEffect` must reply through the *rejected
-        // token's own* request context, not a fresh or wrong one.
-        let mut set = PendingCancelableCallSet::with_capacity(1);
-        set.try_insert(token(1_u64, 10)).expect("first insert");
-        let rejected = match set.try_insert(token(2_u64, 77)) {
-            Err(PendingCancelableInsertError::Full { token }) => token,
-            other => panic!("expected Full, got {other:?}"),
-        };
-
-        let effect = rejected
-            .reply_request::<ReplyRequestTestIsolate>("busy")
-            .into_effect();
-        match effect {
-            tina::Effect::ReplyTo(slot, value) => {
-                assert_eq!(
-                    slot.slot_id(),
-                    77,
-                    "must settle the rejected token's own slot"
-                );
-                assert_eq!(value, "busy");
-            }
-            other => panic!("expected ReplyTo effect, got {other:?}"),
-        }
     }
 }

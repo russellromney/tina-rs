@@ -6,7 +6,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use http::Method;
-use tina::CallContext;
 use tina::prelude::*;
 use tina_http::{
     HttpListener, HttpListenerMsg, HttpRequest, HttpResponse, HttpsListener, HttpsListenerMsg,
@@ -15,7 +14,7 @@ use tina_http::{
     WebSocketSessionId, WebSocketSessionMsg, WebSocketSessionOutcome, websocket_upgrade,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime,
+    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime,
     ThreadedRuntimeConfig, sleep,
 };
 
@@ -157,16 +156,13 @@ struct Gateway {
     idle_generation: u64,
 }
 
-impl Isolate for Gateway {
-    tina::isolate_types! {
-        message: HttpRequest,
-        reply: HttpResponse,
-        send: tina::Outbound<WebSocketSessionMsg>,
-        spawn: Infallible,
-        io: RuntimeCall<HttpRequest>,
-        shard: DemoShard,
-    }
-
+#[tina_runtime::isolate(
+    message = HttpRequest,
+    reply = HttpResponse,
+    send = tina::Outbound<WebSocketSessionMsg>,
+    shard = DemoShard
+)]
+impl Gateway {
     fn handle(
         &mut self,
         request: HttpRequest,
@@ -416,16 +412,12 @@ struct Room {
     deleting: bool,
 }
 
-impl Isolate for Room {
-    tina::isolate_types! {
-        message: WebSocketSessionMsg,
-        reply: WebSocketSessionOutcome,
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        io: RuntimeCall<WebSocketSessionMsg>,
-        shard: DemoShard,
-    }
-
+#[tina_runtime::isolate(
+    message = WebSocketSessionMsg,
+    reply = WebSocketSessionOutcome,
+    shard = DemoShard
+)]
+impl Room {
     fn handle(
         &mut self,
         msg: WebSocketSessionMsg,
@@ -441,9 +433,7 @@ impl Isolate for Room {
     ) -> Effect<Self> {
         self.handle_room_msg(msg)
     }
-}
 
-impl Room {
     fn after_possible_leave(&mut self, removed_member: bool) -> Effect<Self> {
         if removed_member && self.members.is_empty() {
             self.arm_idle_expiry()

@@ -6,6 +6,7 @@
 //! `ThreadedRuntime`.
 
 use std::alloc::Global;
+use std::fmt;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -17,7 +18,9 @@ use tina_supervisor::SupervisorConfig;
 use crate::call::IntoErasedCall;
 use crate::capabilities::RuntimeCapabilities;
 use crate::driver;
-use crate::errors::{ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError};
+use crate::errors::{
+    StartupError, ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError,
+};
 use crate::live_report::{LiveShardReport, LiveShardState, LiveTopologyReport};
 use crate::mailbox::MailboxFactory;
 use crate::observer::TraceObserver;
@@ -185,8 +188,28 @@ pub enum LocalSystemConfigError {
     ZeroTimerCapacity,
 }
 
+impl fmt::Display for LocalSystemConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let field = match self {
+            Self::ZeroIngressCapacity => "ingress_capacity",
+            Self::ZeroShardPairCapacity => "shard_pair_capacity",
+            Self::ZeroRemoteInboundDrainBudget => "remote_inbound_drain_budget",
+            Self::ZeroStorageLaneCapacity => "storage_lane_capacity",
+            Self::ZeroDnsLaneCapacity => "dns_lane_capacity",
+            Self::ZeroTlsLaneCapacity => "tls_lane_capacity",
+            Self::ZeroProcessLaneCapacity => "process_lane_capacity",
+            Self::ZeroSignalCapacity => "signal_capacity",
+            Self::ZeroTimerCapacity => "timer_capacity",
+        };
+        write!(f, "{field} must be greater than zero")
+    }
+}
+
+impl std::error::Error for LocalSystemConfigError {}
+
 pub(crate) type ThreadedCommandFn<S, F> = Box<dyn FnOnce(&mut Runtime<S, F>) + Send>;
-pub(crate) type ThreadedIoLoopFactory = Box<dyn FnOnce() -> IOLoopHandle<Global> + Send>;
+pub(crate) type ThreadedIoLoopFactory =
+    Box<dyn FnOnce() -> std::io::Result<IOLoopHandle<Global>> + Send>;
 pub(crate) type ThreadedWorkerJoin = JoinHandle<ThreadedWorkerExit>;
 
 pub(crate) struct ThreadedWorkerExit {
@@ -762,6 +785,90 @@ where
             .register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
     }
 
+    /// Registers one split event/request root service.
+    #[allow(private_bounds)]
+    pub fn register_split_service<I, Event, Request, Outbound>(
+        &self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Result<crate::SplitServiceHandle<Event, Request, I::Reply>, ThreadedRuntimeError>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<Event, Request>,
+                Send = TinaOutbound<Outbound>,
+            > + tina::CallableIsolate
+            + Send
+            + 'static,
+        Event: 'static,
+        Request: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: 'static,
+    {
+        self.runtime()
+            .register_split_service::<I, Event, Request, Outbound>(isolate, mailbox_capacity)
+    }
+
+    /// Registers one event-only root service.
+    #[allow(private_bounds)]
+    pub fn register_event_service<I, Event, Outbound>(
+        &self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Result<crate::EventServiceHandle<Event>, ThreadedRuntimeError>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<Event, std::convert::Infallible>,
+                Reply = (),
+                Send = TinaOutbound<Outbound>,
+            > + Send
+            + 'static,
+        Event: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: 'static,
+    {
+        self.runtime()
+            .register_event_service::<I, Event, Outbound>(isolate, mailbox_capacity)
+    }
+
+    /// Registers one request-only root service.
+    #[allow(private_bounds)]
+    pub fn register_request_service<I, Request, Outbound>(
+        &self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Result<crate::RequestServiceHandle<Request, I::Reply>, ThreadedRuntimeError>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<std::convert::Infallible, Request>,
+                Send = TinaOutbound<Outbound>,
+            > + tina::CallableIsolate
+            + Send
+            + 'static,
+        Request: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: 'static,
+    {
+        self.runtime()
+            .register_request_service::<I, Request, Outbound>(isolate, mailbox_capacity)
+    }
+
     /// Configures a registered root as a supervisor.
     pub fn supervise<M: 'static, R: 'static>(
         &self,
@@ -778,6 +885,58 @@ where
         message: M,
     ) -> Result<(), ThreadedTrySendError> {
         self.runtime().try_send(address, message)
+    }
+
+    /// Attempts bounded ingress through a service event capability.
+    pub fn try_send_event<Event, Request>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        event: Event,
+    ) -> Result<(), ThreadedTrySendError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+    {
+        self.runtime().try_send_event(address, event)
+    }
+
+    /// Performs one typed isolate call from the host thread and returns its
+    /// ordinary terminal [`crate::CallOutcome`].
+    ///
+    /// This is the host-call companion to [`Self::register_root`]. The timeout
+    /// is the target call deadline; backend admission and worker failures are
+    /// returned as [`ThreadedRuntimeError`].
+    pub fn call_blocking<M, R>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        timeout: Duration,
+    ) -> Result<crate::CallOutcome<R>, ThreadedRuntimeError>
+    where
+        M: Send + 'static,
+        R: Send + 'static,
+    {
+        self.runtime().call_blocking(address, message, timeout)
+    }
+
+    /// Performs one blocking host call through a split-service request
+    /// capability.
+    ///
+    /// The request is wrapped in the private service envelope by the runtime;
+    /// callers retain the full [`crate::CallOutcome`] terminal vocabulary.
+    pub fn call_blocking_request<Event, Request, Reply>(
+        &self,
+        address: tina::ServiceRequestAddress<Event, Request, Reply>,
+        request: Request,
+        timeout: Duration,
+    ) -> Result<crate::CallOutcome<Reply>, ThreadedRuntimeError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+        Reply: Send + 'static,
+    {
+        self.runtime()
+            .call_blocking_request(address, request, timeout)
     }
 
     /// Attempts one ingress send and observes the mailbox outcome.
@@ -935,26 +1094,35 @@ where
     }
 
     /// Builds the local app and starts its worker.
+    ///
+    /// # Panics
+    ///
+    /// Panics when [`Self::try_build`] returns a startup error. Applications
+    /// should prefer `try_build`; this method is a setup/test convenience.
     pub fn build(self) -> LocalSystem<S, F> {
-        self.config
-            .validate()
-            .expect("invalid LocalSystemConfig for single-shard system");
+        self.try_build()
+            .expect("failed to build single-shard local system")
+    }
+
+    /// Validates configuration and starts the worker, returning startup failures.
+    pub fn try_build(self) -> Result<LocalSystem<S, F>, StartupError> {
+        self.config.validate()?;
         let runtime = match self.trace_observer {
-            Some(observer) => ThreadedRuntime::with_config_and_trace_observer(
+            Some(observer) => ThreadedRuntime::try_with_config_and_trace_observer(
                 self.shard,
                 self.mailbox_factory,
                 self.config.threaded_runtime_config(),
                 observer,
             ),
-            None => ThreadedRuntime::with_config(
+            None => ThreadedRuntime::try_with_config(
                 self.shard,
                 self.mailbox_factory,
                 self.config.threaded_runtime_config(),
             ),
-        };
-        LocalSystem {
+        }?;
+        Ok(LocalSystem {
             runtime: Some(runtime),
-        }
+        })
     }
 }
 
@@ -1127,26 +1295,35 @@ where
     }
 
     /// Builds the multi-shard local app and starts one worker per shard.
+    ///
+    /// # Panics
+    ///
+    /// Panics when [`Self::try_build`] returns a startup error. Applications
+    /// should prefer `try_build`; this method is a setup/test convenience.
     pub fn build(self) -> LocalMultiShardSystem<S, F> {
-        self.config
-            .validate()
-            .expect("invalid LocalSystemConfig for multi-shard system");
+        self.try_build()
+            .expect("failed to build multi-shard local system")
+    }
+
+    /// Validates topology/configuration and starts every shard worker.
+    pub fn try_build(self) -> Result<LocalMultiShardSystem<S, F>, StartupError> {
+        self.config.validate()?;
         let runtime = match self.trace_observer {
-            Some(observer) => ThreadedMultiShardRuntime::with_config_and_trace_observer(
+            Some(observer) => ThreadedMultiShardRuntime::try_with_config_and_trace_observer(
                 self.shards,
                 self.mailbox_factory,
                 self.config.threaded_runtime_config(),
                 observer,
             ),
-            None => ThreadedMultiShardRuntime::with_config(
+            None => ThreadedMultiShardRuntime::try_with_config(
                 self.shards,
                 self.mailbox_factory,
                 self.config.threaded_runtime_config(),
             ),
-        };
-        LocalMultiShardSystem {
+        }?;
+        Ok(LocalMultiShardSystem {
             runtime: Some(runtime),
-        }
+        })
     }
 }
 
@@ -1187,6 +1364,106 @@ where
             .register_with_capacity_on::<I, Outbound>(shard, isolate, mailbox_capacity)
     }
 
+    /// Registers one split event/request root service on the chosen shard.
+    ///
+    /// Returns [`ThreadedRuntimeError::UnknownShard`] when `shard` is not
+    /// owned by this local system.
+    #[allow(private_bounds)]
+    pub fn register_split_service_on<I, Event, Request, Outbound>(
+        &self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Result<crate::SplitServiceHandle<Event, Request, I::Reply>, ThreadedRuntimeError>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<Event, Request>,
+                Send = TinaOutbound<Outbound>,
+            > + tina::CallableIsolate
+            + Send
+            + 'static,
+        Event: 'static,
+        Request: 'static,
+        I::Reply: Send + 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: Send + 'static,
+    {
+        self.runtime()
+            .register_split_service_on::<I, Event, Request, Outbound>(
+                shard,
+                isolate,
+                mailbox_capacity,
+            )
+    }
+
+    /// Registers one event-only root service on the chosen shard.
+    ///
+    /// Returns [`ThreadedRuntimeError::UnknownShard`] when `shard` is not
+    /// owned by this local system.
+    #[allow(private_bounds)]
+    pub fn register_event_service_on<I, Event, Outbound>(
+        &self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Result<crate::EventServiceHandle<Event>, ThreadedRuntimeError>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<Event, std::convert::Infallible>,
+                Reply = (),
+                Send = TinaOutbound<Outbound>,
+            > + Send
+            + 'static,
+        Event: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: Send + 'static,
+    {
+        self.runtime()
+            .register_event_service_on::<I, Event, Outbound>(shard, isolate, mailbox_capacity)
+    }
+
+    /// Registers one request-only root service on the chosen shard.
+    ///
+    /// Returns [`ThreadedRuntimeError::UnknownShard`] when `shard` is not
+    /// owned by this local system.
+    #[allow(private_bounds)]
+    pub fn register_request_service_on<I, Request, Outbound>(
+        &self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> Result<crate::RequestServiceHandle<Request, I::Reply>, ThreadedRuntimeError>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<std::convert::Infallible, Request>,
+                Send = TinaOutbound<Outbound>,
+            > + tina::CallableIsolate
+            + Send
+            + 'static,
+        Request: 'static,
+        I::Reply: Send + 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: Send + 'static,
+    {
+        self.runtime()
+            .register_request_service_on::<I, Request, Outbound>(shard, isolate, mailbox_capacity)
+    }
+
     /// Configures a registered root as a supervisor.
     pub fn supervise<M: 'static, R: 'static>(
         &self,
@@ -1203,6 +1480,68 @@ where
         message: M,
     ) -> Result<(), ThreadedTrySendError> {
         self.runtime().try_send(address, message)
+    }
+
+    /// Attempts bounded ingress through a service event capability.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the address targets a shard not owned by this local system.
+    pub fn try_send_event<Event, Request>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        event: Event,
+    ) -> Result<(), ThreadedTrySendError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+    {
+        self.runtime().try_send_event(address, event)
+    }
+
+    /// Performs one typed isolate call from the host thread, routed by the
+    /// shard carried in `address`.
+    ///
+    /// This is the host-call companion to [`Self::register_root_on`]. It
+    /// preserves the backend's [`crate::CallOutcome`] terminal vocabulary.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the address targets a shard not owned by this local system,
+    /// matching [`Self::try_send`] and the lower-level threaded owner.
+    pub fn call_blocking<M, R>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        timeout: Duration,
+    ) -> Result<crate::CallOutcome<R>, ThreadedRuntimeError>
+    where
+        M: Send + 'static,
+        R: Send + 'static,
+    {
+        self.runtime().call_blocking(address, message, timeout)
+    }
+
+    /// Performs one blocking host call through a split-service request
+    /// capability, routed by the shard carried in `address`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the address targets a shard not owned by this local system,
+    /// matching [`Self::call_blocking`].
+    pub fn call_blocking_request<Event, Request, Reply>(
+        &self,
+        address: tina::ServiceRequestAddress<Event, Request, Reply>,
+        request: Request,
+        timeout: Duration,
+    ) -> Result<crate::CallOutcome<Reply>, ThreadedRuntimeError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+        Reply: Send + 'static,
+    {
+        self.runtime()
+            .call_blocking_request(address, request, timeout)
     }
 
     /// Returns retained trace without failing the observability path.

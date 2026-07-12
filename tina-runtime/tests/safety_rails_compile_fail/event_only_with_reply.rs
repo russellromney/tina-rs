@@ -1,13 +1,10 @@
-//! Negative fixture: split services must declare event and request together.
-
-#[derive(Debug)]
 enum Event {
-    Filled,
+    Tick,
 }
 
 struct Service;
 
-#[tina_runtime::isolate(event = Event, reply = ())]
+#[tina_runtime::isolate(event = Event, reply = u32)]
 impl Service {
     fn handle_event(
         &mut self,

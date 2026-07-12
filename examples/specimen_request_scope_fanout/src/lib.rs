@@ -112,7 +112,7 @@ impl Worker {
     ) -> RequestEffect<Self> {
         call.capture(move |req| {
             self.held = Some(req.into_deferred());
-            sleep(self.work).then(|reply| tina::ServiceMessage::Event(WorkerEvent::Wake(reply)))
+            sleep(self.work).then_service_event(WorkerEvent::Wake)
         })
     }
 }

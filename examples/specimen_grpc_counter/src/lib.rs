@@ -79,7 +79,8 @@ impl SpecimenServer {
         };
         let conn = runtime
             .register_with_capacity::<Http2ClientConnection<SpecimenShard>, _>(
-                Http2ClientConnection::<SpecimenShard>::new(target, Http2ClientLimits::default()),
+                Http2ClientConnection::<SpecimenShard>::new(target, Http2ClientLimits::default())
+                    .map_err(|error| format!("HTTP/2 client config: {error}"))?,
                 32,
             )
             .map_err(|error| format!("register connection: {error:?}"))?;
@@ -245,16 +246,12 @@ impl StreamingEchoSource {
     }
 }
 
-impl Isolate for StreamingEchoSource {
-    tina::isolate_types! {
-        message: ResponseChunkMsg,
-        reply: ResponseChunkReply,
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        io: tina_runtime::RuntimeCall<ResponseChunkMsg>,
-        shard: SpecimenShard,
-    }
-
+#[tina_runtime::isolate(
+    message = ResponseChunkMsg,
+    reply = ResponseChunkReply,
+    shard = SpecimenShard
+)]
+impl StreamingEchoSource {
     fn handle(
         &mut self,
         msg: ResponseChunkMsg,
@@ -455,7 +452,8 @@ pub fn start_server() -> Result<SpecimenServer, String> {
                 "127.0.0.1:0".parse::<SocketAddr>().expect("loopback"),
                 service,
                 config,
-            ),
+            )
+            .map_err(|error| format!("HTTP/2 server config: {error}"))?,
             config.listener_mailbox_capacity,
         )
         .map_err(|error| format!("register listener: {error:?}"))?;

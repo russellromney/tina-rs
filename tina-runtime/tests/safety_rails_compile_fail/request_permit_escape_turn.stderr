@@ -1,0 +1,12 @@
+error: lifetime may not live long enough
+  --> tests/safety_rails_compile_fail/request_permit_escape_turn.rs:17:5
+   |
+14 | fn escape<'request>(
+   |           -------- lifetime `'request` defined here
+...
+17 |     permit
+   |     ^^^^^^ returning this value requires that `'request` must outlive `'static`
+   |
+   = note: requirement occurs because of the type `RequestEffectPermit<'_, Demo>`, which makes the generic argument `'_` invariant
+   = note: the struct `RequestEffectPermit<'request, I>` is invariant over the parameter `'request`
+   = help: see <https://doc.rust-lang.org/nomicon/subtyping.html> for more information about variance

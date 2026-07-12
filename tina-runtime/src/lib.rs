@@ -54,6 +54,7 @@ mod capabilities;
 pub mod capacity;
 mod child_lifecycle;
 mod clock;
+mod concurrency_pending;
 pub mod deferred;
 mod drain_state;
 mod driver;
@@ -101,11 +102,16 @@ pub use admission::{
     ConcurrencyReleaseError, KeyedLimit, KeyedPermit, KeyedReleaseError, KeyedSlotReport,
     PressureAction, RateGrant, RateKeyState, RateLimit, ServicePolicy, SurfaceName,
 };
+pub use concurrency_pending::{
+    ConcurrencyGuardedInsertError, ConcurrencyInsertError, ConcurrencyParkError,
+    ConcurrencyParkTicket, ConcurrencyPendingInitError, ConcurrencyPendingReplies,
+    ConcurrencyPendingReport, ConcurrencyReplyError, request_effect_after_concurrency_park,
+};
 pub use drain_state::{AdmitDecision, DrainReport, DrainStage, DrainState};
 pub use errors::{
     RegisterBootstrapError, SendObservedUntilError, ShutdownRequestError, ShutdownWaitError,
-    SuperviseError, ThreadedRegisterBootstrapError, ThreadedRuntimeError,
-    ThreadedSendObservedError, ThreadedTrySendError,
+    StartupError, SuperviseError, ThreadedRegisterBootstrapError, ThreadedRuntimeConfigError,
+    ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError,
 };
 pub use full_handling::{
     FullDecision, FullExhaustionReason, FullHandling, FullHandlingReport, FullHandlingToken,
@@ -135,7 +141,10 @@ mod host_call;
 mod registration;
 mod remote;
 mod service_handle;
-pub use service_handle::{SendOnlyServiceHandle, ServiceHandle, SplitServiceHandle};
+pub use service_handle::{
+    EventServiceHandle, RequestServiceHandle, SendOnlyServiceHandle, ServiceHandle,
+    SplitServiceHandle,
+};
 
 use remote::{QueuedRemoteEnvelope, SendableQueuedRemoteEnvelope};
 
@@ -151,8 +160,8 @@ pub(crate) use dispatch::{ChildRecordSnapshot, SupervisorRecordSnapshot};
 pub use shutdown::ThreadedShutdownHandle;
 pub use single_call_gate::SingleCallGate;
 pub use threaded::{
-    DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, HOST_CALL_DISPATCHER_POOL_SIZE, ThreadedRuntime,
-    ThreadedRuntimeConfig,
+    DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, DEFAULT_STARTUP_HANDSHAKE_TIMEOUT,
+    HOST_CALL_DISPATCHER_POOL_SIZE, ThreadedRuntime, ThreadedRuntimeConfig,
 };
 pub use threaded_multi_shard::ThreadedMultiShardRuntime;
 
@@ -208,17 +217,18 @@ pub use call::{
     PendingCancelableInsertError, PendingCancelableRemoveError, PendingCancelableTicket,
     PersistenceTraceInfo, ProcessRunReply, ProcessRunResult, ProcessStatus, ReadDirReply,
     RemoveFileReply, RenameReplaceReply, RequestDeferredCancelableCall, RequestDeferredIsolateCall,
-    RequestDeferredObservedSend, RequestDeferredTypedCall, RuntimeCall, RuntimeCallCompletion,
-    RuntimeCallParts, RuntimeCallable, SendOutcome, SignalWaitReply, SleepCall, SleepReply,
-    SnapshotCommitReply, SnapshotImage, SnapshotLoadReply, StreamId, SyncParentReply,
-    TcpAcceptReply, TcpBindReply, TcpConnectReply, TcpListenerCloseReply, TcpReadBufReply,
-    TcpReadReply, TcpStreamCloseReply, TcpWriteOwnedCloseReply, TcpWriteOwnedReply, TcpWriteReply,
-    TlsAcceptReply, TlsBindReply, TlsCloseReply, TlsConnectReply, TlsListenerCloseReply,
-    TlsListenerId, TlsReadBufReply, TlsReadReply, TlsStreamId, TlsWriteOwnedReply, TlsWriteReply,
-    TypedCall, UdpBindReply, UdpCloseSocketReply, UdpRecvFromReply, UdpSendToReply, UdpSocketId,
-    UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerCloseReply, UnixListenerId,
-    UnixReadReply, UnixStreamCloseReply, UnixStreamId, UnixWriteOwnedReply, UnixWriteReply,
-    WorkTicket, WriteOwnedError, WriteOwnedReply, call, call_cancelable, call_cancelable_request,
+    RequestDeferredObservedSend, RequestDeferredTypedCall, RequestPendingCancelableInsertError,
+    RuntimeCall, RuntimeCallCompletion, RuntimeCallParts, RuntimeCallable, SendOutcome,
+    SignalWaitReply, SleepCall, SleepReply, SnapshotCommitReply, SnapshotImage, SnapshotLoadReply,
+    StreamId, SyncParentReply, TcpAcceptReply, TcpBindReply, TcpConnectReply,
+    TcpListenerCloseReply, TcpReadBufReply, TcpReadReply, TcpStreamCloseReply,
+    TcpWriteOwnedCloseReply, TcpWriteOwnedReply, TcpWriteReply, TlsAcceptReply, TlsBindReply,
+    TlsCloseReply, TlsConnectReply, TlsListenerCloseReply, TlsListenerId, TlsReadBufReply,
+    TlsReadReply, TlsStreamId, TlsWriteOwnedReply, TlsWriteReply, TypedCall, UdpBindReply,
+    UdpCloseSocketReply, UdpRecvFromReply, UdpSendToReply, UdpSocketId, UnixAcceptReply,
+    UnixBindReply, UnixConnectReply, UnixListenerCloseReply, UnixListenerId, UnixReadReply,
+    UnixStreamCloseReply, UnixStreamId, UnixWriteOwnedReply, UnixWriteReply, WorkTicket,
+    WriteOwnedError, WriteOwnedReply, call, call_cancelable, call_cancelable_request,
     call_handle_call_id, call_request, call_typed, call_with_handle, cancel_call, dns_lookup,
     file_close, file_create, file_fsync, file_open, file_read, file_read_at, file_size, file_write,
     file_write_at, file_write_at_owned, journal_append, journal_replay, mkdir, path_metadata,
@@ -305,6 +315,17 @@ pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWrit
 ///
 /// This is the preferred runtime authoring path. It keeps the handler as normal
 /// Rust code and only fills the repetitive [`tina::Isolate`] associated types.
+///
+/// Choose the smallest service shape that matches the public contract:
+///
+/// - `message = Message` uses the legacy combined-message `handle` method.
+/// - `event = Event` uses only `handle_event` and has no callable lane.
+/// - `request = Request, reply = Reply` uses only `handle_request`.
+/// - `event = Event, request = Request, reply = Reply` uses both typed lanes.
+///
+/// Event/request forms keep the internal [`tina::ServiceMessage`] envelope out
+/// of handlers and work with the matching `Runtime::register_*_service`
+/// methods.
 ///
 /// **The expansion is rooted at `::tina`.** The generated impl names
 /// `::tina::Isolate`, `::tina::Effect`, `::tina::Context`, and friends, so the

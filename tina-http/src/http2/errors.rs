@@ -6,6 +6,74 @@
 
 use tina_runtime::Http2ResetReason;
 
+/// Why caller-supplied HTTP/2 limits cannot construct a connection.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Http2ConfigError {
+    /// `max_frame_size` is outside the RFC 9113 SETTINGS range.
+    FrameSizeOutOfRange { value: usize },
+    /// `max_concurrent_streams` does not fit its 32-bit SETTINGS value.
+    ConcurrentStreamsOutOfRange { value: usize },
+    /// The initial connection receive window is below HTTP/2's fixed default.
+    InitialConnectionWindowTooSmall { value: i32 },
+    /// The initial stream receive window is negative.
+    InitialStreamWindowNegative { value: i32 },
+    /// The connection's outbound frame queue has zero capacity.
+    ZeroOutboundQueueCapacity,
+    /// The client's pre-connect submit queue has zero capacity.
+    ZeroPreConnectSubmitCapacity,
+    /// The server's request-stream chunk size is zero.
+    ZeroRequestStreamChunkSize,
+    /// A connection isolate mailbox has zero capacity.
+    ZeroConnectionMailboxCapacity,
+    /// The server listener mailbox has zero capacity.
+    ZeroListenerMailboxCapacity,
+    /// The TLS I/O deadline is zero.
+    ZeroTlsIoTimeout,
+}
+
+impl std::fmt::Display for Http2ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FrameSizeOutOfRange { value } => write!(
+                f,
+                "max_frame_size must be in 16384..=16777215 (got {value})"
+            ),
+            Self::ConcurrentStreamsOutOfRange { value } => {
+                write!(f, "max_concurrent_streams must fit u32 (got {value})")
+            }
+            Self::InitialConnectionWindowTooSmall { value } => write!(
+                f,
+                "initial_connection_window must be at least 65535 (got {value})"
+            ),
+            Self::InitialStreamWindowNegative { value } => {
+                write!(
+                    f,
+                    "initial_stream_window must be non-negative (got {value})"
+                )
+            }
+            Self::ZeroOutboundQueueCapacity => {
+                f.write_str("connection_outbound_queue_capacity must be positive")
+            }
+            Self::ZeroPreConnectSubmitCapacity => {
+                f.write_str("pre_connect_submit_capacity must be positive")
+            }
+            Self::ZeroRequestStreamChunkSize => {
+                f.write_str("request_stream_chunk_size must be positive")
+            }
+            Self::ZeroConnectionMailboxCapacity => {
+                f.write_str("connection_mailbox_capacity must be positive")
+            }
+            Self::ZeroListenerMailboxCapacity => {
+                f.write_str("listener_mailbox_capacity must be positive")
+            }
+            Self::ZeroTlsIoTimeout => f.write_str("tls_io_timeout must be non-zero"),
+        }
+    }
+}
+
+impl std::error::Error for Http2ConfigError {}
+
 /// HTTP/2 wire error codes (RFC 9113 §7).
 pub(super) const ERR_NO_ERROR: u32 = 0x0;
 pub(super) const ERR_PROTOCOL_ERROR: u32 = 0x1;

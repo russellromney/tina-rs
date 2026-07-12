@@ -1,5 +1,5 @@
-//! Negative fixture: `request_effect_after_shared_wait(&ticket, effect)`
-//! requires a real `&SharedWorkTicket<K>` borrow. Passing a non-ticket
+//! Negative fixture: `request_effect_after_shared_wait(permit, effect)`
+//! requires the one-use request permit returned by admission. Passing a ticket
 //! is rejected at compile time, so user code cannot escape admission
 //! by handing a `RequestEffect<I>` derived from plain `noop()`.
 
@@ -31,6 +31,6 @@ impl Isolate for NoTicket {
 }
 
 fn main() {
-    let not_a_ticket: u32 = 0;
-    let _ = request_effect_after_shared_wait::<NoTicket, u32>(&not_a_ticket, tina::noop());
+    let not_a_permit: u32 = 0;
+    let _ = request_effect_after_shared_wait::<NoTicket>(not_a_permit, tina::noop());
 }

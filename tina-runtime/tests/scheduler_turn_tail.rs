@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, StartupError, ThreadedRuntime,
+    ThreadedRuntimeConfig, ThreadedRuntimeConfigError, sleep,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -352,40 +353,55 @@ fn shutdown_observed_during_self_send_storm() {
 }
 
 #[test]
-#[should_panic(expected = "hot_drain_max_rounds > 0")]
 fn zero_hot_drain_rounds_rejected() {
-    let _ = ThreadedRuntime::<TestShard, DefaultThreadedMailboxFactory>::with_config(
+    let error = ThreadedRuntime::<TestShard, DefaultThreadedMailboxFactory>::try_with_config(
         TestShard,
         DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
             hot_drain_max_rounds: 0,
             ..ThreadedRuntimeConfig::default()
         },
-    );
+    )
+    .err()
+    .expect("zero rounds must fail");
+    assert!(matches!(
+        error,
+        StartupError::InvalidThreadedConfig(ThreadedRuntimeConfigError::ZeroHotDrainMaxRounds)
+    ));
 }
 
 #[test]
-#[should_panic(expected = "hot_drain_max_elapsed > 0")]
 fn zero_hot_drain_elapsed_rejected() {
-    let _ = ThreadedRuntime::<TestShard, DefaultThreadedMailboxFactory>::with_config(
+    let error = ThreadedRuntime::<TestShard, DefaultThreadedMailboxFactory>::try_with_config(
         TestShard,
         DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
             hot_drain_max_elapsed: Duration::ZERO,
             ..ThreadedRuntimeConfig::default()
         },
-    );
+    )
+    .err()
+    .expect("zero elapsed budget must fail");
+    assert!(matches!(
+        error,
+        StartupError::InvalidThreadedConfig(ThreadedRuntimeConfigError::ZeroHotDrainMaxElapsed)
+    ));
 }
 
 #[test]
-#[should_panic(expected = "idle_repoll_interval > 0")]
 fn zero_idle_repoll_rejected() {
-    let _ = ThreadedRuntime::<TestShard, DefaultThreadedMailboxFactory>::with_config(
+    let error = ThreadedRuntime::<TestShard, DefaultThreadedMailboxFactory>::try_with_config(
         TestShard,
         DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
             idle_repoll_interval: Duration::ZERO,
             ..ThreadedRuntimeConfig::default()
         },
-    );
+    )
+    .err()
+    .expect("zero idle repoll must fail");
+    assert!(matches!(
+        error,
+        StartupError::InvalidThreadedConfig(ThreadedRuntimeConfigError::ZeroIdleRepollInterval)
+    ));
 }

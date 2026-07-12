@@ -46,7 +46,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tina::{CallHandle, CallHandleShared, CallHandleState, CancelOutcome, Effect, Isolate};
+use tina::{
+    CallHandle, CallHandleShared, CallHandleState, CancelOutcome, Effect, Isolate, ServiceMessage,
+};
 
 use crate::call::{CallOutcome, RuntimeCall};
 
@@ -429,6 +431,27 @@ impl RequestScope {
             _ => Effect::Batch(effects),
         };
         (report, effect)
+    }
+
+    /// Like [`cancel_into_effect`](Self::cancel_into_effect), but the translator
+    /// returns a domain event and this helper wraps the split-service envelope.
+    pub fn cancel_into_service_event_effect<I, Event, Request, F>(
+        &self,
+        cause: ScopeCancelCause,
+        translator: F,
+    ) -> (ScopeCancelReport, Effect<I>)
+    where
+        I: Isolate<
+                Message = ServiceMessage<Event, Request>,
+                Io = RuntimeCall<ServiceMessage<Event, Request>>,
+            >,
+        F: Fn(RequestScopeId, &'static str, CancelOutcome) -> Event + Clone + Send + 'static,
+        Event: 'static,
+        Request: 'static,
+    {
+        self.cancel_into_effect(cause, move |scope, label, outcome| {
+            ServiceMessage::Event(translator(scope, label, outcome))
+        })
     }
 
     /// Marks the scope cancelled without producing cancel effects.

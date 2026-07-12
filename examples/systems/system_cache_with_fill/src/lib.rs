@@ -190,22 +190,22 @@ impl Cache {
         }
 
         match self.waiters.wait(key.clone(), call) {
-            Ok(ticket) => {
+            Ok((_ticket, permit)) => {
                 let entry = self.entries.entry(key.clone()).or_default();
                 if entry.filling.is_some() {
-                    return request_effect_after_shared_wait(&ticket, noop());
+                    return request_effect_after_shared_wait(permit, noop());
                 }
                 let generation = entry.generation;
                 entry.filling = Some(FillState { generation });
                 self.fills_started += 1;
-                let fill_effect = sleep(self.fill_delay).then(move |result| {
-                    tina::ServiceMessage::Event(CacheEvent::FillDone {
+                let fill_effect = sleep(self.fill_delay).then_service_event(move |result| {
+                    CacheEvent::FillDone {
                         key,
                         generation,
                         result,
-                    })
+                    }
                 });
-                request_effect_after_shared_wait(&ticket, fill_effect)
+                request_effect_after_shared_wait(permit, fill_effect)
             }
             Err(SharedWorkError::Full { call, .. }) => {
                 self.busy_replies += 1;

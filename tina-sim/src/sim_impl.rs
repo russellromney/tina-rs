@@ -205,6 +205,68 @@ where
         SplitServiceHandle::from_address(address)
     }
 
+    /// Registers an event-only service and returns only its event capability.
+    #[allow(private_bounds)]
+    pub fn register_event_service<I, Event, Outbound>(
+        &mut self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> tina_runtime::EventServiceHandle<Event>
+    where
+        I: Isolate<
+                Message = tina::ServiceMessage<Event, std::convert::Infallible>,
+                Reply = (),
+                Shard = S,
+                Send = TinaOutbound<Outbound>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, std::convert::Infallible>>,
+            > + 'static,
+        I::Io: RuntimeCallable,
+        I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
+        Event: 'static,
+        Outbound: 'static,
+    {
+        SplitServiceHandle::from_address(self.register_with_mailbox_capacity::<
+            I,
+            tina::ServiceMessage<Event, std::convert::Infallible>,
+            Outbound,
+        >(isolate, mailbox_capacity))
+        .events
+    }
+
+    /// Registers a request-only service and returns only its request capability.
+    #[allow(private_bounds)]
+    pub fn register_request_service<I, Request, Outbound>(
+        &mut self,
+        isolate: I,
+        mailbox_capacity: usize,
+    ) -> tina_runtime::RequestServiceHandle<Request, I::Reply>
+    where
+        I: Isolate<
+                Message = tina::ServiceMessage<std::convert::Infallible, Request>,
+                Shard = S,
+                Send = TinaOutbound<Outbound>,
+                Io = RuntimeCall<tina::ServiceMessage<std::convert::Infallible, Request>>,
+            > + tina::CallableIsolate
+            + 'static,
+        I::Io: RuntimeCallable,
+        I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
+        I::Reply: 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
+        Request: 'static,
+        Outbound: 'static,
+    {
+        self.register_split_service::<I, std::convert::Infallible, Request, Outbound>(
+            isolate,
+            mailbox_capacity,
+        )
+        .requests
+    }
+
     /// Configures a registered isolate as supervisor for its direct children.
     ///
     /// The simulator mirrors `tina-runtime`: supervision applies to
@@ -273,6 +335,32 @@ where
                     .downcast::<M>()
                     .unwrap_or_else(|_| panic!("simulator ingress hit wrong mailbox type")),
             )),
+        }
+    }
+
+    /// Attempts one public event send through a service event capability.
+    pub fn try_send_event<Event: 'static, Request: 'static>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        event: Event,
+    ) -> Result<(), TrySendError<Event>> {
+        match self.try_send(
+            address.address().address(),
+            tina::ServiceMessage::Event(event),
+        ) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(tina::ServiceMessage::Event(event))) => {
+                Err(TrySendError::Full(event))
+            }
+            Err(TrySendError::Closed(tina::ServiceMessage::Event(event))) => {
+                Err(TrySendError::Closed(event))
+            }
+            Err(TrySendError::Full(tina::ServiceMessage::Request(_)))
+            | Err(TrySendError::Closed(tina::ServiceMessage::Request(_))) => {
+                unreachable!(
+                    "simulator returned a different split-service payload than it received"
+                )
+            }
         }
     }
 

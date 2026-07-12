@@ -1,0 +1,7 @@
+error[E0133]: call to unsafe function `CallContext::<'a, I>::new` is unsafe and requires unsafe block
+  --> tests/safety_rails_compile_fail/request_call_fake_context.rs:19:17
+   |
+19 |     let _call = tina::CallContext::<Demo>::new(context);
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+   |
+   = note: consult the function's documentation for information on how to avoid undefined behavior

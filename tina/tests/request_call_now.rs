@@ -39,8 +39,23 @@ impl Isolate for PingService {
 
 fn request_call_with_now(stamped: Instant) -> RequestCall<'static, PingService> {
     let shard: &'static mut tina::SingleShard = Box::leak(Box::new(tina::SingleShard));
-    let ctx = Context::<_, ()>::new_typed(shard, IsolateId::new(1)).with_now(stamped);
-    RequestCall::new(CallContext::new(ctx))
+    let registry = std::rc::Rc::new(tina::DeferredSlotRegistry::new());
+    let caller = tina::MessageCaller::new(
+        registry,
+        1,
+        IsolateId::new(1),
+        tina::CallRouting::Local,
+        std::any::TypeId::of::<()>(),
+    );
+    // SAFETY: this helper builds the complete caller/context pair for this
+    // isolated public-surface test; no live runtime registry is involved.
+    let call = unsafe {
+        let ctx = Context::<_, ()>::new_typed(shard, IsolateId::new(1))
+            .with_now(stamped)
+            .with_caller(caller);
+        CallContext::new(ctx)
+    };
+    RequestCall::new(call)
 }
 
 #[test]
