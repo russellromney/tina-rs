@@ -312,6 +312,48 @@ pub struct LocalSystemShutdownReport {
     unclean_reasons: Vec<ShutdownUncleanReason>,
 }
 
+/// Typed failure returned when a terminal report proves shutdown was unclean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncleanShutdownError {
+    report: LocalSystemShutdownReport,
+}
+
+impl UncleanShutdownError {
+    /// Full terminal shutdown accounting that made the clean check fail.
+    pub const fn report(&self) -> &LocalSystemShutdownReport {
+        &self.report
+    }
+}
+
+impl fmt::Display for UncleanShutdownError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "unclean shutdown: final_state={:?} reasons={:?} failed_shards={:?} \
+             remaining_owned={} remaining_worker_held={} remaining_pending_driver_calls={} \
+             canceled={} tombstoned={} rejected_after_drain={}",
+            self.report.final_state(),
+            self.report.unclean_reasons(),
+            self.report.failed_shards(),
+            self.report.remaining_owned_resource_count(),
+            self.report.remaining_worker_held_resource_count(),
+            self.report.remaining_pending_driver_call_count(),
+            self.report.canceled_count(),
+            self.report.tombstoned_count(),
+            self.report.rejected_after_drain_count(),
+        )
+    }
+}
+
+impl std::error::Error for UncleanShutdownError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self.report.unclean_reasons().first() {
+            Some(ShutdownUncleanReason::RuntimeError(error)) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 impl LocalSystemShutdownReport {
     pub(crate) fn from_parts(
         state: LocalSystemState,
@@ -666,6 +708,22 @@ impl LocalSystemTerminalReport {
     /// Terminal shutdown accounting.
     pub const fn shutdown_report(&self) -> &LocalSystemShutdownReport {
         &self.shutdown
+    }
+
+    /// Confirms that terminal shutdown accounting is clean.
+    ///
+    /// A successfully observed terminal report can still describe a failed or
+    /// resource-leaking shutdown. This check keeps transport/wait success
+    /// distinct from lifecycle truth and preserves the full typed accounting
+    /// in [`UncleanShutdownError`].
+    pub fn ensure_clean(&self) -> Result<(), UncleanShutdownError> {
+        if self.shutdown.clean() {
+            Ok(())
+        } else {
+            Err(UncleanShutdownError {
+                report: self.shutdown.clone(),
+            })
+        }
     }
 
     /// Consumes the report and returns the final trace.
