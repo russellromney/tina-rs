@@ -9,8 +9,8 @@
 //!
 //! - [`Address`] / [`SendAddress`] / [`CallAddress`] — typed addresses for
 //!   sends and calls.
-//! - [`ServiceMessage`] / [`ServiceEventAddress`] / [`ServiceRequestAddress`]
-//!   — service-shaped event vs request addressing.
+//! - [`ServiceMessage`] / [`ServiceOutbound`] / [`ServiceEventAddress`] /
+//!   [`ServiceRequestAddress`] — service-shaped event vs request routing.
 //! - [`Outbound`] — the (destination, message) pair returned by send
 //!   constructors.
 //! - [`ShardId`] / [`IsolateId`] / [`AddressGeneration`] — opaque newtype
@@ -299,7 +299,7 @@ pub enum ServiceMessage<Event, Request> {
 ///
 /// ```
 /// # use tina::prelude::*;
-/// # use tina::{ServiceEventAddress, ServiceOutbound};
+/// # use tina::ServiceEventAddress;
 /// # enum Event { Refresh }
 /// # enum Request { Read }
 /// # enum ClientMessage { Refresh }
