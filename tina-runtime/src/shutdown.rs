@@ -668,7 +668,7 @@ mod tests {
         report: LocalSystemTerminalReport,
         wait_error: Option<ShutdownWaitError>,
         wait_timeouts: Mutex<Vec<Duration>>,
-        request_calls: std::sync::atomic::AtomicUsize,
+        request_calls: Mutex<usize>,
     }
 
     impl ScriptedShutdownInner {
@@ -681,7 +681,7 @@ mod tests {
                 report,
                 wait_error: None,
                 wait_timeouts: Mutex::new(Vec::new()),
-                request_calls: std::sync::atomic::AtomicUsize::new(0),
+                request_calls: Mutex::new(0),
             }
         }
 
@@ -689,12 +689,15 @@ mod tests {
             self.wait_error = Some(error);
             self
         }
+
+        fn request_calls(&self) -> usize {
+            *self.request_calls.lock().expect("scripted request count")
+        }
     }
 
     impl ShutdownInner for ScriptedShutdownInner {
         fn request_shutdown(&self) -> Result<(), ShutdownRequestError> {
-            self.request_calls
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *self.request_calls.lock().expect("scripted request count") += 1;
             self.requests
                 .lock()
                 .expect("scripted requests")
@@ -791,12 +794,7 @@ mod tests {
             .request_and_wait_report(Duration::from_secs(1))
             .expect("retry converges");
         assert_eq!(report.state(), LocalSystemState::Closed);
-        assert_eq!(
-            inner
-                .request_calls
-                .load(std::sync::atomic::Ordering::Relaxed),
-            2
-        );
+        assert_eq!(inner.request_calls(), 2);
     }
 
     #[test]
@@ -828,9 +826,7 @@ mod tests {
             Err(ShutdownAndWaitError::RequestTimeout { last: observed }) if observed == last
         ));
         assert_eq!(
-            inner
-                .request_calls
-                .load(std::sync::atomic::Ordering::Relaxed),
+            inner.request_calls(),
             1,
             "the scripted late success must not be attempted after the deadline"
         );
@@ -861,12 +857,7 @@ mod tests {
             .request_and_wait_report(Duration::ZERO)
             .expect("immediate request and cached report need no wait budget");
         assert_eq!(report.state(), LocalSystemState::Closed);
-        assert_eq!(
-            inner
-                .request_calls
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
+        assert_eq!(inner.request_calls(), 1);
     }
 
     #[test]
@@ -888,12 +879,7 @@ mod tests {
             .request_and_wait_report(Duration::from_secs(1))
             .expect("remaining shards are still signaled");
         assert_eq!(report.error(), Some(ThreadedRuntimeError::WorkerStopped));
-        assert_eq!(
-            inner
-                .request_calls
-                .load(std::sync::atomic::Ordering::Relaxed),
-            2
-        );
+        assert_eq!(inner.request_calls(), 2);
     }
 
     #[test]
@@ -930,17 +916,17 @@ mod tests {
     }
 
     struct SlowFirstRequestInner {
-        calls: std::sync::atomic::AtomicUsize,
+        calls: Mutex<usize>,
         wait_timeout: Mutex<Option<Duration>>,
     }
 
     impl ShutdownInner for SlowFirstRequestInner {
         fn request_shutdown(&self) -> Result<(), ShutdownRequestError> {
-            if self
-                .calls
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                == 0
-            {
+            let mut calls = self.calls.lock().expect("slow request count");
+            let first = *calls == 0;
+            *calls += 1;
+            drop(calls);
+            if first {
                 thread::sleep(Duration::from_millis(10));
                 Err(ShutdownRequestError::CommandFull { shard: None })
             } else {
@@ -963,7 +949,7 @@ mod tests {
     #[test]
     fn request_and_wait_passes_only_remaining_budget_to_wait_phase() {
         let inner = Arc::new(SlowFirstRequestInner {
-            calls: std::sync::atomic::AtomicUsize::new(0),
+            calls: Mutex::new(0),
             wait_timeout: Mutex::new(None),
         });
         let handle = ThreadedShutdownHandle::new(inner.clone());
