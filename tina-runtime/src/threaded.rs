@@ -1227,7 +1227,9 @@ where
     /// calling. `Ctor: Send + 'static` so the closure ships across the
     /// worker command channel.
     /// The constructor is dropped without executing when command admission
-    /// returns [`ThreadedRuntimeError::CommandFull`].
+    /// returns [`ThreadedRuntimeError::CommandFull`] or `WorkerStopped`. Once
+    /// admitted, `WorkerUnresponsive` does not return constructor authority:
+    /// the constructor may still finish and publish the isolate later.
     #[allow(private_bounds)]
     pub fn register_with_capacity_using<I, Outbound, Ctor>(
         &self,

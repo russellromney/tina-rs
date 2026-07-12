@@ -285,6 +285,39 @@ where
             )
     }
 
+    /// Registers one root on the requested shard whose constructor receives
+    /// its final typed address before the entry is published.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `shard` is not owned or when `construct` panics. Constructor
+    /// panic consumes the shard-local deterministic id without adding an entry.
+    /// Sending through an address leaked by a panicking constructor follows the
+    /// simulator's unknown-isolate contract and panics; the id is never reused.
+    #[allow(private_bounds)]
+    pub fn register_with_capacity_using_on<I, Msg, Outbound, Ctor>(
+        &mut self,
+        shard: ShardId,
+        mailbox_capacity: usize,
+        construct: Ctor,
+    ) -> Address<Msg, I::Reply>
+    where
+        I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
+            + 'static,
+        I::Io: RuntimeCallable,
+        I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
+        I::Reply: 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
+        Msg: 'static,
+        Outbound: 'static,
+        Ctor: FnOnce(Address<Msg, I::Reply>) -> I,
+    {
+        self.simulator_mut(shard)
+            .register_with_capacity_using::<I, Msg, Outbound, _>(mailbox_capacity, construct)
+    }
+
     /// Registers one split event/request service on the requested shard.
     ///
     /// # Panics

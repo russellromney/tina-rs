@@ -1025,6 +1025,32 @@ where
             )
     }
 
+    /// Registers one root whose constructor receives its final typed address.
+    /// The entry is not published until construction succeeds. Pre-admission
+    /// failure drops the constructor without running it; an accepted
+    /// `WorkerUnresponsive` constructor may still publish later.
+    #[allow(private_bounds)]
+    pub fn register_root_using<I, Outbound, Ctor>(
+        &self,
+        mailbox_capacity: usize,
+        construct: Ctor,
+    ) -> Result<Address<I::Message, I::Reply>, ThreadedRuntimeError>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
+        I::Message: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: 'static,
+        Ctor: FnOnce(Address<I::Message, I::Reply>) -> I + Send + 'static,
+    {
+        self.runtime()
+            .register_with_capacity_using::<I, Outbound, _>(mailbox_capacity, construct)
+    }
+
     /// Registers one split event/request root service.
     #[allow(private_bounds)]
     pub fn register_split_service<I, Event, Request, Outbound>(
@@ -1831,6 +1857,33 @@ where
                 mailbox_capacity,
                 bootstrap,
             )
+    }
+
+    /// Registers one root on the chosen shard whose constructor receives its
+    /// final typed address before the entry is published. Pre-admission failure
+    /// drops the constructor without running it; an accepted
+    /// `WorkerUnresponsive` constructor may still publish later on that shard.
+    #[allow(private_bounds)]
+    pub fn register_root_using_on<I, Outbound, Ctor>(
+        &self,
+        shard: ShardId,
+        mailbox_capacity: usize,
+        construct: Ctor,
+    ) -> Result<Address<I::Message, I::Reply>, ThreadedRuntimeError>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
+        I::Message: 'static,
+        I::Reply: Send + 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: Send + 'static,
+        Ctor: FnOnce(Address<I::Message, I::Reply>) -> I + Send + 'static,
+    {
+        self.runtime()
+            .register_with_capacity_using_on::<I, Outbound, _>(shard, mailbox_capacity, construct)
     }
 
     /// Registers one split event/request root service on the chosen shard.

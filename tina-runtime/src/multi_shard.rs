@@ -243,6 +243,36 @@ where
             .register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
     }
 
+    /// Registers one root on the requested shard; its constructor receives
+    /// the final typed address before the entry is published.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `shard` is not owned or when `construct` panics. A failed
+    /// constructor consumes its isolate id without publishing an entry.
+    #[allow(private_bounds)]
+    pub fn register_with_capacity_using_on<I, Outbound, Ctor>(
+        &mut self,
+        shard: ShardId,
+        mailbox_capacity: usize,
+        construct: Ctor,
+    ) -> Address<I::Message, I::Reply>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
+        I::Message: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: 'static,
+        Ctor: FnOnce(Address<I::Message, I::Reply>) -> I,
+    {
+        self.runtime_mut(shard)
+            .register_with_capacity_using::<I, Outbound, _>(mailbox_capacity, construct)
+    }
+
     /// Registers one split event/request service on the requested shard.
     ///
     /// # Panics

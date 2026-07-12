@@ -3,7 +3,7 @@
 //! `register_with_capacity_using(cap, |self_addr| ...)` lets the
 //! constructor receive its own typed `Address`. Tests pin: same
 //! generation as plain registration, address routes correctly,
-//! panic semantics (no entry, id leaked, address dies loud), and
+//! panic semantics (no entry, id consumed, leaked address is closed), and
 //! the threaded form actually handles messages (not just accepts
 //! them).
 
@@ -65,6 +65,7 @@ fn constructor_receives_typed_self_address() {
     });
 
     let captured = captured.expect("constructor saw self_addr");
+    assert_eq!(captured.system(), addr.system());
     assert_eq!(captured.shard(), addr.shard());
     assert_eq!(captured.isolate(), addr.isolate());
     assert_eq!(captured.generation(), addr.generation());
@@ -282,10 +283,3 @@ fn helpers_compose_self_address_plus_drain_replies_into_stop() {
         .expect("front stops after drain_replies_into_stop");
     let _ = runtime.shutdown();
 }
-
-// Marker: multi-shard parity is deferred. Replace the body with a
-// real parity test when the multi-shard forms ship and drop the
-// ignore. Empty body so an accidental un-ignore passes trivially.
-#[test]
-#[ignore = "multi-shard register_with_capacity_using_on is deferred; design note in .intent/phases/064-..."]
-fn multi_shard_register_with_capacity_using_on_is_deferred() {}

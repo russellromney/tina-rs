@@ -246,6 +246,30 @@ Threaded owners also distinguish `WorkerStopped` from
 accepted, but an unresponsive worker may still complete registration after
 the host-side timeout.
 
+### Construct with the root address
+
+When root state genuinely needs its own typed address, construct it through the
+owner instead of adding a `Begin { self_addr }` message:
+
+```rust
+let coordinator = app.register_root_using(capacity, |self_addr| Coordinator {
+    self_addr,
+    pending: PendingCallSet::with_capacity(limit),
+})?;
+```
+
+Use `register_root_using_on(shard, ...)` for a local multi-shard application.
+The lower-level runtime and simulator spelling is
+`register_with_capacity_using[_on]`. Construction finishes before the entry is
+published, so no message can arrive against partly initialized state. A
+constructor panic does not register the isolate and its allocated id is never
+reused. Keep expensive or fallible resource construction outside the closure;
+on threaded owners the closure runs synchronously on the shard worker.
+If an accepted threaded constructor exceeds the host control timeout, the
+caller receives `WorkerUnresponsive` but the constructor may still finish and
+publish the root later. Pre-admission `CommandFull`, `WorkerStopped`, and
+unknown-shard failures do not run the closure.
+
 ### Single-in-flight timer
 
 Use `tina_runtime::SingleCallGate` for isolates whose rate-limit

@@ -37,6 +37,14 @@ impl Shard for TestShard {
     }
 }
 
+struct ConstructorDropProbe(Arc<AtomicU32>);
+
+impl Drop for ConstructorDropProbe {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 // All multi-shard test isolates live on TestShard so they can be registered
 // on any shard the runtime owns. Single-shard tests use SingleShard.
 
@@ -412,6 +420,20 @@ fn local_system_and_multi_shard_registration_share_bounded_admission() {
         app.register_root::<EchoSimple, Infallible>(EchoSimple, 4),
         Err(ThreadedRuntimeError::CommandFull)
     ));
+    let local_constructed = Arc::new(AtomicU32::new(0));
+    let local_constructed_in_ctor = Arc::clone(&local_constructed);
+    let local_drops = Arc::new(AtomicU32::new(0));
+    let local_authority = ConstructorDropProbe(Arc::clone(&local_drops));
+    assert!(matches!(
+        app.register_root_using::<EchoSimple, Infallible, _>(4, move |_| {
+            let _authority = local_authority;
+            local_constructed_in_ctor.fetch_add(1, Ordering::AcqRel);
+            EchoSimple
+        }),
+        Err(ThreadedRuntimeError::CommandFull)
+    ));
+    assert_eq!(local_constructed.load(Ordering::Acquire), 0);
+    assert_eq!(local_drops.load(Ordering::Acquire), 1);
     release.store(true, Ordering::Release);
     app.shutdown_handle()
         .request_and_wait_report(Duration::from_secs(2))
@@ -445,6 +467,24 @@ fn local_system_and_multi_shard_registration_share_bounded_admission() {
         runtime.register_with_capacity_on::<EchoMS, Infallible>(ShardId::new(1), EchoMS, 4,),
         Err(ThreadedRuntimeError::CommandFull)
     ));
+    let multi_constructed = Arc::new(AtomicU32::new(0));
+    let multi_constructed_in_ctor = Arc::clone(&multi_constructed);
+    let multi_drops = Arc::new(AtomicU32::new(0));
+    let multi_authority = ConstructorDropProbe(Arc::clone(&multi_drops));
+    assert!(matches!(
+        runtime.register_with_capacity_using_on::<EchoMS, Infallible, _>(
+            ShardId::new(1),
+            4,
+            move |_| {
+                let _authority = multi_authority;
+                multi_constructed_in_ctor.fetch_add(1, Ordering::AcqRel);
+                EchoMS
+            },
+        ),
+        Err(ThreadedRuntimeError::CommandFull)
+    ));
+    assert_eq!(multi_constructed.load(Ordering::Acquire), 0);
+    assert_eq!(multi_drops.load(Ordering::Acquire), 1);
     release.store(true, Ordering::Release);
     runtime
         .shutdown_handle()

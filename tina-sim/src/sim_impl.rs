@@ -231,6 +231,45 @@ where
         ))
     }
 
+    /// Registers one isolate whose constructor receives its final typed
+    /// address before the entry is published.
+    ///
+    /// This mirrors `tina_runtime::Runtime::register_with_capacity_using`.
+    /// Constructor panic propagates, consumes the deterministic isolate id,
+    /// and leaves no registered entry. If the constructor leaks its address,
+    /// later simulator ingress through that address panics under the
+    /// simulator's existing unknown-isolate contract; the leaked address does
+    /// not acquire authority over a later registration because ids are never
+    /// reused.
+    #[allow(private_bounds)]
+    pub fn register_with_capacity_using<I, Msg, Outbound, Ctor>(
+        &mut self,
+        mailbox_capacity: usize,
+        construct: Ctor,
+    ) -> Address<Msg, I::Reply>
+    where
+        I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
+            + 'static,
+        I::Io: RuntimeCallable,
+        I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
+        I::Reply: 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
+        Msg: 'static,
+        Outbound: 'static,
+        Ctor: FnOnce(Address<Msg, I::Reply>) -> I,
+    {
+        let address =
+            self.register_entry_using::<I, Msg, Outbound, _>(construct, None, mailbox_capacity);
+        Address::new_with_generation_in(
+            address.system,
+            address.shard,
+            address.isolate,
+            address.generation,
+        )
+    }
+
     /// Registers one split event/request isolate and returns split
     /// capabilities.
     ///
@@ -1422,6 +1461,58 @@ where
             isolate: isolate_id,
             generation,
         })
+    }
+
+    fn register_entry_using<I, Msg, Outbound, Ctor>(
+        &mut self,
+        construct: Ctor,
+        parent: Option<IsolateId>,
+        mailbox_capacity: usize,
+    ) -> RegisteredAddress
+    where
+        I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
+            + 'static,
+        I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
+        I::Reply: 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
+        Msg: 'static,
+        Outbound: 'static,
+        Ctor: FnOnce(Address<Msg, I::Reply>) -> I,
+    {
+        let isolate_id = IsolateId::new(self.next_isolate_id);
+        self.next_isolate_id += 1;
+        let generation = AddressGeneration::new(0);
+        let address = Address::new_with_generation_in(
+            self.system_incarnation,
+            self.shard.id(),
+            isolate_id,
+            generation,
+        );
+        let inbox = LocalInbox::new(mailbox_capacity);
+        let isolate = construct(address);
+
+        self.entries.push(RegisteredEntry {
+            id: isolate_id,
+            generation,
+            parent,
+            stopped: Cell::new(false),
+            stopped_event: Cell::new(None),
+            inbox,
+            handler: RefCell::new(Box::new(HandlerAdapter::<I, Outbound> {
+                isolate,
+                system_incarnation: self.system_incarnation,
+                marker: PhantomData,
+            })),
+        });
+
+        RegisteredAddress {
+            system: self.system_incarnation,
+            shard: self.shard.id(),
+            isolate: isolate_id,
+            generation,
+        }
     }
 
     /// Registers a child for `spawn_observed(...).on_shard(owner_or_other)`.
