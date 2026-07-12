@@ -337,14 +337,12 @@ impl FakeBridgeInstall {
             thread::sleep(Duration::from_millis(1));
         }
         let drained = worker.is_finished();
-        if drained {
-            let _ = worker.join();
-        }
+        let joined = !drained || worker.join().is_ok();
         // Dropping an unfinished JoinHandle detaches the thread.
         let remaining = self.metrics.state.current.load(Ordering::Acquire);
         BridgeDrainReport::new(
             true,
-            drained && remaining == 0,
+            drained && joined && remaining == 0,
             remaining,
             vec![("compute", remaining)],
             start.elapsed(),
@@ -467,7 +465,8 @@ fn run_timeout_and_late_result() -> (bool, u64, u64) {
         // close_and_drain consumes the install; read pressure first via a
         // clone of the metrics handle.
         let metrics = bridge.metrics().clone();
-        let _ = bridge.close_and_drain(Duration::from_secs(2));
+        let drain = bridge.close_and_drain(Duration::from_secs(2));
+        assert!(drain.drained(), "late-result bridge must drain");
         metrics.pressure()
     };
 
@@ -511,8 +510,8 @@ fn run_full() -> bool {
         *released = true;
         gate.cv.notify_all();
     }
-    let _ = bridge.close_and_drain(Duration::from_secs(2));
-    saw_full
+    let drain = bridge.close_and_drain(Duration::from_secs(2));
+    saw_full && drain.drained()
 }
 
 fn run_closed() -> bool {
@@ -530,8 +529,8 @@ fn run_closed() -> bool {
             BridgeUnavailable::BridgeClosed
         ))
     );
-    let _ = bridge.close_and_drain(Duration::from_secs(2));
-    saw_closed
+    let drain = bridge.close_and_drain(Duration::from_secs(2));
+    saw_closed && drain.drained()
 }
 
 #[cfg(test)]
@@ -575,6 +574,6 @@ mod tests {
         bridge.closer().close();
         bridge.closer().close(); // idempotent
         assert!(bridge.closer().is_closed());
-        let _ = bridge.close_and_drain(Duration::from_secs(1));
+        assert!(bridge.close_and_drain(Duration::from_secs(1)).drained());
     }
 }

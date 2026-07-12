@@ -61,14 +61,25 @@ impl TestServer {
             handle: Some(handle),
         })
     }
+
+    pub fn stop(mut self) -> anyhow::Result<()> {
+        self.stop_inner()
+    }
+
+    fn stop_inner(&mut self) -> anyhow::Result<()> {
+        let _ = TcpStream::connect(self.addr);
+        if let Some(handle) = self.handle.take() {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("test server thread panicked"))?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        // Best-effort wake the listener thread if it's still on `accept`.
-        let _ = TcpStream::connect(self.addr);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        // Drop cannot report teardown failure; explicit runs call `stop`.
+        let _ = self.stop_inner();
     }
 }

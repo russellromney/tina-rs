@@ -1,4 +1,24 @@
-use system_realtime_rooms::{RunConfig, run};
+use system_realtime_rooms::{RoomServer, RoomShutdownTimeout, RunConfig, run};
+
+#[test]
+fn shutdown_timeout_is_typed_and_carries_the_last_snapshot() {
+    let server = RoomServer::start(RunConfig {
+        member_capacity: 0,
+        ..RunConfig::default()
+    })
+    .expect("start empty room server");
+
+    let error = server
+        .shutdown_room()
+        .expect_err("an empty room cannot request a member close");
+    let timeout = error
+        .downcast_ref::<RoomShutdownTimeout>()
+        .expect("shutdown timeout remains typed");
+    assert!(timeout.stats.shutdown_started);
+    assert_eq!(timeout.stats.shutdown_close_requested, 0);
+    assert_eq!(timeout.stats, server.snapshot());
+    server.stop().expect("stop empty room server");
+}
 
 #[test]
 fn join_tick_overflow_and_shutdown_all_work_end_to_end() {

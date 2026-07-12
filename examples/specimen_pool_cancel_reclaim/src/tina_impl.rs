@@ -11,8 +11,8 @@ use std::time::Duration;
 use tina::pool::{AcquireFailure, PoolConfig, PoolLease, ReleaseDisposition};
 use tina::prelude::*;
 use tina_runtime::pool::{
-    WorkerPool, WorkerPoolMsg, WorkerPoolReply, acquire_result_effect,
-    acquire_with_handle_effect, pressure_effect, release_result_effect, try_acquired,
+    WorkerPool, WorkerPoolMsg, WorkerPoolReply, acquire_result_effect, acquire_with_handle_effect,
+    pressure_effect, release_result_effect, try_acquired,
 };
 use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, cancel_call};
 
@@ -67,7 +67,10 @@ impl Driver {
         match msg {
             DriverMsg::BeginPrime => {
                 acquire_result_effect(self.pool, CALL_TIMEOUT, move |result| {
-                    DriverMsg::AcquireReturned { wave: Wave::Prime, result }
+                    DriverMsg::AcquireReturned {
+                        wave: Wave::Prime,
+                        result,
+                    }
                 })
             }
             DriverMsg::BeginWaiters => {
@@ -140,7 +143,10 @@ impl Driver {
                     effects.push(acquire_result_effect(
                         self.pool,
                         CALL_TIMEOUT,
-                        move |result| DriverMsg::AcquireReturned { wave: Wave::Retry, result },
+                        move |result| DriverMsg::AcquireReturned {
+                            wave: Wave::Retry,
+                            result,
+                        },
                     ));
                 }
                 self.report.retried_admitted = WAITERS;
@@ -161,8 +167,7 @@ impl Driver {
                         "pool.demo.waiters",
                         tina::capacity::CapacityMode::Tuning,
                     );
-                    self.report.discovery_line =
-                        tina_runtime::format_discovery_line(&surface);
+                    self.report.discovery_line = tina_runtime::format_discovery_line(&surface);
                 }
                 noop()
             }
@@ -193,6 +198,7 @@ pub fn run() -> anyhow::Result<Report> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
 
     let pool: WorkerPool<Resource, SingleShard> =
         WorkerPool::new(PoolConfig::new(1, WAITERS), vec![1]);
@@ -256,9 +262,9 @@ pub fn run() -> anyhow::Result<Report> {
         .wait(Duration::from_secs(5))
         .map_err(|e| anyhow::anyhow!("driver did not produce a report: {e:?}"))?;
 
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
 
     Ok(report)
 }

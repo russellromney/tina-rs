@@ -9,9 +9,7 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime};
-use tina_sqlx_bridge::{
-    PgConfig, PgMsg, PgPoolConfig, PgRequest, PgResponse, PgWorker,
-};
+use tina_sqlx_bridge::{PgConfig, PgMsg, PgPoolConfig, PgRequest, PgResponse, PgWorker};
 
 use crate::{INCREMENTS, Report, unique_table};
 
@@ -22,6 +20,7 @@ pub fn run(url: &str) -> anyhow::Result<Report> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
 
     let cfg = PgConfig::new()
         .with_pool(
@@ -66,9 +65,9 @@ pub fn run(url: &str) -> anyhow::Result<Report> {
         snap.in_flight_high_water,
     );
 
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
     Ok(report)
 }
 
@@ -105,7 +104,8 @@ fn execute(
     db: tina_sqlx_bridge::PgAddress,
     sql: String,
 ) -> anyhow::Result<u64> {
-    let outcome = runtime.call_blocking_typed(db, PgMsg::Send(PgRequest::execute(sql)), SQL_TIMEOUT)?;
+    let outcome =
+        runtime.call_blocking_typed(db, PgMsg::Send(PgRequest::execute(sql)), SQL_TIMEOUT)?;
     match outcome {
         CallOutcome::Replied(Ok(PgResponse::Executed { rows_affected })) => Ok(rows_affected),
         other => anyhow::bail!("unexpected execute outcome {other:?}"),

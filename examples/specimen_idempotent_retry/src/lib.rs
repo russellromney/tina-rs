@@ -203,6 +203,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<Report> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
 
     let backoff = Backoff::constant(Duration::from_millis(config.backoff_ms), config.max_retries)
         .map_err(|e| anyhow::anyhow!("backoff config: {e:?}"))?;
@@ -234,8 +235,8 @@ pub fn run(config: RunConfig) -> anyhow::Result<Report> {
         .wait(Duration::from_secs(5))
         .map_err(|e| anyhow::anyhow!("relay did not finish: {e:?}"))?;
 
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
     Ok(report)
 }

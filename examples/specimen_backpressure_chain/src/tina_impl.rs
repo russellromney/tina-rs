@@ -53,7 +53,11 @@ struct ServiceC;
 
 #[tina_runtime::isolate(event = CEvent, request = CRequest, reply = ())]
 impl ServiceC {
-    fn handle_event(&mut self, event: CEvent, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle_event(
+        &mut self,
+        event: CEvent,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match event {
             CEvent::Done(req, Ok(())) => reply_to(req, ()),
             CEvent::Done(req, Err(_)) => reply_to(req, ()),
@@ -109,7 +113,11 @@ struct ServiceB {
 
 #[tina_runtime::isolate(event = BEvent, request = BRequest, reply = BReply)]
 impl ServiceB {
-    fn handle_event(&mut self, event: BEvent, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle_event(
+        &mut self,
+        event: BEvent,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match event {
             BEvent::CDone(req, outcome) => match outcome {
                 CallOutcome::Replied(()) => reply_to(req, BReply::Ok),
@@ -127,15 +135,22 @@ impl ServiceB {
         call: RequestCall<'_, Self>,
     ) -> RequestEffect<Self> {
         match request {
-            BRequest::Forward { iteration, deadline } => {
+            BRequest::Forward {
+                iteration,
+                deadline,
+            } => {
                 // Read the remaining budget against B's own `now`.
                 // Whatever time A's hop spent already shrank the
                 // deadline; the call to C waits no longer than what
                 // is left. Expired deadline -> `Duration::ZERO`, which
                 // surfaces as `CallOutcome::Timeout`.
                 let timeout = deadline.remaining_or_zero(call.now());
-                call.defer(call_request(self.c_addr, CRequest::Compute { iteration }, timeout))
-                    .reply_service_event(BEvent::CDone)
+                call.defer(call_request(
+                    self.c_addr,
+                    CRequest::Compute { iteration },
+                    timeout,
+                ))
+                .reply_service_event(BEvent::CDone)
             }
         }
     }
@@ -173,7 +188,11 @@ struct ServiceA {
 
 #[tina_runtime::isolate(event = AEvent, request = ARequest, reply = AReply)]
 impl ServiceA {
-    fn handle_event(&mut self, event: AEvent, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle_event(
+        &mut self,
+        event: AEvent,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match event {
             AEvent::BDone(req, outcome) => match outcome {
                 CallOutcome::Replied(BReply::Ok) => reply_to(req, AReply::Success),
@@ -200,7 +219,10 @@ impl ServiceA {
                 let deadline = Deadline::from_instant(call.now(), self.budget);
                 call.defer(call_request(
                     self.b_addr,
-                    BRequest::Forward { iteration, deadline },
+                    BRequest::Forward {
+                        iteration,
+                        deadline,
+                    },
                     // A's outer timeout is generous: it gives B room
                     // to surface a typed `CTimedOut` reply *after* B's
                     // own `call(C, ..., remaining_or_zero)` fires. If
@@ -280,6 +302,7 @@ pub fn run() -> anyhow::Result<Report> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
 
     let c_addr = runtime
         .register_split_service::<ServiceC, CEvent, CRequest, Infallible>(ServiceC, 8)
@@ -323,8 +346,8 @@ pub fn run() -> anyhow::Result<Report> {
         .wait(Duration::from_secs(5))
         .map_err(|e| anyhow::anyhow!("driver did not finish: {e:?}"))?;
 
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
     Ok(report)
 }

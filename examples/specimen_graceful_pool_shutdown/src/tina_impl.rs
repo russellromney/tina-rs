@@ -19,7 +19,9 @@ use tina_runtime::pool::{
     WorkerPool, WorkerPoolMsg, WorkerPoolReply, acquire_result_effect, close_effect,
     release_result_effect,
 };
-use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, sleep};
+use tina_runtime::{
+    CallOutcome, DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, sleep,
+};
 
 use crate::{CALLERS, Report, SHUTDOWN_AFTER_MS, WORK_MS, WORKERS};
 
@@ -155,21 +157,20 @@ impl Driver {
                 } else {
                     self.outcome.failed += 1;
                 }
-                release_result_effect(
-                    lease,
-                    self.pool,
-                    disposition,
-                    CALL_TIMEOUT,
-                    move |_| DriverMsg::ReleaseReturned { job },
-                )
+                release_result_effect(lease, self.pool, disposition, CALL_TIMEOUT, move |_| {
+                    DriverMsg::ReleaseReturned { job }
+                })
             }
             DriverMsg::ReleaseReturned { job } => {
                 self.jobs.remove(&job);
                 self.maybe_finish()
             }
-            DriverMsg::Shutdown => {
-                close_effect(self.pool, CloseMode::Drain, CALL_TIMEOUT, DriverMsg::CloseReturned)
-            }
+            DriverMsg::Shutdown => close_effect(
+                self.pool,
+                CloseMode::Drain,
+                CALL_TIMEOUT,
+                DriverMsg::CloseReturned,
+            ),
             DriverMsg::CloseReturned(outcome) => {
                 self.shutdown_close_observed = close_was_observed(&outcome);
                 self.maybe_finish()
@@ -198,6 +199,7 @@ pub fn run() -> anyhow::Result<Report> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
 
     let mut workers = Vec::with_capacity(WORKERS);
     for _ in 0..WORKERS {
@@ -250,10 +252,9 @@ pub fn run() -> anyhow::Result<Report> {
         .wait(Duration::from_secs(10))
         .map_err(|e| anyhow::anyhow!("driver finishes: {e:?}"))?;
 
-    let rt = Arc::try_unwrap(runtime)
-        .map_err(|_| anyhow::anyhow!("runtime still had outstanding references at shutdown"))?;
-    rt.shutdown()
-        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
 
     Ok(Report {
         callers: CALLERS,
@@ -271,7 +272,9 @@ mod tests {
 
     #[test]
     fn close_observed_requires_real_closed_reply() {
-        assert!(close_was_observed(&CallOutcome::Replied(WorkerPoolReply::Closed)));
+        assert!(close_was_observed(&CallOutcome::Replied(
+            WorkerPoolReply::Closed
+        )));
         assert!(!close_was_observed(&CallOutcome::Timeout));
         assert!(!close_was_observed(&CallOutcome::Full));
         assert!(!close_was_observed(&CallOutcome::Closed));

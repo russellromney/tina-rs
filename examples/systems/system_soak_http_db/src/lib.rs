@@ -96,7 +96,7 @@ pub enum SoakEvent {
     Flow(SoakFlow),
 }
 
-/// Split-service envelope for [`Soak`].
+/// Split-service envelope for `Soak`.
 pub type SoakMsg = tina::ServiceMessage<SoakEvent, SoakRequest>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,6 +327,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
     let soak = Soak::new(&config);
     let http_scope = soak.http_scope.clone();
     let db_scope = soak.db_scope.clone();
@@ -431,7 +432,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     let event_snap = events.snapshot();
     let service_summary_line = summary.summary_line();
 
-    shutdown(runtime);
+    shutdown_runtime(shutdown, runtime)?;
 
     let report = RunReport {
         total_requests: total,
@@ -455,8 +456,12 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     Ok(report)
 }
 
-fn shutdown(runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>) {
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+fn shutdown_runtime(
+    shutdown: tina_runtime::ThreadedShutdownHandle,
+    runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
+) -> anyhow::Result<()> {
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
+    Ok(())
 }

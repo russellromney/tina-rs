@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 use tina::prelude::*;
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime};
 use tina_sqlite_bridge::{
-    InstalledSqliteBridge, SqliteAddress, SqliteConfig, SqliteExecutedOutcome,
-    SqliteOutcomeClass, SqliteOutcomeExt, SqliteRowsOutcome, SqliteTransientReason, SqliteWorker,
-    execute_call, query_call,
+    InstalledSqliteBridge, SqliteAddress, SqliteConfig, SqliteExecutedOutcome, SqliteOutcomeClass,
+    SqliteOutcomeExt, SqliteRowsOutcome, SqliteTransientReason, SqliteWorker, execute_call,
+    query_call,
 };
 
 #[derive(Default)]
@@ -36,10 +36,7 @@ impl ExecSink {
             if now >= deadline {
                 panic!("demo: ExecSink wait exceeded {timeout:?}");
             }
-            let (g, _) = self
-                .cv
-                .wait_timeout(guard, deadline - now)
-                .expect("wait");
+            let (g, _) = self.cv.wait_timeout(guard, deadline - now).expect("wait");
             guard = g;
         }
         guard.take().expect("populated")
@@ -66,10 +63,7 @@ impl QuerySink {
             if now >= deadline {
                 panic!("demo: QuerySink wait exceeded {timeout:?}");
             }
-            let (g, _) = self
-                .cv
-                .wait_timeout(guard, deadline - now)
-                .expect("wait");
+            let (g, _) = self.cv.wait_timeout(guard, deadline - now).expect("wait");
             guard = g;
         }
         guard.take().expect("populated")
@@ -110,11 +104,16 @@ impl Caller {
     }
 }
 
-fn make_runtime() -> anyhow::Result<Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>>
-{
-    ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)
-        .map(Arc::new)
-        .map_err(anyhow::Error::new)
+fn make_runtime() -> anyhow::Result<(
+    Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
+    tina_runtime::ThreadedShutdownHandle,
+)> {
+    let runtime = Arc::new(ThreadedRuntime::try_new(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+    )?);
+    let shutdown = runtime.shutdown_handle();
+    Ok((runtime, shutdown))
 }
 
 fn install(
@@ -230,17 +229,21 @@ fn report_query(label: &str, outcome: &SqliteRowsOutcome) {
     println!("demo={label} outcome={outcome:?}");
 }
 
-fn shutdown(runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>) {
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+fn shutdown(
+    shutdown: tina_runtime::ThreadedShutdownHandle,
+    runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
+) -> anyhow::Result<()> {
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
+    Ok(())
 }
 
 /// Demo: a `UNIQUE` constraint violation surfaces as
 /// [`tina_sqlite_bridge::SqliteError::Constraint`] with the underlying
 /// SQLite message preserved.
 pub fn demo_constraint() -> anyhow::Result<()> {
-    let runtime = make_runtime()?;
+    let (runtime, shutdown_handle) = make_runtime()?;
     let bridge = install(&runtime, SqliteConfig::memory());
 
     let _ = run_exec(
@@ -275,7 +278,7 @@ pub fn demo_constraint() -> anyhow::Result<()> {
         snap.admitted, snap.worker_executed, snap.worker_constraint,
     );
 
-    shutdown(runtime);
+    shutdown(shutdown_handle, runtime)?;
     Ok(())
 }
 
@@ -283,7 +286,7 @@ pub fn demo_constraint() -> anyhow::Result<()> {
 /// finishes a long query. Caller sees `SqliteError::Timeout`;
 /// metrics show `late_results` once the worker terminal lands.
 pub fn demo_timeout() -> anyhow::Result<()> {
-    let runtime = make_runtime()?;
+    let (runtime, shutdown_handle) = make_runtime()?;
     let cfg = SqliteConfig::memory()
         .with_default_timeout(Duration::from_millis(20))
         .with_poll_interval(Duration::from_millis(1));
@@ -315,14 +318,14 @@ pub fn demo_timeout() -> anyhow::Result<()> {
         snap.timeouts, snap.late_results, snap.worker_rows,
     );
 
-    shutdown(runtime);
+    shutdown(shutdown_handle, runtime)?;
     Ok(())
 }
 
 /// Demo: a closed bridge replies `SqliteError::Closed` to new
 /// admissions.
 pub fn demo_closed() -> anyhow::Result<()> {
-    let runtime = make_runtime()?;
+    let (runtime, shutdown_handle) = make_runtime()?;
     let bridge = install(&runtime, SqliteConfig::memory());
 
     bridge.closer.close();
@@ -339,7 +342,7 @@ pub fn demo_closed() -> anyhow::Result<()> {
     let snap = bridge.metrics.snapshot();
     println!("demo=closed metrics: closed={}", snap.closed);
 
-    shutdown(runtime);
+    shutdown(shutdown_handle, runtime)?;
     Ok(())
 }
 
@@ -347,7 +350,7 @@ pub fn demo_closed() -> anyhow::Result<()> {
 /// `SqliteError::InvalidRequest` before the worker thread sees the
 /// request.
 pub fn demo_invalid() -> anyhow::Result<()> {
-    let runtime = make_runtime()?;
+    let (runtime, shutdown_handle) = make_runtime()?;
     let bridge = install(&runtime, SqliteConfig::memory().with_max_request_params(2));
 
     let outcome = run_exec(
@@ -363,7 +366,7 @@ pub fn demo_invalid() -> anyhow::Result<()> {
     let snap = bridge.metrics.snapshot();
     println!("demo=invalid metrics: invalid={}", snap.invalid);
 
-    shutdown(runtime);
+    shutdown(shutdown_handle, runtime)?;
     Ok(())
 }
 
@@ -379,7 +382,7 @@ pub fn demo_invalid() -> anyhow::Result<()> {
 /// violations are not retryable), and we print the classification
 /// chain so users see the shape.
 pub fn demo_retry() -> anyhow::Result<()> {
-    let runtime = make_runtime()?;
+    let (runtime, shutdown_handle) = make_runtime()?;
     let bridge = install(&runtime, SqliteConfig::memory());
 
     let _ = run_exec(
@@ -438,6 +441,6 @@ pub fn demo_retry() -> anyhow::Result<()> {
         }
     }
 
-    shutdown(runtime);
+    shutdown(shutdown_handle, runtime)?;
     Ok(())
 }

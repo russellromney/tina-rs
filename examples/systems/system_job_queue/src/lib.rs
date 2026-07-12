@@ -36,7 +36,7 @@ use tina::{ChildDefinition, prelude::*};
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, PendingCancelableCallSet,
     PendingCancelableRemoveError, PendingCancelableTicket, RequestPendingCancelableInsertError,
-    SleepReply, ThreadedRuntime, call_cancelable_request, sleep,
+    SleepReply, ThreadedRuntime, ThreadedShutdownHandle, call_cancelable_request, sleep,
 };
 
 /// Tunables for one specimen run.
@@ -138,7 +138,7 @@ pub enum QueueRequest {
     Stats,
 }
 
-/// Split-service envelope for [`Queue`]. The `event = .. request = ..`
+/// Split-service envelope for `Queue`. The `event = .. request = ..`
 /// isolate macro form generates the wrong-lane rejection arms, so neither
 /// `handle_event` nor `handle_request` writes one by hand.
 pub type QueueMsg = tina::ServiceMessage<QueueEvent, QueueRequest>;
@@ -156,16 +156,23 @@ pub enum WorkerReply {
 pub enum WorkerEvent {
     Cancel(JobId),
     /// Internal: the runtime-owned sleep finished.
-    Wake { id: JobId, result: SleepReply },
+    Wake {
+        id: JobId,
+        result: SleepReply,
+    },
 }
 
 /// The one caller-authority request a worker accepts.
 #[derive(Debug, Clone)]
 pub enum WorkerRequest {
-    Process { id: JobId, payload: Payload, sleep_ms: u64 },
+    Process {
+        id: JobId,
+        payload: Payload,
+        sleep_ms: u64,
+    },
 }
 
-/// Split-service envelope for [`Worker`]. The `event = .. request = ..`
+/// Split-service envelope for `Worker`. The `event = .. request = ..`
 /// isolate macro form generates the caller-authority rejection arms, so
 /// neither `handle_event` nor `handle_request` writes one by hand.
 type WorkerMsg = tina::ServiceMessage<WorkerEvent, WorkerRequest>;
@@ -200,7 +207,9 @@ impl Worker {
                 noop()
             }
             WorkerEvent::Wake { id, result: _ } => {
-                let Some(current) = self.current.take() else { return noop(); };
+                let Some(current) = self.current.take() else {
+                    return noop();
+                };
                 if current.id != id {
                     return noop();
                 }
@@ -223,16 +232,24 @@ impl Worker {
         call: RequestCall<'_, Self>,
     ) -> RequestEffect<Self> {
         match request {
-            WorkerRequest::Process { id, payload, sleep_ms } => {
+            WorkerRequest::Process {
+                id,
+                payload,
+                sleep_ms,
+            } => {
                 if self.current.is_some() {
                     return call.reject(tina::CallRejectedReason::ReplyAbandoned);
                 }
                 call.capture(move |req| {
                     let slot = req.into_deferred();
-                    self.current = Some(WorkerCurrent { id, payload, cancelled: false, slot });
-                    sleep(Duration::from_millis(sleep_ms)).then_service_event(move |result| {
-                        WorkerEvent::Wake { id, result }
-                    })
+                    self.current = Some(WorkerCurrent {
+                        id,
+                        payload,
+                        cancelled: false,
+                        slot,
+                    });
+                    sleep(Duration::from_millis(sleep_ms))
+                        .then_service_event(move |result| WorkerEvent::Wake { id, result })
                 })
             }
         }
@@ -330,9 +347,8 @@ impl Queue {
 
     fn spawn_worker(&self, slot: usize) -> Effect<Self> {
         let cap = self.config.worker_mailbox;
-        spawn_observed(ChildDefinition::new(Worker { current: None }, cap)).then(move |result| {
-            QueueMsg::Event(QueueEvent::WorkerStarted { slot, result })
-        })
+        spawn_observed(ChildDefinition::new(Worker { current: None }, cap))
+            .then(move |result| QueueMsg::Event(QueueEvent::WorkerStarted { slot, result }))
     }
 
     fn on_worker_started(
@@ -359,11 +375,7 @@ impl Queue {
         }
     }
 
-    fn submit(
-        &mut self,
-        payload: Payload,
-        call: RequestCall<'_, Self>,
-    ) -> RequestEffect<Self> {
+    fn submit(&mut self, payload: Payload, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
         let Some(slot) = self.idle_slot() else {
             self.stats.jobs_busy_rejected += 1;
             return call.reply(QueueReply::Busy);
@@ -387,18 +399,14 @@ impl Queue {
                 },
                 dispatch_timeout,
             ))
-            .try_admit(
-                &mut self.pending,
-                id,
-                move |key, ticket, outcome| {
-                    QueueMsg::Event(QueueEvent::WorkerCallReturned {
-                        slot,
-                        id: key,
-                        ticket,
-                        outcome,
-                    })
-                },
-            );
+            .try_admit(&mut self.pending, id, move |key, ticket, outcome| {
+                QueueMsg::Event(QueueEvent::WorkerCallReturned {
+                    slot,
+                    id: key,
+                    ticket,
+                    outcome,
+                })
+            });
         match admission {
             Ok(effect) => {
                 self.worker_busy[slot] = Some(id);
@@ -508,11 +516,17 @@ impl Queue {
                     self.stats.workers_alive = self.stats.workers_alive.saturating_sub(1);
                 }
                 self.workers[slot] = None;
-                JobOutcome::Failed { id, reason: format!("worker call returned {outcome:?}") }
+                JobOutcome::Failed {
+                    id,
+                    reason: format!("worker call returned {outcome:?}"),
+                }
             }
             CallOutcome::Timeout | CallOutcome::Full => {
                 self.stats.jobs_failed += 1;
-                JobOutcome::Failed { id, reason: format!("worker call returned {outcome:?}") }
+                JobOutcome::Failed {
+                    id,
+                    reason: format!("worker call returned {outcome:?}"),
+                }
             }
         };
 
@@ -618,6 +632,7 @@ pub fn run_overflow(config: RunConfig) -> anyhow::Result<OverflowReport> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
     let queue = register_queue(&runtime, config)?;
     // Admission cap is `workers`. Burst beyond it.
     let cap = config.workers;
@@ -633,7 +648,11 @@ pub fn run_overflow(config: RunConfig) -> anyhow::Result<OverflowReport> {
         let out = Arc::clone(&outcomes);
         threads.push(thread::spawn(move || {
             gate.wait();
-            let outcome = rt.call_blocking(queue, QueueMsg::Request(QueueRequest::Submit(Payload::Work(7))), timeout);
+            let outcome = rt.call_blocking(
+                queue,
+                QueueMsg::Request(QueueRequest::Submit(Payload::Work(7))),
+                timeout,
+            );
             out.lock().expect("outcomes lock").push(outcome);
         }));
     }
@@ -655,8 +674,12 @@ pub fn run_overflow(config: RunConfig) -> anyhow::Result<OverflowReport> {
     }
 
     let stats = stats(&runtime, queue)?;
-    shutdown(runtime);
-    Ok(OverflowReport { completed, busy, stats })
+    shutdown_runtime(shutdown, runtime)?;
+    Ok(OverflowReport {
+        completed,
+        busy,
+        stats,
+    })
 }
 
 pub fn run_cancel_in_flight(config: RunConfig) -> anyhow::Result<CancelInFlightReport> {
@@ -667,18 +690,26 @@ pub fn run_cancel_in_flight(config: RunConfig) -> anyhow::Result<CancelInFlightR
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
     let queue = register_queue(&runtime, config)?;
     let timeout = Duration::from_millis(config.call_timeout_ms);
 
     let rt = Arc::clone(&runtime);
     let submit = thread::spawn(move || {
-        rt.call_blocking(queue, QueueMsg::Request(QueueRequest::Submit(Payload::Work(99))), timeout)
+        rt.call_blocking(
+            queue,
+            QueueMsg::Request(QueueRequest::Submit(Payload::Work(99))),
+            timeout,
+        )
     });
 
     // Let the submit reach the worker before we cancel.
     thread::sleep(Duration::from_millis(config.job_sleep_ms / 4 + 5));
-    let cancel_outcome =
-        runtime.call_blocking(queue, QueueMsg::Request(QueueRequest::Cancel(JobId(1))), timeout)?;
+    let cancel_outcome = runtime.call_blocking(
+        queue,
+        QueueMsg::Request(QueueRequest::Cancel(JobId(1))),
+        timeout,
+    )?;
     let cancel_reply = match cancel_outcome {
         CallOutcome::Replied(reply) => reply,
         other => anyhow::bail!("unexpected cancel outcome: {other:?}"),
@@ -693,9 +724,13 @@ pub fn run_cancel_in_flight(config: RunConfig) -> anyhow::Result<CancelInFlightR
     // ticks before we read stats.
     thread::sleep(Duration::from_millis(config.job_sleep_ms + 30));
     let stats = stats(&runtime, queue)?;
-    shutdown(runtime);
+    shutdown_runtime(shutdown, runtime)?;
 
-    Ok(CancelInFlightReport { submit_outcome, cancel_reply, stats })
+    Ok(CancelInFlightReport {
+        submit_outcome,
+        cancel_reply,
+        stats,
+    })
 }
 
 pub fn run_poison_crash(config: RunConfig) -> anyhow::Result<PoisonCrashReport> {
@@ -703,10 +738,15 @@ pub fn run_poison_crash(config: RunConfig) -> anyhow::Result<PoisonCrashReport> 
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
     let queue = register_queue(&runtime, config)?;
     let timeout = Duration::from_millis(config.call_timeout_ms);
 
-    let outcome = runtime.call_blocking(queue, QueueMsg::Request(QueueRequest::Submit(Payload::Poison)), timeout)?;
+    let outcome = runtime.call_blocking(
+        queue,
+        QueueMsg::Request(QueueRequest::Submit(Payload::Poison)),
+        timeout,
+    )?;
     let failed_outcome = match outcome {
         CallOutcome::Replied(QueueReply::Done(o)) => o,
         other => anyhow::bail!("unexpected poison outcome: {other:?}"),
@@ -719,8 +759,11 @@ pub fn run_poison_crash(config: RunConfig) -> anyhow::Result<PoisonCrashReport> 
     })?;
 
     let stats = stats(&runtime, queue)?;
-    shutdown(runtime);
-    Ok(PoisonCrashReport { failed_outcome, stats })
+    shutdown_runtime(shutdown, runtime)?;
+    Ok(PoisonCrashReport {
+        failed_outcome,
+        stats,
+    })
 }
 
 pub fn run_respawn_then_admit(config: RunConfig) -> anyhow::Result<RespawnThenAdmitReport> {
@@ -728,10 +771,15 @@ pub fn run_respawn_then_admit(config: RunConfig) -> anyhow::Result<RespawnThenAd
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
     let queue = register_queue(&runtime, config)?;
     let timeout = Duration::from_millis(config.call_timeout_ms);
 
-    let poison = runtime.call_blocking(queue, QueueMsg::Request(QueueRequest::Submit(Payload::Poison)), timeout)?;
+    let poison = runtime.call_blocking(
+        queue,
+        QueueMsg::Request(QueueRequest::Submit(Payload::Poison)),
+        timeout,
+    )?;
     let poison_outcome = match poison {
         CallOutcome::Replied(QueueReply::Done(o)) => o,
         other => anyhow::bail!("unexpected poison outcome: {other:?}"),
@@ -739,18 +787,28 @@ pub fn run_respawn_then_admit(config: RunConfig) -> anyhow::Result<RespawnThenAd
 
     // Wait for the respawn to land before sending the follow-up.
     wait_until(Duration::from_secs(2), "respawn", || {
-        stats(&runtime, queue).map(|s| s.workers_alive == config.workers).unwrap_or(false)
+        stats(&runtime, queue)
+            .map(|s| s.workers_alive == config.workers)
+            .unwrap_or(false)
     })?;
 
-    let follow_up = runtime.call_blocking(queue, QueueMsg::Request(QueueRequest::Submit(Payload::Work(21))), timeout)?;
+    let follow_up = runtime.call_blocking(
+        queue,
+        QueueMsg::Request(QueueRequest::Submit(Payload::Work(21))),
+        timeout,
+    )?;
     let follow_up_outcome = match follow_up {
         CallOutcome::Replied(QueueReply::Done(o)) => o,
         other => anyhow::bail!("unexpected follow-up outcome: {other:?}"),
     };
 
     let stats = stats(&runtime, queue)?;
-    shutdown(runtime);
-    Ok(RespawnThenAdmitReport { poison_outcome, follow_up_outcome, stats })
+    shutdown_runtime(shutdown, runtime)?;
+    Ok(RespawnThenAdmitReport {
+        poison_outcome,
+        follow_up_outcome,
+        stats,
+    })
 }
 
 // ---------- Helpers ----------
@@ -769,7 +827,9 @@ fn register_queue(
         )
         .map_err(|e| anyhow::anyhow!("register queue: {e:?}"))?;
 
-    wait_until(Duration::from_secs(2), "all workers ready", || ready.ready())?;
+    wait_until(Duration::from_secs(2), "all workers ready", || {
+        ready.ready()
+    })?;
     Ok(address)
 }
 
@@ -791,14 +851,22 @@ fn stats(
     runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
     queue: Address<QueueMsg, QueueReply>,
 ) -> anyhow::Result<QueueStats> {
-    match runtime.call_blocking(queue, QueueMsg::Request(QueueRequest::Stats), Duration::from_secs(2))? {
+    match runtime.call_blocking(
+        queue,
+        QueueMsg::Request(QueueRequest::Stats),
+        Duration::from_secs(2),
+    )? {
         CallOutcome::Replied(QueueReply::Stats(s)) => Ok(s),
         other => anyhow::bail!("stats call failed: {other:?}"),
     }
 }
 
-fn shutdown(runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>) {
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+fn shutdown_runtime(
+    shutdown: ThreadedShutdownHandle,
+    runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
+) -> anyhow::Result<()> {
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
+    Ok(())
 }

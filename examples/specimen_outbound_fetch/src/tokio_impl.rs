@@ -28,7 +28,7 @@ pub fn run() -> anyhow::Result<Report> {
         report
     });
 
-    drop(server);
+    server.stop()?;
     Ok(report)
 }
 

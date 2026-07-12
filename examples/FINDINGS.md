@@ -11,6 +11,30 @@ valid; the long-form history lives in
 
 ## Active
 
+### 2026-07-11 Bounded shutdown truth across the example corpus
+
+Migrated production examples away from exclusive-`Arc` teardown and
+transport-only shutdown success. Shared runtimes capture a
+`ThreadedShutdownHandle` at construction, use
+`request_and_wait_report(total_timeout)`, drop the remaining owner only after
+terminal observation, and require `LocalSystemTerminalReport::ensure_clean()`.
+Owned runtimes use `shutdown_report().ensure_clean()`. Explicit auxiliary
+server, worker, stop-signal, and join failures are propagated instead of
+discarded; WebSocket room shutdown returns a typed timeout with the last
+snapshot when close settlement misses its bound.
+
+The perf corpus now records leak cleanliness only after Tina terminal truth or
+Tokio stop-and-join truth succeeds, preserving any earlier failed surface
+observation. `scripts/examples_shutdown_truth_guard.sh`, wired into
+`verify-guards`, rejects exclusive-owner and transport-only runtime shutdown,
+discarded synchronous or Tokio task joins, ignored service stop sends, and
+ignored bridge drain reports. The guard strips literals and comments before
+matching so documentation cannot masquerade as lifecycle code.
+
+**Still open:** broader `LocalSystem` host-facade migration remains a separate
+ergonomics cohort; this slice establishes truthful shutdown behavior for the
+current hosts.
+
 ### 2026-07-11 Fallible production startup propagation
 
 Migrated every production-shaped example host from the panic convenience

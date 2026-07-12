@@ -145,6 +145,7 @@ pub fn run() -> anyhow::Result<Report> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
 
     let shared = Arc::new(Mutex::new(0u64));
     let writer = runtime
@@ -173,9 +174,9 @@ pub fn run() -> anyhow::Result<Report> {
 
     let writes = *shared.lock().expect("shared mutex") as u32;
 
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
     Ok(Report {
         documented_compile_fails: crate::DOCUMENTED_COMPILE_FAILS,
         intentional_escape_writes: writes,

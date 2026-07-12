@@ -164,14 +164,24 @@ impl WebhookServer {
         self.bodies.lock().expect("webhook bodies lock").clone()
     }
 
-    pub fn stop(mut self) {
-        if let Some(tx) = self.shutdown.take() {
-            let _ = tx.send(());
-        }
-        if let Some(join) = self.join.take() {
-            self.runtime.block_on(async move {
-                let _ = tokio::time::timeout(Duration::from_secs(2), join).await;
-            });
+    pub fn stop(mut self) -> anyhow::Result<()> {
+        let send_failed = self.shutdown.take().is_some_and(|tx| tx.send(()).is_err());
+        let join = self.join.take().map(|join| {
+            self.runtime
+                .block_on(async move { tokio::time::timeout(Duration::from_secs(2), join).await })
+        });
+        let join_error = match join {
+            None | Some(Ok(Ok(()))) => None,
+            Some(Ok(Err(error))) => Some(format!("webhook task failed: {error}")),
+            Some(Err(_)) => Some("webhook task shutdown timed out".to_string()),
+        };
+        match (send_failed, join_error) {
+            (false, None) => Ok(()),
+            (true, None) => anyhow::bail!("webhook shutdown receiver closed"),
+            (false, Some(join)) => anyhow::bail!("{join}"),
+            (true, Some(join)) => {
+                anyhow::bail!("webhook shutdown receiver closed; {join}")
+            }
         }
     }
 }

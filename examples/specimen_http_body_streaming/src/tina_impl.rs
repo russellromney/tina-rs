@@ -24,9 +24,7 @@ use tina_http::{
 };
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, format_discovery_line};
 
-use crate::{
-    CHUNK_BYTES, RESPONSE_BODY_BYTES, Report, decode_chunked, slow_reader_client,
-};
+use crate::{CHUNK_BYTES, RESPONSE_BODY_BYTES, Report, decode_chunked, slow_reader_client};
 
 /// Service: `/big` returns a known-length stream, `/big-chunked`
 /// returns a chunked stream. Both pull from chunk sources the
@@ -85,8 +83,7 @@ fn body_chunks() -> impl Iterator<Item = Vec<u8>> + Send + 'static {
 pub fn run() -> anyhow::Result<Report> {
     let runtime: ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory> =
         ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
-    let metrics =
-        BodyMetrics::with_body_capacity("http.bodies", CHUNK_BYTES, RESPONSE_BODY_BYTES);
+    let metrics = BodyMetrics::with_body_capacity("http.bodies", CHUNK_BYTES, RESPONSE_BODY_BYTES);
 
     // `IterBodySource::register` wraps the iterator and registers
     // the source isolate in one step — no turbofish, no
@@ -106,12 +103,9 @@ pub fn run() -> anyhow::Result<Report> {
         .map_err(|e| anyhow::anyhow!("register service: {e:?}"))?;
 
     let server_config = HttpServerConfig::dev();
-    let listener_isolate = HttpListener::<SingleShard>::with_config(
-        "127.0.0.1:0".parse()?,
-        service,
-        server_config,
-    )
-    .with_metrics(metrics.clone());
+    let listener_isolate =
+        HttpListener::<SingleShard>::with_config("127.0.0.1:0".parse()?, service, server_config)
+            .with_metrics(metrics.clone());
     let listener = runtime
         .register_with_capacity::<_, _>(listener_isolate, server_config.listener_mailbox_capacity)
         .map_err(|e| anyhow::anyhow!("register listener: {e:?}"))?;
@@ -137,7 +131,7 @@ pub fn run() -> anyhow::Result<Report> {
     runtime
         .try_send(listener, HttpListenerMsg::Stop)
         .map_err(|e| anyhow::anyhow!("send Stop: {e:?}"))?;
-    let _ = runtime.shutdown();
+    runtime.shutdown_report().ensure_clean()?;
 
     let snap = metrics.snapshot();
     let capacity_discovery_line = snap
@@ -162,9 +156,7 @@ pub fn run() -> anyhow::Result<Report> {
 /// Fetches `/big-chunked`, captures the whole response, decodes
 /// the chunked body, and verifies the head advertises chunked
 /// framing. Returns `(wire_body_bytes, decoded_bytes, status_ok)`.
-fn chunked_request_decoded(
-    addr: std::net::SocketAddr,
-) -> anyhow::Result<(usize, usize, bool)> {
+fn chunked_request_decoded(addr: std::net::SocketAddr) -> anyhow::Result<(usize, usize, bool)> {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 

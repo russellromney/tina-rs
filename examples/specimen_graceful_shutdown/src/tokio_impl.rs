@@ -14,10 +14,10 @@ use crate::{ITEM_INTERVAL_MS, Report, SIGNAL_AFTER_MS, TOTAL_PLANNED_ITEMS};
 
 pub fn run() -> anyhow::Result<Report> {
     let runtime = Builder::new_current_thread().enable_all().build()?;
-    Ok(runtime.block_on(async_run()))
+    runtime.block_on(async_run())
 }
 
-async fn async_run() -> Report {
+async fn async_run() -> anyhow::Result<Report> {
     let (tx, mut rx) = mpsc::channel::<u32>(TOTAL_PLANNED_ITEMS as usize + 1);
     let signal_received = Arc::new(AtomicBool::new(false));
     let items_produced = Arc::new(AtomicU32::new(0));
@@ -53,7 +53,7 @@ async fn async_run() -> Report {
     });
 
     // External SIGINT trigger: simulate the operator sending Ctrl-C.
-    tokio::spawn(async {
+    let signaler = tokio::spawn(async {
         sleep(Duration::from_millis(SIGNAL_AFTER_MS)).await;
         signal_hook::low_level::raise(signal_hook::consts::SIGINT).expect("raise SIGINT");
     });
@@ -71,14 +71,15 @@ async fn async_run() -> Report {
         }
     });
 
-    let _ = producer.await;
-    let _ = consumer.await;
+    producer.await?;
+    consumer.await?;
+    signaler.await?;
 
-    Report {
+    Ok(Report {
         items_produced: items_produced.load(Ordering::Relaxed),
         items_processed: items_processed.load(Ordering::Relaxed),
         signal_received: signal_received.load(Ordering::Acquire),
         items_remaining_in_queue_at_exit: 0,
         exit_clean: true,
-    }
+    })
 }

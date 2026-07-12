@@ -59,9 +59,10 @@ impl Worker {
             // Vary the wait by id so replies arrive out of dispatch order.
             WorkerRequest::Do(payload) => {
                 let id = self.id;
-                call.defer(sleep(self.work)).reply_service_event(move |req, reply| {
-                    WorkerEvent::Done(req, reply, payload + id)
-                })
+                call.defer(sleep(self.work))
+                    .reply_service_event(move |req, reply| {
+                        WorkerEvent::Done(req, reply, payload + id)
+                    })
             }
         }
     }
@@ -125,14 +126,11 @@ impl Frontend {
                     Ok((_ticket, permit)) => {
                         let worker = self.workers[self.next_worker];
                         self.next_worker = (self.next_worker + 1) % self.workers.len();
-                        let dispatch_effect = call_request(
-                            worker,
-                            WorkerRequest::Do(payload),
-                            CALL_TIMEOUT,
-                        )
-                        .then_service_event(move |outcome| {
-                            FrontendEvent::WorkerDone(qid, outcome)
-                        });
+                        let dispatch_effect =
+                            call_request(worker, WorkerRequest::Do(payload), CALL_TIMEOUT)
+                                .then_service_event(move |outcome| {
+                                    FrontendEvent::WorkerDone(qid, outcome)
+                                });
                         request_effect_after_park(permit, dispatch_effect)
                     }
                     Err(ParkError::Full { call, .. }) => call.reply(FrontendReply::PendingFull),
@@ -299,9 +297,7 @@ pub fn run() -> anyhow::Result<Report> {
         .wait(Duration::from_secs(10))
         .map_err(|e| anyhow::anyhow!("driver finishes: {e:?}"))?;
 
-    runtime
-        .shutdown()
-        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e}"))?;
+    runtime.shutdown_report().ensure_clean()?;
 
     Ok(Report {
         clients: CLIENTS,

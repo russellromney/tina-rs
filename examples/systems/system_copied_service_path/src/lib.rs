@@ -82,7 +82,7 @@ pub struct RunReport {
     pub scope_full_count: u64,
     pub scope_admitted: u64,
     pub scope_released: u64,
-    /// Scope `current` *after* `runtime.shutdown()`. Owner stop must
+    /// Scope `current` after terminal runtime observation. Owner stop must
     /// release every held charge; a non-zero value here is a lease leak.
     pub scope_current_at_drain: usize,
     pub discovery_line: String,
@@ -191,9 +191,8 @@ impl Gateway {
                     // fsync/INSERT here instead of pushing to a `Vec`.
                     self.ledger.push(id);
                     self.next_id = id + 1;
-                    sleep(hold).then_service_event(move |result| {
-                        GatewayEvent::HoldDone { id, result }
-                    })
+                    sleep(hold)
+                        .then_service_event(move |result| GatewayEvent::HoldDone { id, result })
                 }
                 // Pending capacity == scope capacity, and every pending
                 // entry holds exactly one scope charge, so pending can
@@ -230,6 +229,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
     let scope =
         SharedCapacityScope::new("copied_service_path.in_flight", "requests", config.capacity);
     // "Recovered" state seeded before the isolate accepts traffic — the
@@ -310,7 +310,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
 
     // Graceful shutdown: owner stop must release every held charge. The
     // post-shutdown snapshot is the load-bearing proof of that claim.
-    shutdown(runtime);
+    shutdown_runtime(shutdown, runtime)?;
     let post_shutdown_snap = scope.snapshot();
 
     let summary_line = format!(
@@ -340,8 +340,12 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     })
 }
 
-fn shutdown(runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>) {
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+fn shutdown_runtime(
+    shutdown: tina_runtime::ThreadedShutdownHandle,
+    runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
+) -> anyhow::Result<()> {
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
+    Ok(())
 }

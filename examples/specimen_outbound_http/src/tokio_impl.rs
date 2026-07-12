@@ -50,7 +50,7 @@ pub fn run() -> anyhow::Result<Report> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (report_tx, report_rx) = std::sync::mpsc::channel::<Report>();
 
-    let server_handle = thread::spawn(move || {
+    let server_handle = thread::spawn(move || -> anyhow::Result<()> {
         runtime.block_on(async move {
             let state = Arc::new(CounterState::default());
             let app = Router::new()
@@ -69,10 +69,17 @@ pub fn run() -> anyhow::Result<Report> {
                     .expect("serve");
             });
             let report = scripted_client(local).await;
-            let _ = report_tx.send(report);
-            let _ = shutdown_tx.send(());
-            let _ = server_task.await;
-        });
+            report_tx
+                .send(report)
+                .map_err(|_| anyhow::anyhow!("report receiver dropped"))?;
+            shutdown_tx
+                .send(())
+                .map_err(|_| anyhow::anyhow!("HTTP server stop receiver dropped"))?;
+            server_task
+                .await
+                .map_err(|error| anyhow::anyhow!("HTTP server task: {error}"))?;
+            Ok(())
+        })
     });
 
     let _ = addr_rx.recv_timeout(Duration::from_secs(2))?;
@@ -83,7 +90,7 @@ pub fn run() -> anyhow::Result<Report> {
     }
     server_handle
         .join()
-        .map_err(|_| anyhow::anyhow!("server thread panicked"))?;
+        .map_err(|_| anyhow::anyhow!("server thread panicked"))??;
 
     Ok(report)
 }

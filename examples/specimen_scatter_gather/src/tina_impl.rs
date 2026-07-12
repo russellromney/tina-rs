@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ParkError, PendingReplies,
-    request_effect_after_park, ThreadedRuntime, call_request,
+    CallOutcome, DefaultThreadedMailboxFactory, ParkError, PendingReplies, ThreadedRuntime,
+    call_request, request_effect_after_park,
 };
 
 use crate::{CLIENTS, MAX_IN_FLIGHT, Report, WORKERS, expected_aggregate};
@@ -280,7 +280,7 @@ pub fn run() -> anyhow::Result<Report> {
         .wait(Duration::from_secs(10))
         .map_err(|e| anyhow::anyhow!("driver finishes: {e:?}"))?;
 
-    let _ = runtime.shutdown();
+    runtime.shutdown_report().ensure_clean()?;
 
     Ok(Report {
         clients: CLIENTS,

@@ -125,7 +125,7 @@ fn run_target(binary: &PathBuf, spinner_count: usize) -> RunResult {
 
     stop.store(true, Ordering::Relaxed);
     for spinner in spinners {
-        let _ = spinner.join();
+        spinner.join().expect("CPU spinner thread panicked");
     }
 
     // Sleep for one tick to let any IPC settle.

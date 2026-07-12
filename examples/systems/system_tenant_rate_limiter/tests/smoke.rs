@@ -92,11 +92,11 @@ fn key_table_full_returns_typed_tenant_table_full() {
 
     // Spin up the limiter ourselves so we can drive three distinct
     // tenants without changing the public `run` shape.
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )
-    .expect("start runtime"));
+    let runtime = Arc::new(
+        ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)
+            .expect("start runtime"),
+    );
+    let shutdown = runtime.shutdown_handle();
     let rate = tina_runtime::RateLimit::<&'static str>::new(
         "tenant.rate",
         config.max_tenants,
@@ -133,7 +133,9 @@ fn key_table_full_returns_typed_tenant_table_full() {
         other => panic!("expected TenantTableFull, got {other:?}"),
     }
 
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+    let terminal = shutdown
+        .request_and_wait_report(Duration::from_secs(5))
+        .expect("request and await shutdown");
+    drop(runtime);
+    terminal.ensure_clean().expect("clean terminal report");
 }

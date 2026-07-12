@@ -297,17 +297,18 @@ fn new_runtime(observer: Option<Arc<dyn TraceObserver>>) -> Runtime {
             observer,
         )
         .expect("start observed runtime"),
-        None => ThreadedRuntime::try_with_config(
-            SingleShard,
-            DefaultThreadedMailboxFactory,
-            config,
-        )
-        .expect("start runtime"),
+        None => {
+            ThreadedRuntime::try_with_config(SingleShard, DefaultThreadedMailboxFactory, config)
+                .expect("start runtime")
+        }
     }
 }
 
 fn shutdown(runtime: Runtime) {
-    let _ = runtime.shutdown();
+    runtime
+        .shutdown_report()
+        .ensure_clean()
+        .expect("clean hotpath runtime shutdown");
 }
 
 fn median(samples: &[u64]) -> u64 {

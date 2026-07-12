@@ -193,8 +193,10 @@ pub fn run() -> anyhow::Result<Report> {
         .wait(Duration::from_secs(5))
         .map_err(|e| anyhow::anyhow!("fetcher finishes with result: {e:?}"))?;
 
-    let _ = runtime.shutdown();
-    drop(server);
+    let runtime_shutdown = runtime.shutdown_report().ensure_clean();
+    let server_shutdown = server.stop();
+    runtime_shutdown?;
+    server_shutdown?;
 
     Ok(Report {
         successful_fetches: outcome.successful,

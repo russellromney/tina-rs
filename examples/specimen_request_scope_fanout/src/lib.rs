@@ -73,8 +73,8 @@ enum WorkerRequest {
 /// Internal event: sleep finished for a call in flight.
 #[derive(Debug)]
 #[allow(dead_code)] // `SleepReply` payload is part of the runtime
-                    // contract; only the variant tag matters in this
-                    // specimen.
+// contract; only the variant tag matters in this
+// specimen.
 enum WorkerEvent {
     Wake(SleepReply),
 }
@@ -175,9 +175,7 @@ impl Driver {
                 rails_total: self.rails_total,
                 rails_settled_before_cancel: self.rails_settled_before_cancel,
                 rails_pending_at_cancel: self.rails_pending_at_cancel,
-                cause: self
-                    .cancel_cause
-                    .expect("cancel must fire before Finish"),
+                cause: self.cancel_cause.expect("cancel must fire before Finish"),
                 late_rejected_in_trace: 0, // host fills this from the trace
                 cancel_acks: self.cancel_acks,
             }),
@@ -231,6 +229,7 @@ pub fn run() -> anyhow::Result<Report> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
 
     let mut workers = Vec::with_capacity(FANOUT as usize);
     for _ in 0..FANOUT {
@@ -323,10 +322,9 @@ pub fn run() -> anyhow::Result<Report> {
     }
     report.late_rejected_in_trace = count_rejected(&runtime.trace());
 
-    let rt = Arc::try_unwrap(runtime)
-        .map_err(|_| anyhow::anyhow!("runtime still had outstanding references at shutdown"))?;
-    rt.shutdown()
-        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
 
     Ok(report)
 }

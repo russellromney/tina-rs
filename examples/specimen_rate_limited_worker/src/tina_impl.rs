@@ -25,7 +25,7 @@
 //!   explicit `pending` count serialize work over the rate window —
 //!   without them, multiple `sleep` continuations would fire in parallel.
 //! - **End-of-burst as a Tina message.** The host signals "no more
-//!   submits" via [`WorkerMsg::BurstClosed`] (sent through the same
+//!   submits" via `WorkerMsg::BurstClosed` (sent through the same
 //!   bounded mailbox) so the worker stops the moment its `processed`
 //!   count catches up — no `Arc<AtomicU32>` side channel.
 //! - **Final value via `stop_with`.** The host reads the worker's
@@ -184,6 +184,7 @@ pub fn run() -> anyhow::Result<Report> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
 
     let worker = Worker {
         // burst 1 → one job, then pace at one per refill window.
@@ -257,8 +258,8 @@ pub fn run() -> anyhow::Result<Report> {
         exit_clean: report.exit_clean,
     };
 
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
     Ok(final_report)
 }

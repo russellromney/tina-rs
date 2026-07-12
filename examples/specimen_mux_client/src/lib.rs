@@ -72,7 +72,7 @@ pub async fn spawn_responder() -> anyhow::Result<(SocketAddr, tokio::task::JoinH
             }));
         }
         for task in tasks {
-            let _ = task.await;
+            task.await.expect("responder request task");
         }
     });
     Ok((addr, handle))

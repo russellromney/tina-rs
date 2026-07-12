@@ -1,5 +1,5 @@
 //! Tina side. The driver fans out one IsolateCall per worker via
-//! [`call_cancelable`], stores each named wait in a bounded
+//! [`tina_runtime::call_cancelable`], stores each named wait in a bounded
 //! [`CallGroup`], and on the host's `Cancel` signal drains the group
 //! and cancels each entry explicitly with [`cancel_call`]. Worker
 //! replies that arrive after cancellation are
@@ -169,13 +169,13 @@ impl Driver {
                 // user code, one named wait at a time.
                 for request in cancel_requests {
                     let (worker, token, handle) = request.into_parts();
-                    effects.push(cancel_call(handle).then(move |outcome| {
-                        DriverMsg::Cancelled {
+                    effects.push(
+                        cancel_call(handle).then(move |outcome| DriverMsg::Cancelled {
                             worker,
                             token,
                             outcome,
-                        }
-                    }));
+                        }),
+                    );
                 }
                 Effect::Batch(effects)
             }
@@ -206,6 +206,7 @@ pub fn run() -> anyhow::Result<Report> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
 
     let mut workers = Vec::with_capacity(FANOUT as usize);
     for _ in 0..FANOUT {
@@ -301,9 +302,8 @@ pub fn run() -> anyhow::Result<Report> {
     }
     report.replies_after_cancel = count_rejected(&runtime.trace());
 
-    let rt = Arc::try_unwrap(runtime)
-        .map_err(|_| anyhow::anyhow!("runtime still had outstanding references at shutdown"))?;
-    rt.shutdown()
-        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
     Ok(report)
 }

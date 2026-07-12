@@ -13,10 +13,9 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ListenerId, StreamId, TcpAcceptReply,
-    TcpBindReply, TcpListenerCloseReply, TcpReadReply, TcpStreamCloseReply, TcpWriteReply,
-    ThreadedRuntime, call, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read,
-    tcp_write,
+    CallOutcome, DefaultThreadedMailboxFactory, ListenerId, StreamId, TcpAcceptReply, TcpBindReply,
+    TcpListenerCloseReply, TcpReadReply, TcpStreamCloseReply, TcpWriteReply, ThreadedRuntime, call,
+    tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
 };
 
 use crate::{Command, Report, SCRIPT, parse_commands};
@@ -290,7 +289,7 @@ pub fn run() -> anyhow::Result<Report> {
         .join()
         .map_err(|_| anyhow::anyhow!("client thread panicked"))??;
 
-    let _ = runtime.shutdown();
+    runtime.shutdown_report().ensure_clean()?;
     Ok(parse_response(&response))
 }
 

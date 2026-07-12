@@ -85,7 +85,11 @@ struct Counter {
 
 #[tina_runtime::isolate(message = CounterMsg)]
 impl Counter {
-    fn handle(&mut self, msg: CounterMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: CounterMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             CounterMsg::Recover { op } => snapshot_load(self.snapshot_path.clone())
                 .then(move |result| CounterMsg::SnapshotLoaded { op, result }),
@@ -285,7 +289,7 @@ fn run_phase(
     }
     let journal_records_written = observation.journal_records_observed.load(Ordering::Relaxed);
 
-    let _ = runtime.shutdown();
+    runtime.shutdown_report().ensure_clean()?;
 
     Ok(PhaseReport {
         recovered_value,
