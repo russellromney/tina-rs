@@ -506,7 +506,7 @@ struct SplitProducer {
 
 #[tina_runtime::isolate(
     message = SplitProducerMsg,
-    send = tina::Outbound<tina::ServiceMessage<SplitEvent, SplitRequest>>
+    send = tina::ServiceOutbound<SplitEvent, SplitRequest>
 )]
 impl SplitProducer {
     fn handle(
@@ -535,11 +535,8 @@ fn split_service_routes_events_and_requests_on_separate_capabilities() {
     let request_addr: tina::ServiceRequestAddress<SplitEvent, SplitRequest, SplitReply> =
         handle.requests;
 
-    let producer = runtime
-        .register_with_capacity::<SplitProducer, tina::ServiceMessage<SplitEvent, SplitRequest>>(
-            SplitProducer { target: event_addr },
-            8,
-        );
+    let producer =
+        runtime.register_with_capacity::<SplitProducer, _>(SplitProducer { target: event_addr }, 8);
     runtime
         .try_send(producer, SplitProducerMsg::Publish(42))
         .expect("producer accepted publish");
@@ -572,8 +569,17 @@ fn split_service_threaded_runtime_routes_request_lane() {
         )
         .expect("register split service");
 
-    // Host code has the same capability-shaped lane helpers as isolate code:
-    // no raw `ServiceMessage` envelope is needed on the copied path.
+    let producer = runtime
+        .register_with_capacity::<SplitProducer, _>(
+            SplitProducer {
+                target: handle.events,
+            },
+            8,
+        )
+        .expect("register split-service producer");
+    runtime
+        .try_send(producer, SplitProducerMsg::Publish(55))
+        .expect("producer accepts publish");
     runtime
         .send_event_and_observe(handle.events, SplitEvent::Filled(55))
         .expect("send event and observe target mailbox");

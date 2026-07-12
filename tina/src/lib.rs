@@ -451,9 +451,10 @@ pub mod prelude {
         ChildRef, Context, CrossShardRestartableChildDefinition, Deadline, DeferCancelableThrough,
         DeferThrough, DeferredReply, Effect, Isolate, IsolateId, Outbound, PendingCallSet,
         PendingCallSetInsertError, RequestCall, RequestContext, RequestDeferCancelableThrough,
-        RequestDeferThrough, RequestEffect, RequestEffectPermit, RestartableChildDefinition, Shard,
-        ShardId, SingleShard, SpawnObservedError, batch, fail, isolate, isolate_types, noop, reply,
-        reply_to, restart_children, send, spawn, spawn_observed, stop, stop_children, stop_with,
+        RequestDeferThrough, RequestEffect, RequestEffectPermit, RestartableChildDefinition,
+        ServiceOutbound, Shard, ShardId, SingleShard, SpawnObservedError, batch, fail, isolate,
+        isolate_types, noop, reply, reply_to, restart_children, send, spawn, spawn_observed, stop,
+        stop_children, stop_with,
         time::{
             Backoff, BackoffDelay, RecurringCatchUp, RecurringTick, RecurringTickDecision,
             RecurringTickReport, RecurringTickStale, RecurringTickToken, TimerConfigError,

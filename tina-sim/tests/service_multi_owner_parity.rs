@@ -1,4 +1,3 @@
-use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -115,11 +114,15 @@ enum ClientMessage {
 }
 
 struct Client {
-    split: tina::ServiceRequestAddress<SplitEvent, SplitRequest, u32>,
+    split: SplitServiceHandle<SplitEvent, SplitRequest, u32>,
     observed: Arc<AtomicU32>,
 }
 
-#[tina_runtime::isolate(message = ClientMessage, shard = ServiceShard)]
+#[tina_runtime::isolate(
+    message = ClientMessage,
+    send = tina::ServiceOutbound<SplitEvent, SplitRequest>,
+    shard = ServiceShard
+)]
 impl Client {
     fn handle(
         &mut self,
@@ -133,8 +136,15 @@ impl Client {
             }
             ClientMessage::RequestReturned(CallOutcome::Replied(value)) => {
                 self.observed.store(value, Ordering::Release);
-                call_request(self.split, SplitRequest::Read, Duration::from_millis(10))
-                    .then(ClientMessage::SplitReturned)
+                batch([
+                    tina::send_event(self.split.events, SplitEvent::Reset),
+                    call_request(
+                        self.split.requests,
+                        SplitRequest::Read,
+                        Duration::from_millis(10),
+                    )
+                    .then(ClientMessage::SplitReturned),
+                ])
             }
             ClientMessage::SplitReturned(CallOutcome::Replied(value)) => {
                 assert_eq!(self.observed.load(Ordering::Acquire), 37);
@@ -197,10 +207,10 @@ fn simulator_multi_owner_preserves_service_capabilities_and_domain_errors() {
         .expect("split event accepted");
 
     let request_seen = Arc::new(AtomicU32::new(0));
-    let client = simulator.register_with_capacity_on::<Client, ClientMessage, Infallible>(
+    let client = simulator.register_with_capacity_on::<Client, ClientMessage, _>(
         ShardId::new(2),
         Client {
-            split: split.requests,
+            split,
             observed: Arc::clone(&request_seen),
         },
         4,

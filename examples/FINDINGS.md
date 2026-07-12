@@ -39,6 +39,20 @@ drain/quarantine contract. A tracked-backend regression proves zero cancel
 calls for empty shared I/O; retained-completion quarantine tests and 200
 consecutive copied-path owner-stop runs prove both sides of the boundary.
 
+### 2026-07-12 Split-service outbound facade prerequisite
+
+**Surfaced by:** `ergonomics_playground`'s debounced batch client.
+
+A mixed event/request client could use the typed `send_event` and
+`call_request` helpers, but its isolate declaration still had to expose the
+private routing shape as
+`Outbound<ServiceMessage<BatcherEvent, BatcherRequest>>`. Tina now exports
+`ServiceOutbound<Event, Request>` as the canonical associated type for that
+capability. It is a transparent alias, so it adds no conversion layer and does
+not weaken the separate event/request address rails. Runtime and compile-fail
+proofs use the public spelling, and the motivating batching migration can now
+contain no direct service-envelope vocabulary.
+
 ### 2026-07-12 Request-aware raw flow prerequisite
 
 `flow!` now accepts `-> raw request T` for typed timer and runtime-I/O

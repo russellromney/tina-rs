@@ -14,7 +14,7 @@ struct Producer {
     events: tina::ServiceEventAddress<Event, Request>,
 }
 
-#[tina_runtime::isolate(message = (), send = tina::Outbound<tina::ServiceMessage<Event, Request>>)]
+#[tina_runtime::isolate(message = (), send = tina::ServiceOutbound<Event, Request>)]
 impl Producer {
     fn handle(
         &mut self,

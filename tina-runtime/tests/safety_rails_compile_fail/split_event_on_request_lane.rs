@@ -1,7 +1,5 @@
 //! Negative fixture: split service events cannot be called as requests.
 
-use std::time::Duration;
-
 #[derive(Debug)]
 enum Event {
     Filled,
@@ -12,15 +10,26 @@ enum Request {
     Read,
 }
 
-fn main() {
-    let raw: tina::Address<tina::ServiceMessage<Event, Request>, u32> =
-        tina::Address::new_with_generation(
-            tina::ShardId::new(0),
-            tina::IsolateId::new(1),
-            tina::AddressGeneration::new(0),
-        );
-    let requests = tina::ServiceRequestAddress::from_call_address(raw.callable());
+struct Producer {
+    requests: tina::ServiceRequestAddress<Event, Request, u32>,
+}
 
-    // Expected `Request`, found `Event`.
-    let _ = tina_runtime::call_request(requests, Event::Filled, Duration::from_millis(1));
+#[tina_runtime::isolate(message = (), send = tina::ServiceOutbound<Event, Request>)]
+impl Producer {
+    fn handle(
+        &mut self,
+        _msg: (),
+        _ctx: &mut tina::Context<'_, tina::SingleShard, Self::Reply>,
+    ) -> tina::Effect<Self> {
+        // Expected `Request`, found `Event`.
+        tina_runtime::call_request(
+            self.requests,
+            Event::Filled,
+            std::time::Duration::from_millis(1),
+        )
+        .then(|_| ())
+    }
+}
+
+fn main() {
 }
