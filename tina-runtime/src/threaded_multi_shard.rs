@@ -532,6 +532,40 @@ where
         })
     }
 
+    /// Registers one root on a chosen shard; its constructor receives the
+    /// final typed address before the entry is published.
+    ///
+    /// The constructor runs on the chosen worker. Command admission preserves
+    /// [`ThreadedRuntimeError::CommandFull`], `WorkerStopped`, and
+    /// `UnknownShard`; a constructor panic terminates that worker and returns
+    /// `WorkerStopped`.
+    #[allow(private_bounds)]
+    pub fn register_with_capacity_using_on<I, Outbound, Ctor>(
+        &self,
+        shard: ShardId,
+        mailbox_capacity: usize,
+        construct: Ctor,
+    ) -> Result<Address<I::Message, I::Reply>, ThreadedRuntimeError>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
+        I::Message: 'static,
+        I::Reply: Send + 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: Send + 'static,
+        Ctor: FnOnce(Address<I::Message, I::Reply>) -> I + Send + 'static,
+    {
+        self.call_on(shard, move |runtime| {
+            runtime.register_sendable_with_capacity_using::<I, Outbound, _>(
+                mailbox_capacity,
+                construct,
+            )
+        })
+    }
+
     /// Registers one split event/request service on a chosen shard.
     ///
     /// Returns [`ThreadedRuntimeError::UnknownShard`] when `shard` is not

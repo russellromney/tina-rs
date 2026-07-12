@@ -73,6 +73,31 @@ blocking owner drop, escaped-handle retry, partial multi-shard progress, and
 single-/multi-shard parity.
 Motivating example migrations remain separate follow-up cohorts.
 
+### 2026-07-12 Address-aware LocalSystem root construction prerequisite
+
+**Surfaced by:** `specimen_dynamic_worker_pool` during the LocalSystem host
+migration.
+
+The specimen had already removed `Begin { self_addr }` through the lower-level
+`ThreadedRuntime::register_with_capacity_using`, but that forced an otherwise
+application-shaped host to retain the raw threaded owner. The preferred facade
+now exposes the honest form directly:
+
+```rust
+let coordinator = app.register_root_using(capacity, |self_addr| Coordinator {
+    self_addr,
+    // application state
+})?;
+```
+
+`LocalMultiShardSystem::register_root_using_on` and the explicit-step,
+threaded-multi-shard, single-simulator, and multi-shard-simulator mirrors use
+the same constructor-address contract. The entry is not published until the
+constructor returns. Panic consumes the monotonic id without registering an
+isolate; bounded threaded admission and unknown-shard rejection do not execute
+the closure. The motivating specimen migration remains in its example cohort,
+not this framework prerequisite.
+
 ### 2026-07-12 Copied service path flow migration
 
 The canonical `system_copied_service_path` now uses `LocalSystem` and a
@@ -808,13 +833,15 @@ ScatterCoord { ..., self_addr } }`. Avoids the bind-before-start handshake
 and removes the `Option<Address<...>>` field that's only `None` for one
 turn.
 
-Self-address half shipped on the single-shard runtimes:
+Self-address construction now ships across all root owners:
 `Runtime::register_with_capacity_using(cap, |self_addr| ...)` and
-the threaded mirror. `specimen_dynamic_worker_pool` migrated to it;
-the chicken-and-egg `Begin { self_addr }` variant is gone.
-Multi-shard parity (`MultiShardRuntime` /
-`ThreadedMultiShardRuntime` / simulator) is deferred until a
-multi-shard example needs it.
+the threaded mirror; `MultiShardRuntime` and
+`ThreadedMultiShardRuntime` expose `register_with_capacity_using_on`;
+`LocalSystem` and `LocalMultiShardSystem` expose
+`register_root_using[_on]`; and both simulator owners mirror the explicit-step
+vocabulary. `specimen_dynamic_worker_pool` removed its chicken-and-egg
+`Begin { self_addr }` variant with the lower-level method; its pending
+LocalSystem migration can now keep that shape without an owner escape hatch.
 
 Still open: the cross-isolate handshake half — `Bind { bridge }` in
 `specimen_sharded_fanout_read` is *not* about self-address, it's about

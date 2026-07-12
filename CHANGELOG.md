@@ -4,6 +4,18 @@ This file records completed work.
 
 ## Unreleased
 
+### Address-aware root construction parity
+
+- `LocalSystem::register_root_using` and
+  `LocalMultiShardSystem::register_root_using_on` let application roots receive
+  their final typed address during construction without dropping to a raw
+  threaded owner. Explicit-step, threaded multi-shard, and simulator owners
+  expose the matching `register_with_capacity_using[_on]` vocabulary.
+- Construction remains atomic with respect to publication: a panic consumes a
+  monotonic isolate id but creates no entry. Threaded command admission keeps
+  `CommandFull`, `WorkerStopped`, and `UnknownShard` outcomes and never runs a
+  constructor rejected before admission.
+
 ### Deterministic application shutdown proof
 
 - Added atomic open-input peer creation to the simulated TCP backend. Shutdown

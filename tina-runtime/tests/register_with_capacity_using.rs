@@ -282,10 +282,3 @@ fn helpers_compose_self_address_plus_drain_replies_into_stop() {
         .expect("front stops after drain_replies_into_stop");
     let _ = runtime.shutdown();
 }
-
-// Marker: multi-shard parity is deferred. Replace the body with a
-// real parity test when the multi-shard forms ship and drop the
-// ignore. Empty body so an accidental un-ignore passes trivially.
-#[test]
-#[ignore = "multi-shard register_with_capacity_using_on is deferred; design note in .intent/phases/064-..."]
-fn multi_shard_register_with_capacity_using_on_is_deferred() {}

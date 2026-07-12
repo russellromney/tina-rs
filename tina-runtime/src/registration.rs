@@ -409,8 +409,8 @@ where
     ///   escape through user-captured shared state.
     /// - Constructor panic *or* mailbox-create panic leaves the
     ///   allocated id with no entry. The id is never reused. A
-    ///   `try_send` to a leaked address panics like any send to an
-    ///   unknown id.
+    ///   `try_send` to a leaked address returns `Closed` like any send
+    ///   to an unknown id.
     /// - `construct` runs synchronously. Heavy work blocks the
     ///   caller; on `ThreadedRuntime` it blocks the worker thread
     ///   and starves every other isolate on that shard — build the
@@ -880,6 +880,55 @@ where
             address.isolate,
             address.generation,
         )
+    }
+
+    pub(crate) fn register_sendable_with_capacity_using<I, Outbound, Ctor>(
+        &mut self,
+        mailbox_capacity: usize,
+        construct: Ctor,
+    ) -> Address<I::Message, I::Reply>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + 'static,
+        I::Message: 'static,
+        I::Reply: Send + 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
+        Outbound: Send + 'static,
+        Ctor: FnOnce(Address<I::Message, I::Reply>) -> I,
+    {
+        let isolate_id = IsolateId::new(self.next_isolate_id);
+        self.next_isolate_id += 1;
+        let generation = AddressGeneration::new(0);
+        let self_addr = Address::<I::Message, I::Reply>::new_with_generation_in(
+            self.system_incarnation,
+            self.shard.id(),
+            isolate_id,
+            generation,
+        );
+        let mailbox = self.create_mailbox::<Box<dyn Any>>(mailbox_capacity);
+        let isolate = construct(self_addr);
+
+        let entry_index = self.entries.len();
+        self.entries.push(RegisteredEntry {
+            id: isolate_id,
+            generation,
+            parent: None,
+            stopped: Cell::new(false),
+            stopped_event: Cell::new(None),
+            mailbox: Box::new(AnyMailboxAdapter { mailbox }),
+            call_contexts: RefCell::new(VecDeque::new()),
+            continuation_overflow: RefCell::new(VecDeque::new()),
+            handler: RefCell::new(Box::new(SendableHandlerAdapter::<I, Outbound> {
+                isolate,
+                marker: PhantomData,
+            })),
+        });
+        self.entry_indexes.insert(isolate_id, entry_index);
+
+        self_addr
     }
 
     #[allow(clippy::type_complexity)]

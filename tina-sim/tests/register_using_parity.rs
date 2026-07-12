@@ -1,0 +1,164 @@
+use std::cell::RefCell;
+use std::convert::Infallible;
+use std::rc::Rc;
+
+use tina::TrySendError;
+use tina::prelude::*;
+use tina_sim::{MultiShardSimulator, Simulator, SimulatorConfig};
+
+#[derive(Debug, Clone, Copy)]
+struct SimShard(u32);
+
+impl Shard for SimShard {
+    fn id(&self) -> ShardId {
+        ShardId::new(self.0)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Msg {
+    Record,
+    Stop,
+}
+
+struct SelfAware {
+    me: Address<Msg>,
+    observed: Rc<RefCell<Vec<Address<Msg>>>>,
+}
+
+#[tina_runtime::isolate(message = Msg, shard = SimShard)]
+impl SelfAware {
+    fn handle(
+        &mut self,
+        message: Msg,
+        _ctx: &mut Context<'_, SimShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match message {
+            Msg::Record => {
+                self.observed.borrow_mut().push(self.me);
+                noop()
+            }
+            Msg::Stop => stop(),
+        }
+    }
+}
+
+#[test]
+fn single_shard_constructor_address_routes_and_keeps_mailbox_bound() {
+    let mut sim = Simulator::new(SimShard(7), SimulatorConfig::default());
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let observed_in_ctor = Rc::clone(&observed);
+    let address =
+        sim.register_with_capacity_using::<SelfAware, Msg, Infallible, _>(1, move |me| SelfAware {
+            me,
+            observed: observed_in_ctor,
+        });
+
+    sim.try_send(address, Msg::Record).expect("first admission");
+    assert!(matches!(
+        sim.try_send(address, Msg::Stop),
+        Err(TrySendError::Full(Msg::Stop))
+    ));
+    sim.run_until_quiescent();
+    assert_eq!(observed.borrow().as_slice(), &[address]);
+}
+
+#[test]
+fn multi_shard_constructor_address_uses_requested_owner() {
+    let mut sim = MultiShardSimulator::new([SimShard(3), SimShard(9)], SimulatorConfig::default());
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let observed_in_ctor = Rc::clone(&observed);
+    let address = sim.register_with_capacity_using_on::<SelfAware, Msg, Infallible, _>(
+        ShardId::new(9),
+        2,
+        move |me| SelfAware {
+            me,
+            observed: observed_in_ctor,
+        },
+    );
+
+    assert_eq!(address.shard(), ShardId::new(9));
+    sim.try_send(address, Msg::Record).expect("route to owner");
+    sim.run_until_quiescent();
+    assert_eq!(observed.borrow().as_slice(), &[address]);
+}
+
+#[test]
+fn constructor_panic_publishes_no_entry_and_consumes_id() {
+    let mut sim = Simulator::new(SimShard(7), SimulatorConfig::default());
+    let leaked = Rc::new(RefCell::new(None));
+    let leaked_in_ctor = Rc::clone(&leaked);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sim.register_with_capacity_using::<SelfAware, Msg, Infallible, _>(
+            2,
+            move |address| -> SelfAware {
+                *leaked_in_ctor.borrow_mut() = Some(address);
+                panic!("constructor failed")
+            },
+        )
+    }));
+    assert!(panicked.is_err());
+
+    let leaked = leaked.borrow().expect("constructor saw address");
+    let next =
+        sim.register_with_capacity_using::<SelfAware, Msg, Infallible, _>(2, |me| SelfAware {
+            me,
+            observed: Rc::new(RefCell::new(Vec::new())),
+        });
+    assert_ne!(leaked.isolate(), next.isolate());
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = sim.try_send(leaked, Msg::Record);
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn unknown_multi_shard_owner_does_not_run_constructor() {
+    let mut sim = MultiShardSimulator::new([SimShard(3)], SimulatorConfig::default());
+    let constructed = Rc::new(RefCell::new(0_u32));
+    let constructed_in_ctor = Rc::clone(&constructed);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sim.register_with_capacity_using_on::<SelfAware, Msg, Infallible, _>(
+            ShardId::new(99),
+            2,
+            move |me| {
+                *constructed_in_ctor.borrow_mut() += 1;
+                SelfAware {
+                    me,
+                    observed: Rc::new(RefCell::new(Vec::new())),
+                }
+            },
+        )
+    }));
+    assert!(panicked.is_err());
+    assert_eq!(*constructed.borrow(), 0);
+}
+
+fn replay(seed: u64) -> (Address<Msg>, Vec<String>) {
+    let config = SimulatorConfig {
+        seed,
+        ..SimulatorConfig::default()
+    };
+    let mut sim = Simulator::new(SimShard(7), config);
+    let address =
+        sim.register_with_capacity_using::<SelfAware, Msg, Infallible, _>(4, |me| SelfAware {
+            me,
+            observed: Rc::new(RefCell::new(Vec::new())),
+        });
+    sim.try_send(address, Msg::Record).expect("record");
+    sim.try_send(address, Msg::Stop).expect("stop");
+    sim.run_until_quiescent();
+    let trace = sim
+        .trace()
+        .iter()
+        .map(|event| format!("{event:?}"))
+        .collect();
+    (address, trace)
+}
+
+#[test]
+fn constructor_registration_replays_deterministically() {
+    assert_eq!(replay(0x5eed), replay(0x5eed));
+}
