@@ -11,7 +11,9 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use reqwest::Client;
 use tina::CallContext;
 use tina::prelude::*;
-use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeError, sleep};
+use tina_runtime::{
+    LocalSystem, MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeError, sleep,
+};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
@@ -149,7 +151,7 @@ impl Drop for OwnedRuntime {
     }
 }
 
-/// Result of [`ReqwestWorker::install`].
+/// Result of [`ReqwestWorker::install`] or [`ReqwestWorker::install_local`].
 pub struct InstalledReqwestBridge<S: Shard + 'static> {
     /// Tina address callers use with `call(...)`.
     pub address: Address<ReqwestMsg, Result<ReqwestResponse, ReqwestError>>,
@@ -160,7 +162,7 @@ pub struct InstalledReqwestBridge<S: Shard + 'static> {
     _shard: PhantomData<S>,
 }
 
-/// Reasons [`ReqwestWorker::install`] cannot register the worker.
+/// Reasons a [`ReqwestWorker`] install helper cannot register the worker.
 #[derive(Debug)]
 pub enum InstallError {
     /// Config rejected by [`ReqwestConfig::validate`].
@@ -799,6 +801,29 @@ fn retry_on_reqwest_io(policy: &RetryPolicy) -> bool {
 }
 
 impl<S: Shard + Send + 'static> ReqwestWorker<S> {
+    fn install_via(
+        config: ReqwestConfig,
+        register: impl FnOnce(
+            Self,
+            usize,
+        ) -> Result<
+            Address<ReqwestMsg, Result<ReqwestResponse, ReqwestError>>,
+            ThreadedRuntimeError,
+        >,
+    ) -> Result<InstalledReqwestBridge<S>, InstallError> {
+        config.validate()?;
+        let cap = config.mailbox_capacity;
+        let (worker, metrics) = Self::new(config)?;
+        let closer = worker.closer();
+        let address = register(worker, cap).map_err(InstallError::Register)?;
+        Ok(InstalledReqwestBridge {
+            address,
+            closer,
+            metrics,
+            _shard: PhantomData,
+        })
+    }
+
     /// One-call helper: validate config, build the worker, register it
     /// on `runtime`, and return the address, closer, and metrics handle.
     pub fn install<F>(
@@ -808,16 +833,25 @@ impl<S: Shard + Send + 'static> ReqwestWorker<S> {
     where
         F: MailboxFactory + Send + 'static,
     {
-        config.validate()?;
-        let cap = config.mailbox_capacity;
-        let (worker, metrics) = Self::new(config)?;
-        let closer = worker.closer();
-        let address = runtime.register_with_capacity::<_, Infallible>(worker, cap)?;
-        Ok(InstalledReqwestBridge {
-            address,
-            closer,
-            metrics,
-            _shard: PhantomData,
+        Self::install_via(config, |worker, cap| {
+            runtime.register_with_capacity::<_, Infallible>(worker, cap)
+        })
+    }
+
+    /// Local-system first form of [`Self::install`].
+    ///
+    /// Validation, worker construction, typed install errors, returned
+    /// address, closer, and metrics are identical; registration stays behind
+    /// the application facade.
+    pub fn install_local<F>(
+        system: &LocalSystem<S, F>,
+        config: ReqwestConfig,
+    ) -> Result<InstalledReqwestBridge<S>, InstallError>
+    where
+        F: MailboxFactory + Send + 'static,
+    {
+        Self::install_via(config, |worker, cap| {
+            system.register_root::<_, Infallible>(worker, cap)
         })
     }
 }

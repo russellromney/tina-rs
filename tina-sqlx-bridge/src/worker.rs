@@ -21,7 +21,9 @@ use futures_util::TryStreamExt;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow as SqlxRow};
 use sqlx::{Column, Connection, Row as _, TypeInfo};
 use tina::prelude::*;
-use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, sleep};
+use tina_runtime::{
+    LocalSystem, MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeError, sleep,
+};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 #[cfg(feature = "tracing")]
@@ -88,7 +90,7 @@ struct InFlight {
     request_kind: &'static str,
 }
 
-/// Result of [`PgWorker::install`] / [`PgWorker::install_with_pool`].
+/// Result of any owned- or supplied-pool [`PgWorker`] install helper.
 pub struct InstalledPgBridge<S: Shard + 'static> {
     /// Tina address callers use with `call(...)`.
     pub address: tina::CallAddress<PgMsg, PgResult>,
@@ -516,21 +518,7 @@ fn emit_replied(result: &PgResult, request_kind: &'static str) {
 }
 
 impl<S: Shard + Send + 'static> PgWorker<S> {
-    /// Build a worker that owns its own Tokio runtime and SQLx pool.
-    /// Requires `config.pool` to be `Some`. Returns
-    /// [`InstallError::MissingPoolConfig`] otherwise.
-    ///
-    /// The owned Tokio runtime is sized small (two worker threads) and
-    /// is not configurable in first form. Teams that need a larger
-    /// runtime, or that already have one, should build a `PgPool` on
-    /// their own runtime and use [`Self::install_with_pool`].
-    pub fn install<F>(
-        runtime: &ThreadedRuntime<S, F>,
-        config: PgConfig,
-    ) -> Result<InstalledPgBridge<S>, InstallError>
-    where
-        F: MailboxFactory + Send + 'static,
-    {
+    fn build_owned(config: PgConfig) -> Result<(Self, PgMetricsHandle, usize), InstallError> {
         config.validate()?;
         let pool_cfg = config.pool.clone().ok_or(InstallError::MissingPoolConfig)?;
         let tokio_rt = tokio::runtime::Builder::new_multi_thread()
@@ -550,18 +538,78 @@ impl<S: Shard + Send + 'static> PgWorker<S> {
                 Ok::<_, sqlx::Error>(main)
             })
             .map_err(InstallError::Pool)?;
-        let owned = OwnedRuntime(Some(tokio_rt));
         let cap = config.mailbox_capacity;
-        let (worker, metrics) = Self::assemble(config, pool, handle, Some(owned));
+        let (worker, metrics) =
+            Self::assemble(config, pool, handle, Some(OwnedRuntime(Some(tokio_rt))));
+        Ok((worker, metrics, cap))
+    }
+
+    fn build_with_pool(
+        config: PgConfig,
+        pool: PgPool,
+        tokio_handle: Handle,
+    ) -> Result<(Self, PgMetricsHandle, usize), InstallError> {
+        // Tina-only validation: config.pool is ignored because the supplied
+        // pool owns its SQLx settings. config.cancel is also ignored because
+        // DB-side cancellation belongs only to the config-built path.
+        config.validate_tina()?;
+        let cap = config.mailbox_capacity;
+        let (worker, metrics) = Self::assemble(config, pool, tokio_handle, None);
+        Ok((worker, metrics, cap))
+    }
+
+    fn finish_install(
+        worker: Self,
+        metrics: PgMetricsHandle,
+        cap: usize,
+        register: impl FnOnce(Self, usize) -> Result<Address<PgMsg, PgResult>, ThreadedRuntimeError>,
+    ) -> Result<InstalledPgBridge<S>, InstallError> {
         let closer = worker.closer();
-        let address = runtime
-            .register_with_capacity::<_, Infallible>(worker, cap)
-            .map_err(InstallError::Register)?;
+        let address = register(worker, cap).map_err(InstallError::Register)?;
         Ok(InstalledPgBridge {
             address: address.callable(),
             closer,
             metrics,
             _shard: PhantomData,
+        })
+    }
+
+    /// Build a worker that owns its own Tokio runtime and SQLx pool.
+    /// Requires `config.pool` to be `Some`. Returns
+    /// [`InstallError::MissingPoolConfig`] otherwise.
+    ///
+    /// The owned Tokio runtime is sized small (two worker threads) and
+    /// is not configurable in first form. Teams that need a larger
+    /// runtime, or that already have one, should build a `PgPool` on
+    /// their own runtime and use [`Self::install_with_pool`].
+    pub fn install<F>(
+        runtime: &ThreadedRuntime<S, F>,
+        config: PgConfig,
+    ) -> Result<InstalledPgBridge<S>, InstallError>
+    where
+        F: MailboxFactory + Send + 'static,
+    {
+        let (worker, metrics, cap) = Self::build_owned(config)?;
+        Self::finish_install(worker, metrics, cap, |worker, cap| {
+            runtime.register_with_capacity::<_, Infallible>(worker, cap)
+        })
+    }
+
+    /// Local-system first form of [`Self::install`].
+    ///
+    /// Pool/runtime construction and all typed [`InstallError`] phases are
+    /// unchanged; only root registration is performed through the application
+    /// facade.
+    pub fn install_local<F>(
+        system: &LocalSystem<S, F>,
+        config: PgConfig,
+    ) -> Result<InstalledPgBridge<S>, InstallError>
+    where
+        F: MailboxFactory + Send + 'static,
+    {
+        let (worker, metrics, cap) = Self::build_owned(config)?;
+        Self::finish_install(worker, metrics, cap, |worker, cap| {
+            system.register_root::<_, Infallible>(worker, cap)
         })
     }
 
@@ -600,24 +648,29 @@ impl<S: Shard + Send + 'static> PgWorker<S> {
     where
         F: MailboxFactory + Send + 'static,
     {
-        // Tina-only validation: `config.pool` is ignored on this path
-        // because the supplied `PgPool` owns its SQLx settings.
-        // Validating `config.pool` here would reject callers for
-        // fields the bridge promised not to apply. `config.cancel`
-        // is also ignored — DB-side cancel is opt-in only on the
-        // config-built path.
-        config.validate_tina()?;
-        let cap = config.mailbox_capacity;
-        let (worker, metrics) = Self::assemble(config, pool, tokio_handle, None);
-        let closer = worker.closer();
-        let address = runtime
-            .register_with_capacity::<_, Infallible>(worker, cap)
-            .map_err(InstallError::Register)?;
-        Ok(InstalledPgBridge {
-            address: address.callable(),
-            closer,
-            metrics,
-            _shard: PhantomData,
+        let (worker, metrics, cap) = Self::build_with_pool(config, pool, tokio_handle)?;
+        Self::finish_install(worker, metrics, cap, |worker, cap| {
+            runtime.register_with_capacity::<_, Infallible>(worker, cap)
+        })
+    }
+
+    /// Local-system first form of [`Self::install_with_pool`].
+    ///
+    /// The supplied pool and Tokio handle retain the same ownership and
+    /// validation contract; registration remains behind the application
+    /// facade.
+    pub fn install_local_with_pool<F>(
+        system: &LocalSystem<S, F>,
+        config: PgConfig,
+        pool: PgPool,
+        tokio_handle: Handle,
+    ) -> Result<InstalledPgBridge<S>, InstallError>
+    where
+        F: MailboxFactory + Send + 'static,
+    {
+        let (worker, metrics, cap) = Self::build_with_pool(config, pool, tokio_handle)?;
+        Self::finish_install(worker, metrics, cap, |worker, cap| {
+            system.register_root::<_, Infallible>(worker, cap)
         })
     }
 }

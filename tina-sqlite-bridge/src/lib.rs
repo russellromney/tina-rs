@@ -115,6 +115,10 @@
 //! shows up in the trace as `CallReplyRejected` and increments
 //! `late_results`.
 //!
+//! [`SqliteWorker::install_local`] is the application-facade counterpart to
+//! [`SqliteWorker::install`]. Both return the same callable address, closer,
+//! metrics, and typed setup/registration errors.
+//!
 //! # Pressure rule
 //!
 //! ```text

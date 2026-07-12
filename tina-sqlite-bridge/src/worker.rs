@@ -16,7 +16,9 @@ use std::time::Instant;
 
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
 use tina::prelude::*;
-use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, sleep};
+use tina_runtime::{
+    LocalSystem, MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeError, sleep,
+};
 #[cfg(feature = "tracing")]
 use tracing::{Level, event};
 
@@ -188,7 +190,7 @@ pub struct SqliteWorker<S: Shard + 'static> {
     _shard: PhantomData<S>,
 }
 
-/// Result of [`SqliteWorker::install`].
+/// Result of [`SqliteWorker::install`] or [`SqliteWorker::install_local`].
 pub struct InstalledSqliteBridge<S: Shard + 'static> {
     /// Tina address callers use with `call(...)`.
     pub address: tina::CallAddress<SqliteMsg, SqliteResult>,
@@ -479,6 +481,26 @@ impl<S: Shard + 'static> SqliteWorker<S> {
 }
 
 impl<S: Shard + Send + 'static> SqliteWorker<S> {
+    fn install_via(
+        config: SqliteConfig,
+        register: impl FnOnce(
+            Self,
+            usize,
+        )
+            -> Result<tina::Address<SqliteMsg, SqliteResult>, ThreadedRuntimeError>,
+    ) -> Result<InstalledSqliteBridge<S>, InstallError> {
+        let cap = config.mailbox_capacity;
+        let (worker, metrics) = Self::new(config)?;
+        let closer = worker.closer();
+        let address = register(worker, cap).map_err(InstallError::Register)?;
+        Ok(InstalledSqliteBridge {
+            address: address.callable(),
+            closer,
+            metrics,
+            _shard: PhantomData,
+        })
+    }
+
     /// Validate, build, register. Returns address + closer + metrics.
     pub fn install<F>(
         runtime: &ThreadedRuntime<S, F>,
@@ -487,17 +509,24 @@ impl<S: Shard + Send + 'static> SqliteWorker<S> {
     where
         F: MailboxFactory + Send + 'static,
     {
-        let cap = config.mailbox_capacity;
-        let (worker, metrics) = Self::new(config)?;
-        let closer = worker.closer();
-        let address = runtime
-            .register_with_capacity::<_, Infallible>(worker, cap)
-            .map_err(InstallError::Register)?;
-        Ok(InstalledSqliteBridge {
-            address: address.callable(),
-            closer,
-            metrics,
-            _shard: PhantomData,
+        Self::install_via(config, |worker, cap| {
+            runtime.register_with_capacity::<_, Infallible>(worker, cap)
+        })
+    }
+
+    /// Local-system first form of [`Self::install`].
+    ///
+    /// Worker setup and registration retain the existing typed
+    /// [`InstallError`] phases while callers stay on the application facade.
+    pub fn install_local<F>(
+        system: &LocalSystem<S, F>,
+        config: SqliteConfig,
+    ) -> Result<InstalledSqliteBridge<S>, InstallError>
+    where
+        F: MailboxFactory + Send + 'static,
+    {
+        Self::install_via(config, |worker, cap| {
+            system.register_root::<_, Infallible>(worker, cap)
         })
     }
 }

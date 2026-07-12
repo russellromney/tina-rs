@@ -50,6 +50,13 @@ This file records completed work.
   releases global and per-key capacity. Lock and lease services no longer need
   a parallel waiter-id queue beside their bounded pending-reply storage.
 
+### LocalSystem bridge installation
+
+- The reqwest, SQLite, and SQLx Postgres workers now install directly through
+  `LocalSystem` without exposing its lower threaded runtime. The new local
+  entry points preserve the existing callable address, closer, metrics, pool
+  ownership, and typed install-error phases.
+
 ### Authoritative child-restart observation
 
 - Child-restart waiters now match the complete parent address identity

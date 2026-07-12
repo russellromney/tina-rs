@@ -145,6 +145,9 @@
 //!   and Tokio runtime handle. Use this when other code in the
 //!   application already holds a pool. The supplied pool owns its
 //!   own SQLx settings; the bridge does not re-apply them.
+//! - [`PgWorker::install_local`] and [`PgWorker::install_local_with_pool`]
+//!   preserve those two ownership modes while registering through
+//!   `LocalSystem`.
 //!
 //! # Tina caps vs SQLx pool caps
 //!
