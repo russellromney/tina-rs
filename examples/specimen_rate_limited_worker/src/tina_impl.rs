@@ -180,10 +180,10 @@ fn rate_per_sec() -> u64 {
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
 
     let worker = Worker {
         // burst 1 → one job, then pace at one per refill window.

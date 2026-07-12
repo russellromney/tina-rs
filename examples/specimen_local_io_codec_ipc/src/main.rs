@@ -18,7 +18,7 @@ fn main() -> anyhow::Result<()> {
             framed_keyspace::smoke(),
             framed_keyspace::bad_input_frame_too_large(),
         ],
-        "live-unix" => vec![live_unix_smoke::smoke()],
+        "live-unix" => vec![live_unix_smoke::smoke()?],
         "all" => vec![
             file_ingest::smoke(),
             file_ingest::bad_input_cap_reached(),
@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
             admin_socket::bad_input_line_too_long(),
             framed_keyspace::smoke(),
             framed_keyspace::bad_input_frame_too_large(),
-            live_unix_smoke::smoke(),
+            live_unix_smoke::smoke()?,
         ],
         other => anyhow::bail!(
             "unknown mode {other:?}; expected one of file-ingest | admin-socket | framed-keyspace | live-unix | all"

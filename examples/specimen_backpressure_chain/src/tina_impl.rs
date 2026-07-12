@@ -276,10 +276,10 @@ impl Driver {
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
 
     let c_addr = runtime
         .register_split_service::<ServiceC, CEvent, CRequest, Infallible>(ServiceC, 8)

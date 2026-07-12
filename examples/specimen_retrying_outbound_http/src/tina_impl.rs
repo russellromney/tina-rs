@@ -178,7 +178,7 @@ impl Caller {
 pub fn run() -> anyhow::Result<Report> {
     let upstream = spawn_flaky_upstream()?;
 
-    let runtime = Arc::new(ThreadedRuntime::with_config(
+    let runtime = Arc::new(ThreadedRuntime::try_with_config(
         SingleShard,
         DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
@@ -186,7 +186,7 @@ pub fn run() -> anyhow::Result<Report> {
             idle_wait: Duration::from_millis(1),
             ..Default::default()
         },
-    ));
+    )?);
 
     let bridge = ReqwestWorker::<SingleShard>::install(&runtime, ReqwestConfig::default())
         .map_err(|e| anyhow::anyhow!("install reqwest bridge: {e}"))?;

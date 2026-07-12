@@ -110,11 +110,11 @@ impl Caller {
     }
 }
 
-fn make_runtime() -> Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>> {
-    Arc::new(ThreadedRuntime::new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    ))
+fn make_runtime() -> anyhow::Result<Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>>
+{
+    ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)
+        .map(Arc::new)
+        .map_err(anyhow::Error::new)
 }
 
 fn install(
@@ -240,7 +240,7 @@ fn shutdown(runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFact
 /// [`tina_sqlite_bridge::SqliteError::Constraint`] with the underlying
 /// SQLite message preserved.
 pub fn demo_constraint() -> anyhow::Result<()> {
-    let runtime = make_runtime();
+    let runtime = make_runtime()?;
     let bridge = install(&runtime, SqliteConfig::memory());
 
     let _ = run_exec(
@@ -283,7 +283,7 @@ pub fn demo_constraint() -> anyhow::Result<()> {
 /// finishes a long query. Caller sees `SqliteError::Timeout`;
 /// metrics show `late_results` once the worker terminal lands.
 pub fn demo_timeout() -> anyhow::Result<()> {
-    let runtime = make_runtime();
+    let runtime = make_runtime()?;
     let cfg = SqliteConfig::memory()
         .with_default_timeout(Duration::from_millis(20))
         .with_poll_interval(Duration::from_millis(1));
@@ -322,7 +322,7 @@ pub fn demo_timeout() -> anyhow::Result<()> {
 /// Demo: a closed bridge replies `SqliteError::Closed` to new
 /// admissions.
 pub fn demo_closed() -> anyhow::Result<()> {
-    let runtime = make_runtime();
+    let runtime = make_runtime()?;
     let bridge = install(&runtime, SqliteConfig::memory());
 
     bridge.closer.close();
@@ -347,7 +347,7 @@ pub fn demo_closed() -> anyhow::Result<()> {
 /// `SqliteError::InvalidRequest` before the worker thread sees the
 /// request.
 pub fn demo_invalid() -> anyhow::Result<()> {
-    let runtime = make_runtime();
+    let runtime = make_runtime()?;
     let bridge = install(&runtime, SqliteConfig::memory().with_max_request_params(2));
 
     let outcome = run_exec(
@@ -379,7 +379,7 @@ pub fn demo_invalid() -> anyhow::Result<()> {
 /// violations are not retryable), and we print the classification
 /// chain so users see the shape.
 pub fn demo_retry() -> anyhow::Result<()> {
-    let runtime = make_runtime();
+    let runtime = make_runtime()?;
     let bridge = install(&runtime, SqliteConfig::memory());
 
     let _ = run_exec(

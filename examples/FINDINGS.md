@@ -11,6 +11,22 @@ valid; the long-form history lives in
 
 ## Active
 
+### 2026-07-11 Fallible production startup propagation
+
+Migrated every production-shaped example host from the panic convenience
+constructors to `ThreadedRuntime::try_*` or `LocalSystem::try_build`, preserving
+`StartupError` and its source chain through the host's existing error return.
+Public server/demo helpers that previously returned an initialized host or
+panicked now return `Result`; test-only fixtures unwrap explicitly at the test
+boundary. `scripts/examples_startup_api_guard.sh`, wired into `verify-guards`,
+prevents the infallible constructors from returning to production example
+sources.
+
+**Still open:** this closes panic-on-startup behavior, not the broader
+`LocalSystem` host-facade migration. Raw `ThreadedRuntime::try_*` hosts remain
+the next applied-ergonomics probe; bridge-heavy examples should expose whether
+`LocalSystem::into_threaded_runtime` is sufficient or a facade API is missing.
+
 ### 2026-07-12 Remaining raw Isolate → macro (rooms / fanout / grpc / mini_saas)
 
 Converted the last hand-rolled `impl Isolate` / `isolate_types!` blocks:

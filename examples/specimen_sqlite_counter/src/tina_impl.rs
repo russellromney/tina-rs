@@ -25,10 +25,10 @@ pub fn run() -> anyhow::Result<Report> {
     let path: PathBuf = dir.path().join("counter-tina.sqlite");
     seed_database(&path)?;
 
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
 
     let cfg = SqliteConfig::path(&path)
         .with_default_timeout(Duration::from_secs(5))

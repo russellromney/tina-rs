@@ -226,10 +226,10 @@ impl Gateway {
 /// `ThreadedRuntime`, drive real concurrent callers through it, prove
 /// progress and a clean shutdown, then report what actually happened.
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
     let scope =
         SharedCapacityScope::new("copied_service_path.in_flight", "requests", config.capacity);
     // "Recovered" state seeded before the isolate accepts traffic — the

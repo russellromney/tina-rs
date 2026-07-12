@@ -232,7 +232,7 @@ impl Driver {
 // --- Run ------------------------------------------------------------------
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
 
     let mut workers = Vec::with_capacity(WORKERS);
     for w in 0..WORKERS as u64 {

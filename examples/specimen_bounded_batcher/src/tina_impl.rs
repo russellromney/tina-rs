@@ -179,7 +179,7 @@ impl Driver {
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
 
     let size_flushes = Arc::new(AtomicUsize::new(0));
     let timer_flushes = Arc::new(AtomicUsize::new(0));

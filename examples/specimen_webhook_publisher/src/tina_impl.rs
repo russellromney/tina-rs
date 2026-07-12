@@ -163,11 +163,10 @@ fn check_flat(result: &Result<ReqwestResponse, ReqwestCallError>) {
     }
 }
 
-pub fn run() -> Report {
-    let runtime = Arc::new(ThreadedRuntime::new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    ));
+pub fn run() -> anyhow::Result<Report> {
+    let runtime = Arc::new(
+        ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?,
+    );
 
     let webhook = WebhookServer::spawn();
     let url = webhook.url();
@@ -207,5 +206,5 @@ pub fn run() -> Report {
     if let Ok(rt) = Arc::try_unwrap(runtime) {
         let _ = rt.shutdown();
     }
-    Report { bodies }
+    Ok(Report { bodies })
 }

@@ -211,7 +211,7 @@ impl Listener {
 // -------------------------------------------------------------------
 
 pub fn run(config: RunConfig) -> anyhow::Result<Report> {
-    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
 
     let slow_client = runtime
         .register_with_capacity::<_, Infallible>(SlowClient, config.slow_consumer_capacity)

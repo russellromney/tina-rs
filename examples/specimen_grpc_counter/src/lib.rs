@@ -354,7 +354,7 @@ impl StreamingEchoSourcePool {
 }
 
 pub fn start_server() -> Result<SpecimenServer, String> {
-    let runtime = ThreadedRuntime::with_config(
+    let runtime = ThreadedRuntime::try_with_config(
         SpecimenShard,
         DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
@@ -362,7 +362,7 @@ pub fn start_server() -> Result<SpecimenServer, String> {
             idle_wait: Duration::from_millis(1),
             ..Default::default()
         },
-    );
+    ).map_err(|e| format!("start runtime: {e:?}"))?;
 
     let state = Arc::new(Mutex::new(0_u64));
     let router_state = Arc::clone(&state);

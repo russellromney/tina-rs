@@ -303,10 +303,10 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
 }
 
 pub fn run_single_flight(config: RunConfig) -> anyhow::Result<SingleFlightReport> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
     let cache = register_cache(&runtime, config)?;
 
     let barrier = Arc::new(Barrier::new(config.callers + 1));
@@ -377,10 +377,10 @@ pub fn run_single_flight(config: RunConfig) -> anyhow::Result<SingleFlightReport
 }
 
 pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalidationReport> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
     let cache = register_cache(&runtime, config)?;
     let timeout = Duration::from_millis(config.call_timeout_ms);
 

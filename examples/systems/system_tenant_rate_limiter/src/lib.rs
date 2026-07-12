@@ -204,10 +204,10 @@ pub struct RunReport {
 
 /// Drive the specimen with `config`.
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
 
     let rate = RateLimit::<TenantId>::new(
         "tenant.rate",

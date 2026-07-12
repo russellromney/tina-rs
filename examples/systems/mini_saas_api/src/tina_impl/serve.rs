@@ -181,7 +181,7 @@ impl ServiceInstance {
         let db_path = dir.path().join("mini-saas.sqlite");
         seed_db(&db_path)?;
 
-        let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+        let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
         let sqlite = SqliteWorker::<SingleShard>::install(
             &runtime,
             SqliteConfig::path(&db_path)

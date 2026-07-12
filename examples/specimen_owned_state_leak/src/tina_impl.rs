@@ -27,7 +27,7 @@ pub mod compile_fail {
     /// }
     ///
     /// fn _smuggle() {
-    ///     let r = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    ///     let r = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory).unwrap();
     ///     let a = r.register_with_capacity::<_, Infallible>(I, 1).unwrap();
     ///     let _ = r.try_send(a, Msg::Leak(Rc::new(RefCell::new(0))));
     /// }
@@ -141,10 +141,10 @@ impl Writer {
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
 
     let shared = Arc::new(Mutex::new(0u64));
     let writer = runtime

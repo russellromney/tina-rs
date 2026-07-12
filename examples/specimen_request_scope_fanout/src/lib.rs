@@ -227,10 +227,10 @@ impl Driver {
 
 /// Runs the specimen end-to-end against a live threaded runtime.
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
 
     let mut workers = Vec::with_capacity(FANOUT as usize);
     for _ in 0..FANOUT {

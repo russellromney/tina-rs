@@ -81,7 +81,7 @@ pub fn run() -> anyhow::Result<Report> {
         identity_bundle.private_key_der.clone(),
     );
 
-    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
 
     let counter = runtime
         .register_with_capacity::<_, Infallible>(Counter::default(), 16)

@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+anyhow = "1"
 tina = { path = "../../tina" }
 tina-http = { path = "../../tina-http" }
 tina-runtime = { path = "../../tina-runtime" }

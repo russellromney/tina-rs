@@ -3,8 +3,11 @@
 //!
 //! What this specimen pulls on:
 //!
-//! - `tina_runtime::ThreadedRuntime::with_config_and_trace_observer` to
-//!   wire a live trace observer before the first event.
+//! - `tina_runtime::ThreadedRuntime::try_with_config_and_trace_observer` to
+//!   fallibly start the worker and wire a live trace observer before the first
+//!   event.
+//!   `LocalSystemBuilder::trace_observer(...).try_build()` already supports
+//!   this shape; migrating this example to that facade remains follow-up work.
 //! - [`tina_proof_harness::LiveTrace`] to capture the live trace shape
 //!   (event count + `stable_trace_hash`).
 //! - [`tina_sim::dst::capture_overload_run`] /
@@ -364,7 +367,7 @@ fn run_captured_case(
 pub fn run() -> anyhow::Result<BugboxReport> {
     // 1) Live capture. ThreadedRuntime + LiveTrace observer.
     let live_trace = LiveTrace::new();
-    let runtime = ThreadedRuntime::with_config_and_trace_observer(
+    let runtime = ThreadedRuntime::try_with_config_and_trace_observer(
         SingleShard,
         DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
@@ -373,7 +376,7 @@ pub fn run() -> anyhow::Result<BugboxReport> {
             ..Default::default()
         },
         live_trace.observer(),
-    );
+    )?;
     let live_received = Arc::new(Mutex::new(Vec::<u32>::new()));
     let sink = runtime
         .register_with_capacity::<_, Infallible>(

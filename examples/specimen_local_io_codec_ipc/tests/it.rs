@@ -64,6 +64,6 @@ fn framed_keyspace_rejects_oversize_frame() {
 /// platform, so this fails closed if the live rail regresses.
 #[test]
 fn live_unix_smoke_runs_on_this_platform() {
-    let report = live_unix_smoke::smoke();
+    let report = live_unix_smoke::smoke().expect("run live Unix smoke");
     assert!(report.ok, "live unix smoke failed: {report:?}");
 }

@@ -189,10 +189,10 @@ impl Driver {
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
 
     let pool: WorkerPool<Resource, SingleShard> =
         WorkerPool::new(PoolConfig::new(1, WAITERS), vec![1]);

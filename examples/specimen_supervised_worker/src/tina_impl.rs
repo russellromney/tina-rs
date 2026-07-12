@@ -98,7 +98,7 @@ pub fn run() -> anyhow::Result<Report> {
     let poison_count = script.iter().filter(|j| matches!(j, Job::Poison)).count() as u32;
     let work_count = script.iter().filter(|j| matches!(j, Job::Work(_))).count() as u32;
 
-    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
     let slot = Arc::new(WorkerSlot::default());
 
     let parent = runtime

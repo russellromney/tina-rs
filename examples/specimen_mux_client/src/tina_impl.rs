@@ -108,7 +108,7 @@ pub fn run() -> anyhow::Result<Report> {
     });
     let target = server_addr_rx.recv()?;
 
-    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
     let address = runtime
         .register_with_capacity::<_, Infallible>(
             MuxClient {

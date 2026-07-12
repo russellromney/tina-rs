@@ -4,8 +4,9 @@ Live capture → sim replay → shrink, in one specimen.
 
 ## What this pulls on
 
-- `tina_runtime::ThreadedRuntime::with_config_and_trace_observer` to
-  wire a live trace observer before the first event.
+- `tina_runtime::ThreadedRuntime::try_with_config_and_trace_observer` to
+  fallibly start the worker and wire a live trace observer before the first
+  event.
 - `tina_proof_harness::LiveTrace` to capture the live trace shape
   (event count + `stable_trace_hash`).
 - `tina_sim::dst::capture_overload_run`, `save_overload_bug`,
@@ -112,7 +113,7 @@ want to compare only protocol behaviour rather than full trace shape.
 ## Findings
 
 What felt good:
-- `LiveTrace::new()` → `observer()` → `with_config_and_trace_observer`
+- `LiveTrace::new()` → `observer()` → `try_with_config_and_trace_observer`
   is a one-line "wire the live trace" — no `Arc<Mutex<_>>` plumbing.
 - `assert_replay_case` panics with the full case history, the
   expected vs actual count + hash, and the next review step — enough
@@ -132,7 +133,7 @@ What felt rough:
   keep one alphabet on purpose.
 
 Tina capability pulled:
-- `tina_runtime::TraceObserver`, `with_config_and_trace_observer`,
+- `tina_runtime::TraceObserver`, `try_with_config_and_trace_observer`,
   `stable_trace_hash`.
 - `tina_sim::dst::ReplayCase`, `assert_replay_case`,
   `discover_constants`, `capture_overload_run`, `replay_overload_bug`,
@@ -145,8 +146,10 @@ Suggested follow-up:
   specimen wants to ignore RuntimeEventKind variants it does not
   care about (e.g., when a service-shaped specimen wants to compare
   only handler-started/handler-finished pairs across live/sim).
-- Consider promoting the `with_config_and_trace_observer` setup into
-  a builder shortcut on `LocalSystemBuilder`-shaped helpers.
+- The live path still uses `ThreadedRuntime` directly even though
+  `LocalSystemBuilder::trace_observer(...).try_build()` already provides the
+  fallible facade form. This example is pending that `LocalSystem` migration;
+  it is not evidence of a missing framework helper.
 
 Verdict:
 - keep. The user-proof gate "live capture → save → replay → shrink"

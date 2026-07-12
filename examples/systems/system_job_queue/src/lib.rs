@@ -614,7 +614,10 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
 }
 
 pub fn run_overflow(config: RunConfig) -> anyhow::Result<OverflowReport> {
-    let runtime = Arc::new(ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory));
+    let runtime = Arc::new(ThreadedRuntime::try_new(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+    )?);
     let queue = register_queue(&runtime, config)?;
     // Admission cap is `workers`. Burst beyond it.
     let cap = config.workers;
@@ -660,7 +663,10 @@ pub fn run_cancel_in_flight(config: RunConfig) -> anyhow::Result<CancelInFlightR
     // Long-running job so cancel reliably lands first.
     let mut config = config;
     config.job_sleep_ms = config.job_sleep_ms.max(150);
-    let runtime = Arc::new(ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory));
+    let runtime = Arc::new(ThreadedRuntime::try_new(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+    )?);
     let queue = register_queue(&runtime, config)?;
     let timeout = Duration::from_millis(config.call_timeout_ms);
 
@@ -693,7 +699,10 @@ pub fn run_cancel_in_flight(config: RunConfig) -> anyhow::Result<CancelInFlightR
 }
 
 pub fn run_poison_crash(config: RunConfig) -> anyhow::Result<PoisonCrashReport> {
-    let runtime = Arc::new(ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory));
+    let runtime = Arc::new(ThreadedRuntime::try_new(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+    )?);
     let queue = register_queue(&runtime, config)?;
     let timeout = Duration::from_millis(config.call_timeout_ms);
 
@@ -715,7 +724,10 @@ pub fn run_poison_crash(config: RunConfig) -> anyhow::Result<PoisonCrashReport> 
 }
 
 pub fn run_respawn_then_admit(config: RunConfig) -> anyhow::Result<RespawnThenAdmitReport> {
-    let runtime = Arc::new(ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory));
+    let runtime = Arc::new(ThreadedRuntime::try_new(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+    )?);
     let queue = register_queue(&runtime, config)?;
     let timeout = Duration::from_millis(config.call_timeout_ms);
 

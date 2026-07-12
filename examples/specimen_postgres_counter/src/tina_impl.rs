@@ -18,10 +18,10 @@ use crate::{INCREMENTS, Report, unique_table};
 const SQL_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn run(url: &str) -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
 
     let cfg = PgConfig::new()
         .with_pool(

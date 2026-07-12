@@ -233,7 +233,7 @@ fn run_phase(
     increments: u64,
     take_snapshot: bool,
 ) -> anyhow::Result<PhaseReport> {
-    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
     let observation = Arc::new(Observation::default());
     let counter = runtime
         .register_with_capacity::<_, Infallible>(

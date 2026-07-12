@@ -290,13 +290,19 @@ fn new_runtime(observer: Option<Arc<dyn TraceObserver>>) -> Runtime {
         config.idle_repoll_interval = Duration::from_micros(us.max(1));
     }
     match observer {
-        Some(observer) => ThreadedRuntime::with_config_and_trace_observer(
+        Some(observer) => ThreadedRuntime::try_with_config_and_trace_observer(
             SingleShard,
             DefaultThreadedMailboxFactory,
             config,
             observer,
-        ),
-        None => ThreadedRuntime::with_config(SingleShard, DefaultThreadedMailboxFactory, config),
+        )
+        .expect("start observed runtime"),
+        None => ThreadedRuntime::try_with_config(
+            SingleShard,
+            DefaultThreadedMailboxFactory,
+            config,
+        )
+        .expect("start runtime"),
     }
 }
 

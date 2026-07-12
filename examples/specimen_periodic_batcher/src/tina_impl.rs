@@ -111,10 +111,10 @@ impl Batcher {
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::new(
+    let runtime = Arc::new(ThreadedRuntime::try_new(
         SingleShard,
         DefaultThreadedMailboxFactory,
-    ));
+    )?);
 
     let batcher = Batcher {
         interval: RecurringTick::every(Duration::from_millis(BATCH_INTERVAL_MS))

@@ -7,5 +7,5 @@ fn tokio_side_records_three_increments() {
 
 #[test]
 fn tina_side_records_three_increments() {
-    tina_impl::run().assert_expected();
+    tina_impl::run().expect("run Tina specimen").assert_expected();
 }

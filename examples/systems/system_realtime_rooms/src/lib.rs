@@ -628,10 +628,10 @@ pub struct RoomServer {
 }
 
 impl RoomServer {
-    pub fn start(config: RunConfig) -> Self {
+    pub fn start(config: RunConfig) -> anyhow::Result<Self> {
         let report = Arc::new(SharedReport::default());
         report.update(|s| s.member_capacity = config.member_capacity);
-        let runtime = ThreadedRuntime::with_config(
+        let runtime = ThreadedRuntime::try_with_config(
             RoomShard,
             DefaultThreadedMailboxFactory,
             ThreadedRuntimeConfig {
@@ -639,7 +639,7 @@ impl RoomServer {
                 idle_wait: Duration::from_millis(1),
                 ..Default::default()
             },
-        );
+        )?;
 
         let limits = WebSocketLimits {
             max_queued_outbound_bytes: config.max_queued_outbound_bytes,
@@ -664,7 +664,7 @@ impl RoomServer {
                 WebSocketSessionMsg::AppControl(WebSocketSessionControl::Start),
             )
             .map(tina_runtime::ServiceHandle::from_address)
-            .expect("register room");
+            .map_err(|error| anyhow::anyhow!("register room: {error:?}"))?;
 
         let gateway = runtime
             .register_service::<Gateway, Infallible>(
@@ -675,7 +675,7 @@ impl RoomServer {
                 },
                 config.gateway_mailbox_capacity,
             )
-            .expect("register gateway");
+            .map_err(|error| anyhow::anyhow!("register gateway: {error:?}"))?;
 
         let listener_isolate = HttpListener::<RoomShard>::new(
             "127.0.0.1:0".parse().unwrap(),
@@ -693,21 +693,23 @@ impl RoomServer {
                 listener_isolate,
                 config.listener_mailbox_capacity,
             )
-            .expect("register listener");
+            .map_err(|error| anyhow::anyhow!("register listener: {error:?}"))?;
 
         let bound = runtime.observe_next_bound();
         runtime
             .try_send(listener, HttpListenerMsg::Start)
-            .expect("start listener");
-        let addr = bound.wait(Duration::from_secs(2)).expect("bound address");
+            .map_err(|error| anyhow::anyhow!("start listener: {error:?}"))?;
+        let addr = bound
+            .wait(Duration::from_secs(2))
+            .map_err(|error| anyhow::anyhow!("wait for listener bind: {error:?}"))?;
 
-        Self {
+        Ok(Self {
             addr,
             runtime,
             listener,
             room,
             report,
-        }
+        })
     }
 
     pub fn addr(&self) -> std::net::SocketAddr {
@@ -757,7 +759,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
 
 pub fn run_join_and_tick(config: RunConfig) -> anyhow::Result<JoinAndTickReport> {
     use test_client::RecvOutcome;
-    let server = RoomServer::start(config);
+    let server = RoomServer::start(config)?;
     let addr = server.addr();
 
     // Two real WebSocket clients connect to the same room. Each drains on
@@ -820,7 +822,7 @@ pub fn run_overflow(config: RunConfig) -> anyhow::Result<OverflowReport> {
     // Pin the cap small so overflow is deterministic.
     config.member_capacity = 2;
 
-    let server = RoomServer::start(config);
+    let server = RoomServer::start(config)?;
     let addr = server.addr();
     let mut keep = Vec::new();
     let mut admitted = 0usize;
@@ -858,7 +860,7 @@ pub fn run_overflow(config: RunConfig) -> anyhow::Result<OverflowReport> {
 }
 
 pub fn run_shutdown(config: RunConfig) -> anyhow::Result<ShutdownReport> {
-    let server = RoomServer::start(config);
+    let server = RoomServer::start(config)?;
     let addr = server.addr();
     let mut a = test_client::connect(addr)?;
     let mut b = test_client::connect(addr)?;
