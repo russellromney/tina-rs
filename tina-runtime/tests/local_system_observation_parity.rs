@@ -304,6 +304,7 @@ fn local_system_child_restart_waiter_reports_replacement_truth() {
     let parent = app
         .register_root::<Parent, Infallible>(Parent, 8)
         .expect("register parent");
+    assert!(app.child_lifecycle_report(parent).is_ok());
     app.supervise(parent, supervisor_config())
         .expect("supervise parent");
     app.try_send(parent, ParentMsg::Spawn).expect("spawn child");
@@ -321,6 +322,28 @@ fn local_system_child_restart_waiter_reports_replacement_truth() {
         parent.isolate(),
         parent.generation(),
     );
+    assert_eq!(
+        app.child_lifecycle_report(stale_parent),
+        Err(ThreadedRuntimeError::ParentStopped)
+    );
+    assert_eq!(
+        app.child_lifecycle_report(foreign_parent),
+        Err(ThreadedRuntimeError::UnknownShard(foreign_parent.shard()))
+    );
+    let foreign = LocalSystem::single_shard(AppShard(5), DefaultThreadedMailboxFactory)
+        .try_build()
+        .expect("start foreign single-shard owner");
+    assert!(matches!(
+        foreign.child_lifecycle_report(parent),
+        Err(ThreadedRuntimeError::ForeignSystem { expected, actual })
+            if expected != actual && actual == parent.system()
+    ));
+    foreign
+        .shutdown_handle()
+        .request_and_wait_report(Duration::from_secs(2))
+        .expect("foreign runtime shutdown")
+        .ensure_clean()
+        .expect("clean foreign shutdown");
     let stale_waiter = app
         .observe_child_restarted(stale_parent)
         .expect("register restart observer");
@@ -375,10 +398,39 @@ fn local_multi_shard_child_restart_routes_and_rejects_foreign_owner() {
     let parent = app
         .register_root_on::<Parent, Infallible>(AppShard(20).id(), Parent, 8)
         .expect("register parent on second shard");
+    assert!(app.child_lifecycle_report(parent).is_ok());
     app.supervise(parent, supervisor_config())
         .expect("supervise parent");
     app.try_send(parent, ParentMsg::Spawn).expect("spawn child");
     let original = wait_for_spawn(|| app.trace());
+    assert_eq!(
+        app.child_lifecycle_report(parent)
+            .expect("report after child spawn")
+            .children
+            .len(),
+        1
+    );
+
+    let stale_parent = Address::<ParentMsg>::new_with_generation_in(
+        parent.system(),
+        parent.shard(),
+        parent.isolate(),
+        AddressGeneration::new(parent.generation().get() + 1),
+    );
+    let unknown_shard_parent = Address::<ParentMsg>::new_with_generation_in(
+        parent.system(),
+        AppShard(99).id(),
+        parent.isolate(),
+        parent.generation(),
+    );
+    assert_eq!(
+        app.child_lifecycle_report(stale_parent),
+        Err(ThreadedRuntimeError::ParentStopped)
+    );
+    assert_eq!(
+        app.child_lifecycle_report(unknown_shard_parent),
+        Err(ThreadedRuntimeError::UnknownShard(AppShard(99).id()))
+    );
 
     let waiter = app
         .observe_child_restarted(parent)
@@ -395,6 +447,11 @@ fn local_multi_shard_child_restart_routes_and_rejects_foreign_owner() {
         .expect("start foreign owner");
     assert!(matches!(
         foreign.observe_child_restarted(parent),
+        Err(ThreadedRuntimeError::ForeignSystem { expected, actual })
+            if expected != actual && actual == parent.system()
+    ));
+    assert!(matches!(
+        foreign.child_lifecycle_report(parent),
         Err(ThreadedRuntimeError::ForeignSystem { expected, actual })
             if expected != actual && actual == parent.system()
     ));

@@ -654,6 +654,94 @@ mod tests {
         marker: PhantomData<S>,
     }
 
+    #[test]
+    fn defensive_remote_harvest_rejects_foreign_system_before_coincident_delivery() {
+        let local_system = tina::SystemIncarnation::new(0x801);
+        let foreign_system = tina::SystemIncarnation::new(0x802);
+        let mut sim = Simulator::new(
+            NumberedShard(22),
+            SimulatorConfig {
+                system_incarnation: Some(local_system),
+                ..SimulatorConfig::default()
+            },
+        );
+        let sink = sim.register_with_mailbox_capacity::<
+            SimRemoteSink<NumberedShard>,
+            SimRemoteEvent,
+            Infallible,
+        >(
+                SimRemoteSink {
+                    marker: PhantomData,
+                },
+                4,
+            );
+
+        let terminal = sim.harvest_remote_send(QueuedRemoteSend {
+            send: ErasedSend {
+                target_system: foreign_system,
+                target_shard: sink.shard(),
+                target_isolate: sink.isolate(),
+                target_generation: sink.generation(),
+                message: Box::new(SimRemoteEvent::Arrived),
+            },
+            call_context: None,
+            cause: tina_runtime::CauseId::new(tina_runtime::EventId::new(1)),
+        });
+
+        assert!(
+            terminal.is_none(),
+            "ordinary send has no call reply envelope"
+        );
+        sim.run_until_quiescent();
+        assert!(sim.trace().iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::SendRejected {
+                    reason: SendRejectedReason::ForeignSystem { expected, actual },
+                    ..
+                } if expected == local_system && actual == foreign_system
+            )
+        }));
+        assert!(sim.trace().iter().all(|event| {
+            !(event.isolate() == sink.isolate()
+                && matches!(event.kind(), RuntimeEventKind::HandlerStarted))
+        }));
+
+        let requester = RegisteredAddress {
+            system: local_system,
+            shard: sink.shard(),
+            isolate: sink.isolate(),
+            generation: sink.generation(),
+        };
+        let terminal = sim.harvest_remote_send(QueuedRemoteSend {
+            send: ErasedSend {
+                target_system: foreign_system,
+                target_shard: sink.shard(),
+                target_isolate: sink.isolate(),
+                target_generation: sink.generation(),
+                message: Box::new(SimRemoteEvent::Arrived),
+            },
+            call_context: Some(MessageCallContext::Remote {
+                call_id: CallId::new(7),
+                requester,
+                cause: tina_runtime::CauseId::new(tina_runtime::EventId::new(2)),
+                expected_reply_type_id: std::any::TypeId::of::<()>(),
+            }),
+            cause: tina_runtime::CauseId::new(tina_runtime::EventId::new(2)),
+        });
+        assert!(matches!(
+            terminal,
+            Some(QueuedRemoteEnvelope::CallReply(reply))
+                if matches!(
+                    reply.reply,
+                    RemoteCallOutcome::Rejected(tina::CallRejectedReason::ForeignSystem {
+                        expected,
+                        actual,
+                    }) if expected == local_system && actual == foreign_system
+                )
+        ));
+    }
+
     #[derive(Debug)]
     struct SimShardLocalParent<S> {
         marker: PhantomData<S>,

@@ -1156,6 +1156,16 @@ where
         self.runtime().observe_child_restarted(parent)
     }
 
+    /// Returns the runtime-owned lifecycle report for direct children of
+    /// `parent`, preserving foreign-system, unknown-shard, and stale-parent
+    /// outcomes from [`ThreadedRuntime::child_lifecycle_report`].
+    pub fn child_lifecycle_report<M: 'static, R: 'static>(
+        &self,
+        parent: Address<M, R>,
+    ) -> Result<crate::ChildLifecycleReport, ThreadedRuntimeError> {
+        self.runtime().child_lifecycle_report(parent)
+    }
+
     /// Returns retained trace without failing the observability path.
     pub fn trace(&self) -> TraceSnapshot {
         self.runtime().trace()
@@ -1713,6 +1723,16 @@ where
         parent: Address<M, R>,
     ) -> Result<crate::ChildRestartedWaiter, ThreadedRuntimeError> {
         self.runtime().observe_child_restarted(parent)
+    }
+
+    /// Returns the runtime-owned lifecycle report for direct children of
+    /// `parent` on its owning shard, preserving typed provenance, routing,
+    /// and stale-parent outcomes.
+    pub fn child_lifecycle_report<M: 'static, R: 'static>(
+        &self,
+        parent: Address<M, R>,
+    ) -> Result<crate::ChildLifecycleReport, ThreadedRuntimeError> {
+        self.runtime().child_lifecycle_report(parent)
     }
 
     /// Attempts one bounded ingress handoff to the owning worker shard.

@@ -1,5 +1,6 @@
 use super::driver::{DriverCompletion, DriverResourceReport, DriverShutdownError, RuntimeDriver};
 use super::*;
+use crate::remote::{QueuedRemoteEnvelope, QueuedRemoteSend, RemoteCallOutcome};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -16,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tina::{
     Address, AddressGeneration, CallContext, Context, DeferredReply, Effect, Isolate, IsolateId,
-    Mailbox, Outbound, ShardId, TrySendError, batch, noop, send, spawn, stop,
+    Mailbox, Outbound, ShardId, SystemIncarnation, TrySendError, batch, noop, send, spawn, stop,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -2722,6 +2723,85 @@ fn cross_shard_unknown_isolate_rejects_on_destination_harvest() {
         })
         .collect();
     assert_eq!(destination_closed_rejections.len(), 1);
+}
+
+#[test]
+fn defensive_remote_harvest_rejects_foreign_system_before_coincident_delivery() {
+    let local_system = SystemIncarnation::new(0x701);
+    let foreign_system = SystemIncarnation::new(0x702);
+    let mut runtime =
+        Runtime::new(NumberedShard(22), TestMailboxFactory).with_system_incarnation(local_system);
+    let sink = runtime.register_with_capacity::<RemoteSink<NumberedShard>, NeverOutbound>(
+        RemoteSink {
+            marker: PhantomData,
+        },
+        4,
+    );
+
+    let terminal = runtime.harvest_remote_send(QueuedRemoteSend {
+        send: ErasedSend {
+            target_system: foreign_system,
+            target_shard: sink.shard(),
+            target_isolate: sink.isolate(),
+            target_generation: sink.generation(),
+            message: ErasedMessage::Local(Box::new(RemoteEvent::Arrived)),
+        },
+        call_context: None,
+        cause: CauseId::new(EventId::new(1)),
+    });
+
+    assert!(
+        terminal.is_none(),
+        "ordinary send has no call reply envelope"
+    );
+    runtime.step();
+    assert!(runtime.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::SendRejected {
+                reason: SendRejectedReason::ForeignSystem { expected, actual },
+                ..
+            } if expected == local_system && actual == foreign_system
+        )
+    }));
+    assert!(runtime.trace().iter().all(|event| {
+        !(event.isolate() == sink.isolate()
+            && matches!(event.kind(), RuntimeEventKind::HandlerStarted))
+    }));
+
+    let requester = RegisteredAddress {
+        system: local_system,
+        shard: sink.shard(),
+        isolate: sink.isolate(),
+        generation: sink.generation(),
+    };
+    let terminal = runtime.harvest_remote_send(QueuedRemoteSend {
+        send: ErasedSend {
+            target_system: foreign_system,
+            target_shard: sink.shard(),
+            target_isolate: sink.isolate(),
+            target_generation: sink.generation(),
+            message: ErasedMessage::Local(Box::new(RemoteEvent::Arrived)),
+        },
+        call_context: Some(MessageCallContext::Remote {
+            call_id: CallId::new(7),
+            requester,
+            cause: CauseId::new(EventId::new(2)),
+            expected_reply_type_id: std::any::TypeId::of::<()>(),
+        }),
+        cause: CauseId::new(EventId::new(2)),
+    });
+    assert!(matches!(
+        terminal,
+        Some(QueuedRemoteEnvelope::CallReply(reply))
+            if matches!(
+                reply.outcome,
+                RemoteCallOutcome::Rejected(tina::CallRejectedReason::ForeignSystem {
+                    expected,
+                    actual,
+                }) if expected == local_system && actual == foreign_system
+            )
+    ));
 }
 
 #[test]
