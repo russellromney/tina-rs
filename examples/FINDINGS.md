@@ -52,6 +52,30 @@ capability. It is a transparent alias, so it adds no conversion layer and does
 not weaken the separate event/request address rails. Runtime and compile-fail
 proofs use the public spelling, and the motivating batching migration can now
 contain no direct service-envelope vocabulary.
+### 2026-07-12 Debounced batch shared-work migration
+
+The `ergonomics_playground` batch probe now models the actual operation: many
+callers join one bounded batch. `SharedWork<BatchId, BatchReply>` replaces the
+monotonic qid, `PendingReplies`, `(qid, value)` sidecar rows, and manual drain
+correlation. One raw typed `flow!` step carries the batch id and exhaustive
+`SleepReply`; `TimerFull` is a distinct `TimerFailed(CallError)` reply rather
+than being collapsed into application `Full`.
+
+Adversarial review caught a second bound hidden by that simplification:
+`SharedWork` bounds live parked callers, while the batch values are accepted
+operations. A timed-out caller can be reclaimed before the window closes, so
+operation admission now checks the batch-value cap before parking authority.
+The regression proves timeout settlement, in-window overload, next-window
+refill, and exact terminal accounting; a live one-timer test proves real
+`TimerFull` classification rather than only testing the report classifier.
+
+The simulator client records and classifies every `CallOutcome` instead of
+discarding non-reply terminals. Drain closes every waiter, clears the active
+batch, and makes the physically armed late timer harmless. No batch-specific
+framework helper was added: `SharedWork::reply_all_clone` and
+`drain_all_with` already produce the smaller, honest application form. Its
+split-service declaration now uses `ServiceOutbound`, so the motivating
+example contains no direct service-envelope vocabulary.
 
 ### 2026-07-12 Request-aware raw flow prerequisite
 
