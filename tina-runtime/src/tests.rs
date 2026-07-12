@@ -4285,6 +4285,119 @@ fn shutdown_report_sums_counts_across_shards() {
     );
 }
 
+#[test]
+fn terminal_report_ensure_clean_accepts_only_clean_accounting() {
+    let topology = LiveTopologyReport::single(make_shard_report(
+        ShardId::new(0),
+        LiveShardState::Stopped,
+        0,
+        0,
+        0,
+    ));
+    let terminal = LocalSystemTerminalReport::new_with_topology(
+        LocalSystemState::Closed,
+        Vec::new(),
+        topology,
+    );
+    assert_eq!(terminal.ensure_clean(), Ok(()));
+}
+
+#[test]
+fn terminal_report_ensure_clean_preserves_every_unclean_category() {
+    let cases = [
+        (
+            LocalSystemState::Closed,
+            make_shard_report(ShardId::new(1), LiveShardState::Failed, 0, 0, 0),
+            ShutdownUncleanReason::FailedShards,
+        ),
+        (
+            LocalSystemState::Closing,
+            make_shard_report(ShardId::new(1), LiveShardState::Stopped, 0, 0, 0),
+            ShutdownUncleanReason::NotClosed,
+        ),
+        (
+            LocalSystemState::Closed,
+            make_shard_report(ShardId::new(1), LiveShardState::Stopped, 0, 2, 0),
+            ShutdownUncleanReason::WorkerHeldResourcesRemaining,
+        ),
+        (
+            LocalSystemState::Closed,
+            make_shard_report(ShardId::new(1), LiveShardState::Stopped, 0, 0, 3),
+            ShutdownUncleanReason::PendingDriverCallsRemaining,
+        ),
+        (
+            LocalSystemState::Closed,
+            make_shard_report(ShardId::new(1), LiveShardState::Stopped, 4, 0, 0),
+            ShutdownUncleanReason::OwnedResourcesRemaining,
+        ),
+    ];
+
+    for (state, shard, expected) in cases {
+        let terminal = LocalSystemTerminalReport::new_with_topology(
+            state,
+            Vec::new(),
+            LiveTopologyReport::single(shard),
+        );
+        let error = terminal
+            .ensure_clean()
+            .expect_err("unclean terminal report");
+        assert_eq!(error.report().unclean_reason(), Some(expected));
+        assert!(std::error::Error::source(&error).is_none());
+    }
+}
+
+#[test]
+fn unclean_shutdown_error_keeps_full_accounting_source_clone_and_display() {
+    let topology = LiveTopologyReport::single(make_shard_report(
+        ShardId::new(9),
+        LiveShardState::Failed,
+        4,
+        2,
+        3,
+    ));
+    let terminal = LocalSystemTerminalReport::failed_with_topology(
+        ThreadedRuntimeError::DriverShutdownFailed,
+        topology,
+    );
+    let error = terminal.ensure_clean().expect_err("failed terminal report");
+    assert_eq!(
+        error.report().unclean_reasons(),
+        &[
+            ShutdownUncleanReason::RuntimeError(ThreadedRuntimeError::DriverShutdownFailed),
+            ShutdownUncleanReason::FailedShards,
+            ShutdownUncleanReason::NotClosed,
+            ShutdownUncleanReason::WorkerHeldResourcesRemaining,
+            ShutdownUncleanReason::PendingDriverCallsRemaining,
+            ShutdownUncleanReason::OwnedResourcesRemaining,
+        ]
+    );
+    assert_eq!(error.report().failed_shards(), &[ShardId::new(9)]);
+    assert_eq!(error.report().remaining_owned_resource_count(), 4);
+    assert_eq!(error.report().remaining_worker_held_resource_count(), 2);
+    assert_eq!(error.report().remaining_pending_driver_call_count(), 3);
+    assert!(
+        std::error::Error::source(&error)
+            .expect("runtime source")
+            .to_string()
+            .contains("driver shutdown")
+    );
+    assert_eq!(error.clone(), error);
+
+    let display = error.to_string();
+    assert!(display.contains("final_state=Failed"), "{display}");
+    assert!(display.contains("DriverShutdownFailed"), "{display}");
+    assert!(display.contains("failed_shards=[ShardId(9)]"), "{display}");
+    assert!(display.contains("remaining_owned=4"), "{display}");
+    assert!(display.contains("remaining_worker_held=2"), "{display}");
+    assert!(
+        display.contains("remaining_pending_driver_calls=3"),
+        "{display}"
+    );
+    assert!(display.contains("canceled=0"), "{display}");
+    assert!(display.contains("tombstoned=0"), "{display}");
+    assert!(display.contains("rejected_after_drain=0"), "{display}");
+}
+
 // Blessed default mailbox factories. The single-thread
 // default (`DefaultMailboxFactory`) and the threaded variant
 // (`DefaultThreadedMailboxFactory`) each have to honor the explicit

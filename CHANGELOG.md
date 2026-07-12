@@ -4,6 +4,12 @@ This file records completed work.
 
 ## Unreleased
 
+### Typed clean-shutdown check
+
+- Added `LocalSystemTerminalReport::ensure_clean` and
+  `UncleanShutdownError`, preserving the full shutdown accounting when a
+  successfully observed terminal report still proves failed or leaked work.
+
 ### Bounded shared-runtime shutdown
 
 - Added `ThreadedShutdownHandle::request_and_wait_report`, which retries
