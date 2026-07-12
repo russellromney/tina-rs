@@ -200,43 +200,33 @@ where
         Msg: 'static,
         Outbound: 'static,
     {
-        let isolate_id = IsolateId::new(self.next_isolate_id);
-        self.next_isolate_id += 1;
-        let generation = AddressGeneration::new(0);
-        let inbox = LocalInbox::new(mailbox_capacity);
         let boxed: Box<dyn Any> = Box::new(bootstrap);
-        if let Err(error) = inbox.push(boxed, self.step_ordinal, None) {
-            let recover = |message: Box<dyn Any>| {
-                *message
-                    .downcast::<Msg>()
-                    .expect("bootstrap message type recovered from boxed Any")
-            };
-            return Err(match error {
-                TrySendError::Full(message) => {
-                    tina_runtime::RegisterBootstrapError::Full(recover(message))
-                }
-                TrySendError::Closed(message) => {
-                    tina_runtime::RegisterBootstrapError::Closed(recover(message))
-                }
-            });
-        }
-
-        self.entries.push(RegisteredEntry {
-            id: isolate_id,
-            generation,
-            parent: None,
-            stopped: Cell::new(false),
-            stopped_event: Cell::new(None),
-            inbox,
-            handler: RefCell::new(Box::new(HandlerAdapter::<I, Outbound> {
+        let address = self
+            .register_entry_prefilled::<I, Msg, Outbound>(
                 isolate,
-                marker: PhantomData,
-            })),
-        });
+                None,
+                mailbox_capacity,
+                Some(boxed),
+            )
+            .map_err(|error| {
+                let recover = |message: Box<dyn Any>| {
+                    *message
+                        .downcast::<Msg>()
+                        .expect("bootstrap message type recovered from boxed Any")
+                };
+                match error {
+                    TrySendError::Full(message) => {
+                        tina_runtime::RegisterBootstrapError::Full(recover(message))
+                    }
+                    TrySendError::Closed(message) => {
+                        tina_runtime::RegisterBootstrapError::Closed(recover(message))
+                    }
+                }
+            })?;
         Ok(Address::new_with_generation(
-            self.shard.id(),
-            isolate_id,
-            generation,
+            address.shard,
+            address.isolate,
+            address.generation,
         ))
     }
 
@@ -1382,16 +1372,42 @@ where
         Msg: 'static,
         Outbound: 'static,
     {
+        self.register_entry_prefilled::<I, Msg, Outbound>(isolate, parent, mailbox_capacity, None)
+            .expect("registration without a prefill cannot be refused")
+    }
+
+    fn register_entry_prefilled<I, Msg, Outbound>(
+        &mut self,
+        isolate: I,
+        parent: Option<IsolateId>,
+        mailbox_capacity: usize,
+        prefill: Option<Box<dyn Any>>,
+    ) -> Result<RegisteredAddress, TrySendError<Box<dyn Any>>>
+    where
+        I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
+            + 'static,
+        I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
+        I::Reply: 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
+        Msg: 'static,
+        Outbound: 'static,
+    {
         let isolate_id = IsolateId::new(self.next_isolate_id);
         self.next_isolate_id += 1;
         let generation = AddressGeneration::new(0);
+        let inbox = LocalInbox::new(mailbox_capacity);
+        if let Some(message) = prefill {
+            inbox.push(message, self.step_ordinal, None)?;
+        }
         self.entries.push(RegisteredEntry {
             id: isolate_id,
             generation,
             parent,
             stopped: Cell::new(false),
             stopped_event: Cell::new(None),
-            inbox: LocalInbox::new(mailbox_capacity),
+            inbox,
             handler: RefCell::new(Box::new(HandlerAdapter::<I, Outbound> {
                 isolate,
                 system_incarnation: self.system_incarnation,
@@ -1399,12 +1415,12 @@ where
             })),
         });
 
-        RegisteredAddress {
+        Ok(RegisteredAddress {
             system: self.system_incarnation,
             shard: self.shard.id(),
             isolate: isolate_id,
             generation,
-        }
+        })
     }
 
     /// Registers a child for `spawn_observed(...).on_shard(owner_or_other)`.

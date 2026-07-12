@@ -4,6 +4,7 @@ use std::cell::Cell;
 use std::convert::Infallible;
 use std::rc::Rc;
 
+use tina::TrySendError;
 use tina::prelude::*;
 use tina_runtime::RegisterBootstrapError;
 use tina_sim::{MultiShardSimulator, Simulator, SimulatorConfig};
@@ -29,6 +30,7 @@ impl Drop for DropProbe {
 #[derive(Debug)]
 enum Msg {
     Bootstrap(DropProbe),
+    Inspect,
 }
 
 struct Service {
@@ -54,6 +56,7 @@ impl Service {
                 self.delivered.set(self.delivered.get() + 1);
                 noop()
             }
+            Msg::Inspect => noop(),
         }
     }
 }
@@ -76,7 +79,7 @@ fn simulator_bootstrap_is_admitted_before_address_publication() {
     let mut simulator = Simulator::new(TestShard(1), SimulatorConfig::default());
     let (service, delivered, service_drops) = fresh_service();
     let message_drops = Rc::new(Cell::new(0));
-    let _address = simulator
+    let address = simulator
         .register_with_capacity_and_bootstrap::<Service, Msg, Infallible>(
             service,
             1,
@@ -84,12 +87,47 @@ fn simulator_bootstrap_is_admitted_before_address_publication() {
         )
         .expect("bootstrap admitted");
 
+    assert!(matches!(
+        simulator.try_send(address, Msg::Inspect),
+        Err(TrySendError::Full(Msg::Inspect))
+    ));
     assert!(simulator.trace().is_empty());
     simulator.run_until_quiescent();
     assert_eq!(delivered.get(), 1);
     assert_eq!(message_drops.get(), 1);
     drop(simulator);
     assert_eq!(service_drops.get(), 1);
+}
+
+#[test]
+fn simulator_bootstrap_registration_replays_identity_and_trace_exactly() {
+    fn run() -> (IsolateId, tina_sim::ReplayArtifact) {
+        let mut simulator = Simulator::new(TestShard(3), SimulatorConfig::default());
+        let (refused_service, _, _) = fresh_service();
+        let refused = simulator.register_with_capacity_and_bootstrap::<Service, Msg, Infallible>(
+            refused_service,
+            0,
+            Msg::Bootstrap(DropProbe(Rc::new(Cell::new(0)))),
+        );
+        assert!(matches!(refused, Err(RegisterBootstrapError::Full(_))));
+
+        let (service, _, _) = fresh_service();
+        let address = simulator
+            .register_with_capacity_and_bootstrap::<Service, Msg, Infallible>(
+                service,
+                1,
+                Msg::Bootstrap(DropProbe(Rc::new(Cell::new(0)))),
+            )
+            .expect("bootstrap admitted after deterministic refused identity");
+        simulator.run_until_quiescent();
+        (address.isolate(), simulator.replay_artifact())
+    }
+
+    let first = run();
+    let replay = run();
+    assert_eq!(first.0, IsolateId::new(2));
+    assert_eq!(replay.0, first.0);
+    assert_eq!(replay.1, first.1);
 }
 
 #[test]
