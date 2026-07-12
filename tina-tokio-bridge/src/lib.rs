@@ -138,6 +138,7 @@ const TRACE_TARGET_BRIDGE: &str = "tina_tokio.bridge";
 #[cfg(feature = "tracing")]
 fn bridge_error_reason(error: BridgeError) -> &'static str {
     match error {
+        BridgeError::ForeignSystem { .. } => "ForeignSystem",
         BridgeError::UnknownShard(_) => "UnknownShard",
         BridgeError::Full => "Full",
         BridgeError::Closed => "Closed",
@@ -148,6 +149,13 @@ fn bridge_error_reason(error: BridgeError) -> &'static str {
 /// Error returned by a Tokio-to-Tina bridge call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BridgeError {
+    /// The target address belongs to another runtime/system incarnation.
+    ForeignSystem {
+        /// Incarnation owned by the routing runtime.
+        expected: tina::SystemIncarnation,
+        /// Incarnation carried by the target.
+        actual: tina::SystemIncarnation,
+    },
     /// The target address belongs to a shard outside this runtime topology.
     UnknownShard(ShardId),
     /// The bounded Tina worker ingress queue is full.
@@ -161,6 +169,12 @@ pub enum BridgeError {
 impl std::fmt::Display for BridgeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ForeignSystem { expected, actual } => write!(
+                f,
+                "tina bridge: target system {} does not match runtime system {}",
+                actual.get(),
+                expected.get()
+            ),
             Self::UnknownShard(shard) => {
                 write!(f, "tina bridge: unknown target shard {}", shard.get())
             }
@@ -177,6 +191,9 @@ impl BridgeError {
     /// Converts only the bridge errors that are true send-rejection reasons.
     pub fn send_rejected_reason(self) -> Option<SendRejectedReason> {
         match self {
+            Self::ForeignSystem { expected, actual } => {
+                Some(SendRejectedReason::ForeignSystem { expected, actual })
+            }
             Self::UnknownShard(_) => None,
             Self::Full => Some(SendRejectedReason::Full),
             Self::Closed => Some(SendRejectedReason::Closed),
@@ -191,6 +208,16 @@ mod tests {
 
     #[test]
     fn bridge_error_send_rejection_mapping_keeps_timeout_distinct() {
+        let expected = tina::SystemIncarnation::new(10);
+        let actual = tina::SystemIncarnation::new(11);
+        assert_eq!(
+            BridgeError::ForeignSystem { expected, actual }.send_rejected_reason(),
+            Some(SendRejectedReason::ForeignSystem { expected, actual })
+        );
+        assert_eq!(
+            CallError::from(BridgeError::ForeignSystem { expected, actual }),
+            CallError::Rejected(tina::CallRejectedReason::ForeignSystem { expected, actual })
+        );
         assert_eq!(
             BridgeError::Full.send_rejected_reason(),
             Some(SendRejectedReason::Full)
@@ -219,6 +246,23 @@ mod tests {
 
         let metrics = state.metrics.snapshot();
         assert_eq!(metrics.unknown_shard, 1);
+        assert_eq!(metrics.closed, 0);
+        assert_eq!(metrics.full, 0);
+        assert_eq!(metrics.timeout, 0);
+    }
+
+    #[test]
+    fn foreign_system_has_a_distinct_metrics_bucket() {
+        let state = BridgeState::default();
+
+        state.record_error(BridgeError::ForeignSystem {
+            expected: tina::SystemIncarnation::new(10),
+            actual: tina::SystemIncarnation::new(11),
+        });
+
+        let metrics = state.metrics.snapshot();
+        assert_eq!(metrics.foreign_system, 1);
+        assert_eq!(metrics.unknown_shard, 0);
         assert_eq!(metrics.closed, 0);
         assert_eq!(metrics.full, 0);
         assert_eq!(metrics.timeout, 0);
@@ -326,6 +370,8 @@ pub enum BridgeHealth {
 /// Snapshot of bridge counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BridgeMetricsSnapshot {
+    /// Calls rejected because the target belongs to another system.
+    pub foreign_system: u64,
     /// Calls submitted by Tokio/Tower code.
     pub attempts: u64,
     /// Requests accepted into the target Tina mailbox.
@@ -347,6 +393,7 @@ pub struct BridgeMetricsSnapshot {
 
 #[derive(Debug, Default)]
 struct BridgeMetrics {
+    foreign_system: AtomicU64,
     attempts: AtomicU64,
     accepted: AtomicU64,
     full: AtomicU64,
@@ -360,6 +407,7 @@ struct BridgeMetrics {
 impl BridgeMetrics {
     fn snapshot(&self) -> BridgeMetricsSnapshot {
         BridgeMetricsSnapshot {
+            foreign_system: self.foreign_system.load(Ordering::Relaxed),
             attempts: self.attempts.load(Ordering::Relaxed),
             accepted: self.accepted.load(Ordering::Relaxed),
             full: self.full.load(Ordering::Relaxed),
@@ -398,6 +446,9 @@ impl BridgeState {
 
     fn record_error(&self, error: BridgeError) {
         match error {
+            BridgeError::ForeignSystem { .. } => {
+                self.metrics.foreign_system.fetch_add(1, Ordering::Relaxed);
+            }
             BridgeError::UnknownShard(_) => {
                 self.metrics.unknown_shard.fetch_add(1, Ordering::Relaxed);
             }
@@ -561,6 +612,9 @@ where
 impl From<ThreadedTrySendError> for BridgeError {
     fn from(error: ThreadedTrySendError) -> Self {
         match error {
+            ThreadedTrySendError::ForeignSystem { expected, actual } => {
+                Self::ForeignSystem { expected, actual }
+            }
             ThreadedTrySendError::UnknownShard(shard) => Self::UnknownShard(shard),
             ThreadedTrySendError::IngressFull => Self::Full,
             ThreadedTrySendError::WorkerStopped => Self::Closed,
@@ -571,6 +625,9 @@ impl From<ThreadedTrySendError> for BridgeError {
 impl From<ThreadedSendObservedError> for BridgeError {
     fn from(error: ThreadedSendObservedError) -> Self {
         match error {
+            ThreadedSendObservedError::ForeignSystem { expected, actual } => {
+                Self::ForeignSystem { expected, actual }
+            }
             ThreadedSendObservedError::UnknownShard(shard) => Self::UnknownShard(shard),
             ThreadedSendObservedError::IngressFull | ThreadedSendObservedError::MailboxFull => {
                 Self::Full
@@ -585,6 +642,9 @@ impl From<ThreadedSendObservedError> for BridgeError {
 impl From<BridgeError> for CallError {
     fn from(error: BridgeError) -> Self {
         match error {
+            BridgeError::ForeignSystem { expected, actual } => {
+                Self::Rejected(tina::CallRejectedReason::ForeignSystem { expected, actual })
+            }
             BridgeError::UnknownShard(_) => Self::InvalidResource,
             BridgeError::Full => Self::TargetFull,
             BridgeError::Closed => Self::TargetClosed,

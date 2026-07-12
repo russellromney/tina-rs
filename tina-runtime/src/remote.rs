@@ -320,7 +320,10 @@ where
         call_context: Option<MessageCallContext>,
     ) -> Result<(), SendRejectedReason> {
         if send.target_system != self.system_incarnation {
-            return Err(SendRejectedReason::Closed);
+            return Err(SendRejectedReason::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: send.target_system,
+            });
         }
         if send.target_shard != self.shard.id() {
             panic!(

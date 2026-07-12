@@ -1217,6 +1217,9 @@ pub enum CallOutcome<T> {
 impl SendOutcome {
     pub(crate) fn from_rejected(reason: crate::trace::SendRejectedReason) -> Self {
         match reason {
+            crate::trace::SendRejectedReason::ForeignSystem { expected, actual } => {
+                Self::ForeignSystem { expected, actual }
+            }
             crate::trace::SendRejectedReason::Full => Self::Full,
             crate::trace::SendRejectedReason::Closed => Self::Closed,
         }

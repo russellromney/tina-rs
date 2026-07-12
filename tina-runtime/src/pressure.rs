@@ -59,12 +59,16 @@ pub struct PressureSummary {
     pub reply_rejected_reply_path_full: u64,
     /// The requester shard was closed or failed.
     pub reply_rejected_requester_shard_closed: u64,
+    /// A reply targeted a requester from another system incarnation.
+    pub reply_rejected_foreign_system: u64,
     /// A direct local send was rejected because the target mailbox
     /// was full.
     pub send_rejected_full: u64,
     /// A direct local send was rejected because the target mailbox
     /// was closed.
     pub send_rejected_closed: u64,
+    /// A direct send targeted another system incarnation.
+    pub send_rejected_foreign_system: u64,
 }
 
 impl PressureSummary {
@@ -92,6 +96,9 @@ impl PressureSummary {
                     }
                 },
                 RuntimeEventKind::CallReplyRejected { reason, .. } => match reason {
+                    CallReplyRejectedReason::ForeignSystem { .. } => {
+                        summary.reply_rejected_foreign_system += 1;
+                    }
                     CallReplyRejectedReason::NoPendingCall => {
                         summary.reply_rejected_no_pending_call += 1;
                     }
@@ -115,6 +122,9 @@ impl PressureSummary {
                     }
                 },
                 RuntimeEventKind::SendRejected { reason, .. } => match reason {
+                    SendRejectedReason::ForeignSystem { .. } => {
+                        summary.send_rejected_foreign_system += 1;
+                    }
                     SendRejectedReason::Full => summary.send_rejected_full += 1,
                     SendRejectedReason::Closed => summary.send_rejected_closed += 1,
                 },
@@ -137,8 +147,10 @@ impl PressureSummary {
             || self.reply_rejected_runtime_stopped > 0
             || self.reply_rejected_reply_path_full > 0
             || self.reply_rejected_requester_shard_closed > 0
+            || self.reply_rejected_foreign_system > 0
             || self.send_rejected_full > 0
             || self.send_rejected_closed > 0
+            || self.send_rejected_foreign_system > 0
     }
 
     /// True if any *Full*-shaped rejection was counted. The
@@ -160,8 +172,8 @@ impl fmt::Display for PressureSummary {
             formatter,
             "completion[mbox_full={} requester_closed={} resource_closed={} terminal_action_on_failure={}] \
              reply[no_pending={} path_full={} shard_closed={} \
-             cancelled={} timed_out={} owner_stopped={} runtime_stopped={}] \
-             send[full={} closed={}]",
+             cancelled={} timed_out={} owner_stopped={} runtime_stopped={} foreign_system={}] \
+             send[full={} closed={} foreign_system={}]",
             self.completion_rejected_mailbox_full,
             self.completion_rejected_requester_closed,
             self.completion_rejected_resource_closed,
@@ -173,8 +185,10 @@ impl fmt::Display for PressureSummary {
             self.reply_rejected_caller_timed_out,
             self.reply_rejected_owner_stopped,
             self.reply_rejected_runtime_stopped,
+            self.reply_rejected_foreign_system,
             self.send_rejected_full,
             self.send_rejected_closed,
+            self.send_rejected_foreign_system,
         )
     }
 }

@@ -803,7 +803,7 @@ fn simulator_supervision_persistence_recovers_after_durable_append_then_panic() 
     sim.run_until_quiescent();
 
     let child = first_spawned_child(sim.trace()).expect("spawned persist child");
-    let child_address = persist_address(child);
+    let child_address = persist_address(sim.system_incarnation(), child);
     sim.try_send(child_address, PersistMsg::Mutate("before".to_owned()))
         .unwrap();
     sim.run_until_quiescent();
@@ -846,6 +846,6 @@ fn first_spawned_child(trace: &[tina_runtime::RuntimeEvent]) -> Option<IsolateId
     })
 }
 
-fn persist_address(isolate: IsolateId) -> Address<PersistMsg> {
-    Address::new_with_generation(SimShard.id(), isolate, AddressGeneration::new(0))
+fn persist_address(system: tina::SystemIncarnation, isolate: IsolateId) -> Address<PersistMsg> {
+    Address::new_with_generation_in(system, SimShard.id(), isolate, AddressGeneration::new(0))
 }

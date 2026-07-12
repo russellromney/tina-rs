@@ -39,6 +39,9 @@ use crate::{
 /// configurable here or named as a fixed capability in [`RuntimeCapabilities`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalSystemConfig {
+    /// Address provenance for this local owner. `None` allocates a fresh
+    /// nonzero incarnation at startup.
+    pub system_incarnation: Option<tina::SystemIncarnation>,
     /// Capacity of the bounded control/ingress queue feeding each shard worker.
     pub ingress_capacity: usize,
     /// Capacity of each local source-shard -> destination-shard transport.
@@ -89,6 +92,7 @@ pub struct LocalSystemConfig {
 impl Default for LocalSystemConfig {
     fn default() -> Self {
         Self {
+            system_incarnation: None,
             ingress_capacity: ThreadedRuntimeConfig::default().command_capacity,
             shard_pair_capacity: ThreadedRuntimeConfig::default().command_capacity,
             remote_inbound_drain_budget: ThreadedRuntimeConfig::default()
@@ -113,6 +117,12 @@ impl Default for LocalSystemConfig {
 impl LocalSystemConfig {
     /// Validates that no bounded resource silently starts with zero capacity.
     pub fn validate(&self) -> Result<(), LocalSystemConfigError> {
+        if self
+            .system_incarnation
+            .is_some_and(tina::SystemIncarnation::is_unscoped)
+        {
+            return Err(LocalSystemConfigError::UnscopedSystemIncarnation);
+        }
         if self.ingress_capacity == 0 {
             return Err(LocalSystemConfigError::ZeroIngressCapacity);
         }
@@ -145,6 +155,7 @@ impl LocalSystemConfig {
 
     fn threaded_runtime_config(self) -> ThreadedRuntimeConfig {
         ThreadedRuntimeConfig {
+            system_incarnation: self.system_incarnation,
             command_capacity: self.ingress_capacity,
             shard_pair_capacity: self.shard_pair_capacity,
             remote_inbound_drain_budget: self.remote_inbound_drain_budget,
@@ -169,6 +180,8 @@ impl LocalSystemConfig {
 /// Invalid local system bounded-shape config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalSystemConfigError {
+    /// A live owner cannot use the zero marker reserved for manual addresses.
+    UnscopedSystemIncarnation,
     /// Ingress capacity must be greater than zero.
     ZeroIngressCapacity,
     /// Shard-pair capacity must be greater than zero.
@@ -192,6 +205,9 @@ pub enum LocalSystemConfigError {
 impl fmt::Display for LocalSystemConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let field = match self {
+            Self::UnscopedSystemIncarnation => {
+                return write!(f, "system_incarnation must be nonzero");
+            }
             Self::ZeroIngressCapacity => "ingress_capacity",
             Self::ZeroShardPairCapacity => "shard_pair_capacity",
             Self::ZeroRemoteInboundDrainBudget => "remote_inbound_drain_budget",
@@ -776,6 +792,11 @@ where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
 {
+    /// Returns the provenance stamped into addresses issued by this owner.
+    pub fn system_incarnation(&self) -> tina::SystemIncarnation {
+        self.runtime().system_incarnation()
+    }
+
     /// Starts configuring one single-shard local app.
     pub fn single_shard(shard: S, mailbox_factory: F) -> LocalSystemSingleShardBuilder<S, F> {
         LocalSystemSingleShardBuilder {
@@ -1545,6 +1566,11 @@ where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + Clone + 'static,
 {
+    /// Returns the provenance stamped into addresses issued by this owner.
+    pub fn system_incarnation(&self) -> tina::SystemIncarnation {
+        self.runtime().system_incarnation()
+    }
+
     /// Registers one root isolate on the chosen shard.
     #[allow(private_bounds)]
     pub fn register_root_on<I, Outbound>(

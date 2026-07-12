@@ -308,9 +308,13 @@ where
         &self,
         address: Address<M, R>,
         message: M,
-    ) -> Result<(), TrySendError<M>> {
+    ) -> Result<(), tina_runtime::IngressSendError<M>> {
         if address.system() != self.system_incarnation {
-            return Err(TrySendError::Closed(message));
+            return Err(tina_runtime::IngressSendError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+                message,
+            });
         }
         if address.shard() != self.shard.id() {
             panic!(
@@ -333,17 +337,17 @@ where
         };
 
         if entry.generation != address.generation() || entry.stopped.get() {
-            return Err(TrySendError::Closed(message));
+            return Err(tina_runtime::IngressSendError::Closed(message));
         }
 
         match entry.inbox.push(Box::new(message), self.step_ordinal, None) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(message)) => {
-                Err(TrySendError::Full(*message.downcast::<M>().unwrap_or_else(
-                    |_| panic!("simulator ingress hit wrong mailbox type"),
-                )))
-            }
-            Err(TrySendError::Closed(message)) => Err(TrySendError::Closed(
+            Err(TrySendError::Full(message)) => Err(tina_runtime::IngressSendError::Full(
+                *message
+                    .downcast::<M>()
+                    .unwrap_or_else(|_| panic!("simulator ingress hit wrong mailbox type")),
+            )),
+            Err(TrySendError::Closed(message)) => Err(tina_runtime::IngressSendError::Closed(
                 *message
                     .downcast::<M>()
                     .unwrap_or_else(|_| panic!("simulator ingress hit wrong mailbox type")),
@@ -356,20 +360,33 @@ where
         &self,
         address: tina::ServiceEventAddress<Event, Request>,
         event: Event,
-    ) -> Result<(), TrySendError<Event>> {
+    ) -> Result<(), tina_runtime::IngressSendError<Event>> {
         match self.try_send(
             address.address().address(),
             tina::ServiceMessage::Event(event),
         ) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(tina::ServiceMessage::Event(event))) => {
-                Err(TrySendError::Full(event))
+            Err(tina_runtime::IngressSendError::Full(tina::ServiceMessage::Event(event))) => {
+                Err(tina_runtime::IngressSendError::Full(event))
             }
-            Err(TrySendError::Closed(tina::ServiceMessage::Event(event))) => {
-                Err(TrySendError::Closed(event))
+            Err(tina_runtime::IngressSendError::Closed(tina::ServiceMessage::Event(event))) => {
+                Err(tina_runtime::IngressSendError::Closed(event))
             }
-            Err(TrySendError::Full(tina::ServiceMessage::Request(_)))
-            | Err(TrySendError::Closed(tina::ServiceMessage::Request(_))) => {
+            Err(tina_runtime::IngressSendError::ForeignSystem {
+                expected,
+                actual,
+                message: tina::ServiceMessage::Event(event),
+            }) => Err(tina_runtime::IngressSendError::ForeignSystem {
+                expected,
+                actual,
+                message: event,
+            }),
+            Err(tina_runtime::IngressSendError::Full(tina::ServiceMessage::Request(_)))
+            | Err(tina_runtime::IngressSendError::Closed(tina::ServiceMessage::Request(_)))
+            | Err(tina_runtime::IngressSendError::ForeignSystem {
+                message: tina::ServiceMessage::Request(_),
+                ..
+            }) => {
                 unreachable!(
                     "simulator returned a different split-service payload than it received"
                 )
@@ -1003,6 +1020,9 @@ where
                                 QueuedRemoteEnvelope::CallReply(remote_reply),
                             ) {
                                 let reason = match reason {
+                                    SendRejectedReason::ForeignSystem { expected, actual } => {
+                                        CallReplyRejectedReason::ForeignSystem { expected, actual }
+                                    }
                                     SendRejectedReason::Full => {
                                         CallReplyRejectedReason::ReplyPathFull
                                     }
@@ -1127,6 +1147,9 @@ where
                     QueuedRemoteEnvelope::CallReply(remote_reply),
                 ) {
                     let reason = match rejected {
+                        SendRejectedReason::ForeignSystem { expected, actual } => {
+                            CallReplyRejectedReason::ForeignSystem { expected, actual }
+                        }
                         SendRejectedReason::Full => CallReplyRejectedReason::ReplyPathFull,
                         SendRejectedReason::Closed => CallReplyRejectedReason::RequesterShardClosed,
                     };
@@ -1245,6 +1268,9 @@ where
                     }
                     Err(reason) => {
                         let reject_reason = match reason {
+                            SendRejectedReason::ForeignSystem { expected, actual } => {
+                                DeferredReplyRejectedReason::ForeignSystem { expected, actual }
+                            }
                             SendRejectedReason::Full => {
                                 tina_runtime::DeferredReplyRejectedReason::ReplyPathFull
                             }
@@ -2112,6 +2138,9 @@ where
                     },
                 );
                 match reason {
+                    SendRejectedReason::ForeignSystem { expected, actual } => {
+                        SendOutcome::ForeignSystem { expected, actual }
+                    }
                     SendRejectedReason::Full => SendOutcome::Full,
                     SendRejectedReason::Closed => SendOutcome::Closed,
                 }
@@ -2232,6 +2261,12 @@ where
                         },
                     );
                     let outcome = match reason {
+                        SendRejectedReason::ForeignSystem { expected, actual } => {
+                            CallOutcome::Rejected(tina::CallRejectedReason::ForeignSystem {
+                                expected,
+                                actual,
+                            })
+                        }
                         SendRejectedReason::Full => CallOutcome::Full,
                         SendRejectedReason::Closed => CallOutcome::Closed,
                     };
@@ -2307,6 +2342,12 @@ where
                     },
                 );
                 let outcome = match reason {
+                    SendRejectedReason::ForeignSystem { expected, actual } => {
+                        CallOutcome::Rejected(tina::CallRejectedReason::ForeignSystem {
+                            expected,
+                            actual,
+                        })
+                    }
                     SendRejectedReason::Full => CallOutcome::Full,
                     SendRejectedReason::Closed => CallOutcome::Closed,
                 };
@@ -6136,7 +6177,10 @@ where
         call_context: Option<MessageCallContext>,
     ) -> Result<(), SendRejectedReason> {
         if send.target_system != self.system_incarnation {
-            return Err(SendRejectedReason::Closed);
+            return Err(SendRejectedReason::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: send.target_system,
+            });
         }
         if send.target_shard != self.shard.id() {
             panic!(

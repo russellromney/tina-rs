@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use tina::TrySendError;
 use tina::prelude::*;
+use tina_runtime::IngressSendError;
 use tina_runtime::sharded::{ShardPlacement, ShardRequestServiceTable};
 use tina_runtime::{
     CallError, CallOutcome, DefaultMailboxFactory, DefaultThreadedMailboxFactory,
@@ -170,7 +170,7 @@ fn explicit_multi_owner_preserves_event_pressure_and_shard_choice() {
         .expect("first event accepted");
     assert_eq!(
         runtime.try_send_event(events, Event::Record(42)),
-        Err(TrySendError::Full(Event::Record(42)))
+        Err(IngressSendError::Full(Event::Record(42)))
     );
     runtime.step();
     assert_eq!(seen.load(Ordering::Acquire), 41);
@@ -181,7 +181,7 @@ fn explicit_multi_owner_preserves_event_pressure_and_shard_choice() {
     runtime.step();
     assert_eq!(
         runtime.try_send_event(events, Event::Record(43)),
-        Err(TrySendError::Closed(Event::Record(43)))
+        Err(IngressSendError::Closed(Event::Record(43)))
     );
 
     let requests = runtime.register_request_service_on(ShardId::new(10), RequestService(9), 2);
@@ -515,7 +515,7 @@ fn request_service_table_registers_and_calls_local_multi_services() {
 }
 
 #[test]
-fn local_multi_request_call_panics_on_an_address_from_an_unknown_shard() {
+fn local_multi_request_call_rejects_foreign_system_before_unknown_shard() {
     let local = LocalSystem::multi_shard(DefaultThreadedMailboxFactory)
         .shard(ServiceShard(80))
         .build();
@@ -526,14 +526,16 @@ fn local_multi_request_call_panics_on_an_address_from_an_unknown_shard() {
         .register_split_service_on(ShardId::new(99), SplitService, 4)
         .expect("foreign split service registered");
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = local.call_blocking_request(
+    assert!(matches!(
+        local.call_blocking_request(
             foreign_service.requests,
             SplitRequest::Read,
             Duration::from_millis(50),
-        );
-    }));
-    assert!(result.is_err(), "unknown shard must remain a loud misuse");
+        ),
+        Err(ThreadedRuntimeError::ForeignSystem { expected, actual })
+            if expected == local.system_incarnation()
+                && actual == foreign.system_incarnation()
+    ));
 
     local
         .shutdown()

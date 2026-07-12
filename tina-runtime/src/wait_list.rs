@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)] // Errors return linear caller authority intact.
+
 //! Many-callers-wait-for-one-key helper (mechanism name).
 //!
 //! New code should reach for [`crate::SharedWork`]: it is the public wrapper

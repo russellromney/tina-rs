@@ -850,6 +850,9 @@ where
                                 QueuedRemoteEnvelope::CallReply(reply),
                             ) {
                                 let reason = match reason {
+                                    SendRejectedReason::ForeignSystem { expected, actual } => {
+                                        CallReplyRejectedReason::ForeignSystem { expected, actual }
+                                    }
                                     SendRejectedReason::Full => {
                                         CallReplyRejectedReason::ReplyPathFull
                                     }
@@ -965,6 +968,9 @@ where
                     route_remote(self.shard.id(), QueuedRemoteEnvelope::CallReply(reply))
                 {
                     let reason = match rejected {
+                        SendRejectedReason::ForeignSystem { expected, actual } => {
+                            CallReplyRejectedReason::ForeignSystem { expected, actual }
+                        }
                         SendRejectedReason::Full => CallReplyRejectedReason::ReplyPathFull,
                         SendRejectedReason::Closed => CallReplyRejectedReason::RequesterShardClosed,
                     };
@@ -1126,6 +1132,9 @@ where
                     }
                     Err(reason) => {
                         let reject_reason = match reason {
+                            SendRejectedReason::ForeignSystem { expected, actual } => {
+                                DeferredReplyRejectedReason::ForeignSystem { expected, actual }
+                            }
                             SendRejectedReason::Full => DeferredReplyRejectedReason::ReplyPathFull,
                             SendRejectedReason::Closed => {
                                 DeferredReplyRejectedReason::RequesterShardClosed
@@ -1553,6 +1562,12 @@ where
                     },
                 );
                 let outcome = match reason {
+                    SendRejectedReason::ForeignSystem { expected, actual } => {
+                        CallOutcome::Rejected(CallRejectedReason::ForeignSystem {
+                            expected,
+                            actual,
+                        })
+                    }
                     SendRejectedReason::Full => CallOutcome::Full,
                     SendRejectedReason::Closed => CallOutcome::Closed,
                 };

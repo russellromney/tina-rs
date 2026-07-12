@@ -14,9 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use betelgeuse::{IOLoopHandle, io_loop};
-use tina::{
-    Address, Isolate, Outbound as TinaOutbound, Shard, ShardId, SystemIncarnation, TrySendError,
-};
+use tina::{Address, Isolate, Outbound as TinaOutbound, Shard, ShardId, SystemIncarnation};
 use tina_supervisor::SupervisorConfig;
 
 use crate::call::{CallOutcome, IntoErasedCall};
@@ -190,6 +188,12 @@ impl ThreadedRuntimeConfig {
     pub fn validate(&self) -> Result<(), ThreadedRuntimeConfigError> {
         use ThreadedRuntimeConfigError as Error;
 
+        if self
+            .system_incarnation
+            .is_some_and(tina::SystemIncarnation::is_unscoped)
+        {
+            return Err(Error::UnscopedSystemIncarnation);
+        }
         if self.command_capacity == 0 {
             return Err(Error::ZeroCommandCapacity);
         }
@@ -458,8 +462,11 @@ where
                     .expect("deadline-observed command runs once"),
             )
             .map_err(|error| match error {
-                TrySendError::Full(_) => ThreadedSendObservedError::MailboxFull,
-                TrySendError::Closed(_) => ThreadedSendObservedError::MailboxClosed,
+                crate::IngressSendError::ForeignSystem {
+                    expected, actual, ..
+                } => ThreadedSendObservedError::ForeignSystem { expected, actual },
+                crate::IngressSendError::Full(_) => ThreadedSendObservedError::MailboxFull,
+                crate::IngressSendError::Closed(_) => ThreadedSendObservedError::MailboxClosed,
             });
         *state = DeadlineObservedState::Completed(outcome);
         if let Some(reply) = self.reply.take() {
@@ -597,8 +604,11 @@ where
         let outcome = runtime
             .try_send(self.address, message)
             .map_err(|error| match error {
-                TrySendError::Full(_) => ThreadedSendObservedError::MailboxFull,
-                TrySendError::Closed(_) => ThreadedSendObservedError::MailboxClosed,
+                crate::IngressSendError::ForeignSystem {
+                    expected, actual, ..
+                } => ThreadedSendObservedError::ForeignSystem { expected, actual },
+                crate::IngressSendError::Full(_) => ThreadedSendObservedError::MailboxFull,
+                crate::IngressSendError::Closed(_) => ThreadedSendObservedError::MailboxClosed,
             });
         let observer = self
             .observer
@@ -649,10 +659,18 @@ pub(crate) fn run_host_call<S, F>(
 {
     match runtime.try_send(dispatcher, DispatcherMsg::Begin(begin)) {
         Ok(()) => {}
-        Err(TrySendError::Full(DispatcherMsg::Begin(begin))) => begin.reject_full(),
-        Err(TrySendError::Closed(DispatcherMsg::Begin(begin))) => begin.reject_closed(),
-        Err(TrySendError::Full(DispatcherMsg::Returned))
-        | Err(TrySendError::Closed(DispatcherMsg::Returned)) => {
+        Err(crate::IngressSendError::Full(DispatcherMsg::Begin(begin))) => begin.reject_full(),
+        Err(crate::IngressSendError::Closed(DispatcherMsg::Begin(begin))) => begin.reject_closed(),
+        Err(crate::IngressSendError::ForeignSystem {
+            message: DispatcherMsg::Begin(_),
+            ..
+        }) => unreachable!("runtime-owned dispatcher carried foreign provenance"),
+        Err(crate::IngressSendError::Full(DispatcherMsg::Returned))
+        | Err(crate::IngressSendError::Closed(DispatcherMsg::Returned))
+        | Err(crate::IngressSendError::ForeignSystem {
+            message: DispatcherMsg::Returned,
+            ..
+        }) => {
             unreachable!("host call command only sends Begin messages")
         }
     }
@@ -702,6 +720,11 @@ where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
 {
+    /// Returns the provenance stamped into addresses issued by this owner.
+    pub const fn system_incarnation(&self) -> SystemIncarnation {
+        self.system_incarnation
+    }
+
     /// Starts one worker thread for one shard runtime.
     pub fn new(shard: S, mailbox_factory: F) -> Self {
         Self::try_new(shard, mailbox_factory).expect("failed to start Tina threaded runtime")
@@ -1517,8 +1540,11 @@ where
             let result = runtime
                 .try_send(address, message)
                 .map_err(|error| match error {
-                    TrySendError::Full(_) => ThreadedSendObservedError::MailboxFull,
-                    TrySendError::Closed(_) => ThreadedSendObservedError::MailboxClosed,
+                    crate::IngressSendError::ForeignSystem {
+                        expected, actual, ..
+                    } => ThreadedSendObservedError::ForeignSystem { expected, actual },
+                    crate::IngressSendError::Full(_) => ThreadedSendObservedError::MailboxFull,
+                    crate::IngressSendError::Closed(_) => ThreadedSendObservedError::MailboxClosed,
                 });
             let _ = reply_tx.send(result);
         }));
@@ -1772,6 +1798,12 @@ where
         M: Send + 'static,
         R: 'static,
     {
+        if address.system() != self.system_incarnation {
+            return Err(ThreadedTrySendError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
         outcomes.note_submitted();
         let observer = outcomes.observer();
         match self.try_send_and_observe_with(address, message, observer) {
@@ -1805,6 +1837,12 @@ where
         P: FnOnce(&M) -> Option<ThreadedSendObservedError> + Send + 'static,
         O: FnOnce(Result<(), ThreadedSendObservedError>) + Send + 'static,
     {
+        if address.system() != self.system_incarnation {
+            return Err(ThreadedTrySendError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
         // Match `try_send`: once the worker is known failed, do not enqueue a
         // command into the still-live dispatcher channel. Such a command can
         // never run, so accepting it would strand the observer indefinitely.

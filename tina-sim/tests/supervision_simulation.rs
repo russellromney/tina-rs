@@ -436,8 +436,11 @@ fn run_restart_checker_failure() -> tina_sim::ReplayArtifact {
     sim.run_until_quiescent();
 
     let child = spawned_children(sim.trace())[0];
-    sim.try_send(address_for_worker(child), WorkerMsg::Poison)
-        .unwrap();
+    sim.try_send(
+        address_for_worker(sim.system_incarnation(), child),
+        WorkerMsg::Poison,
+    )
+    .unwrap();
     let mut checker = NoRestartCompletionChecker;
     let failure = sim
         .run_until_quiescent_checked(&mut checker)
@@ -465,8 +468,8 @@ fn completed_restarts(trace: &[RuntimeEvent]) -> Vec<(IsolateId, IsolateId)> {
         .collect()
 }
 
-fn address_for_worker(isolate: IsolateId) -> Address<WorkerMsg> {
-    Address::new_with_generation(ShardId::new(71), isolate, AddressGeneration::new(0))
+fn address_for_worker(system: tina::SystemIncarnation, isolate: IsolateId) -> Address<WorkerMsg> {
+    Address::new_with_generation_in(system, ShardId::new(71), isolate, AddressGeneration::new(0))
 }
 
 fn run_restarted_parent(
@@ -486,8 +489,11 @@ fn run_restarted_parent(
     sim.run_until_quiescent();
 
     let child = spawned_children(sim.trace())[poisoned_child_index];
-    sim.try_send(address_for_worker(child), WorkerMsg::Poison)
-        .unwrap();
+    sim.try_send(
+        address_for_worker(sim.system_incarnation(), child),
+        WorkerMsg::Poison,
+    )
+    .unwrap();
     sim.run_until_quiescent();
 
     (sim.trace().to_vec(), observations.borrow().clone())
@@ -520,13 +526,16 @@ fn run_restart_then_delayed_send() -> (Vec<RuntimeEvent>, Vec<WorkerObservation>
     sim.run_until_quiescent();
 
     let first = spawned_children(sim.trace())[0];
-    sim.try_send(address_for_worker(first), WorkerMsg::Poison)
-        .unwrap();
+    sim.try_send(
+        address_for_worker(sim.system_incarnation(), first),
+        WorkerMsg::Poison,
+    )
+    .unwrap();
     sim.run_until_quiescent();
     let replacement = completed_restarts(sim.trace())[0].1;
 
     let sender = sim.register(StaleSender {
-        target: address_for_worker(replacement),
+        target: address_for_worker(sim.system_incarnation(), replacement),
     });
     sim.try_send(sender, SenderMsg::SendToStale).unwrap();
     sim.run_until_quiescent();
@@ -626,14 +635,20 @@ fn restartable_bootstrap_is_redelivered_and_repeated_restarts_replay() {
         sim.run_until_quiescent();
 
         let first = spawned_children(sim.trace())[0];
-        sim.try_send(address_for_worker(first), WorkerMsg::Poison)
-            .unwrap();
+        sim.try_send(
+            address_for_worker(sim.system_incarnation(), first),
+            WorkerMsg::Poison,
+        )
+        .unwrap();
         let mut checker = StrictlyIncreasingRestartChecker::default();
         assert!(sim.run_until_quiescent_checked(&mut checker).is_none());
 
         let first_replacement = completed_restarts(sim.trace())[0].1;
-        sim.try_send(address_for_worker(first_replacement), WorkerMsg::Poison)
-            .unwrap();
+        sim.try_send(
+            address_for_worker(sim.system_incarnation(), first_replacement),
+            WorkerMsg::Poison,
+        )
+        .unwrap();
         let mut checker = StrictlyIncreasingRestartChecker::default();
         assert!(sim.run_until_quiescent_checked(&mut checker).is_none());
 
@@ -671,8 +686,11 @@ fn restartable_bootstrap_factory_runs_fresh_for_each_replacement() {
     sim.run_until_quiescent();
 
     let first = spawned_children(sim.trace())[0];
-    sim.try_send(address_for_worker(first), WorkerMsg::Poison)
-        .unwrap();
+    sim.try_send(
+        address_for_worker(sim.system_incarnation(), first),
+        WorkerMsg::Poison,
+    )
+    .unwrap();
     sim.run_until_quiescent();
     let replacement = completed_restarts(sim.trace())[0].1;
 
@@ -721,13 +739,19 @@ fn restart_budget_exhaustion_is_visible_and_reproducible() {
         sim.run_until_quiescent();
 
         let first = spawned_children(sim.trace())[0];
-        sim.try_send(address_for_worker(first), WorkerMsg::Poison)
-            .unwrap();
+        sim.try_send(
+            address_for_worker(sim.system_incarnation(), first),
+            WorkerMsg::Poison,
+        )
+        .unwrap();
         sim.run_until_quiescent();
 
         let replacement = completed_restarts(sim.trace())[0].1;
-        sim.try_send(address_for_worker(replacement), WorkerMsg::Poison)
-            .unwrap();
+        sim.try_send(
+            address_for_worker(sim.system_incarnation(), replacement),
+            WorkerMsg::Poison,
+        )
+        .unwrap();
         sim.run_until_quiescent();
         sim.trace().to_vec()
     }
@@ -765,8 +789,11 @@ fn non_panic_child_failure_start_fail_restart_stop_sequence_is_replayable() {
 
         let first = spawned_children(sim.trace())[0];
         // Typed, non-panic failure rather than a panic.
-        sim.try_send(address_for_worker(first), WorkerMsg::Fail)
-            .unwrap();
+        sim.try_send(
+            address_for_worker(sim.system_incarnation(), first),
+            WorkerMsg::Fail,
+        )
+        .unwrap();
         sim.run_until_quiescent();
         sim.trace().to_vec()
     }
@@ -888,7 +915,7 @@ fn stale_pre_restart_identity_fails_through_send_rejected_closed_event() {
     sim.run_until_quiescent();
 
     let sender = sim.register(StaleSender {
-        target: address_for_worker(stale_child),
+        target: address_for_worker(sim.system_incarnation(), stale_child),
     });
     sim.try_send(sender, SenderMsg::SendToStale).unwrap();
     sim.run_until_quiescent();

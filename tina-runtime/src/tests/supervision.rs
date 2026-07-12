@@ -82,7 +82,7 @@ fn supervised_one_for_one_restarts_only_failed_child() {
             lineage_address(&runtime, first_child),
             LineageMsg::SpawnChild
         ),
-        Err(TrySendError::Closed(LineageMsg::SpawnChild))
+        Err(crate::IngressSendError::Closed(LineageMsg::SpawnChild))
     );
     assert!(
         supervisor_events(runtime.trace())
@@ -638,7 +638,7 @@ fn non_panic_child_failure_restarts_with_new_incarnation_and_rejects_stale_addre
     // The stale pre-restart address rejects loudly.
     assert_eq!(
         runtime.try_send(lineage_address(&runtime, child), LineageMsg::SpawnChild),
-        Err(TrySendError::Closed(LineageMsg::SpawnChild))
+        Err(crate::IngressSendError::Closed(LineageMsg::SpawnChild))
     );
 
     // The same supervision path ran: one completed restart, naming the new
@@ -689,14 +689,14 @@ fn stop_children_closes_owned_children_and_reports_them_without_stopping_owner()
             lineage_address(&runtime, first_child),
             LineageMsg::SpawnChild
         ),
-        Err(TrySendError::Closed(LineageMsg::SpawnChild))
+        Err(crate::IngressSendError::Closed(LineageMsg::SpawnChild))
     );
     assert_eq!(
         runtime.try_send(
             lineage_address(&runtime, second_child),
             LineageMsg::SpawnChild
         ),
-        Err(TrySendError::Closed(LineageMsg::SpawnChild))
+        Err(crate::IngressSendError::Closed(LineageMsg::SpawnChild))
     );
 
     // The owner itself stayed up: plain Stop never cascades, and neither does
@@ -745,7 +745,7 @@ fn unsupervised_isolate_failure_stops_without_restart() {
     assert_eq!(supervisor_events(runtime.trace()), Vec::new());
     assert_eq!(
         runtime.try_send(lineage_address(&runtime, child), LineageMsg::SpawnChild),
-        Err(TrySendError::Closed(LineageMsg::SpawnChild))
+        Err(crate::IngressSendError::Closed(LineageMsg::SpawnChild))
     );
 }
 

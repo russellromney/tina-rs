@@ -178,15 +178,35 @@ impl<S> Simulator<S>
 where
     S: Shard,
 {
+    /// Returns the provenance stamped into addresses issued by this owner.
+    pub const fn system_incarnation(&self) -> tina::SystemIncarnation {
+        self.system_incarnation
+    }
+
     /// Creates a new simulator with virtual time starting at zero.
     pub fn new(shard: S, config: SimulatorConfig) -> Self {
         Self::with_ids(shard, config, IdSource::new())
     }
 
     pub(crate) fn with_ids(shard: S, config: SimulatorConfig, ids: IdSource) -> Self {
+        assert!(
+            !config
+                .system_incarnation
+                .is_some_and(tina::SystemIncarnation::is_unscoped),
+            "simulator system incarnation must be nonzero"
+        );
         let system_incarnation = config
             .system_incarnation
             .unwrap_or_else(tina_runtime::fresh_system_incarnation);
+        Self::with_ids_and_system(shard, config, ids, system_incarnation)
+    }
+
+    pub(crate) fn with_ids_and_system(
+        shard: S,
+        config: SimulatorConfig,
+        ids: IdSource,
+        system_incarnation: tina::SystemIncarnation,
+    ) -> Self {
         // Advance the user-visible `IsolateId` counter past the system isolates
         // a live `ThreadedRuntime` registers at startup (e.g. its host-call
         // dispatcher pool). The simulator never registers those isolates
@@ -1062,7 +1082,8 @@ mod tests {
             multishard,
         );
 
-        let unknown = Address::new_with_generation(
+        let unknown = Address::new_with_generation_in(
+            sim.system_incarnation(),
             ShardId::new(22),
             IsolateId::new(999),
             AddressGeneration::new(0),
@@ -1366,7 +1387,8 @@ mod tests {
             SimulatorConfig::default(),
         );
 
-        let unknown = Address::new_with_generation(
+        let unknown = Address::new_with_generation_in(
+            sim.system_incarnation(),
             ShardId::new(22),
             IsolateId::new(999),
             AddressGeneration::new(0),
@@ -1410,7 +1432,8 @@ mod tests {
             SimulatorConfig::default(),
         );
 
-        let unknown = Address::new_with_generation(
+        let unknown = Address::new_with_generation_in(
+            sim.system_incarnation(),
             ShardId::new(22),
             IsolateId::new(999),
             AddressGeneration::new(0),
@@ -1911,7 +1934,7 @@ mod tests {
             "multi-shard supervision must not create children on another shard"
         );
 
-        let child_address = Address::new(ShardId::new(22), child);
+        let child_address = Address::new_in(sim.system_incarnation(), ShardId::new(22), child);
         sim.try_send(child_address, SimShardLocalSupervisionEvent::Panic)
             .unwrap();
         assert_eq!(sim.step(), 1);
@@ -1942,7 +1965,7 @@ mod tests {
         );
 
         sim.try_send(
-            Address::new(ShardId::new(22), restart),
+            Address::new_in(sim.system_incarnation(), ShardId::new(22), restart),
             SimShardLocalSupervisionEvent::Noop,
         )
         .unwrap();

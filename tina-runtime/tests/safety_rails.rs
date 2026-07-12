@@ -329,12 +329,14 @@ fn event_only_service_needs_no_envelope_or_uninhabited_type_arguments() {
     );
     let _: EventServiceHandle<EventOnlyEvent> = events;
 
-    let sent: Result<(), tina::TrySendError<EventOnlyEvent>> =
+    let sent: Result<(), tina_runtime::IngressSendError<EventOnlyEvent>> =
         runtime.try_send_event(events, EventOnlyEvent::Record(41));
     sent.expect("event accepted");
     assert!(matches!(
         runtime.try_send_event(events, EventOnlyEvent::Record(42)),
-        Err(tina::TrySendError::Full(EventOnlyEvent::Record(42)))
+        Err(tina_runtime::IngressSendError::Full(
+            EventOnlyEvent::Record(42)
+        ))
     ));
     while runtime.step() > 0 {}
 

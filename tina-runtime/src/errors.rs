@@ -5,9 +5,42 @@ use std::fmt;
 
 use tina::ShardId;
 
+/// Error returned by explicit-step and simulated runtime ingress.
+///
+/// Unlike the mailbox-local [`tina::TrySendError`], this routing boundary can
+/// reject an address before selecting a mailbox. Every variant returns message
+/// ownership to the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IngressSendError<T> {
+    /// The target belongs to another runtime/system incarnation.
+    ForeignSystem {
+        /// Incarnation owned by the routing runtime.
+        expected: tina::SystemIncarnation,
+        /// Incarnation carried by the target address.
+        actual: tina::SystemIncarnation,
+        /// Message ownership returned to the caller.
+        message: T,
+    },
+    /// The target mailbox is currently at capacity.
+    Full(T),
+    /// The target mailbox is closed, stale, or unknown.
+    Closed(T),
+}
+
+impl<T> From<tina::TrySendError<T>> for IngressSendError<T> {
+    fn from(error: tina::TrySendError<T>) -> Self {
+        match error {
+            tina::TrySendError::Full(message) => Self::Full(message),
+            tina::TrySendError::Closed(message) => Self::Closed(message),
+        }
+    }
+}
+
 /// Invalid bounded worker configuration supplied at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadedRuntimeConfigError {
+    /// A live owner cannot use the zero marker reserved for manual addresses.
+    UnscopedSystemIncarnation,
     /// `command_capacity` is zero.
     ZeroCommandCapacity,
     /// `shard_pair_capacity` is zero.
@@ -43,6 +76,9 @@ pub enum ThreadedRuntimeConfigError {
 impl fmt::Display for ThreadedRuntimeConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let field = match self {
+            Self::UnscopedSystemIncarnation => {
+                return write!(f, "system_incarnation must be nonzero");
+            }
             Self::ZeroCommandCapacity => "command_capacity",
             Self::ZeroShardPairCapacity => "shard_pair_capacity",
             Self::ZeroRemoteInboundDrainBudget => "remote_inbound_drain_budget",

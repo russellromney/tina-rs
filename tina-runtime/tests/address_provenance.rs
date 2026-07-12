@@ -6,11 +6,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina::{AddressGeneration, SystemIncarnation, TrySendError};
+use tina::{AddressGeneration, SystemIncarnation};
 use tina_runtime::{
     CallOutcome, DefaultMailboxFactory, DefaultThreadedMailboxFactory, LocalSystem,
-    MultiShardRuntime, ResultWaitError, Runtime, ThreadedMultiShardRuntime, ThreadedRuntimeConfig,
-    ThreadedRuntimeError,
+    MultiShardRuntime, ResultWaitError, Runtime, ThreadedMultiShardRuntime, ThreadedRuntime,
+    ThreadedRuntimeConfig, ThreadedRuntimeError, ThreadedTrySendError,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -109,7 +109,11 @@ fn separately_constructed_explicit_runtimes_reject_coincident_tuple() {
     assert_ne!(local_address.system(), foreign_address.system());
     assert!(matches!(
         local.try_send(foreign_address, ProbeMsg::Set(42)),
-        Err(TrySendError::Closed(ProbeMsg::Set(42)))
+        Err(tina_runtime::IngressSendError::ForeignSystem {
+            expected,
+            actual,
+            message: ProbeMsg::Set(42),
+        }) if expected == local_address.system() && actual == foreign_address.system()
     ));
     local.step();
     assert_eq!(
@@ -117,6 +121,56 @@ fn separately_constructed_explicit_runtimes_reject_coincident_tuple() {
         0,
         "foreign tuple reached the local isolate"
     );
+}
+
+#[test]
+fn explicit_foreign_ingress_returns_message_ownership_exactly_once() {
+    let local = Runtime::new(TestShard(7), DefaultMailboxFactory);
+    let mut foreign = Runtime::new(TestShard(7), DefaultMailboxFactory);
+    let foreign_address = foreign.register_with_capacity::<DropProbe, Infallible>(DropProbe, 4);
+    let drops = Arc::new(AtomicU32::new(0));
+
+    let error = local
+        .try_send(foreign_address, DropMsg(Arc::clone(&drops)))
+        .expect_err("foreign ingress must be rejected");
+    assert_eq!(drops.load(Ordering::Acquire), 0, "message must be returned");
+    assert!(matches!(
+        error,
+        tina_runtime::IngressSendError::ForeignSystem { expected, actual, .. }
+            if expected == local.system_incarnation()
+                && actual == foreign.system_incarnation()
+    ));
+    drop(error);
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn default_runtime_incarnations_are_nonzero_and_distinct() {
+    let first = Runtime::new(TestShard(1), DefaultMailboxFactory);
+    let second = Runtime::new(TestShard(1), DefaultMailboxFactory);
+
+    assert!(!first.system_incarnation().is_unscoped());
+    assert!(!second.system_incarnation().is_unscoped());
+    assert_ne!(first.system_incarnation(), second.system_incarnation());
+}
+
+#[test]
+fn explicit_owners_reject_the_unscoped_system_marker() {
+    let runtime = std::panic::catch_unwind(|| {
+        Runtime::new(TestShard(1), DefaultMailboxFactory)
+            .with_system_incarnation(SystemIncarnation::DEFAULT)
+    });
+    assert!(runtime.is_err());
+
+    let multi = std::panic::catch_unwind(|| {
+        MultiShardRuntime::with_config_and_system(
+            [TestShard(1)],
+            DefaultMailboxFactory,
+            tina_runtime::MultiShardRuntimeConfig::default(),
+            SystemIncarnation::DEFAULT,
+        )
+    });
+    assert!(multi.is_err());
 }
 
 #[test]
@@ -216,6 +270,50 @@ fn threaded_multi_rejects_foreign_coincident_tuple_before_authority_claim() {
     assert_eq!(drops.load(Ordering::Acquire), 2);
 
     local.shutdown().expect("local shutdown");
+    foreign.shutdown().expect("foreign shutdown");
+}
+
+#[test]
+fn threaded_observed_ingress_rejects_foreign_before_observer_registration() {
+    let owner = ThreadedRuntime::with_config(
+        TestShard(9),
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            system_incarnation: Some(SystemIncarnation::new(300)),
+            ..ThreadedRuntimeConfig::default()
+        },
+    );
+    let foreign = ThreadedRuntime::with_config(
+        TestShard(9),
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            system_incarnation: Some(SystemIncarnation::new(400)),
+            ..ThreadedRuntimeConfig::default()
+        },
+    );
+    let address = foreign
+        .register_with_capacity::<DropProbe, Infallible>(DropProbe, 4)
+        .expect("foreign registration");
+    let drops = Arc::new(AtomicU32::new(0));
+    let observer_calls = Arc::new(AtomicU32::new(0));
+    let observer_calls_for_send = Arc::clone(&observer_calls);
+
+    assert!(matches!(
+        owner.try_send_and_observe_with(
+            address,
+            DropMsg(Arc::clone(&drops)),
+            move |_| {
+                observer_calls_for_send.fetch_add(1, Ordering::Release);
+            },
+        ),
+        Err(ThreadedTrySendError::ForeignSystem { expected, actual })
+            if expected == SystemIncarnation::new(300)
+                && actual == SystemIncarnation::new(400)
+    ));
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    assert_eq!(observer_calls.load(Ordering::Acquire), 0);
+
+    owner.shutdown().expect("owner shutdown");
     foreign.shutdown().expect("foreign shutdown");
 }
 

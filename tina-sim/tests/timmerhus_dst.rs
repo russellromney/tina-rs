@@ -505,7 +505,7 @@ fn direct_send_after_stop_is_known_negative_contract() {
 
     assert_eq!(
         sim.try_send(target, TargetMsg::Value(2)),
-        Err(TrySendError::Closed(TargetMsg::Value(2)))
+        Err(tina_runtime::IngressSendError::Closed(TargetMsg::Value(2)))
     );
     sim.run_until_quiescent();
 

@@ -1577,7 +1577,8 @@ fn multishard_dispatcher_workload_continues_after_bad_remote_address_on_same_sha
         Worker,
         4,
     );
-    let bad_worker = Address::new_with_generation(
+    let bad_worker = Address::new_with_generation_in(
+        sim.system_incarnation(),
         ShardId::new(22),
         IsolateId::new(999),
         AddressGeneration::new(0),
@@ -2279,7 +2280,7 @@ fn multishard_supervision_workload_composes_with_seeded_local_send_delay() {
 
     let first = spawned_children(&sim.trace())[0];
     sim.try_send(
-        Address::new(ShardId::new(22), first),
+        Address::new_in(sim.system_incarnation(), ShardId::new(22), first),
         RestartableWorkerEvent::Poison,
     )
     .unwrap();
@@ -2287,7 +2288,7 @@ fn multishard_supervision_workload_composes_with_seeded_local_send_delay() {
 
     let replacement = completed_restarts(&sim.trace())[0].1;
     sim.try_send(
-        Address::new(ShardId::new(22), replacement),
+        Address::new_in(sim.system_incarnation(), ShardId::new(22), replacement),
         RestartableWorkerEvent::Work(99),
     )
     .unwrap();

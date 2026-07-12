@@ -225,6 +225,7 @@ enum IngressOutcome {
     Ok,
     Full,
     Closed,
+    ForeignSystem,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,8 +260,9 @@ fn run_history(operations: &[Operation]) -> HistoryResult {
         .try_send(parent, ParentMsg::Spawn)
         .expect("initial restartable child spawn should enqueue");
     assert_eq!(runtime.step(), 1);
-    let mut current_child = latest_restart_child_address(runtime.trace())
-        .expect("initial restartable child should have spawned");
+    let mut current_child =
+        latest_restart_child_address(runtime.system_incarnation(), runtime.trace())
+            .expect("initial restartable child should have spawned");
 
     let mut ingress = Vec::new();
     let mut steps = Vec::new();
@@ -284,7 +286,9 @@ fn run_history(operations: &[Operation]) -> HistoryResult {
             }
             Operation::Step => {
                 steps.push(runtime.step());
-                if let Some(replacement) = latest_restart_child_address(runtime.trace()) {
+                if let Some(replacement) =
+                    latest_restart_child_address(runtime.system_incarnation(), runtime.trace())
+                {
                     current_child = replacement;
                 }
             }
@@ -298,29 +302,34 @@ fn run_history(operations: &[Operation]) -> HistoryResult {
     }
 }
 
-fn latest_restart_child_address(trace: &[RuntimeEvent]) -> Option<Address<TargetMsg>> {
+fn latest_restart_child_address(
+    system: tina::SystemIncarnation,
+    trace: &[RuntimeEvent],
+) -> Option<Address<TargetMsg>> {
     trace.iter().rev().find_map(|event| match event.kind() {
         RuntimeEventKind::RestartChildCompleted {
             new_isolate,
             new_generation,
             ..
-        } => Some(Address::new_with_generation(
+        } => Some(Address::new_with_generation_in(
+            system,
             event.shard(),
             new_isolate,
             new_generation,
         )),
         RuntimeEventKind::Spawned { child_isolate } => {
-            Some(Address::new(event.shard(), child_isolate))
+            Some(Address::new_in(system, event.shard(), child_isolate))
         }
         _ => None,
     })
 }
 
-fn outcome<T>(result: Result<(), TrySendError<T>>) -> IngressOutcome {
+fn outcome<T>(result: Result<(), tina_runtime::IngressSendError<T>>) -> IngressOutcome {
     match result {
         Ok(()) => IngressOutcome::Ok,
-        Err(TrySendError::Full(_)) => IngressOutcome::Full,
-        Err(TrySendError::Closed(_)) => IngressOutcome::Closed,
+        Err(tina_runtime::IngressSendError::Full(_)) => IngressOutcome::Full,
+        Err(tina_runtime::IngressSendError::Closed(_)) => IngressOutcome::Closed,
+        Err(tina_runtime::IngressSendError::ForeignSystem { .. }) => IngressOutcome::ForeignSystem,
     }
 }
 
@@ -671,8 +680,11 @@ fn run_dispatcher_history(operations: &[DispatcherOperation]) -> DispatcherHisto
             .try_send(dispatcher, DispatcherMsg::SpawnWorker)
             .expect("initial worker spawn should enqueue");
         assert_eq!(runtime.step(), 1);
-        let child = latest_dispatcher_worker_address(&runtime.trace()[trace_len_before..])
-            .expect("spawned worker address");
+        let child = latest_dispatcher_worker_address(
+            runtime.system_incarnation(),
+            &runtime.trace()[trace_len_before..],
+        )
+        .expect("spawned worker address");
         runtime
             .try_send(
                 registry,
@@ -699,6 +711,7 @@ fn run_dispatcher_history(operations: &[DispatcherOperation]) -> DispatcherHisto
             }
             DispatcherOperation::RefreshSlot(slot) => {
                 let refreshed = latest_dispatcher_replacement_for(
+                    runtime.system_incarnation(),
                     slot_addresses[slot as usize].isolate(),
                     runtime.trace(),
                 )
@@ -734,6 +747,7 @@ fn run_dispatcher_history(operations: &[DispatcherOperation]) -> DispatcherHisto
 }
 
 fn latest_dispatcher_worker_address(
+    system: tina::SystemIncarnation,
     trace: &[RuntimeEvent],
 ) -> Option<Address<DispatcherWorkerMsg>> {
     trace.iter().rev().find_map(|event| match event.kind() {
@@ -741,19 +755,21 @@ fn latest_dispatcher_worker_address(
             new_isolate,
             new_generation,
             ..
-        } => Some(Address::new_with_generation(
+        } => Some(Address::new_with_generation_in(
+            system,
             event.shard(),
             new_isolate,
             new_generation,
         )),
         RuntimeEventKind::Spawned { child_isolate } => {
-            Some(Address::new(event.shard(), child_isolate))
+            Some(Address::new_in(system, event.shard(), child_isolate))
         }
         _ => None,
     })
 }
 
 fn latest_dispatcher_replacement_for(
+    system: tina::SystemIncarnation,
     failed_isolate: IsolateId,
     trace: &[RuntimeEvent],
 ) -> Option<Address<DispatcherWorkerMsg>> {
@@ -763,7 +779,8 @@ fn latest_dispatcher_replacement_for(
             new_isolate,
             new_generation,
             ..
-        } if old_isolate == failed_isolate => Some(Address::new_with_generation(
+        } if old_isolate == failed_isolate => Some(Address::new_with_generation_in(
+            system,
             event.shard(),
             new_isolate,
             new_generation,

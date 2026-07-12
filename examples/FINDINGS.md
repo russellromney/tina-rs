@@ -218,8 +218,9 @@ host call routing all preserve and validate the stamp before shard or isolate
 routing.
 
 Typed threaded and call surfaces report `ForeignSystem` without claiming call
-or observation authority. Explicit-step `try_send` retains message ownership
-through its existing `Closed(message)` rail. Focused tests cover coincident
+or observation authority. Explicit-step and simulated ingress use a routing-
+level `IngressSendError::ForeignSystem` that returns message ownership without
+misreporting a mailbox closure. Focused tests cover coincident
 foreign address tuples, exact message drop settlement, same-owner cross-shard
 identity, preferred `LocalSystem` routing, deterministic replay, configured
 live/simulator parity, stale post-restart addresses, and replacement delivery

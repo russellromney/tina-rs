@@ -570,12 +570,12 @@ fn sends_after_panic_still_become_closed() {
 fn unknown_target_send_rejects_closed_without_becoming_handler_panicked() {
     let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let sender_mailbox = TestMailbox::new(8);
-    let sender_address = runtime.register(
-        PanicSender {
-            target: Address::new(ShardId::new(3), IsolateId::new(99)),
-        },
-        sender_mailbox.clone(),
+    let target = Address::new_in(
+        runtime.system_incarnation(),
+        ShardId::new(3),
+        IsolateId::new(99),
     );
+    let sender_address = runtime.register(PanicSender { target }, sender_mailbox.clone());
 
     assert_eq!(sender_mailbox.try_send(DriverMsg::Kick(1)), Ok(()));
 

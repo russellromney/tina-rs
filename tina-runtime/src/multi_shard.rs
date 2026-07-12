@@ -9,7 +9,6 @@ use std::collections::{BTreeMap, VecDeque};
 
 use tina::{
     Address, Isolate, Mailbox, Outbound as TinaOutbound, Shard, ShardId, SystemIncarnation,
-    TrySendError,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -110,6 +109,10 @@ where
     where
         I: IntoIterator<Item = S>,
     {
+        assert!(
+            !system_incarnation.is_unscoped(),
+            "multi-shard runtime system incarnation must be nonzero"
+        );
         let mut shards: Vec<S> = shards.into_iter().collect();
         if shards.is_empty() {
             panic!("multi-shard runtime requires at least one shard");
@@ -454,9 +457,13 @@ where
         &self,
         address: Address<M, R>,
         message: M,
-    ) -> Result<(), TrySendError<M>> {
+    ) -> Result<(), crate::IngressSendError<M>> {
         if address.system() != self.system_incarnation {
-            return Err(TrySendError::Closed(message));
+            return Err(crate::IngressSendError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+                message,
+            });
         }
         self.runtime(address.shard()).try_send(address, message)
     }
@@ -470,20 +477,33 @@ where
         &self,
         address: tina::ServiceEventAddress<Event, Request>,
         event: Event,
-    ) -> Result<(), TrySendError<Event>> {
+    ) -> Result<(), crate::IngressSendError<Event>> {
         match self.try_send(
             address.address().address(),
             tina::ServiceMessage::Event(event),
         ) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(tina::ServiceMessage::Event(event))) => {
-                Err(TrySendError::Full(event))
+            Err(crate::IngressSendError::Full(tina::ServiceMessage::Event(event))) => {
+                Err(crate::IngressSendError::Full(event))
             }
-            Err(TrySendError::Closed(tina::ServiceMessage::Event(event))) => {
-                Err(TrySendError::Closed(event))
+            Err(crate::IngressSendError::Closed(tina::ServiceMessage::Event(event))) => {
+                Err(crate::IngressSendError::Closed(event))
             }
-            Err(TrySendError::Full(tina::ServiceMessage::Request(_)))
-            | Err(TrySendError::Closed(tina::ServiceMessage::Request(_))) => {
+            Err(crate::IngressSendError::ForeignSystem {
+                expected,
+                actual,
+                message: tina::ServiceMessage::Event(event),
+            }) => Err(crate::IngressSendError::ForeignSystem {
+                expected,
+                actual,
+                message: event,
+            }),
+            Err(crate::IngressSendError::Full(tina::ServiceMessage::Request(_)))
+            | Err(crate::IngressSendError::Closed(tina::ServiceMessage::Request(_)))
+            | Err(crate::IngressSendError::ForeignSystem {
+                message: tina::ServiceMessage::Request(_),
+                ..
+            }) => {
                 unreachable!("runtime returned a different service payload than it received")
             }
         }

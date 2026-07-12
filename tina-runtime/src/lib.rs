@@ -110,10 +110,10 @@ pub use concurrency_pending::{
 };
 pub use drain_state::{AdmitDecision, DrainReport, DrainStage, DrainState};
 pub use errors::{
-    RegisterBootstrapError, SendObservedUntilError, ShutdownAndWaitError, ShutdownRequestError,
-    ShutdownWaitError, StartupError, SuperviseError, ThreadedRegisterBootstrapError,
-    ThreadedRuntimeConfigError, ThreadedRuntimeError, ThreadedSendObservedError,
-    ThreadedTrySendError,
+    IngressSendError, RegisterBootstrapError, SendObservedUntilError, ShutdownAndWaitError,
+    ShutdownRequestError, ShutdownWaitError, StartupError, SuperviseError,
+    ThreadedRegisterBootstrapError, ThreadedRuntimeConfigError, ThreadedRuntimeError,
+    ThreadedSendObservedError, ThreadedTrySendError,
 };
 pub use full_handling::{
     FullDecision, FullExhaustionReason, FullHandling, FullHandlingReport, FullHandlingToken,
@@ -427,15 +427,18 @@ impl IdSource {
 /// an unbounded delivery loop. The remainder carries over to the next step.
 pub const DEFAULT_DRIVER_COMPLETION_DRAIN_BUDGET: usize = 64;
 
-/// Allocates a nonzero process-unique system incarnation from OS randomness.
+static NEXT_SYSTEM_INCARNATION: AtomicU64 = AtomicU64::new(1);
+
+/// Allocates a nonzero process-unique system incarnation.
 ///
-/// Deterministic/replay owners may instead configure a fixed
-/// [`tina::SystemIncarnation`] explicitly.
+/// This identifier is a local routing provenance stamp, not a security token
+/// or distributed node id. A process-local monotonic source gives the contract
+/// exact uniqueness without adding an OS-entropy panic to runtime startup.
+/// Deterministic/replay owners may configure a fixed incarnation explicitly.
 pub fn fresh_system_incarnation() -> SystemIncarnation {
-    let mut bytes = [0u8; 8];
-    getrandom::fill(&mut bytes).expect("OS randomness unavailable for runtime provenance");
-    let raw = u64::from_le_bytes(bytes);
-    SystemIncarnation::new(if raw == 0 { 1 } else { raw })
+    let raw = NEXT_SYSTEM_INCARNATION.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(raw, 0, "system incarnation space exhausted");
+    SystemIncarnation::new(raw)
 }
 
 /// Small deterministic single-shard runtime.
@@ -980,6 +983,10 @@ where
         assert!(
             self.entries.is_empty(),
             "system incarnation must be set before registration"
+        );
+        assert!(
+            !system_incarnation.is_unscoped(),
+            "runtime system incarnation must be nonzero"
         );
         self.system_incarnation = system_incarnation;
         self

@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)] // Errors return linear caller authority intact.
+
 //! Runtime-owned bookkeeping for deferred reply slots.
 //!
 //! Slot-id allocation and the per-message pending-capture queue live in

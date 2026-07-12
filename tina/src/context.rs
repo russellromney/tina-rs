@@ -327,6 +327,7 @@ where
     /// caller cannot be captured. Lets bounded helpers like `park_request`
     /// check admission first and surface caller authority back on failure
     /// instead of stranding it inside the helper.
+    #[allow(clippy::result_large_err)] // Failure returns linear request authority intact.
     pub fn try_capture<F>(self, build: F) -> Result<RequestEffect<I>, (Self, TakeReplySlotError)>
     where
         I::Reply: 'static,
@@ -489,6 +490,7 @@ where
     /// Returns the original [`CallContext`] alongside a typed error so
     /// helpers like `park_call` can return caller authority unchanged when
     /// the slot cannot be captured (cross-shard, missing caller).
+    #[allow(clippy::result_large_err)] // Failure returns linear call authority intact.
     pub fn try_into_request_context(
         mut self,
     ) -> Result<RequestContext<I::Reply>, (Self, TakeReplySlotError)>

@@ -482,6 +482,9 @@ impl SystemIncarnation {
     pub const DEFAULT: Self = Self(0);
 
     /// Creates a system incarnation from its stable raw representation.
+    ///
+    /// Zero is reserved for [`Self::DEFAULT`] and is rejected by runtime and
+    /// simulator owner configuration.
     pub const fn new(raw: u64) -> Self {
         Self(raw)
     }
@@ -489,6 +492,11 @@ impl SystemIncarnation {
     /// Returns the stable raw representation.
     pub const fn get(self) -> u64 {
         self.0
+    }
+
+    /// Returns whether this is the unscoped marker used by manual addresses.
+    pub const fn is_unscoped(self) -> bool {
+        self.0 == 0
     }
 }
 

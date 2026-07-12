@@ -1239,7 +1239,7 @@ fn restart_children_replaces_restartable_child_and_preserves_ordinal() {
     );
     assert!(matches!(
         runtime.try_send(lineage_address(&runtime, old_child), LineageMsg::SpawnChild),
-        Err(TrySendError::Closed(LineageMsg::SpawnChild))
+        Err(crate::IngressSendError::Closed(LineageMsg::SpawnChild))
     ));
     assert_eq!(
         runtime.try_send(

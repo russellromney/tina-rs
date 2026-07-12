@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 
+use tina::SystemIncarnation;
 use tina::prelude::*;
-use tina::{SystemIncarnation, TrySendError};
 use tina_runtime::{
     DefaultThreadedMailboxFactory, HOST_CALL_DISPATCHER_POOL_SIZE, ThreadedRuntime,
     ThreadedRuntimeConfig, stable_trace_hash,
@@ -48,7 +48,11 @@ fn default_simulators_reject_foreign_coincident_tuple() {
     assert_ne!(local_address.system(), foreign_address.system());
     assert!(matches!(
         local.try_send(foreign_address, Msg::Tick),
-        Err(TrySendError::Closed(Msg::Tick))
+        Err(tina_runtime::IngressSendError::ForeignSystem {
+            expected,
+            actual,
+            message: Msg::Tick,
+        }) if expected == local_address.system() && actual == foreign_address.system()
     ));
     assert_eq!(local.trace().len(), 0);
 }
@@ -111,4 +115,29 @@ fn configured_live_and_simulated_owners_issue_matching_user_identity() {
 fn explicitly_configured_provenance_preserves_replay_determinism() {
     let system = SystemIncarnation::new(0x1234);
     assert_eq!(deterministic_trace(system), deterministic_trace(system));
+}
+
+#[test]
+fn simulators_reject_the_unscoped_system_marker() {
+    let single = std::panic::catch_unwind(|| {
+        Simulator::new(
+            SimShard(1),
+            SimulatorConfig {
+                system_incarnation: Some(SystemIncarnation::DEFAULT),
+                ..SimulatorConfig::default()
+            },
+        )
+    });
+    assert!(single.is_err());
+
+    let multi = std::panic::catch_unwind(|| {
+        MultiShardSimulator::new(
+            [SimShard(1)],
+            SimulatorConfig {
+                system_incarnation: Some(SystemIncarnation::DEFAULT),
+                ..SimulatorConfig::default()
+            },
+        )
+    });
+    assert!(multi.is_err());
 }

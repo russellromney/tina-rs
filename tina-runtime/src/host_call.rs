@@ -244,9 +244,13 @@ where
         &self,
         address: Address<M, R>,
         message: M,
-    ) -> Result<(), TrySendError<M>> {
+    ) -> Result<(), crate::IngressSendError<M>> {
         if address.system() != self.system_incarnation {
-            return Err(TrySendError::Closed(message));
+            return Err(crate::IngressSendError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+                message,
+            });
         }
         if address.shard() != self.shard.id() {
             panic!(
@@ -267,19 +271,19 @@ where
             isolate: address.isolate(),
             generation: address.generation(),
         }) else {
-            return Err(TrySendError::Closed(message));
+            return Err(crate::IngressSendError::Closed(message));
         };
 
         match self.enqueue_entry_message(entry_index, Box::new(message), None) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(message)) => Err(TrySendError::Full(
+            Err(TrySendError::Full(message)) => Err(crate::IngressSendError::Full(
                 *message.downcast::<M>().unwrap_or_else(|_| {
                     panic!(
                         "runtime ingress attempted to deliver a message to a mailbox with the wrong type"
                     )
                 }),
             )),
-            Err(TrySendError::Closed(message)) => Err(TrySendError::Closed(
+            Err(TrySendError::Closed(message)) => Err(crate::IngressSendError::Closed(
                 *message.downcast::<M>().unwrap_or_else(|_| {
                     panic!(
                         "runtime ingress attempted to deliver a message to a mailbox with the wrong type"
@@ -299,20 +303,33 @@ where
         &self,
         address: tina::ServiceEventAddress<Event, Request>,
         event: Event,
-    ) -> Result<(), TrySendError<Event>> {
+    ) -> Result<(), crate::IngressSendError<Event>> {
         match self.try_send(
             address.address().address(),
             tina::ServiceMessage::Event(event),
         ) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(tina::ServiceMessage::Event(event))) => {
-                Err(TrySendError::Full(event))
+            Err(crate::IngressSendError::Full(tina::ServiceMessage::Event(event))) => {
+                Err(crate::IngressSendError::Full(event))
             }
-            Err(TrySendError::Closed(tina::ServiceMessage::Event(event))) => {
-                Err(TrySendError::Closed(event))
+            Err(crate::IngressSendError::Closed(tina::ServiceMessage::Event(event))) => {
+                Err(crate::IngressSendError::Closed(event))
             }
-            Err(TrySendError::Full(tina::ServiceMessage::Request(_)))
-            | Err(TrySendError::Closed(tina::ServiceMessage::Request(_))) => {
+            Err(crate::IngressSendError::ForeignSystem {
+                expected,
+                actual,
+                message: tina::ServiceMessage::Event(event),
+            }) => Err(crate::IngressSendError::ForeignSystem {
+                expected,
+                actual,
+                message: event,
+            }),
+            Err(crate::IngressSendError::Full(tina::ServiceMessage::Request(_)))
+            | Err(crate::IngressSendError::Closed(tina::ServiceMessage::Request(_)))
+            | Err(crate::IngressSendError::ForeignSystem {
+                message: tina::ServiceMessage::Request(_),
+                ..
+            }) => {
                 unreachable!("runtime returned a different split-service payload than it received")
             }
         }

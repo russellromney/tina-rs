@@ -17,7 +17,6 @@ use std::time::{Duration, Instant};
 use betelgeuse::io_loop;
 use tina::{
     Address, Context, Effect, Isolate, Outbound as TinaOutbound, Shard, ShardId, SystemIncarnation,
-    TrySendError as TinaTrySendError,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -874,8 +873,11 @@ where
             let outcome = runtime
                 .try_send(address, message)
                 .map_err(|error| match error {
-                    TinaTrySendError::Full(_) => ThreadedSendObservedError::MailboxFull,
-                    TinaTrySendError::Closed(_) => ThreadedSendObservedError::MailboxClosed,
+                    crate::IngressSendError::ForeignSystem {
+                        expected, actual, ..
+                    } => ThreadedSendObservedError::ForeignSystem { expected, actual },
+                    crate::IngressSendError::Full(_) => ThreadedSendObservedError::MailboxFull,
+                    crate::IngressSendError::Closed(_) => ThreadedSendObservedError::MailboxClosed,
                 });
             let _ = reply_tx.send(outcome);
         }));
@@ -1432,11 +1434,14 @@ where
                 },
             ) {
                 Ok(()) => {}
-                Err(TinaTrySendError::Full(_)) => {
+                Err(crate::IngressSendError::Full(_)) => {
                     panic!("fresh host-call driver mailbox was unexpectedly full");
                 }
-                Err(TinaTrySendError::Closed(_)) => {
+                Err(crate::IngressSendError::Closed(_)) => {
                     panic!("fresh host-call driver mailbox was unexpectedly closed");
+                }
+                Err(crate::IngressSendError::ForeignSystem { .. }) => {
+                    panic!("fresh host-call driver carried foreign provenance");
                 }
             }
         }));

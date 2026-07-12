@@ -15,7 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina::{AddressGeneration, RestartBudget, RestartPolicy, TrySendError};
+use tina::{AddressGeneration, RestartBudget, RestartPolicy};
+use tina_runtime::IngressSendError;
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallKind, CallOutcome, CallReplyRejectedReason,
     RuntimeEventKind, SendOutcome, SendRejectedReason, call, send_observed, sleep_then,
@@ -633,8 +634,9 @@ fn tina_bounded_ingress_full() -> Vec<&'static str> {
     let sink = sim.register_with_mailbox_capacity(Sink { events }, 0);
     match sim.try_send(sink, SinkMsg::Hit) {
         Ok(()) => vec!["accepted"],
-        Err(TrySendError::Full(_)) => vec!["full"],
-        Err(TrySendError::Closed(_)) => vec!["closed"],
+        Err(IngressSendError::Full(_)) => vec!["full"],
+        Err(IngressSendError::Closed(_)) => vec!["closed"],
+        Err(IngressSendError::ForeignSystem { .. }) => vec!["foreign_system"],
     }
 }
 
@@ -650,8 +652,9 @@ fn tina_ingress_try_send_backpressure() -> Vec<&'static str> {
     sim.try_send(sink, SinkMsg::Hit).unwrap();
     let admission = match sim.try_send(sink, SinkMsg::Hit) {
         Ok(()) => "accepted",
-        Err(TrySendError::Full(_)) => "full",
-        Err(TrySendError::Closed(_)) => "closed",
+        Err(IngressSendError::Full(_)) => "full",
+        Err(IngressSendError::Closed(_)) => "closed",
+        Err(IngressSendError::ForeignSystem { .. }) => "foreign_system",
     };
     sim.run_until_quiescent();
 
@@ -891,8 +894,16 @@ fn tina_seeded_send_perturbation(seed: u64) -> Vec<&'static str> {
     snapshot(&events)
 }
 
-fn supervised_child_address(isolate: IsolateId) -> Address<SupervisedChildMsg> {
-    Address::new_with_generation(ShardId::new(151), isolate, AddressGeneration::new(0))
+fn supervised_child_address(
+    system: tina::SystemIncarnation,
+    isolate: IsolateId,
+) -> Address<SupervisedChildMsg> {
+    Address::new_with_generation_in(
+        system,
+        ShardId::new(151),
+        isolate,
+        AddressGeneration::new(0),
+    )
 }
 
 fn tina_supervision_restart() -> Vec<&'static str> {
@@ -919,8 +930,11 @@ fn tina_supervision_restart() -> Vec<&'static str> {
         })
         .expect("child should spawn");
 
-    sim.try_send(supervised_child_address(child), SupervisedChildMsg::Poison)
-        .unwrap();
+    sim.try_send(
+        supervised_child_address(sim.system_incarnation(), child),
+        SupervisedChildMsg::Poison,
+    )
+    .unwrap();
     sim.run_until_quiescent();
     assert!(
         sim.trace().iter().any(|event| {
