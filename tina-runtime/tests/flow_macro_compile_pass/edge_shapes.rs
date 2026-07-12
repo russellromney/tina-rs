@@ -13,6 +13,10 @@ macro_rules! respond {
 pub mod api {
     use super::*;
 
+    mod request {
+        pub type Outcome = u32;
+    }
+
     pub struct Driver;
 
     pub enum DriverMsg {
@@ -73,6 +77,11 @@ pub mod api {
             step Woke(seed: u32) -> raw u32 {
                 // No `req` in scope; the body compiles without mentioning it.
                 let _ = (seed, outcome);
+                noop()
+            }
+
+            step QualifiedRawType() -> raw request::Outcome {
+                let _ = outcome;
                 noop()
             }
         }
@@ -221,12 +230,17 @@ fn assert_raw_step_shape(seed: u32, woke: u32) -> api::MixedArrowFlow {
     api::MixedArrowFlow::Woke(seed, woke)
 }
 
+fn assert_qualified_raw_type_is_not_a_request_step(outcome: u32) -> api::MixedArrowFlow {
+    api::MixedArrowFlow::QualifiedRawType(outcome)
+}
+
 fn main() {
     let _ = noop::<api::Driver>();
     let _ = dispatch_public;
     let _ = assert_acronym_variant;
     let _ = assert_call_step_shape;
     let _ = assert_raw_step_shape;
+    let _ = assert_qualified_raw_type_is_not_a_request_step;
     let _ = SoakRequest::Run;
     let _ = continue_typed_io_without_envelope;
 }

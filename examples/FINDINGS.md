@@ -27,6 +27,15 @@ timer results, exact lease release, caller timeout, and owner-stop cancellation
 while caller authority is captured. Migrating `system_soak_http_db` remains a
 separate example cohort.
 
+Adversarial review also closed two boundary defects. The contextual `request`
+qualifier no longer steals an existing plain raw type path such as
+`request::Outcome`. More importantly, a local request that times out after it
+is queued but before its handler turn now supplies a closed `RequestContext`
+if the handler captures it; the runtime preserves the established typed late
+reply trace without minting fresh caller authority. Live/simulator proofs now
+also preserve an exact raw `CallError::InvalidResource` from typed file I/O and
+cover caller-gone and owner-stop capture settlement on both backends.
+
 ### 2026-07-12 Lock-manager keyed FIFO canonicalization
 
 Migrated `system_lock_manager` from the historical

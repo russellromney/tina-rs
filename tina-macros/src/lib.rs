@@ -321,7 +321,16 @@ impl Parse for FlowInput {
             content.parse::<Token![->]>()?;
             let outcome = if content.peek(flow_kw::raw) {
                 content.parse::<flow_kw::raw>()?;
-                if content.peek(flow_kw::request) {
+                // `request` is contextual here. Keep existing raw outcome
+                // paths such as `request::Outcome` and `request<T>` valid.
+                let request_qualifier = if content.peek(flow_kw::request) {
+                    let lookahead = content.fork();
+                    lookahead.parse::<flow_kw::request>()?;
+                    !lookahead.peek(Token![::]) && !lookahead.peek(Token![<])
+                } else {
+                    false
+                };
+                if request_qualifier {
                     content.parse::<flow_kw::request>()?;
                     StepOutcome::RawRequest(content.parse()?)
                 } else {

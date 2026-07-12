@@ -413,15 +413,24 @@ where
                 Some(expected_reply_type_id),
             ),
         };
-        let expected_reply_type_id = match routing {
-            CallRouting::Local => self
-                .call_table
-                .isolate_expected_reply_type_id(call_id)
-                .unwrap_or_else(std::any::TypeId::of::<()>),
+        let (expected_reply_type_id, caller_open) = match routing {
+            CallRouting::Local => match self.call_table.isolate_expected_reply_type_id(call_id) {
+                Some(expected) => (expected, true),
+                // The request was already queued when its caller timed out or
+                // cancelled. Preserve late-reply handler/trace behavior, but
+                // any RequestContext captured from it must start closed.
+                None => (std::any::TypeId::of::<()>(), false),
+            },
             CallRouting::Remote { .. } => remote_expected_reply_type_id
+                .map(|expected| (expected, true))
                 .expect("remote call context carries the expected reply type"),
         };
-        Some(MessageCaller::new(
+        let constructor = if caller_open {
+            MessageCaller::new
+        } else {
+            MessageCaller::new_closed
+        };
+        Some(constructor(
             Rc::clone(&self.deferred_registry),
             call_id.get(),
             isolate_id,
