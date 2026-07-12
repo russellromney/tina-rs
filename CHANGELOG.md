@@ -4,6 +4,21 @@ This file records completed work.
 
 ## Unreleased
 
+### Fallible threaded runtime startup (#296)
+
+- Added typed `StartupError` and `ThreadedRuntimeConfigError`. Startup failures
+  carry field, shard, platform source, and panic message instead of panicking
+  inside the constructor.
+- Added fallible `try_*` constructors to `ThreadedRuntime` and
+  `ThreadedMultiShardRuntime`, and `try_build` to both `LocalSystem` builders.
+  The panicking constructors now delegate to the fallible path and keep their
+  old signature.
+- Construction now waits for a worker-ready handshake: success means config
+  validation, I/O loop creation, dispatcher bootstrap, and worker startup all
+  completed. Multi-shard failures shut down and join the partially started
+  topology; a worker blocked indefinitely in user startup code may outlive the
+  timeout error (documented on `StartupError::WorkerHandshakeTimeout`).
+
 ### Split-service set / scope event helpers
 
 - `CallGroup::start_cancelable_service_event`,
