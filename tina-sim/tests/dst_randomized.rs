@@ -631,7 +631,11 @@ fn run_random_multishard_history(
             ShardId::new(371),
             RemoteCoordinator {
                 worker,
-                bad_worker: Address::new(ShardId::new(372), IsolateId::new(999)),
+                bad_worker: Address::new_in(
+                    sim.system_incarnation(),
+                    ShardId::new(372),
+                    IsolateId::new(999),
+                ),
                 observed: Rc::clone(&observed),
             },
             8,

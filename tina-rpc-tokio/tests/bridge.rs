@@ -86,6 +86,21 @@ impl MailboxFactory for EFactory {
 // A typed service via the macro.
 // ---------------------------------------------------------------------------
 
+async fn wait_for_available_slots(bridge: &BridgeClient<SpecimenShard>, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while bridge.available_slots() != expected {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "bridge admission did not reach {expected} available slots; observed {}",
+            bridge.available_slots()
+        )
+    });
+}
+
 #[service]
 pub trait Echo {
     fn say(&mut self, msg: String) -> String;
@@ -402,11 +417,9 @@ async fn admission_full_returns_synchronously_no_hang() {
             .await
     });
 
-    // Yield until both spawned tasks have synchronously claimed
-    // their slots and parked on `rx.await`.
-    for _ in 0..50 {
-        tokio::task::yield_now().await;
-    }
+    // Do not infer admission from scheduler turns. Wait until both permits
+    // are observably charged before asserting the next call is full.
+    wait_for_available_slots(&bridge, 0).await;
 
     // Third call must surface `Full` immediately. Wrap in a timeout
     // so a regression hangs the test loudly instead of forever.
@@ -453,9 +466,7 @@ async fn cancelled_call_releases_slot_after_terminal_backstop() {
             )
             .await
     });
-    for _ in 0..50 {
-        tokio::task::yield_now().await;
-    }
+    wait_for_available_slots(&bridge, 0).await;
     abandoned.abort();
     let _ = abandoned.await;
 
@@ -495,9 +506,7 @@ async fn dropped_awaiter_holds_capacity_until_terminal_backstop() {
             )
             .await
     });
-    for _ in 0..50 {
-        tokio::task::yield_now().await;
-    }
+    wait_for_available_slots(&bridge, 0).await;
     abandoned.abort();
     let _ = abandoned.await;
 

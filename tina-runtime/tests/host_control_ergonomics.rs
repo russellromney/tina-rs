@@ -782,8 +782,7 @@ fn multi_shard_call_blocking_returns_full_when_target_mailbox_full() {
 }
 
 #[test]
-#[should_panic(expected = "unknown shard")]
-fn multi_shard_call_blocking_panics_on_unknown_shard() {
+fn multi_shard_call_blocking_rejects_foreign_system_before_unknown_shard() {
     let runtime = multi_runtime(64);
     let foreign =
         ThreadedMultiShardRuntime::<TestShard, DefaultThreadedMailboxFactory>::with_config(
@@ -799,8 +798,11 @@ fn multi_shard_call_blocking_panics_on_unknown_shard() {
     let foreign_addr = foreign
         .register_with_capacity_on::<EchoMS, Infallible>(ShardId::new(99), EchoMS, 4)
         .expect("register echo on foreign");
-    let _ = runtime.call_blocking(foreign_addr, EchoMsg::AddOne(0), Duration::from_millis(50));
-    drop(foreign);
+    assert!(matches!(
+        runtime.call_blocking(foreign_addr, EchoMsg::AddOne(0), Duration::from_millis(50)),
+        Err(ThreadedRuntimeError::ForeignSystem { .. })
+    ));
+    let _ = foreign.shutdown();
     let _ = runtime.shutdown();
 }
 

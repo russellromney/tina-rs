@@ -769,6 +769,7 @@ pub fn call_kind_name(kind: CallKind) -> &'static str {
 /// Stable string name for a [`SendRejectedReason`].
 pub fn send_rejected_reason_name(reason: SendRejectedReason) -> &'static str {
     match reason {
+        SendRejectedReason::ForeignSystem { .. } => "ForeignSystem",
         SendRejectedReason::Full => "Full",
         SendRejectedReason::Closed => "Closed",
     }
@@ -795,6 +796,7 @@ pub fn terminal_completion_action_name(action: TerminalCompletionAction) -> &'st
 /// Stable string name for a [`CallReplyRejectedReason`].
 pub fn call_reply_rejected_reason_name(reason: CallReplyRejectedReason) -> &'static str {
     match reason {
+        CallReplyRejectedReason::ForeignSystem { .. } => "ForeignSystem",
         CallReplyRejectedReason::NoPendingCall => "NoPendingCall",
         CallReplyRejectedReason::ReplyPathFull => "ReplyPathFull",
         CallReplyRejectedReason::RequesterShardClosed => "RequesterShardClosed",
@@ -808,6 +810,7 @@ pub fn call_reply_rejected_reason_name(reason: CallReplyRejectedReason) -> &'sta
 /// Stable string name for a [`CallRejectedReason`].
 pub fn call_rejected_reason_name(reason: CallRejectedReason) -> &'static str {
     match reason {
+        CallRejectedReason::ForeignSystem { .. } => "ForeignSystem",
         CallRejectedReason::ReplyAbandoned => "ReplyAbandoned",
         CallRejectedReason::HandlerPanicked => "HandlerPanicked",
         CallRejectedReason::UnsupportedMessage => "UnsupportedMessage",
@@ -817,6 +820,7 @@ pub fn call_rejected_reason_name(reason: CallRejectedReason) -> &'static str {
 /// Stable string name for a [`DeferredReplyRejectedReason`].
 pub fn deferred_reply_rejected_reason_name(reason: DeferredReplyRejectedReason) -> &'static str {
     match reason {
+        DeferredReplyRejectedReason::ForeignSystem { .. } => "ForeignSystem",
         DeferredReplyRejectedReason::CallerClosed => "CallerClosed",
         DeferredReplyRejectedReason::ReplyPathFull => "ReplyPathFull",
         DeferredReplyRejectedReason::RequesterShardClosed => "RequesterShardClosed",
@@ -840,6 +844,7 @@ pub fn restart_skipped_reason_name(reason: RestartSkippedReason) -> &'static str
 /// Stable string name for a [`CallError`].
 pub fn call_error_name(error: CallError) -> &'static str {
     match error {
+        CallError::Rejected(CallRejectedReason::ForeignSystem { .. }) => "Rejected.ForeignSystem",
         CallError::InvariantViolation => "InvariantViolation",
         CallError::InvalidResource => "InvalidResource",
         CallError::NotFound => "NotFound",

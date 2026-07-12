@@ -13,6 +13,7 @@
 //! ```text
 //! Tina Full     -> Service future returns Err(BridgeError::Full)
 //! Tina Closed/unknown shard -> Service future returns the matching BridgeError
+//! Tina foreign system -> Service future returns Err(BridgeError::ForeignSystem)
 //! Tina Timeout  -> Service future returns Err(BridgeError::Timeout)
 //! ```
 //!
@@ -128,7 +129,7 @@
 //!     let mut svc = svc;
 //!     match svc.call(7).await {
 //!         Ok(v) => Ok(v.to_string()),
-//!         Err(BridgeError::Full | BridgeError::Closed | BridgeError::UnknownShard(_)) => Err(StatusCode::SERVICE_UNAVAILABLE),
+//!         Err(BridgeError::ForeignSystem { .. } | BridgeError::Full | BridgeError::Closed | BridgeError::UnknownShard(_)) => Err(StatusCode::SERVICE_UNAVAILABLE),
 //!         Err(BridgeError::Timeout) => Err(StatusCode::GATEWAY_TIMEOUT),
 //!     }
 //! }
@@ -176,6 +177,7 @@ const TRACE_TARGET_BRIDGE: &str = "tina_tower.bridge";
 #[cfg(feature = "tracing")]
 fn bridge_error_reason(error: BridgeError) -> &'static str {
     match error {
+        BridgeError::ForeignSystem { .. } => "ForeignSystem",
         BridgeError::UnknownShard(_) => "UnknownShard",
         BridgeError::Full => "Full",
         BridgeError::Closed => "Closed",
@@ -322,3 +324,19 @@ pub use tower_service::Service;
 /// [`TinaTowerService`] with six explicit generics.
 pub type TinaService<M, R> =
     TinaTowerService<M, R, tina::SingleShard, tina_runtime::DefaultThreadedMailboxFactory, ()>;
+
+#[cfg(all(test, feature = "tracing"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn foreign_system_trace_reason_is_distinct() {
+        assert_eq!(
+            bridge_error_reason(BridgeError::ForeignSystem {
+                expected: tina::SystemIncarnation::new(1),
+                actual: tina::SystemIncarnation::new(2),
+            }),
+            "ForeignSystem"
+        );
+    }
+}

@@ -79,6 +79,7 @@ fn spawn_one_shot_https_server(server_config: rustls::ServerConfig) -> SocketAdd
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 enum DriverMsg {
     Begin {
         pool: Address<HttpPoolMsg, Result<HttpResponse, HttpClientError>>,

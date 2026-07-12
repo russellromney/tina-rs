@@ -223,7 +223,6 @@ fn local_multi_shard_observe_result_routes_to_address_owner() {
 }
 
 #[test]
-#[should_panic(expected = "unknown shard")]
 fn local_multi_shard_observe_result_rejects_foreign_shard() {
     let owner = LocalSystem::multi_shard(DefaultThreadedMailboxFactory)
         .shard(AppShard(30))
@@ -237,7 +236,12 @@ fn local_multi_shard_observe_result_rejects_foreign_shard() {
         .try_build()
         .expect("start foreign owner");
 
-    let _ = foreign.observe_result::<u64, _, _>(worker);
+    assert!(matches!(
+        foreign.observe_result::<u64, _, _>(worker),
+        Err(ResultWaitError::ForeignSystem { .. })
+    ));
+    foreign.shutdown().join_report().ensure_clean().unwrap();
+    owner.shutdown().join_report().ensure_clean().unwrap();
 }
 
 #[test]

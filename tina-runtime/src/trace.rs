@@ -113,6 +113,13 @@ pub enum EffectKind {
 /// `compile_fail` doctest on [`tina::reply_to`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DeferredReplyRejectedReason {
+    /// The requester belongs to another runtime/system incarnation.
+    ForeignSystem {
+        /// Incarnation owned by the replying runtime.
+        expected: tina::SystemIncarnation,
+        /// Incarnation carried by the requester address.
+        actual: tina::SystemIncarnation,
+    },
     /// The original caller already closed for a reason not classified
     /// below: e.g. requester shard failure, transport issue, or a
     /// pre-066 lifecycle path we have not yet split out.
@@ -358,6 +365,13 @@ pub enum TerminalCompletionAction {
 /// Why a reply from a callee could not complete its original isolate call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CallReplyRejectedReason {
+    /// The requester belongs to another runtime/system incarnation.
+    ForeignSystem {
+        /// Incarnation owned by the replying runtime.
+        expected: tina::SystemIncarnation,
+        /// Incarnation carried by the requester address.
+        actual: tina::SystemIncarnation,
+    },
     /// The call was no longer pending by the time the callee replied.
     ///
     /// Used as the fall-through when no more specific cause is on
@@ -392,6 +406,13 @@ pub enum CallReplyRejectedReason {
 /// Why a local send could not be enqueued into the target mailbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SendRejectedReason {
+    /// The target belongs to another runtime/system incarnation.
+    ForeignSystem {
+        /// Incarnation owned by the routing runtime.
+        expected: tina::SystemIncarnation,
+        /// Incarnation carried by the target.
+        actual: tina::SystemIncarnation,
+    },
     /// The target mailbox was full.
     Full,
 
@@ -1436,6 +1457,7 @@ fn protocol_fact_write(fact: ProtocolFact, hasher: &mut StableHasher) {
 
 fn deferred_reply_rejected_tag(reason: DeferredReplyRejectedReason) -> u8 {
     match reason {
+        DeferredReplyRejectedReason::ForeignSystem { .. } => 9,
         DeferredReplyRejectedReason::CallerClosed => 1,
         DeferredReplyRejectedReason::ReplyPathFull => 2,
         DeferredReplyRejectedReason::RequesterShardClosed => 3,
@@ -1533,6 +1555,7 @@ fn call_error_tag(error: CallError) -> u8 {
             tina::CallRejectedReason::ReplyAbandoned => 25,
             tina::CallRejectedReason::HandlerPanicked => 26,
             tina::CallRejectedReason::UnsupportedMessage => 27,
+            tina::CallRejectedReason::ForeignSystem { .. } => 31,
         },
         // Appended after the existing tags; never renumber.
         CallError::TlsAlpnMismatch => 28,
@@ -1541,10 +1564,27 @@ fn call_error_tag(error: CallError) -> u8 {
     }
 }
 
+fn call_error_write(error: CallError, hasher: &mut StableHasher) {
+    hasher.write_u8(call_error_tag(error));
+    if let CallError::Rejected(CallRejectedReason::ForeignSystem { expected, actual }) = error {
+        hasher.write_u64(expected.get());
+        hasher.write_u64(actual.get());
+    }
+}
+
 fn send_rejected_tag(reason: SendRejectedReason) -> u8 {
     match reason {
+        SendRejectedReason::ForeignSystem { .. } => 3,
         SendRejectedReason::Full => 1,
         SendRejectedReason::Closed => 2,
+    }
+}
+
+fn send_rejected_write(reason: SendRejectedReason, hasher: &mut StableHasher) {
+    hasher.write_u8(send_rejected_tag(reason));
+    if let SendRejectedReason::ForeignSystem { expected, actual } = reason {
+        hasher.write_u64(expected.get());
+        hasher.write_u64(actual.get());
     }
 }
 
@@ -1581,6 +1621,7 @@ fn call_completion_rejected_tag(reason: CallCompletionRejectedReason) -> u8 {
 
 fn call_reply_rejected_tag(reason: CallReplyRejectedReason) -> u8 {
     match reason {
+        CallReplyRejectedReason::ForeignSystem { .. } => 8,
         CallReplyRejectedReason::NoPendingCall => 1,
         CallReplyRejectedReason::ReplyPathFull => 2,
         CallReplyRejectedReason::RequesterShardClosed => 3,
@@ -1588,6 +1629,14 @@ fn call_reply_rejected_tag(reason: CallReplyRejectedReason) -> u8 {
         CallReplyRejectedReason::CallerTimedOut => 5,
         CallReplyRejectedReason::OwnerStopped => 6,
         CallReplyRejectedReason::RuntimeStopped => 7,
+    }
+}
+
+fn call_reply_rejected_write(reason: CallReplyRejectedReason, hasher: &mut StableHasher) {
+    hasher.write_u8(call_reply_rejected_tag(reason));
+    if let CallReplyRejectedReason::ForeignSystem { expected, actual } = reason {
+        hasher.write_u64(expected.get());
+        hasher.write_u64(actual.get());
     }
 }
 
@@ -1605,6 +1654,23 @@ fn call_rejected_reason_tag(reason: CallRejectedReason) -> u8 {
         CallRejectedReason::ReplyAbandoned => 1,
         CallRejectedReason::HandlerPanicked => 2,
         CallRejectedReason::UnsupportedMessage => 3,
+        CallRejectedReason::ForeignSystem { .. } => 4,
+    }
+}
+
+fn call_rejected_reason_write(reason: CallRejectedReason, hasher: &mut StableHasher) {
+    hasher.write_u8(call_rejected_reason_tag(reason));
+    if let CallRejectedReason::ForeignSystem { expected, actual } = reason {
+        hasher.write_u64(expected.get());
+        hasher.write_u64(actual.get());
+    }
+}
+
+fn deferred_reply_rejected_write(reason: DeferredReplyRejectedReason, hasher: &mut StableHasher) {
+    hasher.write_u8(deferred_reply_rejected_tag(reason));
+    if let DeferredReplyRejectedReason::ForeignSystem { expected, actual } = reason {
+        hasher.write_u64(expected.get());
+        hasher.write_u64(actual.get());
     }
 }
 
@@ -1665,7 +1731,7 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
         } => {
             hasher.write_u8(42);
             hasher.write_u32(target_shard.get());
-            hasher.write_u8(send_rejected_tag(reason));
+            send_rejected_write(reason, hasher);
         }
         RuntimeEventKind::RemoteChildControlPressure { capacity } => {
             hasher.write_u8(43);
@@ -1709,7 +1775,7 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
             hasher.write_u32(target_shard.get());
             hasher.write_u64(target_isolate.get());
             hasher.write_u64(target_generation.get());
-            hasher.write_u8(send_rejected_tag(reason));
+            send_rejected_write(reason, hasher);
         }
         RuntimeEventKind::Spawned { child_isolate } => {
             hasher.write_u8(9);
@@ -1796,7 +1862,7 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
             hasher.write_u8(19);
             hasher.write_u64(call_id.get());
             hasher.write_u8(call_kind_tag(call_kind));
-            hasher.write_u8(call_error_tag(reason));
+            call_error_write(reason, hasher);
         }
         RuntimeEventKind::CallCompletionRejected {
             call_id,
@@ -1821,12 +1887,12 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
         RuntimeEventKind::CallReplyRejected { call_id, reason } => {
             hasher.write_u8(21);
             hasher.write_u64(call_id.get());
-            hasher.write_u8(call_reply_rejected_tag(reason));
+            call_reply_rejected_write(reason, hasher);
         }
         RuntimeEventKind::SnapshotCommitted => hasher.write_u8(22),
         RuntimeEventKind::SnapshotCommitFailed { reason } => {
             hasher.write_u8(23);
-            hasher.write_u8(call_error_tag(reason));
+            call_error_write(reason, hasher);
         }
         RuntimeEventKind::JournalAppended { record_index } => {
             hasher.write_u8(24);
@@ -1838,13 +1904,13 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
         } => {
             hasher.write_u8(25);
             hasher.write_u64(record_index);
-            hasher.write_u8(call_error_tag(reason));
+            call_error_write(reason, hasher);
         }
         RuntimeEventKind::RecoveryStarted => hasher.write_u8(26),
         RuntimeEventKind::RecoveryFinished => hasher.write_u8(27),
         RuntimeEventKind::RecoveryFailed { reason } => {
             hasher.write_u8(28);
-            hasher.write_u8(call_error_tag(reason));
+            call_error_write(reason, hasher);
         }
         RuntimeEventKind::DeferredReplyCaptured { slot_id, call_id } => {
             hasher.write_u8(29);
@@ -1864,7 +1930,7 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
             hasher.write_u8(31);
             hasher.write_u64(slot_id.get());
             hasher.write_u64(call_id.get());
-            hasher.write_u8(deferred_reply_rejected_tag(reason));
+            deferred_reply_rejected_write(reason, hasher);
         }
         RuntimeEventKind::DeferredReplyDropped { slot_id, call_id } => {
             hasher.write_u8(32);
@@ -1883,7 +1949,7 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
         RuntimeEventKind::CallRejected { call_id, reason } => {
             hasher.write_u8(35);
             hasher.write_u64(call_id.get());
-            hasher.write_u8(call_rejected_reason_tag(reason));
+            call_rejected_reason_write(reason, hasher);
         }
         RuntimeEventKind::FactObserved { fact } => {
             hasher.write_u8(36);
@@ -1930,7 +1996,7 @@ mod stable_hash_tests {
         Http2StreamId, ProtocolConnectionId, ProtocolDirection, ProtocolFact, WebSocketCloseReason,
         WebSocketSessionId,
     };
-    use tina::{AddressGeneration, IsolateId, ShardId};
+    use tina::{AddressGeneration, IsolateId, ShardId, SystemIncarnation};
 
     fn sample_event() -> RuntimeEvent {
         RuntimeEvent::new(
@@ -1981,6 +2047,31 @@ mod stable_hash_tests {
             },
         );
         assert_ne!(original.stable_hash(), mutated.stable_hash());
+    }
+
+    #[test]
+    fn stable_hash_includes_foreign_system_provenance() {
+        let event = |expected, actual| {
+            RuntimeEvent::new(
+                EventId::new(1),
+                None,
+                ShardId::new(0),
+                IsolateId::new(1),
+                RuntimeEventKind::SendRejected {
+                    target_shard: ShardId::new(0),
+                    target_isolate: IsolateId::new(2),
+                    target_generation: AddressGeneration::new(0),
+                    reason: SendRejectedReason::ForeignSystem {
+                        expected: SystemIncarnation::new(expected),
+                        actual: SystemIncarnation::new(actual),
+                    },
+                },
+            )
+        };
+
+        assert_ne!(event(1, 2).stable_hash(), event(1, 3).stable_hash());
+        assert_ne!(event(1, 2).stable_hash(), event(3, 2).stable_hash());
+        assert_eq!(event(1, 2).stable_hash(), event(1, 2).stable_hash());
     }
 
     #[test]

@@ -61,7 +61,10 @@ type CounterService = TinaService<CounterRequest, CounterReply>;
 /// within the per-call deadline).
 fn map_error(error: BridgeError) -> StatusCode {
     match error {
-        BridgeError::Full | BridgeError::Closed | BridgeError::UnknownShard(_) => {
+        BridgeError::ForeignSystem { .. }
+        | BridgeError::Full
+        | BridgeError::Closed
+        | BridgeError::UnknownShard(_) => {
             StatusCode::SERVICE_UNAVAILABLE
         }
         BridgeError::Timeout => StatusCode::GATEWAY_TIMEOUT,
@@ -141,4 +144,20 @@ pub fn run() -> Result<Report, Box<dyn std::error::Error>> {
     }
 
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn foreign_system_bridge_error_is_service_unavailable() {
+        assert_eq!(
+            map_error(BridgeError::ForeignSystem {
+                expected: tina::SystemIncarnation::new(1),
+                actual: tina::SystemIncarnation::new(2),
+            }),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
 }

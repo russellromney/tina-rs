@@ -7,7 +7,6 @@ use std::convert::Infallible;
 mod bounded_mailbox;
 
 use bounded_mailbox::{Job, ScenarioReport, Worker};
-use tina::TrySendError;
 use tina::prelude::*;
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -24,7 +23,10 @@ fn run(seed: u64) -> (ScenarioReport, Vec<tina_runtime::RuntimeEvent>) {
     sim.try_send(worker, Job::Run(1)).expect("job 1 fits");
     sim.try_send(worker, Job::Run(2)).expect("job 2 fits");
     let rejected = match sim.try_send(worker, Job::Run(3)) {
-        Err(TrySendError::Full(job)) => job,
+        Err(tina_runtime::IngressSendError::Full(job)) => job,
+        Err(tina_runtime::IngressSendError::ForeignSystem { .. }) => {
+            panic!("worker became foreign")
+        }
         other => panic!("expected Full, got {other:?}"),
     };
     assert_eq!(rejected, Job::Run(3), "Full returns the attempted job");
@@ -37,7 +39,10 @@ fn run(seed: u64) -> (ScenarioReport, Vec<tina_runtime::RuntimeEvent>) {
     sim.try_send(worker, Job::Stop).expect("stop fits");
     assert_eq!(sim.step(), 1);
     let closed = match sim.try_send(worker, Job::Run(4)) {
-        Err(TrySendError::Closed(job)) => job,
+        Err(tina_runtime::IngressSendError::Closed(job)) => job,
+        Err(tina_runtime::IngressSendError::ForeignSystem { .. }) => {
+            panic!("worker became foreign")
+        }
         other => panic!("expected Closed, got {other:?}"),
     };
     assert_eq!(closed, Job::Run(4), "Closed returns the attempted job");

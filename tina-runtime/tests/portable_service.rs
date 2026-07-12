@@ -698,6 +698,9 @@ impl AuditedWorker {
             AuditedWorkerMsg::AuditResult(_, SendOutcome::Closed) => {
                 reply(WorkerReply::DurableFailure(CallError::TargetClosed))
             }
+            AuditedWorkerMsg::AuditResult(_, SendOutcome::ForeignSystem { .. }) => {
+                reply(WorkerReply::DurableFailure(CallError::TargetClosed))
+            }
             AuditedWorkerMsg::AuditResultForCall(req, request, SendOutcome::Accepted) => {
                 self.observed
                     .lock()
@@ -715,6 +718,9 @@ impl AuditedWorker {
                 tina::reply_to(req, WorkerReply::DurableFailure(CallError::TargetFull))
             }
             AuditedWorkerMsg::AuditResultForCall(req, _, SendOutcome::Closed) => {
+                tina::reply_to(req, WorkerReply::DurableFailure(CallError::TargetClosed))
+            }
+            AuditedWorkerMsg::AuditResultForCall(req, _, SendOutcome::ForeignSystem { .. }) => {
                 tina::reply_to(req, WorkerReply::DurableFailure(CallError::TargetClosed))
             }
         }

@@ -93,7 +93,12 @@ where
             }),
         );
 
-        Address::new_with_generation(address.shard, address.isolate, address.generation)
+        Address::new_with_generation_in(
+            self.system_incarnation,
+            address.shard,
+            address.isolate,
+            address.generation,
+        )
     }
 
     /// Registers one isolate and lets the runtime allocate the mailbox.
@@ -122,7 +127,12 @@ where
             }),
         );
 
-        Address::new_with_generation(address.shard, address.isolate, address.generation)
+        Address::new_with_generation_in(
+            self.system_incarnation,
+            address.shard,
+            address.isolate,
+            address.generation,
+        )
     }
 
     /// Registers one isolate as a callable service and returns capability-typed
@@ -375,7 +385,8 @@ where
                 TrySendError::Closed(b) => RegisterBootstrapError::Closed(recover(b)),
             });
         }
-        Ok(Address::new_with_generation(
+        Ok(Address::new_with_generation_in(
+            self.system_incarnation,
             address.shard,
             address.isolate,
             address.generation,
@@ -424,7 +435,8 @@ where
         let isolate_id = IsolateId::new(self.next_isolate_id);
         self.next_isolate_id += 1;
         let generation = AddressGeneration::new(0);
-        let self_addr = Address::<I::Message, I::Reply>::new_with_generation(
+        let self_addr = Address::<I::Message, I::Reply>::new_with_generation_in(
+            self.system_incarnation,
             self.shard.id(),
             isolate_id,
             generation,
@@ -448,6 +460,7 @@ where
             continuation_overflow: RefCell::new(VecDeque::new()),
             handler: RefCell::new(Box::new(HandlerAdapter::<I, Outbound> {
                 isolate,
+                system_incarnation: self.system_incarnation,
                 marker: PhantomData,
             })),
         });
@@ -620,6 +633,9 @@ where
     }
 
     pub(crate) fn entry_index(&self, address: RegisteredAddress) -> Option<usize> {
+        if address.system != self.system_incarnation || address.shard != self.shard.id() {
+            return None;
+        }
         let index = *self.entry_indexes.get(&address.isolate)?;
         let entry = self.entries.get(index)?;
         (entry.generation == address.generation).then_some(index)
@@ -655,7 +671,7 @@ where
         &self,
         address: Address<M, R>,
     ) -> Option<RegisteredAddress> {
-        if address.shard() != self.shard.id() {
+        if address.system() != self.system_incarnation || address.shard() != self.shard.id() {
             return None;
         }
 
@@ -669,6 +685,7 @@ where
         }
 
         Some(RegisteredAddress {
+            system: self.system_incarnation,
             shard: address.shard(),
             isolate: address.isolate(),
             generation: address.generation(),
@@ -708,12 +725,14 @@ where
             continuation_overflow: RefCell::new(VecDeque::new()),
             handler: RefCell::new(Box::new(HandlerAdapter::<I, Outbound> {
                 isolate,
+                system_incarnation: self.system_incarnation,
                 marker: PhantomData,
             })),
         });
         self.entry_indexes.insert(isolate_id, entry_index);
 
         RegisteredAddress {
+            system: self.system_incarnation,
             shard: self.shard.id(),
             isolate: isolate_id,
             generation,
@@ -833,7 +852,12 @@ where
             }),
         );
 
-        Address::new_with_generation(address.shard, address.isolate, address.generation)
+        Address::new_with_generation_in(
+            self.system_incarnation,
+            address.shard,
+            address.isolate,
+            address.generation,
+        )
     }
 
     #[allow(clippy::type_complexity)]
@@ -882,7 +906,8 @@ where
                 TrySendError::Closed(b) => RegisterBootstrapError::Closed(recover(b)),
             });
         }
-        Ok(Address::new_with_generation(
+        Ok(Address::new_with_generation_in(
+            self.system_incarnation,
             address.shard,
             address.isolate,
             address.generation,
@@ -922,12 +947,14 @@ where
             continuation_overflow: RefCell::new(VecDeque::new()),
             handler: RefCell::new(Box::new(SendableHandlerAdapter::<I, Outbound> {
                 isolate,
+                system_incarnation: self.system_incarnation,
                 marker: PhantomData,
             })),
         });
         self.entry_indexes.insert(isolate_id, entry_index);
 
         RegisteredAddress {
+            system: self.system_incarnation,
             shard: self.shard.id(),
             isolate: isolate_id,
             generation,

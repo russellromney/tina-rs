@@ -23,7 +23,9 @@ use tina_runtime::sharded::{
     GroupByOwnerError, MissingShard, ScatterGatherConfig, ScatterGatherConfigError,
     ScatterGatherReport, ScatterGatherTargetOutcome, ShardPlacement, ShardServiceTable, WrongShard,
 };
-use tina_runtime::{MailboxFactory, MultiShardRuntime, RuntimeCall, SendOutcome, send_observed};
+use tina_runtime::{
+    IngressSendError, MailboxFactory, MultiShardRuntime, RuntimeCall, SendOutcome, send_observed,
+};
 
 #[derive(Debug, Clone, Copy)]
 struct AppShard(u32);
@@ -994,13 +996,14 @@ fn hot_key_pressure_caller_retry_loop_observes_full_and_succeeds_on_retry() {
     for i in 0..BURST {
         match runtime.try_send(owner, make_msg()) {
             Ok(()) => report.record(HotKeyAttemptOutcome::Accepted),
-            Err(TrySendError::Full(_)) => {
+            Err(IngressSendError::Full(_)) => {
                 report.record(HotKeyAttemptOutcome::FullFirstAttempt);
                 needs_retry.push(i);
             }
-            Err(TrySendError::Closed(_)) => {
+            Err(IngressSendError::Closed(_)) => {
                 report.record(HotKeyAttemptOutcome::Closed);
             }
+            Err(IngressSendError::ForeignSystem { .. }) => panic!("owner became foreign"),
         }
     }
 
@@ -1016,17 +1019,18 @@ fn hot_key_pressure_caller_retry_loop_observes_full_and_succeeds_on_retry() {
                     report.record(HotKeyAttemptOutcome::RetrySucceeded);
                     break;
                 }
-                Err(TrySendError::Full(_)) => {
+                Err(IngressSendError::Full(_)) => {
                     report.record(HotKeyAttemptOutcome::FullRetry);
                     if attempts >= RETRY_BUDGET {
                         report.record(HotKeyAttemptOutcome::RetryExhausted);
                         break;
                     }
                 }
-                Err(TrySendError::Closed(_)) => {
+                Err(IngressSendError::Closed(_)) => {
                     report.record(HotKeyAttemptOutcome::Closed);
                     break;
                 }
+                Err(IngressSendError::ForeignSystem { .. }) => panic!("owner became foreign"),
             }
         }
     }
@@ -1087,7 +1091,7 @@ fn hot_key_pressure_retries_against_cap_zero_target_record_full_retry_and_exhaus
     loop {
         match runtime.try_send(owner, make_msg()) {
             Ok(()) => panic!("cap=0 mailbox must never accept a send"),
-            Err(TrySendError::Full(_)) => {
+            Err(IngressSendError::Full(_)) => {
                 if attempts == 0 {
                     report.record(HotKeyAttemptOutcome::FullFirstAttempt);
                 } else {
@@ -1100,7 +1104,8 @@ fn hot_key_pressure_retries_against_cap_zero_target_record_full_retry_and_exhaus
                 }
                 runtime.step();
             }
-            Err(TrySendError::Closed(_)) => panic!("owner is not closed"),
+            Err(IngressSendError::Closed(_)) => panic!("owner is not closed"),
+            Err(IngressSendError::ForeignSystem { .. }) => panic!("owner became foreign"),
         }
     }
 
@@ -1145,7 +1150,7 @@ fn hot_key_pressure_retry_exhaustion_is_recorded_when_budget_is_zero() {
     let mut report = HotKeyAttemptReport::default();
     // No retries: budget=0 means the FullFirstAttempt is also terminal.
     match runtime.try_send(owner, make_msg()) {
-        Err(TrySendError::Full(_)) => {
+        Err(IngressSendError::Full(_)) => {
             report.record(HotKeyAttemptOutcome::FullFirstAttempt);
             report.record(HotKeyAttemptOutcome::RetryExhausted);
         }
@@ -1254,6 +1259,9 @@ impl Isolate for ScatterCoordObs {
                         self.cancel_pending(shard, ScatterGatherTargetOutcome::Full);
                     }
                     SendOutcome::Closed => {
+                        self.cancel_pending(shard, ScatterGatherTargetOutcome::Closed);
+                    }
+                    SendOutcome::ForeignSystem { .. } => {
                         self.cancel_pending(shard, ScatterGatherTargetOutcome::Closed);
                     }
                 }
@@ -1839,8 +1847,9 @@ fn hot_key_pressure_first_attempt_only_no_retry_loop() {
     for _ in 0..BURST {
         match runtime.try_send(owner, make_msg()) {
             Ok(()) => report.record(HotKeyAttemptOutcome::Accepted),
-            Err(TrySendError::Full(_)) => report.record(HotKeyAttemptOutcome::FullFirstAttempt),
-            Err(TrySendError::Closed(_)) => report.record(HotKeyAttemptOutcome::Closed),
+            Err(IngressSendError::Full(_)) => report.record(HotKeyAttemptOutcome::FullFirstAttempt),
+            Err(IngressSendError::Closed(_)) => report.record(HotKeyAttemptOutcome::Closed),
+            Err(IngressSendError::ForeignSystem { .. }) => panic!("owner became foreign"),
         }
     }
     run_until_idle(&mut runtime);

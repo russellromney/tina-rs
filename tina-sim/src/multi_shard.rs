@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
-use tina::{Address, Isolate, Outbound as TinaOutbound, Shard, ShardId, TrySendError};
+use tina::{Address, Isolate, Outbound as TinaOutbound, Shard, ShardId};
 use tina_runtime::sharded::ReplyAdapter;
 use tina_runtime::{RuntimeCall, RuntimeCallable, RuntimeEvent, SendRejectedReason};
 use tina_supervisor::SupervisorConfig;
@@ -66,6 +66,11 @@ impl<S> MultiShardSimulator<S>
 where
     S: Shard + 'static,
 {
+    /// Returns the provenance shared by every owned shard simulator.
+    pub fn system_incarnation(&self) -> tina::SystemIncarnation {
+        self.simulators[0].system_incarnation
+    }
+
     /// Creates one additive multi-shard simulator over the provided shards.
     ///
     /// Shards are stepped in ascending [`ShardId`] order, regardless of input
@@ -88,6 +93,15 @@ where
     where
         I: IntoIterator<Item = S>,
     {
+        assert!(
+            !config
+                .system_incarnation
+                .is_some_and(tina::SystemIncarnation::is_unscoped),
+            "multi-shard simulator system incarnation must be nonzero"
+        );
+        let system_incarnation = config
+            .system_incarnation
+            .unwrap_or_else(tina_runtime::fresh_system_incarnation);
         let mut shards: Vec<S> = shards.into_iter().collect();
         if shards.is_empty() {
             panic!("multi-shard simulator requires at least one shard");
@@ -114,7 +128,12 @@ where
             let shard_id = shard.id();
             shard_indexes.insert(shard_id, simulators.len());
             shard_ids.push(shard_id);
-            simulators.push(Simulator::with_ids(shard, config.clone(), ids.clone()));
+            simulators.push(Simulator::with_ids_and_system(
+                shard,
+                config.clone(),
+                ids.clone(),
+                system_incarnation,
+            ));
         }
         let (remote_queue_indexes, remote_queues) =
             build_remote_queues(&shard_ids, multishard.shard_pair_capacity);
@@ -378,7 +397,15 @@ where
         &self,
         address: Address<M, R>,
         message: M,
-    ) -> Result<(), TrySendError<M>> {
+    ) -> Result<(), tina_runtime::IngressSendError<M>> {
+        let expected = self.simulators[0].system_incarnation;
+        if address.system() != expected {
+            return Err(tina_runtime::IngressSendError::ForeignSystem {
+                expected,
+                actual: address.system(),
+                message,
+            });
+        }
         self.simulator(address.shard()).try_send(address, message)
     }
 
@@ -391,20 +418,33 @@ where
         &self,
         address: tina::ServiceEventAddress<Event, Request>,
         event: Event,
-    ) -> Result<(), TrySendError<Event>> {
+    ) -> Result<(), tina_runtime::IngressSendError<Event>> {
         match self.try_send(
             address.address().address(),
             tina::ServiceMessage::Event(event),
         ) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(tina::ServiceMessage::Event(event))) => {
-                Err(TrySendError::Full(event))
+            Err(tina_runtime::IngressSendError::Full(tina::ServiceMessage::Event(event))) => {
+                Err(tina_runtime::IngressSendError::Full(event))
             }
-            Err(TrySendError::Closed(tina::ServiceMessage::Event(event))) => {
-                Err(TrySendError::Closed(event))
+            Err(tina_runtime::IngressSendError::Closed(tina::ServiceMessage::Event(event))) => {
+                Err(tina_runtime::IngressSendError::Closed(event))
             }
-            Err(TrySendError::Full(tina::ServiceMessage::Request(_)))
-            | Err(TrySendError::Closed(tina::ServiceMessage::Request(_))) => {
+            Err(tina_runtime::IngressSendError::ForeignSystem {
+                expected,
+                actual,
+                message: tina::ServiceMessage::Event(event),
+            }) => Err(tina_runtime::IngressSendError::ForeignSystem {
+                expected,
+                actual,
+                message: event,
+            }),
+            Err(tina_runtime::IngressSendError::Full(tina::ServiceMessage::Request(_)))
+            | Err(tina_runtime::IngressSendError::Closed(tina::ServiceMessage::Request(_)))
+            | Err(tina_runtime::IngressSendError::ForeignSystem {
+                message: tina::ServiceMessage::Request(_),
+                ..
+            }) => {
                 unreachable!("simulator returned a different service payload than it received")
             }
         }

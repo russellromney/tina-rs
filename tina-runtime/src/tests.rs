@@ -1,5 +1,6 @@
 use super::driver::{DriverCompletion, DriverResourceReport, DriverShutdownError, RuntimeDriver};
 use super::*;
+use crate::remote::{QueuedRemoteEnvelope, QueuedRemoteSend, RemoteCallOutcome};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -16,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tina::{
     Address, AddressGeneration, CallContext, Context, DeferredReply, Effect, Isolate, IsolateId,
-    Mailbox, Outbound, ShardId, TrySendError, batch, noop, send, spawn, stop,
+    Mailbox, Outbound, ShardId, SystemIncarnation, TrySendError, batch, noop, send, spawn, stop,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -130,6 +131,7 @@ fn carried_completion_for_stopped_requester_is_dropped_not_quarantined() {
     let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     runtime.register(new_root(), root_mailbox());
     let requester = RegisteredAddress {
+        system: runtime.system_incarnation,
         shard: runtime.shard.id(),
         isolate: runtime.entries[0].id,
         generation: runtime.entries[0].generation,
@@ -445,6 +447,7 @@ fn stopped_entry_gc_compacts_a_burst_in_one_pass_and_keeps_indexes_consistent() 
     // collected while a call references it.
     let pinned = stopped_ids[0];
     let pinned_addr = RegisteredAddress {
+        system: runtime.system_incarnation,
         shard: runtime.shard.id(),
         isolate: pinned,
         generation: runtime.entries[0].generation,
@@ -502,6 +505,7 @@ fn stopped_entry_gc_compacts_a_burst_in_one_pass_and_keeps_indexes_consistent() 
 
     // entry_index() resolves a live address through the rebuilt map.
     let live_addr = RegisteredAddress {
+        system: runtime.system_incarnation,
         shard: runtime.shard.id(),
         isolate: addrs[1].isolate(),
         generation: runtime.entries[runtime.entry_indexes[&addrs[1].isolate()]].generation,
@@ -781,8 +785,11 @@ fn assert_root_child_grandchild_lineage(
     );
 }
 
-fn lineage_address(isolate: IsolateId) -> Address<LineageMsg> {
-    Address::new(ShardId::new(3), isolate)
+fn lineage_address(
+    runtime: &Runtime<TestShard, TestMailboxFactory>,
+    isolate: IsolateId,
+) -> Address<LineageMsg> {
+    Address::new_in(runtime.system_incarnation(), ShardId::new(3), isolate)
 }
 
 fn last_spawned_child(trace: &[RuntimeEvent]) -> IsolateId {
@@ -828,8 +835,12 @@ fn child_record_with_generation(
     }
 }
 
-fn replacement_address(record: &ChildRecordSnapshot) -> Address<LineageMsg> {
-    Address::new_with_generation(
+fn replacement_address(
+    runtime: &Runtime<TestShard, TestMailboxFactory>,
+    record: &ChildRecordSnapshot,
+) -> Address<LineageMsg> {
+    Address::new_with_generation_in(
+        runtime.system_incarnation(),
         record.child_shard,
         record.child_isolate,
         record.child_generation,
@@ -1068,7 +1079,10 @@ fn nested_spawns_record_direct_parent_edges() {
     assert_root_and_child_lineage(&runtime, root, child);
 
     assert_eq!(
-        runtime.try_send(lineage_address(child), LineageMsg::SpawnGrandchild),
+        runtime.try_send(
+            lineage_address(&runtime, child),
+            LineageMsg::SpawnGrandchild
+        ),
         Ok(())
     );
     assert_eq!(runtime.step(), 1);
@@ -1142,11 +1156,14 @@ fn non_restartable_child_record_is_pruned_when_child_stops_or_panics() {
     let panicking_child = last_spawned_child(runtime.trace());
 
     assert_eq!(
-        runtime.try_send(lineage_address(stopping_child), LineageMsg::Stop),
+        runtime.try_send(lineage_address(&runtime, stopping_child), LineageMsg::Stop),
         Ok(())
     );
     assert_eq!(
-        runtime.try_send(lineage_address(panicking_child), LineageMsg::Panic),
+        runtime.try_send(
+            lineage_address(&runtime, panicking_child),
+            LineageMsg::Panic
+        ),
         Ok(())
     );
     assert_eq!(runtime.step(), 2);
@@ -1165,7 +1182,7 @@ fn spawn_stop_churn_gcs_non_restartable_children() {
         let child = last_spawned_child(runtime.trace());
 
         assert_eq!(
-            runtime.try_send(lineage_address(child), LineageMsg::Stop),
+            runtime.try_send(lineage_address(&runtime, child), LineageMsg::Stop),
             Ok(())
         );
         assert_eq!(runtime.step(), 1);
@@ -1222,11 +1239,14 @@ fn restart_children_replaces_restartable_child_and_preserves_ordinal() {
         vec![child_record(root.isolate(), replacement, 0, 3, true)]
     );
     assert!(matches!(
-        runtime.try_send(lineage_address(old_child), LineageMsg::SpawnChild),
-        Err(TrySendError::Closed(LineageMsg::SpawnChild))
+        runtime.try_send(lineage_address(&runtime, old_child), LineageMsg::SpawnChild),
+        Err(crate::IngressSendError::Closed(LineageMsg::SpawnChild))
     ));
     assert_eq!(
-        runtime.try_send(replacement_address(&records[0]), LineageMsg::SpawnChild),
+        runtime.try_send(
+            replacement_address(&runtime, &records[0]),
+            LineageMsg::SpawnChild
+        ),
         Ok(())
     );
     assert_eq!(runtime.step(), 1);
@@ -1302,7 +1322,10 @@ fn restart_children_abandons_precollected_old_child_message() {
 
     assert_eq!(runtime.try_send(root, LineageMsg::Restart), Ok(()));
     assert_eq!(
-        runtime.try_send(lineage_address(old_child), LineageMsg::SpawnGrandchild),
+        runtime.try_send(
+            lineage_address(&runtime, old_child),
+            LineageMsg::SpawnGrandchild
+        ),
         Ok(())
     );
     assert_eq!(runtime.step(), 1);
@@ -1340,7 +1363,7 @@ fn restart_children_restarts_already_stopped_or_panicked_children_without_duplic
     assert_eq!(runtime.step(), 1);
     let stopped_child = last_spawned_child(runtime.trace());
     assert_eq!(
-        runtime.try_send(lineage_address(stopped_child), LineageMsg::Stop),
+        runtime.try_send(lineage_address(&runtime, stopped_child), LineageMsg::Stop),
         Ok(())
     );
     assert_eq!(runtime.step(), 1);
@@ -1349,7 +1372,7 @@ fn restart_children_restarts_already_stopped_or_panicked_children_without_duplic
     assert_eq!(runtime.step(), 1);
     let panicked_child = last_spawned_child(runtime.trace());
     assert_eq!(
-        runtime.try_send(lineage_address(panicked_child), LineageMsg::Panic),
+        runtime.try_send(lineage_address(&runtime, panicked_child), LineageMsg::Panic),
         Ok(())
     );
     assert_eq!(runtime.step(), 1);
@@ -1455,9 +1478,11 @@ fn stop_children_closes_precollected_call_once_without_abandoning_waiter() {
         .expect("spawn child");
     assert_eq!(runtime.step(), 1);
     let child = match runtime.trace().last().expect("spawned child").kind() {
-        RuntimeEventKind::Spawned { child_isolate } => {
-            Address::<StopRaceChildMsg>::new(ShardId::new(3), child_isolate)
-        }
+        RuntimeEventKind::Spawned { child_isolate } => Address::<StopRaceChildMsg>::new_in(
+            runtime.system_incarnation(),
+            ShardId::new(3),
+            child_isolate,
+        ),
         other => panic!("expected child spawn, got {other:?}"),
     };
 
@@ -1514,7 +1539,10 @@ fn restart_children_does_not_restart_grandchildren() {
     assert_eq!(runtime.step(), 1);
     let child = last_spawned_child(runtime.trace());
     assert_eq!(
-        runtime.try_send(lineage_address(child), LineageMsg::SpawnGrandchild),
+        runtime.try_send(
+            lineage_address(&runtime, child),
+            LineageMsg::SpawnGrandchild
+        ),
         Ok(())
     );
     assert_eq!(runtime.step(), 1);
@@ -1529,7 +1557,10 @@ fn restart_children_does_not_restart_grandchildren() {
     assert_eq!(records[0].child_ordinal, 0);
     assert_eq!(records[1], child_record(child, grandchild, 0, 3, false));
     assert_eq!(
-        runtime.try_send(lineage_address(grandchild), LineageMsg::SpawnChild),
+        runtime.try_send(
+            lineage_address(&runtime, grandchild),
+            LineageMsg::SpawnChild
+        ),
         Ok(())
     );
 }
@@ -1575,7 +1606,10 @@ fn identical_runs_produce_identical_trace_and_lineage() {
         let child = last_spawned_child(runtime.trace());
 
         assert_eq!(
-            runtime.try_send(lineage_address(child), LineageMsg::SpawnGrandchild),
+            runtime.try_send(
+                lineage_address(&runtime, child),
+                LineageMsg::SpawnGrandchild
+            ),
             Ok(())
         );
         assert_eq!(runtime.step(), 1);
@@ -2651,7 +2685,8 @@ fn cross_shard_unknown_isolate_rejects_on_destination_harvest() {
     let mut runtime =
         MultiShardRuntime::new([NumberedShard(11), NumberedShard(22)], TestMailboxFactory);
 
-    let unknown = Address::new_with_generation(
+    let unknown = Address::new_with_generation_in(
+        runtime.system_incarnation(),
         ShardId::new(22),
         IsolateId::new(999),
         AddressGeneration::new(0),
@@ -2691,11 +2726,91 @@ fn cross_shard_unknown_isolate_rejects_on_destination_harvest() {
 }
 
 #[test]
+fn defensive_remote_harvest_rejects_foreign_system_before_coincident_delivery() {
+    let local_system = SystemIncarnation::new(0x701);
+    let foreign_system = SystemIncarnation::new(0x702);
+    let mut runtime =
+        Runtime::new(NumberedShard(22), TestMailboxFactory).with_system_incarnation(local_system);
+    let sink = runtime.register_with_capacity::<RemoteSink<NumberedShard>, NeverOutbound>(
+        RemoteSink {
+            marker: PhantomData,
+        },
+        4,
+    );
+
+    let terminal = runtime.harvest_remote_send(QueuedRemoteSend {
+        send: ErasedSend {
+            target_system: foreign_system,
+            target_shard: sink.shard(),
+            target_isolate: sink.isolate(),
+            target_generation: sink.generation(),
+            message: ErasedMessage::Local(Box::new(RemoteEvent::Arrived)),
+        },
+        call_context: None,
+        cause: CauseId::new(EventId::new(1)),
+    });
+
+    assert!(
+        terminal.is_none(),
+        "ordinary send has no call reply envelope"
+    );
+    runtime.step();
+    assert!(runtime.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::SendRejected {
+                reason: SendRejectedReason::ForeignSystem { expected, actual },
+                ..
+            } if expected == local_system && actual == foreign_system
+        )
+    }));
+    assert!(runtime.trace().iter().all(|event| {
+        !(event.isolate() == sink.isolate()
+            && matches!(event.kind(), RuntimeEventKind::HandlerStarted))
+    }));
+
+    let requester = RegisteredAddress {
+        system: local_system,
+        shard: sink.shard(),
+        isolate: sink.isolate(),
+        generation: sink.generation(),
+    };
+    let terminal = runtime.harvest_remote_send(QueuedRemoteSend {
+        send: ErasedSend {
+            target_system: foreign_system,
+            target_shard: sink.shard(),
+            target_isolate: sink.isolate(),
+            target_generation: sink.generation(),
+            message: ErasedMessage::Local(Box::new(RemoteEvent::Arrived)),
+        },
+        call_context: Some(MessageCallContext::Remote {
+            call_id: CallId::new(7),
+            requester,
+            cause: CauseId::new(EventId::new(2)),
+            expected_reply_type_id: std::any::TypeId::of::<()>(),
+        }),
+        cause: CauseId::new(EventId::new(2)),
+    });
+    assert!(matches!(
+        terminal,
+        Some(QueuedRemoteEnvelope::CallReply(reply))
+            if matches!(
+                reply.outcome,
+                RemoteCallOutcome::Rejected(tina::CallRejectedReason::ForeignSystem {
+                    expected,
+                    actual,
+                }) if expected == local_system && actual == foreign_system
+            )
+    ));
+}
+
+#[test]
 fn cross_shard_unknown_isolate_does_not_poison_destination_shard() {
     let mut runtime =
         MultiShardRuntime::new([NumberedShard(11), NumberedShard(22)], TestMailboxFactory);
 
-    let unknown = Address::new_with_generation(
+    let unknown = Address::new_with_generation_in(
+        runtime.system_incarnation(),
         ShardId::new(22),
         IsolateId::new(999),
         AddressGeneration::new(0),
@@ -3085,7 +3200,7 @@ fn multishard_supervision_keeps_children_on_parent_shard() {
         "multi-shard supervision must not create children on another shard"
     );
 
-    let child_address = Address::new(ShardId::new(22), child);
+    let child_address = Address::new_in(runtime.system_incarnation(), ShardId::new(22), child);
     runtime
         .try_send(child_address, ShardLocalSupervisionEvent::Panic)
         .unwrap();
@@ -3118,7 +3233,7 @@ fn multishard_supervision_keeps_children_on_parent_shard() {
 
     runtime
         .try_send(
-            Address::new(ShardId::new(22), restart),
+            Address::new_in(runtime.system_incarnation(), ShardId::new(22), restart),
             ShardLocalSupervisionEvent::Noop,
         )
         .unwrap();

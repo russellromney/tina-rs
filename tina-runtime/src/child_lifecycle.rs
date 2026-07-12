@@ -60,6 +60,13 @@ pub struct ChildLifecycleReport {
 /// Why a live child lifecycle report could not be built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildLifecycleReportError {
+    /// The parent address belongs to another runtime/system incarnation.
+    ForeignSystem {
+        /// Incarnation owned by this runtime.
+        expected: tina::SystemIncarnation,
+        /// Incarnation carried by the address.
+        actual: tina::SystemIncarnation,
+    },
     /// The parent's shard is not owned by this runtime shell.
     ParentShardUnavailable(ShardId),
     /// The parent address is stale or stopped.
@@ -69,6 +76,12 @@ pub enum ChildLifecycleReportError {
 impl fmt::Display for ChildLifecycleReportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ForeignSystem { expected, actual } => write!(
+                f,
+                "parent belongs to foreign system {} (expected {})",
+                actual.get(),
+                expected.get()
+            ),
             Self::ParentShardUnavailable(shard) => {
                 write!(f, "parent shard {} is unavailable", shard.get())
             }
@@ -88,6 +101,17 @@ impl ChildLifecycleReport {
         S: Shard,
         F: crate::mailbox::MailboxFactory,
     {
+        if parent.system != runtime.system_incarnation {
+            return Err(ChildLifecycleReportError::ForeignSystem {
+                expected: runtime.system_incarnation,
+                actual: parent.system,
+            });
+        }
+        if parent.shard != runtime.shard.id() {
+            return Err(ChildLifecycleReportError::ParentShardUnavailable(
+                parent.shard,
+            ));
+        }
         let Some(parent_entry) = runtime.entry_by_isolate(parent.isolate) else {
             return Err(ChildLifecycleReportError::ParentStopped);
         };

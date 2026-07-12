@@ -107,12 +107,12 @@ fn simulator_registers_and_routes_single_lane_services() {
         4,
     );
 
-    let sent: Result<(), tina::TrySendError<Event>> =
+    let sent: Result<(), tina_runtime::IngressSendError<Event>> =
         simulator.try_send_event(events, Event::Record(51));
     sent.expect("event accepted");
     assert!(matches!(
         simulator.try_send_event(events, Event::Record(52)),
-        Err(tina::TrySendError::Full(Event::Record(52)))
+        Err(tina_runtime::IngressSendError::Full(Event::Record(52)))
     ));
     simulator
         .try_send(client, ClientMessage::Start(requests))

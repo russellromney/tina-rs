@@ -85,6 +85,7 @@ pub struct Simulator<S>
 where
     S: Shard,
 {
+    pub(crate) system_incarnation: tina::SystemIncarnation,
     pub(crate) shard: S,
     pub(crate) config: SimulatorConfig,
     pub(crate) entries: Vec<RegisteredEntry<S>>,
@@ -177,12 +178,35 @@ impl<S> Simulator<S>
 where
     S: Shard,
 {
+    /// Returns the provenance stamped into addresses issued by this owner.
+    pub const fn system_incarnation(&self) -> tina::SystemIncarnation {
+        self.system_incarnation
+    }
+
     /// Creates a new simulator with virtual time starting at zero.
     pub fn new(shard: S, config: SimulatorConfig) -> Self {
         Self::with_ids(shard, config, IdSource::new())
     }
 
     pub(crate) fn with_ids(shard: S, config: SimulatorConfig, ids: IdSource) -> Self {
+        assert!(
+            !config
+                .system_incarnation
+                .is_some_and(tina::SystemIncarnation::is_unscoped),
+            "simulator system incarnation must be nonzero"
+        );
+        let system_incarnation = config
+            .system_incarnation
+            .unwrap_or_else(tina_runtime::fresh_system_incarnation);
+        Self::with_ids_and_system(shard, config, ids, system_incarnation)
+    }
+
+    pub(crate) fn with_ids_and_system(
+        shard: S,
+        config: SimulatorConfig,
+        ids: IdSource,
+        system_incarnation: tina::SystemIncarnation,
+    ) -> Self {
         // Advance the user-visible `IsolateId` counter past the system isolates
         // a live `ThreadedRuntime` registers at startup (e.g. its host-call
         // dispatcher pool). The simulator never registers those isolates
@@ -194,6 +218,7 @@ where
             .checked_add(1)
             .expect("reserved system isolate count leaves no user id space");
         Self {
+            system_incarnation,
             shard,
             config,
             entries: Vec::with_capacity(INITIAL_ENTRY_CAPACITY),
@@ -629,6 +654,94 @@ mod tests {
         marker: PhantomData<S>,
     }
 
+    #[test]
+    fn defensive_remote_harvest_rejects_foreign_system_before_coincident_delivery() {
+        let local_system = tina::SystemIncarnation::new(0x801);
+        let foreign_system = tina::SystemIncarnation::new(0x802);
+        let mut sim = Simulator::new(
+            NumberedShard(22),
+            SimulatorConfig {
+                system_incarnation: Some(local_system),
+                ..SimulatorConfig::default()
+            },
+        );
+        let sink = sim.register_with_mailbox_capacity::<
+            SimRemoteSink<NumberedShard>,
+            SimRemoteEvent,
+            Infallible,
+        >(
+                SimRemoteSink {
+                    marker: PhantomData,
+                },
+                4,
+            );
+
+        let terminal = sim.harvest_remote_send(QueuedRemoteSend {
+            send: ErasedSend {
+                target_system: foreign_system,
+                target_shard: sink.shard(),
+                target_isolate: sink.isolate(),
+                target_generation: sink.generation(),
+                message: Box::new(SimRemoteEvent::Arrived),
+            },
+            call_context: None,
+            cause: tina_runtime::CauseId::new(tina_runtime::EventId::new(1)),
+        });
+
+        assert!(
+            terminal.is_none(),
+            "ordinary send has no call reply envelope"
+        );
+        sim.run_until_quiescent();
+        assert!(sim.trace().iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::SendRejected {
+                    reason: SendRejectedReason::ForeignSystem { expected, actual },
+                    ..
+                } if expected == local_system && actual == foreign_system
+            )
+        }));
+        assert!(sim.trace().iter().all(|event| {
+            !(event.isolate() == sink.isolate()
+                && matches!(event.kind(), RuntimeEventKind::HandlerStarted))
+        }));
+
+        let requester = RegisteredAddress {
+            system: local_system,
+            shard: sink.shard(),
+            isolate: sink.isolate(),
+            generation: sink.generation(),
+        };
+        let terminal = sim.harvest_remote_send(QueuedRemoteSend {
+            send: ErasedSend {
+                target_system: foreign_system,
+                target_shard: sink.shard(),
+                target_isolate: sink.isolate(),
+                target_generation: sink.generation(),
+                message: Box::new(SimRemoteEvent::Arrived),
+            },
+            call_context: Some(MessageCallContext::Remote {
+                call_id: CallId::new(7),
+                requester,
+                cause: tina_runtime::CauseId::new(tina_runtime::EventId::new(2)),
+                expected_reply_type_id: std::any::TypeId::of::<()>(),
+            }),
+            cause: tina_runtime::CauseId::new(tina_runtime::EventId::new(2)),
+        });
+        assert!(matches!(
+            terminal,
+            Some(QueuedRemoteEnvelope::CallReply(reply))
+                if matches!(
+                    reply.reply,
+                    RemoteCallOutcome::Rejected(tina::CallRejectedReason::ForeignSystem {
+                        expected,
+                        actual,
+                    }) if expected == local_system && actual == foreign_system
+                )
+        ));
+    }
+
     #[derive(Debug)]
     struct SimShardLocalParent<S> {
         marker: PhantomData<S>,
@@ -1057,7 +1170,8 @@ mod tests {
             multishard,
         );
 
-        let unknown = Address::new_with_generation(
+        let unknown = Address::new_with_generation_in(
+            sim.system_incarnation(),
             ShardId::new(22),
             IsolateId::new(999),
             AddressGeneration::new(0),
@@ -1361,7 +1475,8 @@ mod tests {
             SimulatorConfig::default(),
         );
 
-        let unknown = Address::new_with_generation(
+        let unknown = Address::new_with_generation_in(
+            sim.system_incarnation(),
             ShardId::new(22),
             IsolateId::new(999),
             AddressGeneration::new(0),
@@ -1405,7 +1520,8 @@ mod tests {
             SimulatorConfig::default(),
         );
 
-        let unknown = Address::new_with_generation(
+        let unknown = Address::new_with_generation_in(
+            sim.system_incarnation(),
             ShardId::new(22),
             IsolateId::new(999),
             AddressGeneration::new(0),
@@ -1906,7 +2022,7 @@ mod tests {
             "multi-shard supervision must not create children on another shard"
         );
 
-        let child_address = Address::new(ShardId::new(22), child);
+        let child_address = Address::new_in(sim.system_incarnation(), ShardId::new(22), child);
         sim.try_send(child_address, SimShardLocalSupervisionEvent::Panic)
             .unwrap();
         assert_eq!(sim.step(), 1);
@@ -1937,7 +2053,7 @@ mod tests {
         );
 
         sim.try_send(
-            Address::new(ShardId::new(22), restart),
+            Address::new_in(sim.system_incarnation(), ShardId::new(22), restart),
             SimShardLocalSupervisionEvent::Noop,
         )
         .unwrap();

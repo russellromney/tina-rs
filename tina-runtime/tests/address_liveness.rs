@@ -167,7 +167,7 @@ fn runtime_ingress_to_stopped_address_returns_closed() {
 
     assert_eq!(
         runtime.try_send(address, TargetMsg::Data(1)),
-        Err(TrySendError::Closed(TargetMsg::Data(1)))
+        Err(tina_runtime::IngressSendError::Closed(TargetMsg::Data(1)))
     );
 }
 
@@ -175,7 +175,8 @@ fn runtime_ingress_to_stopped_address_returns_closed() {
 fn runtime_ingress_to_wrong_generation_returns_closed() {
     let mut runtime = runtime();
     let address = runtime.register(Target, TestMailbox::default());
-    let stale: Address<TargetMsg, Infallible> = Address::new_with_generation(
+    let stale: Address<TargetMsg, Infallible> = Address::new_with_generation_in(
+        address.system(),
         address.shard(),
         address.isolate(),
         AddressGeneration::new(address.generation().get() + 1),
@@ -183,7 +184,7 @@ fn runtime_ingress_to_wrong_generation_returns_closed() {
 
     assert_eq!(
         runtime.try_send(stale, TargetMsg::Data(1)),
-        Err(TrySendError::Closed(TargetMsg::Data(1)))
+        Err(tina_runtime::IngressSendError::Closed(TargetMsg::Data(1)))
     );
 }
 
@@ -191,7 +192,8 @@ fn runtime_ingress_to_wrong_generation_returns_closed() {
 fn dispatched_send_to_wrong_generation_records_closed_rejection() {
     let mut runtime = runtime();
     let target = runtime.register(Target, TestMailbox::default());
-    let stale_target = Address::new_with_generation(
+    let stale_target = Address::new_with_generation_in(
+        target.system(),
         target.shard(),
         target.isolate(),
         AddressGeneration::new(target.generation().get() + 1),
@@ -261,11 +263,15 @@ fn dispatched_send_trace_includes_target_generation() {
 #[test]
 fn runtime_ingress_to_unknown_isolate_returns_closed_without_trace_event() {
     let runtime = runtime();
-    let synthetic = Address::new(ShardId::new(3), tina::IsolateId::new(99));
+    let synthetic = Address::new_in(
+        runtime.system_incarnation(),
+        ShardId::new(3),
+        tina::IsolateId::new(99),
+    );
 
     assert_eq!(
         runtime.try_send(synthetic, TargetMsg::Data(1)),
-        Err(TrySendError::Closed(TargetMsg::Data(1)))
+        Err(tina_runtime::IngressSendError::Closed(TargetMsg::Data(1)))
     );
     assert!(runtime.trace().is_empty());
 }
@@ -275,7 +281,8 @@ fn repeated_runs_produce_identical_liveness_traces() {
     fn run_once() -> Vec<RuntimeEventKind> {
         let mut runtime = runtime();
         let target = runtime.register(Target, TestMailbox::default());
-        let stale_target = Address::new_with_generation(
+        let stale_target = Address::new_with_generation_in(
+            target.system(),
             target.shard(),
             target.isolate(),
             AddressGeneration::new(target.generation().get() + 1),

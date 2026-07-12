@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tina::{Mailbox, Shard, ShardId, SingleShard, TrySendError};
+use tina::{Mailbox, Shard, ShardId, SingleShard, SystemIncarnation, TrySendError};
 use tina_runtime::{
     DefaultThreadedMailboxFactory, LocalSystem, LocalSystemConfigError, MailboxFactory,
     StartupError, ThreadedMultiShardRuntime, ThreadedRuntime, ThreadedRuntimeConfig,
@@ -81,6 +81,25 @@ fn threaded_config_validation_is_typed_and_precedes_worker_start() {
 }
 
 #[test]
+fn unscoped_threaded_system_incarnation_is_a_typed_startup_error() {
+    let error = ThreadedRuntime::try_with_config(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            system_incarnation: Some(SystemIncarnation::DEFAULT),
+            ..ThreadedRuntimeConfig::default()
+        },
+    )
+    .err()
+    .expect("unscoped system incarnation must fail");
+
+    assert!(matches!(
+        error,
+        StartupError::InvalidThreadedConfig(ThreadedRuntimeConfigError::UnscopedSystemIncarnation)
+    ));
+}
+
+#[test]
 fn io_loop_initialization_error_keeps_platform_source() {
     let error = ThreadedRuntime::try_with_config_and_io_loop_factory(
         SingleShard,
@@ -148,6 +167,23 @@ fn local_system_try_build_returns_local_config_error() {
     assert!(matches!(
         error,
         StartupError::InvalidLocalSystemConfig(LocalSystemConfigError::ZeroIngressCapacity)
+    ));
+}
+
+#[test]
+fn local_system_unscoped_incarnation_is_a_typed_startup_error() {
+    let error = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+        .config(tina_runtime::LocalSystemConfig {
+            system_incarnation: Some(SystemIncarnation::DEFAULT),
+            ..tina_runtime::LocalSystemConfig::default()
+        })
+        .try_build()
+        .err()
+        .expect("unscoped system incarnation must fail");
+
+    assert!(matches!(
+        error,
+        StartupError::InvalidLocalSystemConfig(LocalSystemConfigError::UnscopedSystemIncarnation)
     ));
 }
 

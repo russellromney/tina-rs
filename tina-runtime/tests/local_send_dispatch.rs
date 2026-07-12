@@ -442,7 +442,11 @@ fn rejected_local_send_is_traced_and_not_silently_buffered() {
 fn send_to_unknown_isolate_records_closed_rejection() {
     let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let driver_mailbox = TestMailbox::new(8);
-    let target = Address::new(ShardId::new(3), IsolateId::new(99));
+    let target = Address::new_in(
+        runtime.system_incarnation(),
+        ShardId::new(3),
+        IsolateId::new(99),
+    );
 
     let driver = runtime.register(
         Driver {

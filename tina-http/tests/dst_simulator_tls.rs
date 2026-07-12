@@ -34,6 +34,7 @@ impl Shard for SimShard {
 
 /// One-shot driver: stashes the call outcome into the observation slot.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 enum DriverMsg {
     Begin {
         client: Address<HttpClientMsg, Result<HttpResponse, HttpClientError>>,

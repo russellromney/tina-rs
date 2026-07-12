@@ -13,7 +13,8 @@
 //!   [`ServiceRequestAddress`] — service-shaped event vs request routing.
 //! - [`Outbound`] — the (destination, message) pair returned by send
 //!   constructors.
-//! - [`ShardId`] / [`IsolateId`] / [`AddressGeneration`] — opaque newtype
+//! - [`SystemIncarnation`] / [`ShardId`] / [`IsolateId`] /
+//!   [`AddressGeneration`] — opaque newtype
 //!   identifiers used by every address.
 
 use std::marker::PhantomData;
@@ -31,12 +32,14 @@ type AddressMarker<M, R> = PhantomData<fn(M, R) -> (M, R)>;
 /// can infer the target's reply type from `Address<Message, Reply>` instead of
 /// trusting a separate turbofish at the call site.
 ///
-/// An address identifies one incarnation of an isolate: shard id, isolate id,
-/// and generation. Runtime-issued addresses should be preferred for real
-/// delivery. Manually constructed addresses are useful in tests and examples,
-/// but may be stale or unknown to a runtime.
+/// An address identifies one incarnation of an isolate: system incarnation,
+/// shard id, isolate id, and generation. Runtime-issued addresses should be
+/// preferred for real delivery. Manually constructed addresses use the
+/// unscoped default system unless the caller supplies one explicitly, so they
+/// are primarily useful in tests and protocol fixtures.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Address<M, R = ()> {
+    system: SystemIncarnation,
     shard: ShardId,
     isolate: IsolateId,
     generation: AddressGeneration,
@@ -54,7 +57,12 @@ impl<M, R> Clone for Address<M, R> {
 impl<M> Address<M> {
     /// Creates a new typed address for the initial generation.
     pub const fn new(shard: ShardId, isolate: IsolateId) -> Self {
-        Self::new_with_generation(shard, isolate, AddressGeneration::new(0))
+        Self::new_in(SystemIncarnation::DEFAULT, shard, isolate)
+    }
+
+    /// Creates a typed address in `system` for the initial generation.
+    pub const fn new_in(system: SystemIncarnation, shard: ShardId, isolate: IsolateId) -> Self {
+        Self::new_with_generation_in(system, shard, isolate, AddressGeneration::new(0))
     }
 }
 
@@ -65,12 +73,28 @@ impl<M, R> Address<M, R> {
         isolate: IsolateId,
         generation: AddressGeneration,
     ) -> Self {
+        Self::new_with_generation_in(SystemIncarnation::DEFAULT, shard, isolate, generation)
+    }
+
+    /// Creates a typed address with explicit system and isolate incarnations.
+    pub const fn new_with_generation_in(
+        system: SystemIncarnation,
+        shard: ShardId,
+        isolate: IsolateId,
+        generation: AddressGeneration,
+    ) -> Self {
         Self {
+            system,
             shard,
             isolate,
             generation,
             marker: PhantomData,
         }
+    }
+
+    /// Returns the runtime/system incarnation that issued this address.
+    pub const fn system(self) -> SystemIncarnation {
+        self.system
     }
 
     /// Returns the shard that owns this address.
@@ -93,7 +117,7 @@ impl<M, R> Address<M, R> {
     /// Runtime-issued addresses already carry the right reply type. This is
     /// mostly useful for tests that manually construct addresses.
     pub const fn with_reply<Reply>(self) -> Address<M, Reply> {
-        Address::new_with_generation(self.shard, self.isolate, self.generation)
+        Address::new_with_generation_in(self.system, self.shard, self.isolate, self.generation)
     }
 }
 
@@ -139,6 +163,7 @@ impl<M> Clone for SendAddress<M> {
 impl<M> PartialEq for SendAddress<M> {
     fn eq(&self, other: &Self) -> bool {
         self.address.shard() == other.address.shard()
+            && self.address.system() == other.address.system()
             && self.address.isolate() == other.address.isolate()
             && self.address.generation() == other.address.generation()
     }
@@ -169,6 +194,11 @@ impl<M> SendAddress<M> {
     /// Returns the shard that owns this address.
     pub const fn shard(self) -> ShardId {
         self.address.shard()
+    }
+
+    /// Returns the runtime/system incarnation that issued this address.
+    pub const fn system(self) -> SystemIncarnation {
+        self.address.system()
     }
 
     /// Returns the isolate identifier on the owning shard.
@@ -224,6 +254,7 @@ impl<M, R> Clone for CallAddress<M, R> {
 impl<M, R> PartialEq for CallAddress<M, R> {
     fn eq(&self, other: &Self) -> bool {
         self.address.shard() == other.address.shard()
+            && self.address.system() == other.address.system()
             && self.address.isolate() == other.address.isolate()
             && self.address.generation() == other.address.generation()
     }
@@ -249,6 +280,11 @@ impl<M, R> CallAddress<M, R> {
     /// Returns the shard that owns this address.
     pub const fn shard(self) -> ShardId {
         self.address.shard()
+    }
+
+    /// Returns the runtime/system incarnation that issued this address.
+    pub const fn system(self) -> SystemIncarnation {
+        self.address.system()
     }
 
     /// Returns the isolate identifier on the owning shard.
@@ -428,6 +464,39 @@ impl<M> Outbound<M> {
     /// Splits the request into its destination and message payload.
     pub fn into_parts(self) -> (Address<M>, M) {
         (self.destination, self.message)
+    }
+}
+
+/// Identity of one runtime/system construction.
+///
+/// Every shard owned by one multi-shard runtime shares this value. It is
+/// independent from [`AddressGeneration`], which identifies replacement
+/// incarnations of one isolate inside the system. Deterministic runtimes and
+/// simulators should configure this value explicitly when addresses cross a
+/// replay boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SystemIncarnation(u64);
+
+impl SystemIncarnation {
+    /// Unscoped deterministic marker used by manual addresses.
+    pub const DEFAULT: Self = Self(0);
+
+    /// Creates a system incarnation from its stable raw representation.
+    ///
+    /// Zero is reserved for [`Self::DEFAULT`] and is rejected by runtime and
+    /// simulator owner configuration.
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the stable raw representation.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Returns whether this is the unscoped marker used by manual addresses.
+    pub const fn is_unscoped(self) -> bool {
+        self.0 == 0
     }
 }
 

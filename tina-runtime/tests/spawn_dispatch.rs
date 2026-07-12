@@ -309,8 +309,8 @@ impl Isolate for OrderIsolate {
     }
 }
 
-fn child_address(child_isolate: IsolateId) -> Address<ChildEvent> {
-    Address::new(ShardId::new(3), child_isolate)
+fn child_address(system: tina::SystemIncarnation, child_isolate: IsolateId) -> Address<ChildEvent> {
+    Address::new_in(system, ShardId::new(3), child_isolate)
 }
 
 fn spawned_child_isolate(trace: &[RuntimeEvent]) -> IsolateId {
@@ -504,7 +504,10 @@ fn spawned_child_runs_only_on_a_later_step_and_runtime_ingress_reaches_it() {
     assert_eq!(runtime.try_send(parent, ParentEvent::StartChild), Ok(()));
     assert_eq!(runtime.step(), 1);
 
-    let child = child_address(spawned_child_isolate(runtime.trace()));
+    let child = child_address(
+        runtime.system_incarnation(),
+        spawned_child_isolate(runtime.trace()),
+    );
     assert_eq!(runtime.try_send(child, ChildEvent::Data(7)), Ok(()));
     assert!(child_seen.borrow().is_empty());
 
@@ -536,7 +539,10 @@ fn spawned_child_appends_to_registration_order() {
     assert_eq!(runtime.try_send(parent, ParentEvent::StartChild), Ok(()));
     assert_eq!(runtime.step(), 1);
 
-    let child = child_address(spawned_child_isolate(runtime.trace()));
+    let child = child_address(
+        runtime.system_incarnation(),
+        spawned_child_isolate(runtime.trace()),
+    );
     assert_eq!(runtime.try_send(sibling, OrderMsg::Tick), Ok(()));
     assert_eq!(runtime.try_send(child, ChildEvent::Data(9)), Ok(()));
 
@@ -560,11 +566,14 @@ fn runtime_ingress_returns_typed_full_and_closed_for_spawned_child() {
     assert_eq!(runtime.try_send(parent, ParentEvent::StartChild), Ok(()));
     assert_eq!(runtime.step(), 1);
 
-    let child = child_address(spawned_child_isolate(runtime.trace()));
+    let child = child_address(
+        runtime.system_incarnation(),
+        spawned_child_isolate(runtime.trace()),
+    );
     assert_eq!(runtime.try_send(child, ChildEvent::Data(1)), Ok(()));
     assert_eq!(
         runtime.try_send(child, ChildEvent::Data(2)),
-        Err(TrySendError::Full(ChildEvent::Data(2))),
+        Err(tina_runtime::IngressSendError::Full(ChildEvent::Data(2))),
     );
 
     assert_eq!(runtime.step(), 1);
@@ -572,7 +581,7 @@ fn runtime_ingress_returns_typed_full_and_closed_for_spawned_child() {
     assert_eq!(runtime.step(), 1);
     assert_eq!(
         runtime.try_send(child, ChildEvent::Data(3)),
-        Err(TrySendError::Closed(ChildEvent::Data(3))),
+        Err(tina_runtime::IngressSendError::Closed(ChildEvent::Data(3))),
     );
 }
 
@@ -581,8 +590,11 @@ fn runtime_ingress_to_unknown_isolate_returns_closed() {
     let runtime = Runtime::new(TestShard, TestMailboxFactory);
 
     assert_eq!(
-        runtime.try_send(child_address(IsolateId::new(99)), ChildEvent::Data(1)),
-        Err(TrySendError::Closed(ChildEvent::Data(1)))
+        runtime.try_send(
+            child_address(runtime.system_incarnation(), IsolateId::new(99)),
+            ChildEvent::Data(1),
+        ),
+        Err(tina_runtime::IngressSendError::Closed(ChildEvent::Data(1)))
     );
     assert!(runtime.trace().is_empty());
 }
@@ -593,7 +605,11 @@ fn runtime_ingress_to_other_shard_still_panics() {
 
     let result = catch_unwind(AssertUnwindSafe(|| {
         let _ = runtime.try_send(
-            Address::new(ShardId::new(9), IsolateId::new(1)),
+            Address::new_in(
+                runtime.system_incarnation(),
+                ShardId::new(9),
+                IsolateId::new(1),
+            ),
             ChildEvent::Data(1),
         );
     }));
@@ -641,7 +657,10 @@ fn identical_runs_produce_identical_spawn_sequences_and_causal_links() {
         assert_eq!(runtime.try_send(parent, ParentEvent::StartChild), Ok(()));
         assert_eq!(runtime.step(), 1);
 
-        let child = child_address(spawned_child_isolate(runtime.trace()));
+        let child = child_address(
+            runtime.system_incarnation(),
+            spawned_child_isolate(runtime.trace()),
+        );
         assert_eq!(runtime.try_send(child, ChildEvent::Data(4)), Ok(()));
         assert_eq!(runtime.step(), 1);
 

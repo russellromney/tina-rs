@@ -531,12 +531,12 @@ fn accepted_send_can_become_message_abandoned_when_target_stops_in_the_same_roun
     let target_seen = Rc::new(RefCell::new(Vec::new()));
 
     let sender_mailbox = TestMailbox::new(8);
-    let sender_address = runtime.register(
-        StopSender {
-            target: Address::new(ShardId::new(3), IsolateId::new(2)),
-        },
-        sender_mailbox.clone(),
+    let target = Address::new_in(
+        runtime.system_incarnation(),
+        ShardId::new(3),
+        IsolateId::new(2),
     );
+    let sender_address = runtime.register(StopSender { target }, sender_mailbox.clone());
     let target_mailbox = TestMailbox::new(8);
     let target_address = runtime.register(
         StopAndAudit {

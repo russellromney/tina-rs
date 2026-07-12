@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use tina::Mailbox;
 use tina::prelude::*;
-use tina::{Mailbox, TrySendError};
 use tina_runtime::{
     CallOutcome, DefaultMailboxFactory, DefaultThreadedMailboxFactory, MailboxFactory,
     MultiShardRuntime, RegisterBootstrapError, Runtime, ThreadedMultiShardRuntime,
@@ -204,7 +204,7 @@ fn capacity_one_bootstrap_can_see_full_until_consumed() {
     // Capacity is 1 and Bootstrap is parked in the mailbox; an immediate Tick
     // must see Full. This is honest pressure, documented as such.
     match runtime.try_send(addr, Msg::Tick) {
-        Err(TrySendError::Full(_)) => {}
+        Err(tina_runtime::IngressSendError::Full(_)) => {}
         other => panic!("expected Full while bootstrap parked, got {other:?}"),
     }
 

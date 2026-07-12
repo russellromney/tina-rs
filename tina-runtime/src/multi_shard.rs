@@ -7,7 +7,9 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use tina::{Address, Isolate, Mailbox, Outbound as TinaOutbound, Shard, ShardId, TrySendError};
+use tina::{
+    Address, Isolate, Mailbox, Outbound as TinaOutbound, Shard, ShardId, SystemIncarnation,
+};
 use tina_supervisor::SupervisorConfig;
 
 use crate::call::{IntoErasedCall, RuntimeCall};
@@ -43,6 +45,7 @@ where
     terminal_remote_queues: RemoteQueues,
     next_terminal_remote_queues: RemoteQueues,
     terminal_overflow_queues: RemoteQueues,
+    system_incarnation: SystemIncarnation,
 }
 
 /// Bounded coordinator config for additive multi-shard runtime shells.
@@ -65,6 +68,11 @@ where
     S: Shard + 'static,
     F: MailboxFactory + Clone + 'static,
 {
+    /// Returns the provenance shared by every owned shard runtime.
+    pub const fn system_incarnation(&self) -> SystemIncarnation {
+        self.system_incarnation
+    }
+
     /// Creates one additive multi-shard coordinator over the provided shards.
     ///
     /// Shards are stepped in ascending [`ShardId`] order, regardless of input
@@ -83,6 +91,28 @@ where
     where
         I: IntoIterator<Item = S>,
     {
+        Self::with_config_and_system(
+            shards,
+            mailbox_factory,
+            config,
+            crate::fresh_system_incarnation(),
+        )
+    }
+
+    /// Creates a deterministic multi-shard owner with explicit provenance.
+    pub fn with_config_and_system<I>(
+        shards: I,
+        mailbox_factory: F,
+        config: MultiShardRuntimeConfig,
+        system_incarnation: SystemIncarnation,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+    {
+        assert!(
+            !system_incarnation.is_unscoped(),
+            "multi-shard runtime system incarnation must be nonzero"
+        );
         let mut shards: Vec<S> = shards.into_iter().collect();
         if shards.is_empty() {
             panic!("multi-shard runtime requires at least one shard");
@@ -114,7 +144,8 @@ where
                 mailbox_factory.clone(),
                 Box::new(MonotonicClock),
                 ids.clone(),
-            );
+            )
+            .with_system_incarnation(system_incarnation);
             runtime.remote_child_control_capacity = config.shard_pair_capacity;
             runtimes.push(runtime);
         }
@@ -139,6 +170,7 @@ where
             terminal_remote_queues,
             next_terminal_remote_queues,
             terminal_overflow_queues,
+            system_incarnation,
         }
     }
 
@@ -400,6 +432,12 @@ where
         &self,
         parent: Address<M, R>,
     ) -> Result<crate::ChildLifecycleReport, crate::ChildLifecycleReportError> {
+        if parent.system() != self.system_incarnation {
+            return Err(crate::ChildLifecycleReportError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: parent.system(),
+            });
+        }
         let Some(index) = self.shard_indexes.get(&parent.shard()).copied() else {
             return Err(crate::ChildLifecycleReportError::ParentShardUnavailable(
                 parent.shard(),
@@ -416,8 +454,18 @@ where
         &mut self,
         parent: Address<M, R>,
     ) -> ChildRestartedWaiter {
-        self.runtime_mut(parent.shard())
-            .observe_child_restarted(parent)
+        if parent.system() != self.system_incarnation {
+            return ChildRestartedWaiter::with_error(crate::WaitError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: parent.system(),
+            });
+        }
+        let Some(index) = self.shard_indexes.get(&parent.shard()).copied() else {
+            return ChildRestartedWaiter::with_error(crate::WaitError::UnknownShard(
+                parent.shard(),
+            ));
+        };
+        self.runtimes[index].observe_child_restarted(parent)
     }
 
     /// Attempts one typed global ingress send routed strictly by target shard.
@@ -425,7 +473,14 @@ where
         &self,
         address: Address<M, R>,
         message: M,
-    ) -> Result<(), TrySendError<M>> {
+    ) -> Result<(), crate::IngressSendError<M>> {
+        if address.system() != self.system_incarnation {
+            return Err(crate::IngressSendError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+                message,
+            });
+        }
         self.runtime(address.shard()).try_send(address, message)
     }
 
@@ -438,20 +493,33 @@ where
         &self,
         address: tina::ServiceEventAddress<Event, Request>,
         event: Event,
-    ) -> Result<(), TrySendError<Event>> {
+    ) -> Result<(), crate::IngressSendError<Event>> {
         match self.try_send(
             address.address().address(),
             tina::ServiceMessage::Event(event),
         ) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(tina::ServiceMessage::Event(event))) => {
-                Err(TrySendError::Full(event))
+            Err(crate::IngressSendError::Full(tina::ServiceMessage::Event(event))) => {
+                Err(crate::IngressSendError::Full(event))
             }
-            Err(TrySendError::Closed(tina::ServiceMessage::Event(event))) => {
-                Err(TrySendError::Closed(event))
+            Err(crate::IngressSendError::Closed(tina::ServiceMessage::Event(event))) => {
+                Err(crate::IngressSendError::Closed(event))
             }
-            Err(TrySendError::Full(tina::ServiceMessage::Request(_)))
-            | Err(TrySendError::Closed(tina::ServiceMessage::Request(_))) => {
+            Err(crate::IngressSendError::ForeignSystem {
+                expected,
+                actual,
+                message: tina::ServiceMessage::Event(event),
+            }) => Err(crate::IngressSendError::ForeignSystem {
+                expected,
+                actual,
+                message: event,
+            }),
+            Err(crate::IngressSendError::Full(tina::ServiceMessage::Request(_)))
+            | Err(crate::IngressSendError::Closed(tina::ServiceMessage::Request(_)))
+            | Err(crate::IngressSendError::ForeignSystem {
+                message: tina::ServiceMessage::Request(_),
+                ..
+            }) => {
                 unreachable!("runtime returned a different service payload than it received")
             }
         }

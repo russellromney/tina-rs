@@ -114,6 +114,24 @@ where
         &mut self,
         address: Address<M, R>,
     ) -> IsolateCompleteWaiter {
+        if address.system() != self.system_incarnation {
+            return IsolateCompleteWaiter::with_error(crate::WaitError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
+        if address.shard() != self.shard.id() {
+            return IsolateCompleteWaiter::with_error(crate::WaitError::UnknownShard(
+                address.shard(),
+            ));
+        }
+        if !self.entries.iter().any(|entry| {
+            entry.id == address.isolate()
+                && entry.generation == address.generation()
+                && !entry.stopped.get()
+        }) {
+            return IsolateCompleteWaiter::with_error(crate::WaitError::AlreadyStopped);
+        }
         self.observation
             .register_isolate_complete(address.isolate(), address.generation())
     }
@@ -131,8 +149,26 @@ where
         address: Address<M, R>,
         call_kind: CallKind,
     ) -> OperationDoneWaiter {
+        if address.system() != self.system_incarnation {
+            return OperationDoneWaiter::with_error(crate::WaitError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
+        if address.shard() != self.shard.id() {
+            return OperationDoneWaiter::with_error(crate::WaitError::UnknownShard(
+                address.shard(),
+            ));
+        }
+        if !self.entries.iter().any(|entry| {
+            entry.id == address.isolate()
+                && entry.generation == address.generation()
+                && !entry.stopped.get()
+        }) {
+            return OperationDoneWaiter::with_error(crate::WaitError::AlreadyStopped);
+        }
         self.observation
-            .register_operation_done(address.isolate(), call_kind)
+            .register_operation_done(address.isolate(), address.generation(), call_kind)
     }
 
     /// Registers a typed waiter for the next supervised restart of any
@@ -148,6 +184,24 @@ where
         &mut self,
         parent_address: Address<M, R>,
     ) -> ChildRestartedWaiter {
+        if parent_address.system() != self.system_incarnation {
+            return ChildRestartedWaiter::with_error(crate::WaitError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: parent_address.system(),
+            });
+        }
+        if parent_address.shard() != self.shard.id() {
+            return ChildRestartedWaiter::with_error(crate::WaitError::UnknownShard(
+                parent_address.shard(),
+            ));
+        }
+        if !self.entries.iter().any(|entry| {
+            entry.id == parent_address.isolate()
+                && entry.generation == parent_address.generation()
+                && !entry.stopped.get()
+        }) {
+            return ChildRestartedWaiter::with_error(crate::WaitError::AlreadyStopped);
+        }
         self.observation.register_child_restarted(
             parent_address.shard(),
             parent_address.isolate(),
@@ -161,6 +215,12 @@ where
         &self,
         parent_address: Address<M, R>,
     ) -> Result<ChildLifecycleReport, ChildLifecycleReportError> {
+        if parent_address.system() != self.system_incarnation {
+            return Err(ChildLifecycleReportError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: parent_address.system(),
+            });
+        }
         if parent_address.shard() != self.shard.id() {
             return Err(ChildLifecycleReportError::ParentShardUnavailable(
                 parent_address.shard(),
@@ -169,6 +229,7 @@ where
         ChildLifecycleReport::from_runtime(
             self,
             RegisteredAddress {
+                system: parent_address.system(),
                 shard: parent_address.shard(),
                 isolate: parent_address.isolate(),
                 generation: parent_address.generation(),
@@ -196,6 +257,15 @@ where
     where
         T: Send + 'static,
     {
+        if address.system() != self.system_incarnation {
+            return Err(ResultWaitError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
+        if address.shard() != self.shard.id() {
+            return Err(ResultWaitError::UnknownShard(address.shard()));
+        }
         let isolate = address.isolate();
         let generation = address.generation();
         let alive = self.entries.iter().any(|entry| {
@@ -243,7 +313,14 @@ where
         &self,
         address: Address<M, R>,
         message: M,
-    ) -> Result<(), TrySendError<M>> {
+    ) -> Result<(), crate::IngressSendError<M>> {
+        if address.system() != self.system_incarnation {
+            return Err(crate::IngressSendError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+                message,
+            });
+        }
         if address.shard() != self.shard.id() {
             panic!(
                 "cross-shard runtime ingress is out of scope in this slice: target shard {} != runtime shard {}",
@@ -258,23 +335,24 @@ where
         // previous code scanned `self.entries` twice (once via `find`, once
         // via `position`) to recover the same index.
         let Some(entry_index) = self.entry_index(RegisteredAddress {
+            system: address.system(),
             shard: address.shard(),
             isolate: address.isolate(),
             generation: address.generation(),
         }) else {
-            return Err(TrySendError::Closed(message));
+            return Err(crate::IngressSendError::Closed(message));
         };
 
         match self.enqueue_entry_message(entry_index, Box::new(message), None) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(message)) => Err(TrySendError::Full(
+            Err(TrySendError::Full(message)) => Err(crate::IngressSendError::Full(
                 *message.downcast::<M>().unwrap_or_else(|_| {
                     panic!(
                         "runtime ingress attempted to deliver a message to a mailbox with the wrong type"
                     )
                 }),
             )),
-            Err(TrySendError::Closed(message)) => Err(TrySendError::Closed(
+            Err(TrySendError::Closed(message)) => Err(crate::IngressSendError::Closed(
                 *message.downcast::<M>().unwrap_or_else(|_| {
                     panic!(
                         "runtime ingress attempted to deliver a message to a mailbox with the wrong type"
@@ -294,20 +372,33 @@ where
         &self,
         address: tina::ServiceEventAddress<Event, Request>,
         event: Event,
-    ) -> Result<(), TrySendError<Event>> {
+    ) -> Result<(), crate::IngressSendError<Event>> {
         match self.try_send(
             address.address().address(),
             tina::ServiceMessage::Event(event),
         ) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(tina::ServiceMessage::Event(event))) => {
-                Err(TrySendError::Full(event))
+            Err(crate::IngressSendError::Full(tina::ServiceMessage::Event(event))) => {
+                Err(crate::IngressSendError::Full(event))
             }
-            Err(TrySendError::Closed(tina::ServiceMessage::Event(event))) => {
-                Err(TrySendError::Closed(event))
+            Err(crate::IngressSendError::Closed(tina::ServiceMessage::Event(event))) => {
+                Err(crate::IngressSendError::Closed(event))
             }
-            Err(TrySendError::Full(tina::ServiceMessage::Request(_)))
-            | Err(TrySendError::Closed(tina::ServiceMessage::Request(_))) => {
+            Err(crate::IngressSendError::ForeignSystem {
+                expected,
+                actual,
+                message: tina::ServiceMessage::Event(event),
+            }) => Err(crate::IngressSendError::ForeignSystem {
+                expected,
+                actual,
+                message: event,
+            }),
+            Err(crate::IngressSendError::Full(tina::ServiceMessage::Request(_)))
+            | Err(crate::IngressSendError::Closed(tina::ServiceMessage::Request(_)))
+            | Err(crate::IngressSendError::ForeignSystem {
+                message: tina::ServiceMessage::Request(_),
+                ..
+            }) => {
                 unreachable!("runtime returned a different split-service payload than it received")
             }
         }

@@ -261,6 +261,8 @@ pub fn run() -> anyhow::Result<Report> {
 
 fn record_host_error(report: &mut Report, error: ThreadedRuntimeError) {
     match error {
+        ThreadedRuntimeError::ForeignSystem { .. } => report.host_foreign_system += 1,
+        ThreadedRuntimeError::ParentStopped => report.host_parent_stopped += 1,
         ThreadedRuntimeError::CommandFull => report.host_command_full += 1,
         ThreadedRuntimeError::WorkerStopped => report.host_worker_stopped += 1,
         ThreadedRuntimeError::HostWaitTimeout => report.host_wait_timeout += 1,
@@ -544,7 +546,11 @@ mod tests {
     #[test]
     fn host_control_errors_remain_exhaustive_and_distinct() {
         let mut report = Report::default();
+        let expected = tina::SystemIncarnation::new(1);
+        let actual = tina::SystemIncarnation::new(2);
         for error in [
+            ThreadedRuntimeError::ForeignSystem { expected, actual },
+            ThreadedRuntimeError::ParentStopped,
             ThreadedRuntimeError::CommandFull,
             ThreadedRuntimeError::WorkerStopped,
             ThreadedRuntimeError::HostWaitTimeout,
@@ -555,6 +561,8 @@ mod tests {
         ] {
             record_host_error(&mut report, error);
         }
+        assert_eq!(report.host_foreign_system, 1);
+        assert_eq!(report.host_parent_stopped, 1);
         assert_eq!(report.host_command_full, 1);
         assert_eq!(report.host_worker_stopped, 1);
         assert_eq!(report.host_wait_timeout, 1);

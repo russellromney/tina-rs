@@ -218,7 +218,27 @@ impl LiveShardMetrics {
             LiveShardState::Stopped => LiveShardState::STOPPED,
             LiveShardState::Failed => LiveShardState::FAILED,
         };
-        self.state.store(raw, Ordering::Release);
+        if raw != LiveShardState::FAILED {
+            self.state.store(raw, Ordering::Release);
+            return;
+        }
+
+        // A clean joined worker exit is authoritative terminal truth. Host
+        // calls racing that exit may observe disconnected reply channels, but
+        // they must not overwrite the joiner's final Stopped state with a
+        // late observational failure.
+        let mut current = self.state.load(Ordering::Acquire);
+        while current != LiveShardState::STOPPED {
+            match self.state.compare_exchange_weak(
+                current,
+                LiveShardState::FAILED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     pub(crate) fn set_resource_counts(&self, report: DriverResourceReport) {
@@ -281,6 +301,38 @@ impl LiveShardMetrics {
             worker_held_resource_count: self.worker_held_resource_count.load(Ordering::Acquire),
             pending_driver_call_count: self.pending_driver_call_count.load(Ordering::Acquire),
         }
+    }
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    fn metrics() -> LiveShardMetrics {
+        LiveShardMetrics::new(ShardId::new(1), None, ThreadedRuntimeConfig::default())
+    }
+
+    #[test]
+    fn clean_joined_stop_is_not_overwritten_by_late_disconnect_observation() {
+        let metrics = metrics();
+        metrics.set_state(LiveShardState::Stopped);
+        metrics.set_state(LiveShardState::Failed);
+        assert_eq!(metrics.state(), LiveShardState::Stopped);
+    }
+
+    #[test]
+    fn joined_exit_remains_authoritative_over_prior_observation() {
+        let metrics = metrics();
+        metrics.set_state(LiveShardState::Failed);
+        metrics.set_state(LiveShardState::Stopped);
+        assert_eq!(metrics.state(), LiveShardState::Stopped);
+    }
+
+    #[test]
+    fn failure_is_recorded_while_worker_has_not_joined_cleanly() {
+        let metrics = metrics();
+        metrics.set_state(LiveShardState::Failed);
+        assert_eq!(metrics.state(), LiveShardState::Failed);
     }
 }
 

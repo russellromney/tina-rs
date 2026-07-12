@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use tina::TrySendError;
 use tina::prelude::*;
 use tina_runtime::sharded::{ShardPlacement, ShardRequestServiceTable};
 use tina_runtime::{
@@ -181,7 +180,7 @@ fn simulator_multi_owner_preserves_service_capabilities_and_domain_errors() {
         .expect("first event accepted");
     assert_eq!(
         simulator.try_send_event(events, Event::Record(32)),
-        Err(TrySendError::Full(Event::Record(32)))
+        Err(tina_runtime::IngressSendError::Full(Event::Record(32)))
     );
     simulator.step();
     assert_eq!(seen.load(Ordering::Acquire), 31);
@@ -192,7 +191,7 @@ fn simulator_multi_owner_preserves_service_capabilities_and_domain_errors() {
     simulator.step();
     assert_eq!(
         simulator.try_send_event(events, Event::Record(33)),
-        Err(TrySendError::Closed(Event::Record(33)))
+        Err(tina_runtime::IngressSendError::Closed(Event::Record(33)))
     );
 
     let requests = simulator.register_request_service_on(ShardId::new(1), RequestService(37), 2);

@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use tina::{AddressGeneration, DeferredSlotRegistry, IsolateId, Shard};
+use tina::{AddressGeneration, DeferredSlotRegistry, IsolateId, Shard, SystemIncarnation};
 
 use betelgeuse::IOLoopHandle;
 
@@ -110,10 +110,10 @@ pub use concurrency_pending::{
 };
 pub use drain_state::{AdmitDecision, DrainReport, DrainStage, DrainState};
 pub use errors::{
-    RegisterBootstrapError, SendObservedUntilError, ShutdownAndWaitError, ShutdownRequestError,
-    ShutdownWaitError, StartupError, SuperviseError, ThreadedRegisterBootstrapError,
-    ThreadedRuntimeConfigError, ThreadedRuntimeError, ThreadedSendObservedError,
-    ThreadedTrySendError,
+    IngressSendError, RegisterBootstrapError, SendObservedUntilError, ShutdownAndWaitError,
+    ShutdownRequestError, ShutdownWaitError, StartupError, SuperviseError,
+    ThreadedRegisterBootstrapError, ThreadedRuntimeConfigError, ThreadedRuntimeError,
+    ThreadedSendObservedError, ThreadedTrySendError,
 };
 pub use full_handling::{
     FullDecision, FullExhaustionReason, FullHandling, FullHandlingReport, FullHandlingToken,
@@ -427,6 +427,20 @@ impl IdSource {
 /// an unbounded delivery loop. The remainder carries over to the next step.
 pub const DEFAULT_DRIVER_COMPLETION_DRAIN_BUDGET: usize = 64;
 
+static NEXT_SYSTEM_INCARNATION: AtomicU64 = AtomicU64::new(1);
+
+/// Allocates a nonzero process-unique system incarnation.
+///
+/// This identifier is a local routing provenance stamp, not a security token
+/// or distributed node id. A process-local monotonic source gives the contract
+/// exact uniqueness without adding an OS-entropy panic to runtime startup.
+/// Deterministic/replay owners may configure a fixed incarnation explicitly.
+pub fn fresh_system_incarnation() -> SystemIncarnation {
+    let raw = NEXT_SYSTEM_INCARNATION.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(raw, 0, "system incarnation space exhausted");
+    SystemIncarnation::new(raw)
+}
+
 /// Small deterministic single-shard runtime.
 ///
 /// The runtime owns one shard value plus a private registry of isolates and
@@ -437,6 +451,7 @@ where
     S: Shard,
     F: MailboxFactory,
 {
+    pub(crate) system_incarnation: SystemIncarnation,
     pub(crate) shard: S,
     pub(crate) mailbox_factory: F,
     pub(crate) entries: Vec<RegisteredEntry<S, F>>,
@@ -920,6 +935,7 @@ where
         preallocation: PreallocationConfig,
     ) -> Self {
         Self {
+            system_incarnation: fresh_system_incarnation(),
             shard,
             mailbox_factory,
             entries: Vec::with_capacity(preallocation.entry_capacity),
@@ -960,6 +976,25 @@ where
     /// Returns a shared reference to the shard.
     pub const fn shard(&self) -> &S {
         &self.shard
+    }
+
+    /// Overrides the deterministic system incarnation before addresses are issued.
+    pub fn with_system_incarnation(mut self, system_incarnation: SystemIncarnation) -> Self {
+        assert!(
+            self.entries.is_empty(),
+            "system incarnation must be set before registration"
+        );
+        assert!(
+            !system_incarnation.is_unscoped(),
+            "runtime system incarnation must be nonzero"
+        );
+        self.system_incarnation = system_incarnation;
+        self
+    }
+
+    /// Returns the provenance stamped into addresses issued by this runtime.
+    pub const fn system_incarnation(&self) -> SystemIncarnation {
+        self.system_incarnation
     }
 
     /// Returns the active trace retention policy.

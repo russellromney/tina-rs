@@ -170,6 +170,7 @@ pub fn run() -> anyhow::Result<Report> {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     Ok,
     ServiceUnavailable,
@@ -193,10 +194,27 @@ fn classify(e: &BoxError) -> Outcome {
     if let Some(b) = e.downcast_ref::<BridgeError>() {
         return match b {
             BridgeError::Timeout => Outcome::GatewayTimeout,
-            BridgeError::Full | BridgeError::Closed | BridgeError::UnknownShard(_) => {
+            BridgeError::ForeignSystem { .. }
+            | BridgeError::Full
+            | BridgeError::Closed
+            | BridgeError::UnknownShard(_) => {
                 Outcome::ServiceUnavailable
             }
         };
     }
     Outcome::ServiceUnavailable
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn foreign_system_bridge_error_is_service_unavailable() {
+        let error: BoxError = Box::new(BridgeError::ForeignSystem {
+            expected: tina::SystemIncarnation::new(1),
+            actual: tina::SystemIncarnation::new(2),
+        });
+        assert_eq!(classify(&error), Outcome::ServiceUnavailable);
+    }
 }

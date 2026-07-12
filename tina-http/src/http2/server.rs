@@ -561,8 +561,10 @@ pub struct Http2Connection<S: Shard, M: Http2ServiceMessage = HttpRequest> {
     pending_write: Vec<u8>,
     write_queue: VecDeque<Vec<u8>>,
     report: Http2ConnectionReport,
+    self_system: Option<tina::SystemIncarnation>,
     self_shard_id: Option<tina::ShardId>,
     self_isolate_id: Option<tina::IsolateId>,
+    self_generation: Option<tina::AddressGeneration>,
     _shard: PhantomData<S>,
 }
 
@@ -604,8 +606,10 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
             pending_write: Vec::new(),
             write_queue: VecDeque::new(),
             report: Http2ConnectionReport::default(),
+            self_system: None,
             self_shard_id: None,
             self_isolate_id: None,
+            self_generation: None,
             _shard: PhantomData,
         })
     }
@@ -643,8 +647,11 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Isolate for Http2Connection<S, 
         ctx: &mut Context<'_, S, Self::Reply>,
     ) -> Effect<Self> {
         if self.self_isolate_id.is_none() {
-            self.self_shard_id = Some(ctx.shard_id());
-            self.self_isolate_id = Some(ctx.isolate_id());
+            let me = ctx.me::<Http2ConnectionMsg>();
+            self.self_system = Some(me.system());
+            self.self_shard_id = Some(me.shard());
+            self.self_isolate_id = Some(me.isolate());
+            self.self_generation = Some(me.generation());
         }
         match msg {
             Http2ConnectionMsg::Begin => self.read_more(),
@@ -1477,10 +1484,11 @@ impl<S: Shard + 'static, M: Http2ServiceMessage> Http2Connection<S, M> {
         // keep that value (which already accounts for invalid/duplicate
         // rejection) rather than re-parsing the headers here.
         let content_length = self.streams[idx].request_content_length;
-        let source = tina::Address::new_with_generation(
+        let source = tina::Address::new_with_generation_in(
+            self.self_system.expect("system captured"),
             self.self_shard_id.expect("shard id captured"),
             self.self_isolate_id.expect("isolate id captured"),
-            tina::AddressGeneration::new(0),
+            self.self_generation.expect("generation captured"),
         );
         let parts = Http2RequestParts {
             method: headers

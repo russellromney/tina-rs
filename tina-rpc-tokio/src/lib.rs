@@ -275,6 +275,11 @@ fn fire_observer_err(
     err: ThreadedSendObservedError,
 ) {
     let mapped = match err {
+        ThreadedSendObservedError::ForeignSystem { expected, actual } => {
+            ClientResult::IoError(tina_runtime::CallError::Rejected(
+                tina::CallRejectedReason::ForeignSystem { expected, actual },
+            ))
+        }
         ThreadedSendObservedError::UnknownShard(_) => {
             ClientResult::IoError(tina_runtime::CallError::InvalidResource)
         }

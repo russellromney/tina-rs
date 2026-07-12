@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)] // Errors return linear caller authority intact.
+
 //! Guarded sibling of [`crate::PendingReplies`].
 //!
 //! Some services need an RAII guard (a lease, a permit, a counter) to live

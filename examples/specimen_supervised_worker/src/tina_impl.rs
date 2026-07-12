@@ -157,7 +157,8 @@ pub fn run() -> anyhow::Result<Report> {
                     .wait(Duration::from_secs(2))
                     .map_err(|e| anyhow::anyhow!("supervisor restart: {e:?}"))?;
                 restarts += 1;
-                slot.set(Address::new_with_generation(
+                slot.set(Address::new_with_generation_in(
+                    parent.system(),
                     parent.shard(),
                     restarted.new_isolate,
                     restarted.new_generation,

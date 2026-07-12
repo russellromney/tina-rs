@@ -460,7 +460,8 @@ fn dispatcher_worker_workload_continues_after_bad_remote_address_on_same_shard()
 
     let worker =
         runtime.register_with_capacity_on::<Worker, CoordinatorEvent>(ShardId::new(22), Worker, 4);
-    let bad_worker = Address::new_with_generation(
+    let bad_worker = Address::new_with_generation_in(
+        runtime.system_incarnation(),
         ShardId::new(22),
         IsolateId::new(999),
         AddressGeneration::new(0),

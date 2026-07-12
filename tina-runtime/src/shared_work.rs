@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)] // Errors return linear caller authority intact.
+
 //! Many callers wait for one result — user-facing name.
 //!
 //! `SharedWork<K, R>` names the user's job: "many callers asked for the

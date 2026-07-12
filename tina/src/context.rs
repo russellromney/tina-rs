@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use crate::{
     Address, AddressGeneration, Effect, Isolate, IsolateId, Outbound, RequestEffect,
-    RequestEffectPermit, Shard, ShardId,
+    RequestEffectPermit, Shard, ShardId, SystemIncarnation,
 };
 
 /// Per-handler context provided by the runtime.
@@ -34,6 +34,7 @@ where
 {
     shard: &'a mut S,
     current_isolate: IsolateId,
+    system_incarnation: SystemIncarnation,
     current_generation: AddressGeneration,
     caller: Option<MessageCaller>,
     /// Runtime/sim-stamped current time. `None` for hand-built contexts
@@ -68,11 +69,19 @@ where
         Self {
             shard,
             current_isolate,
+            system_incarnation: SystemIncarnation::DEFAULT,
             current_generation: AddressGeneration::new(0),
             caller: None,
             now: None,
             _reply: PhantomData,
         }
+    }
+
+    /// Attach the runtime/system incarnation. Runtime-only constructor.
+    #[doc(hidden)]
+    pub fn with_system_incarnation(mut self, system_incarnation: SystemIncarnation) -> Self {
+        self.system_incarnation = system_incarnation;
+        self
     }
 
     /// Attach the current isolate generation. Runtime-only constructor.
@@ -210,17 +219,18 @@ where
 
     /// Builds an [`Address`] for an isolate on any shard.
     pub fn address<M>(&self, shard: ShardId, isolate: IsolateId) -> Address<M> {
-        Address::new(shard, isolate)
+        Address::new_in(self.system_incarnation, shard, isolate)
     }
 
     /// Builds an [`Address`] for another isolate on the current shard.
     pub fn local_address<M>(&self, isolate: IsolateId) -> Address<M> {
-        Address::new(self.shard_id(), isolate)
+        Address::new_in(self.system_incarnation, self.shard_id(), isolate)
     }
 
     /// Builds an [`Address`] for the currently executing isolate.
     pub fn me<M>(&self) -> Address<M> {
-        Address::new_with_generation(
+        Address::new_with_generation_in(
+            self.system_incarnation,
             self.shard_id(),
             self.current_isolate,
             self.current_generation,
@@ -317,6 +327,7 @@ where
     /// caller cannot be captured. Lets bounded helpers like `park_request`
     /// check admission first and surface caller authority back on failure
     /// instead of stranding it inside the helper.
+    #[allow(clippy::result_large_err)] // Failure returns linear request authority intact.
     pub fn try_capture<F>(self, build: F) -> Result<RequestEffect<I>, (Self, TakeReplySlotError)>
     where
         I::Reply: 'static,
@@ -479,6 +490,7 @@ where
     /// Returns the original [`CallContext`] alongside a typed error so
     /// helpers like `park_call` can return caller authority unchanged when
     /// the slot cannot be captured (cross-shard, missing caller).
+    #[allow(clippy::result_large_err)] // Failure returns linear call authority intact.
     pub fn try_into_request_context(
         mut self,
     ) -> Result<RequestContext<I::Reply>, (Self, TakeReplySlotError)>
@@ -505,7 +517,8 @@ where
 
     /// Builds an [`Address`] for the currently executing isolate.
     pub fn me(&self) -> Address<I::Message, I::Reply> {
-        Address::<I::Message, I::Reply>::new_with_generation(
+        Address::<I::Message, I::Reply>::new_with_generation_in(
+            self.ctx.system_incarnation,
             self.shard_id(),
             self.ctx.isolate_id(),
             self.ctx.current_generation,
@@ -600,6 +613,13 @@ where
 /// Runtime-level reason a call was rejected without an application reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CallRejectedReason {
+    /// The target address belongs to another runtime/system incarnation.
+    ForeignSystem {
+        /// Incarnation owned by the routing runtime.
+        expected: SystemIncarnation,
+        /// Incarnation carried by the target address.
+        actual: SystemIncarnation,
+    },
     /// The callee returned without consuming the call authority.
     ReplyAbandoned,
     /// The callee panicked before consuming the call authority.
@@ -617,7 +637,7 @@ impl CallRejectedReason {
                  call_ctx.reply(...), call_ctx.reject(...), or \
                  call_ctx.defer(work).reply(...)",
             ),
-            Self::HandlerPanicked | Self::UnsupportedMessage => None,
+            Self::ForeignSystem { .. } | Self::HandlerPanicked | Self::UnsupportedMessage => None,
         }
     }
 }
@@ -1329,6 +1349,8 @@ pub enum CallRouting {
     /// Caller is on a different shard. Reply must travel through the
     /// remote reply path.
     Remote {
+        /// Requester runtime/system incarnation.
+        requester_system: SystemIncarnation,
         /// Requester shard id.
         requester_shard: ShardId,
         /// Requester isolate id on its shard.

@@ -317,6 +317,7 @@ impl Isolate for Registry {
 /// parsing trace events. Trace event variants and ids are not stable across
 /// runtime versions.
 fn replacement_address_for(
+    system: tina::SystemIncarnation,
     failed_isolate: IsolateId,
     trace: &[RuntimeEvent],
 ) -> Option<Address<WorkerEvent>> {
@@ -329,7 +330,8 @@ fn replacement_address_for(
         } = event.kind()
         {
             if old_isolate == failed_isolate {
-                return Some(Address::new_with_generation(
+                return Some(Address::new_with_generation_in(
+                    system,
                     event.shard(),
                     new_isolate,
                     new_generation,
@@ -411,9 +413,12 @@ impl Harness {
         assert_eq!(spawned_ids.len(), count, "expected {count} spawned workers");
 
         let shard = TestShard.id();
+        let system = self.runtime.system_incarnation();
         spawned_ids
             .into_iter()
-            .map(|isolate| Address::new_with_generation(shard, isolate, AddressGeneration::new(0)))
+            .map(|isolate| {
+                Address::new_with_generation_in(system, shard, isolate, AddressGeneration::new(0))
+            })
             .collect()
     }
 
@@ -503,18 +508,29 @@ fn one_for_one_restarts_only_failed_worker_and_keeps_siblings_running() {
     assert!(matches!(
         h.runtime
             .try_send(worker_a, WorkerEvent::Run(Task::Normal(99))),
-        Err(TrySendError::Closed(WorkerEvent::Run(Task::Normal(99))))
+        Err(tina_runtime::IngressSendError::Closed(WorkerEvent::Run(
+            Task::Normal(99)
+        )))
     ));
 
     // Discover the replacement worker A and refresh the registry.
-    let new_worker_a = replacement_address_for(worker_a.isolate(), h.runtime.trace())
-        .expect("replacement worker A address");
+    let new_worker_a = replacement_address_for(
+        h.runtime.system_incarnation(),
+        worker_a.isolate(),
+        h.runtime.trace(),
+    )
+    .expect("replacement worker A address");
     assert_ne!(new_worker_a.isolate(), worker_a.isolate());
     h.register_worker(0, new_worker_a);
 
     // Worker B's identity is unchanged (OneForOne does not restart siblings).
     assert!(
-        replacement_address_for(worker_b.isolate(), h.runtime.trace()).is_none(),
+        replacement_address_for(
+            h.runtime.system_incarnation(),
+            worker_b.isolate(),
+            h.runtime.trace(),
+        )
+        .is_none(),
         "worker B should not be restarted under OneForOne"
     );
 
@@ -567,7 +583,7 @@ fn one_for_all_restarts_every_worker_after_one_panic() {
         assert!(matches!(
             h.runtime
                 .try_send(*address, WorkerEvent::Run(Task::Normal(99))),
-            Err(TrySendError::Closed(_))
+            Err(tina_runtime::IngressSendError::Closed(_))
         ));
     }
 
@@ -575,7 +591,7 @@ fn one_for_all_restarts_every_worker_after_one_panic() {
     let replacements: Vec<Address<WorkerEvent>> = original_ids
         .iter()
         .map(|old| {
-            replacement_address_for(*old, h.runtime.trace())
+            replacement_address_for(h.runtime.system_incarnation(), *old, h.runtime.trace())
                 .expect("replacement for OneForAll worker")
         })
         .collect();
@@ -626,15 +642,28 @@ fn rest_for_one_keeps_older_siblings_and_restarts_failed_and_younger() {
 
     // Slot 0 (older) keeps its identity.
     assert!(
-        replacement_address_for(original_ids[0], h.runtime.trace()).is_none(),
+        replacement_address_for(
+            h.runtime.system_incarnation(),
+            original_ids[0],
+            h.runtime.trace(),
+        )
+        .is_none(),
         "older sibling should not be restarted under RestForOne"
     );
 
     // Slot 1 (failed) and slot 2 (younger) get replacements.
-    let new_1 = replacement_address_for(original_ids[1], h.runtime.trace())
-        .expect("replacement for failed middle worker");
-    let new_2 = replacement_address_for(original_ids[2], h.runtime.trace())
-        .expect("replacement for younger worker");
+    let new_1 = replacement_address_for(
+        h.runtime.system_incarnation(),
+        original_ids[1],
+        h.runtime.trace(),
+    )
+    .expect("replacement for failed middle worker");
+    let new_2 = replacement_address_for(
+        h.runtime.system_incarnation(),
+        original_ids[2],
+        h.runtime.trace(),
+    )
+    .expect("replacement for younger worker");
     assert_ne!(new_1.isolate(), original_ids[1]);
     assert_ne!(new_2.isolate(), original_ids[2]);
 
@@ -644,12 +673,12 @@ fn rest_for_one_keeps_older_siblings_and_restarts_failed_and_younger() {
     assert!(matches!(
         h.runtime
             .try_send(workers[1], WorkerEvent::Run(Task::Normal(99))),
-        Err(TrySendError::Closed(_))
+        Err(tina_runtime::IngressSendError::Closed(_))
     ));
     assert!(matches!(
         h.runtime
             .try_send(workers[2], WorkerEvent::Run(Task::Normal(99))),
-        Err(TrySendError::Closed(_))
+        Err(tina_runtime::IngressSendError::Closed(_))
     ));
 
     // Refresh registry for restarted slots only.
@@ -688,8 +717,12 @@ fn budget_exhaustion_emits_visible_rejection_and_creates_no_replacement() {
 
     // First panic consumes the only budget unit and produces a replacement.
     h.submit(0, Task::Poison);
-    let new_worker_a = replacement_address_for(worker_a.isolate(), h.runtime.trace())
-        .expect("first restart should succeed");
+    let new_worker_a = replacement_address_for(
+        h.runtime.system_incarnation(),
+        worker_a.isolate(),
+        h.runtime.trace(),
+    )
+    .expect("first restart should succeed");
     h.register_worker(0, new_worker_a);
     h.submit(0, Task::Normal(2));
     assert_eq!(
@@ -731,7 +764,7 @@ fn budget_exhaustion_emits_visible_rejection_and_creates_no_replacement() {
     assert!(matches!(
         h.runtime
             .try_send(new_worker_a, WorkerEvent::Run(Task::Normal(99))),
-        Err(TrySendError::Closed(_))
+        Err(tina_runtime::IngressSendError::Closed(_))
     ));
 }
 
@@ -813,8 +846,12 @@ fn repeated_runs_produce_identical_traces_and_completed_logs() {
         h.submit(1, Task::Normal(2));
         h.submit(0, Task::Poison);
 
-        let new_worker_a = replacement_address_for(worker_a.isolate(), h.runtime.trace())
-            .expect("replacement worker A");
+        let new_worker_a = replacement_address_for(
+            h.runtime.system_incarnation(),
+            worker_a.isolate(),
+            h.runtime.trace(),
+        )
+        .expect("replacement worker A");
         h.register_worker(0, new_worker_a);
 
         h.submit(0, Task::Normal(3));

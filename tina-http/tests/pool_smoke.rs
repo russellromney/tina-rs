@@ -25,6 +25,7 @@ use tina_runtime::{
 use common::TestShard;
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 enum DriverMsg {
     Begin {
         pool: Address<HttpPoolMsg, Result<HttpResponse, HttpClientError>>,

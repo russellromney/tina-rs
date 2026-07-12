@@ -132,7 +132,8 @@ fn build_harness(inbound_chunks: Vec<Vec<u8>>) -> Harness {
     let observer_full = sim.register(Observer {
         received: Rc::clone(&received),
     });
-    let observer = Address::<ClientResultMsg>::new_with_generation(
+    let observer = Address::<ClientResultMsg>::new_with_generation_in(
+        observer_full.system(),
         observer_full.shard(),
         observer_full.isolate(),
         observer_full.generation(),
@@ -142,7 +143,8 @@ fn build_harness(inbound_chunks: Vec<Vec<u8>>) -> Harness {
         config: client_config(),
         _shard: std::marker::PhantomData,
     }));
-    let client = Address::<ClientMsg>::new_with_generation(
+    let client = Address::<ClientMsg>::new_with_generation_in(
+        client_full.system(),
         client_full.shard(),
         client_full.isolate(),
         client_full.generation(),

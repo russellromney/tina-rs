@@ -12,11 +12,11 @@ use std::time::Duration;
 
 use tina::{
     AddressGeneration, ChildDefinition, ChildRef, CrossShardRestartableChildDefinition,
-    SpawnObservedError, SpawnObservedRemote, TrySendError, prelude::*,
+    SpawnObservedError, SpawnObservedRemote, prelude::*,
 };
 use tina_runtime::{
-    DefaultMailboxFactory, MultiShardRuntime, MultiShardRuntimeConfig, RuntimeCall,
-    RuntimeEventKind, WaitError,
+    DefaultMailboxFactory, IngressSendError as TrySendError, MultiShardRuntime,
+    MultiShardRuntimeConfig, RuntimeCall, RuntimeEventKind, WaitError,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -355,7 +355,11 @@ fn cross_shard_child_ownership_spawn_on_remote_then_stop_in_one_turn_is_safe() {
         }
         None
     }) {
-        let child = tina::Address::<CrossChildMsg>::new(ShardId::new(22), child_isolate);
+        let child = tina::Address::<CrossChildMsg>::new_in(
+            runtime.system_incarnation(),
+            ShardId::new(22),
+            child_isolate,
+        );
         assert_eq!(
             runtime.try_send(child, CrossChildMsg::Ping),
             Err(TrySendError::Closed(CrossChildMsg::Ping)),
@@ -511,7 +515,11 @@ fn cross_shard_child_ownership_cancel_pressure_does_not_orphan_admitted_children
         })
         .collect();
     for child_isolate in spawned_children {
-        let child = tina::Address::<CrossChildMsg>::new(ShardId::new(22), child_isolate);
+        let child = tina::Address::<CrossChildMsg>::new_in(
+            runtime.system_incarnation(),
+            ShardId::new(22),
+            child_isolate,
+        );
         assert_eq!(
             runtime.try_send(child, CrossChildMsg::Ping),
             Err(TrySendError::Closed(CrossChildMsg::Ping))
@@ -561,12 +569,14 @@ fn cross_shard_restartable_child_restarts_on_remote_shard_and_reports_replacemen
         runtime.step();
     }
     let old_child = learned.borrow().expect("remote child address learned");
-    let stale_parent = Address::<RestartParentMsg>::new_with_generation(
+    let stale_parent = Address::<RestartParentMsg>::new_with_generation_in(
+        parent.system(),
         parent.shard(),
         parent.isolate(),
         AddressGeneration::new(parent.generation().get() + 1),
     );
-    let foreign_parent = Address::<RestartParentMsg>::new_with_generation(
+    let foreign_parent = Address::<RestartParentMsg>::new_with_generation_in(
+        parent.system(),
         ShardId::new(22),
         parent.isolate(),
         parent.generation(),
@@ -591,13 +601,13 @@ fn cross_shard_restartable_child_restarts_on_remote_shard_and_reports_replacemen
     assert_ne!(restarted.new_isolate, old_child.address.isolate());
     assert_eq!(
         stale_waiter.wait(Duration::from_millis(10)),
-        Err(WaitError::Timeout),
-        "a stale owner generation must not claim a cross-shard restart"
+        Err(WaitError::AlreadyStopped),
+        "a stale owner generation must be rejected before claiming a cross-shard restart"
     );
     assert_eq!(
         foreign_waiter.wait(Duration::from_millis(10)),
         Err(WaitError::Timeout),
-        "the same isolate id on another owner shard must not claim the restart"
+        "the live same-id isolate on another owner shard must not claim the restart"
     );
     assert_eq!(
         collision_waiter.wait(Duration::from_millis(10)),
@@ -612,7 +622,8 @@ fn cross_shard_restartable_child_restarts_on_remote_shard_and_reports_replacemen
         "cross-shard restart facts are not replayed"
     );
 
-    let replacement = tina::Address::<CrossChildMsg>::new_with_generation(
+    let replacement = tina::Address::<CrossChildMsg>::new_with_generation_in(
+        parent.system(),
         restarted.new_shard,
         restarted.new_isolate,
         restarted.new_generation,
@@ -739,7 +750,8 @@ fn owner_stop_racing_remote_restart_stops_replacement_child_too() {
     let mut remote_children = vec![old_child];
     remote_children.extend(runtime.trace().iter().filter_map(|event| {
         if let RuntimeEventKind::RestartChildCompleted { new_isolate, .. } = event.kind() {
-            return Some(tina::Address::<CrossChildMsg>::new(
+            return Some(tina::Address::<CrossChildMsg>::new_in(
+                runtime.system_incarnation(),
                 ShardId::new(22),
                 new_isolate,
             ));

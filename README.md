@@ -54,8 +54,8 @@ README block to remain byte-for-byte synchronized with that source.
 use std::convert::Infallible;
 use std::fmt;
 
-use tina::TrySendError;
 use tina::prelude::*;
+use tina_runtime::IngressSendError;
 use tina_runtime::{DefaultMailboxFactory, Runtime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,7 +116,8 @@ pub fn run_scenario() -> ScenarioReport {
     runtime.try_send(worker, Job::Run(2)).expect("job 2 fits");
 
     let rejected = match runtime.try_send(worker, Job::Run(3)) {
-        Err(TrySendError::Full(job)) => job,
+        Err(IngressSendError::Full(job)) => job,
+        Err(IngressSendError::ForeignSystem { .. }) => panic!("worker address became foreign"),
         other => panic!("expected typed Full, got {other:?}"),
     };
     assert_eq!(rejected, Job::Run(3), "Full returns the attempted job");
@@ -132,7 +133,8 @@ pub fn run_scenario() -> ScenarioReport {
     assert_eq!(runtime.step(), 1, "worker handles stop");
 
     let closed = match runtime.try_send(worker, Job::Run(4)) {
-        Err(TrySendError::Closed(job)) => job,
+        Err(IngressSendError::Closed(job)) => job,
+        Err(IngressSendError::ForeignSystem { .. }) => panic!("worker address became foreign"),
         other => panic!("expected typed Closed, got {other:?}"),
     };
     assert_eq!(closed, Job::Run(4), "Closed returns the attempted job");

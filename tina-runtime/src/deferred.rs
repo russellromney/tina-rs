@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)] // Errors return linear caller authority intact.
+
 //! Runtime-owned bookkeeping for deferred reply slots.
 //!
 //! Slot-id allocation and the per-message pending-capture queue live in
@@ -1197,6 +1199,7 @@ mod pending_replies_tests {
             42,
             DeferredRouting::Remote {
                 requester: RegisteredAddress {
+                    system: tina::SystemIncarnation::DEFAULT,
                     shard: ShardId::new(2),
                     isolate: IsolateId::new(3),
                     generation: AddressGeneration::new(4),

@@ -149,7 +149,10 @@ async fn handler(State(svc): State<MyService>) -> Result<String, StatusCode> {
     let mut svc = svc;
     match svc.call(req).await {
         Ok(reply) => Ok(...),
-        Err(BridgeError::Full | BridgeError::Closed) => Err(StatusCode::SERVICE_UNAVAILABLE),
+        Err(BridgeError::ForeignSystem { .. }
+            | BridgeError::UnknownShard(_)
+            | BridgeError::Full
+            | BridgeError::Closed) => Err(StatusCode::SERVICE_UNAVAILABLE),
         Err(BridgeError::Timeout) => Err(StatusCode::GATEWAY_TIMEOUT),
     }
 }

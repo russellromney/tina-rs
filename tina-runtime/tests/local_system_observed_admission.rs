@@ -857,7 +857,7 @@ fn local_multi_observed_admission_reports_worker_stopped_on_owner_only() {
 }
 
 #[test]
-fn local_multi_observed_admission_returns_typed_unknown_shard() {
+fn local_multi_observed_admission_rejects_foreign_system_before_shard_routing() {
     let owner = LocalSystem::multi_shard(DefaultThreadedMailboxFactory)
         .shard(TestShard(11))
         .try_build()
@@ -877,30 +877,30 @@ fn local_multi_observed_admission_returns_typed_unknown_shard() {
         .expect("register foreign target");
     let outcomes = HostBurstOutcomes::new();
     let try_send_drops = Arc::new(AtomicU32::new(0));
-    assert_eq!(
+    assert!(matches!(
         owner.try_send(
             address,
             TestMsg::Owned(DropProbe(Arc::clone(&try_send_drops))),
         ),
-        Err(ThreadedTrySendError::UnknownShard(ShardId::new(99)))
-    );
+        Err(ThreadedTrySendError::ForeignSystem { .. })
+    ));
     assert_eq!(try_send_drops.load(Ordering::Acquire), 1);
 
     let rejected_drops = Arc::new(AtomicU32::new(0));
-    assert_eq!(
+    assert!(matches!(
         owner.try_send_outcome(
             address,
             TestMsg::Owned(DropProbe(Arc::clone(&rejected_drops))),
             &outcomes,
         ),
-        Err(ThreadedTrySendError::UnknownShard(ShardId::new(99)))
-    );
+        Err(ThreadedTrySendError::ForeignSystem { .. })
+    ));
     assert_eq!(rejected_drops.load(Ordering::Acquire), 1);
     assert_eq!(outcomes.snapshot().submitted, 0);
     assert_eq!(outcomes.snapshot().observed, 0);
 
     let factory_calls = Arc::new(AtomicU32::new(0));
-    assert_eq!(
+    assert!(matches!(
         owner.send_observed_until(
             address,
             Instant::now() + Duration::from_secs(1),
@@ -910,8 +910,8 @@ fn local_multi_observed_admission_returns_typed_unknown_shard() {
                 TestMsg::Count
             },
         ),
-        Err(SendObservedUntilError::UnknownShard(ShardId::new(99)))
-    );
+        Err(SendObservedUntilError::ForeignSystem { .. })
+    ));
     assert_eq!(factory_calls.load(Ordering::Acquire), 0);
 
     let event_counted = Arc::new(AtomicU32::new(0));
@@ -925,7 +925,7 @@ fn local_multi_observed_admission_returns_typed_unknown_shard() {
         )
         .expect("register foreign event target");
     let event_factory_calls = Arc::new(AtomicU32::new(0));
-    assert_eq!(
+    assert!(matches!(
         owner.send_event_observed_until(
             events,
             Instant::now() + Duration::from_secs(1),
@@ -935,14 +935,14 @@ fn local_multi_observed_admission_returns_typed_unknown_shard() {
                 ServiceEvent::Count
             },
         ),
-        Err(SendObservedUntilError::UnknownShard(ShardId::new(99)))
-    );
+        Err(SendObservedUntilError::ForeignSystem { .. })
+    ));
     assert_eq!(event_factory_calls.load(Ordering::Acquire), 0);
     assert_eq!(event_counted.load(Ordering::Acquire), 0);
-    assert_eq!(
+    assert!(matches!(
         owner.send_event_and_observe(events, ServiceEvent::Count),
-        Err(ThreadedSendObservedError::UnknownShard(ShardId::new(99)))
-    );
+        Err(ThreadedSendObservedError::ForeignSystem { .. })
+    ));
     assert_eq!(event_counted.load(Ordering::Acquire), 0);
 
     owner

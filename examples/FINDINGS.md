@@ -39,6 +39,10 @@ drain/quarantine contract. A tracked-backend regression proves zero cancel
 calls for empty shared I/O; retained-completion quarantine tests and 200
 consecutive copied-path owner-stop runs prove both sides of the boundary.
 
+This driver hotfix is independent of address provenance; the provenance work
+only stamps and validates routing identity and does not alter backend
+cancellation or completion draining.
+
 ### 2026-07-12 Split-service outbound facade prerequisite
 
 **Surfaced by:** `ergonomics_playground`'s debounced batch client.
@@ -52,6 +56,7 @@ capability. It is a transparent alias, so it adds no conversion layer and does
 not weaken the separate event/request address rails. Runtime and compile-fail
 proofs use the public spelling, and the motivating batching migration can now
 contain no direct service-envelope vocabulary.
+
 ### 2026-07-12 Debounced batch shared-work migration
 
 The `ergonomics_playground` batch probe now models the actual operation: many
@@ -205,6 +210,40 @@ one-shot server now closes both its stream and listener instead of relying on
 simulator teardown to hide the listener. The fake bridge now reserves its
 installed in-flight cap before dispatch, and the custom policy rejects
 self-contradictory zero configurations. The extension sweep is now complete.
+
+### 2026-07-12 Runtime address provenance prerequisite
+
+Address identity now includes an opaque `SystemIncarnation` ahead of shard,
+isolate, and generation. Every live or simulated owner stamps one incarnation
+across all of its shards, while independently constructed owners receive
+distinct nonzero incarnations. Deterministic owners can configure the value
+explicitly, including matching live/simulator fixtures without relying on
+process-global construction order. Address capability wrappers, contexts,
+typed continuations, erased sends, remote envelopes, observation keys, and
+host call routing all preserve and validate the stamp before shard or isolate
+routing.
+
+Typed threaded and call surfaces report `ForeignSystem` without claiming call
+or observation authority. Explicit-step and simulated ingress use a routing-
+level `IngressSendError::ForeignSystem` that returns message ownership without
+misreporting a mailbox closure. Focused tests cover coincident
+foreign address tuples, exact message drop settlement, same-owner cross-shard
+identity, preferred `LocalSystem` routing, deterministic replay, configured
+live/simulator parity, stale post-restart addresses, and replacement delivery
+within the original system incarnation. This prerequisite prevents an address
+from one example-owned runtime from accidentally targeting a coincident tuple
+in another as the corpus moves onto `LocalSystem`.
+
+Post-rebase review found two restart examples reconstructing replacement
+addresses with the unscoped marker; both now inherit the known owner
+incarnation and prove replacement delivery. The first PR matrix then caught
+example workspaces outside the root workspace that had exhaustive terminal
+classifiers predating `ForeignSystem`. Copied-path, bounded-batcher, bridge,
+worker-pool, and soak probes now classify or directly assert that terminal
+instead of adding wildcard arms or collapsing it into an unrelated outcome.
+The final lifecycle-parity review also made a stopped or stale parent distinct
+from a stopped worker. Copied-path, bounded-batcher, and soak now preserve and
+prove the `ParentStopped` host terminal explicitly.
 
 ### 2026-07-12 Lock-manager keyed FIFO canonicalization
 

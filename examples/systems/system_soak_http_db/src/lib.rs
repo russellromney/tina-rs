@@ -505,6 +505,12 @@ mod tests {
             Ok(CallOutcome::Rejected(
                 tina::CallRejectedReason::UnsupportedMessage,
             )),
+            Ok(CallOutcome::Rejected(
+                tina::CallRejectedReason::ForeignSystem {
+                    expected: tina::SystemIncarnation::new(1),
+                    actual: tina::SystemIncarnation::new(2),
+                },
+            )),
         ];
 
         assert_eq!(
@@ -517,7 +523,7 @@ mod tests {
                 call_full: 1,
                 call_closed: 1,
                 call_timeout: 1,
-                call_rejected: 1,
+                call_rejected: 2,
             }
         );
     }
@@ -525,6 +531,11 @@ mod tests {
     #[test]
     fn outer_host_errors_remain_errors() {
         let errors = [
+            ThreadedRuntimeError::ForeignSystem {
+                expected: tina::SystemIncarnation::new(1),
+                actual: tina::SystemIncarnation::new(2),
+            },
+            ThreadedRuntimeError::ParentStopped,
             ThreadedRuntimeError::WorkerStopped,
             ThreadedRuntimeError::UnknownShard(ShardId::new(99)),
             ThreadedRuntimeError::DriverShutdownFailed,

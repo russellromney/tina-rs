@@ -17,8 +17,8 @@ use tina::{AddressGeneration, Mailbox, TrySendError, prelude::*};
 use tina::{RestartBudget, RestartPolicy};
 use tina_runtime::{
     CallError, CallKind, ListenerId, MailboxFactory, ResultWaitError, RuntimeEventKind,
-    ThreadedRuntime, ThreadedRuntimeConfig, ThreadedSendObservedError, WaitError, sleep, tcp_bind,
-    tcp_close_listener,
+    ThreadedRuntime, ThreadedRuntimeConfig, ThreadedRuntimeError, ThreadedSendObservedError,
+    WaitError, sleep, tcp_bind, tcp_close_listener,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -457,8 +457,14 @@ impl Crashy {
     ) -> Effect<Self> {
         match msg {
             CrashMsg::Boom => {
-                self.crashed.fetch_add(1, Ordering::Relaxed);
-                panic!("boom");
+                if self
+                    .crashed
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    panic!("boom");
+                }
+                noop()
             }
         }
     }
@@ -521,12 +527,14 @@ fn child_restarted_waiter_resolves_after_panic_and_restart() {
         )
         .expect("supervise");
 
-    let stale_parent = Address::<ParentMsg>::new_with_generation(
+    let stale_parent = Address::<ParentMsg>::new_with_generation_in(
+        parent.system(),
         parent.shard(),
         parent.isolate(),
         AddressGeneration::new(parent.generation().get() + 1),
     );
-    let foreign_parent = Address::<ParentMsg>::new_with_generation(
+    let foreign_parent = Address::<ParentMsg>::new_with_generation_in(
+        parent.system(),
         ShardId::new(parent.shard().get() + 1),
         parent.isolate(),
         parent.generation(),
@@ -534,9 +542,9 @@ fn child_restarted_waiter_resolves_after_panic_and_restart() {
     let stale_waiter = runtime
         .observe_child_restarted(stale_parent)
         .expect("register restart observer");
-    let foreign_waiter = runtime
+    let foreign_error = runtime
         .observe_child_restarted(foreign_parent)
-        .expect("register restart observer");
+        .expect_err("foreign shard must be rejected eagerly");
     let dropped_waiter = runtime
         .observe_child_restarted(parent)
         .expect("register restart observer");
@@ -553,13 +561,13 @@ fn child_restarted_waiter_resolves_after_panic_and_restart() {
         .expect("restart event resolves");
     assert_eq!(
         stale_waiter.wait(Duration::from_millis(10)),
-        Err(WaitError::Timeout),
-        "a stale generation must not claim the live parent's restart"
+        Err(WaitError::AlreadyStopped),
+        "a stale generation must be rejected before claiming a restart"
     );
     assert_eq!(
-        foreign_waiter.wait(Duration::from_millis(10)),
-        Err(WaitError::Timeout),
-        "a foreign shard with the same isolate id must not claim the restart"
+        foreign_error,
+        ThreadedRuntimeError::UnknownShard(foreign_parent.shard()),
+        "a foreign shard must be rejected before it can claim the restart"
     );
     assert_eq!(
         runtime
@@ -580,15 +588,23 @@ fn child_restarted_waiter_resolves_after_panic_and_restart() {
         })
         .expect("initial child spawn traced");
     assert_ne!(old_child, restarted.new_isolate);
-    let stale = Address::<CrashMsg>::new(parent.shard(), old_child);
+    let replacement = Address::<CrashMsg>::new_with_generation_in(
+        parent.system(),
+        restarted.new_shard,
+        restarted.new_isolate,
+        restarted.new_generation,
+    );
+    runtime
+        .send_and_observe(replacement, CrashMsg::Boom)
+        .expect("replacement remains live after its non-crashing bootstrap");
+    let stale = Address::<CrashMsg>::new_in(parent.system(), parent.shard(), old_child);
     assert!(matches!(
         runtime.send_and_observe(stale, CrashMsg::Boom),
         Err(ThreadedSendObservedError::MailboxClosed)
     ));
-    // The child has crashed at least once. The replacement carries a
-    // fresh incarnation id (and generation policy is owned by the runtime,
-    // not by this test), so just check that the runtime saw the panic.
-    assert!(crashed.load(Ordering::Relaxed) >= 1);
+    // The shared gate permits exactly one crash across the whole replacement
+    // lineage, so the late-waiter assertion above cannot race a fresh restart.
+    assert_eq!(crashed.load(Ordering::Acquire), 1);
 
     let _ = runtime.shutdown();
 }
@@ -619,17 +635,28 @@ fn child_restarted_waiter_reports_runtime_stopped() {
 #[test]
 fn abandoned_child_restart_authorities_do_not_exhaust_observation_capacity() {
     let runtime = make_runtime();
+    let parent = runtime
+        .register_with_capacity::<Parent, Infallible>(
+            Parent {
+                crashed: Arc::new(AtomicU32::new(0)),
+            },
+            8,
+        )
+        .expect("register parent");
 
     for isolate in 1..=(2 * 1024) {
-        let forged = Address::<ParentMsg>::new_with_generation(
+        let forged = Address::<ParentMsg>::new_with_generation_in(
+            parent.system(),
             ShardId::new(99),
             tina::IsolateId::new(isolate),
             AddressGeneration::new(7),
         );
-        let waiter = runtime
-            .observe_child_restarted(forged)
-            .expect("register restart observer");
-        drop(waiter);
+        assert_eq!(
+            runtime.observe_child_restarted(forged).expect_err(
+                "foreign restart authority must be rejected before observer registration"
+            ),
+            ThreadedRuntimeError::UnknownShard(ShardId::new(99))
+        );
     }
 
     assert_eq!(

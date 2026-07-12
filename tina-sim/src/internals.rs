@@ -34,6 +34,7 @@ use crate::config::{ScriptedTlsReadResult, ScriptedTlsWriteResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RegisteredAddress {
+    pub(crate) system: tina::SystemIncarnation,
     pub(crate) shard: ShardId,
     pub(crate) isolate: IsolateId,
     pub(crate) generation: AddressGeneration,
@@ -709,6 +710,7 @@ where
     I: Isolate,
 {
     pub(crate) isolate: I,
+    pub(crate) system_incarnation: tina::SystemIncarnation,
     pub(crate) marker: PhantomData<fn(Outbound) -> Outbound>,
 }
 
@@ -739,7 +741,9 @@ where
         });
 
         let effect = {
-            let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id).with_now(now);
+            let mut ctx = Context::<_, I::Reply>::new_typed(shard, isolate_id)
+                .with_system_incarnation(self.system_incarnation)
+                .with_now(now);
             if let Some(caller) = caller {
                 // SAFETY: simulator dispatch allocated this caller for this delivery.
                 ctx = unsafe { ctx.with_caller(caller) };
@@ -768,6 +772,7 @@ where
                 // SAFETY: simulator dispatch allocated this caller for this delivery.
                 CallContext::new(
                     Context::<_, I::Reply>::new_typed(shard, isolate_id)
+                        .with_system_incarnation(self.system_incarnation)
                         .with_now(now)
                         .with_caller(caller),
                 )
@@ -800,6 +805,7 @@ where
         Effect::Send(send) => {
             let (destination, message) = send.into_parts();
             ErasedEffect::Send(ErasedSend {
+                target_system: destination.system(),
                 target_shard: destination.shard(),
                 target_isolate: destination.isolate(),
                 target_generation: destination.generation(),
@@ -844,6 +850,7 @@ where
                     },
                 },
                 RuntimeCallParts::ObservedSend {
+                    target_system,
                     target_shard,
                     target_isolate,
                     target_generation,
@@ -852,6 +859,7 @@ where
                 } => ErasedCall {
                     kind: ErasedCallKind::ObservedSend {
                         send: ErasedSend {
+                            target_system,
                             target_shard,
                             target_isolate,
                             target_generation,
@@ -863,6 +871,7 @@ where
                     },
                 },
                 RuntimeCallParts::IsolateCall {
+                    target_system,
                     target_shard,
                     target_isolate,
                     target_generation,
@@ -874,6 +883,7 @@ where
                 } => ErasedCall {
                     kind: ErasedCallKind::IsolateCall {
                         send: ErasedSend {
+                            target_system,
                             target_shard,
                             target_isolate,
                             target_generation,
@@ -1035,6 +1045,7 @@ where
 }
 
 pub(crate) struct ErasedSend {
+    pub(crate) target_system: tina::SystemIncarnation,
     pub(crate) target_shard: ShardId,
     pub(crate) target_isolate: IsolateId,
     pub(crate) target_generation: AddressGeneration,

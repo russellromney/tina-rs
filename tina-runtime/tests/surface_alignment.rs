@@ -52,7 +52,11 @@ fn make_threaded() -> ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory
 fn explicit_runtime_try_supervise_returns_unknown_parent_for_unregistered_address() {
     let factory = tina_runtime::DefaultMailboxFactory;
     let mut runtime = Runtime::new(SingleShard, factory);
-    let stale: Address<()> = Address::new(SingleShard.id(), tina::IsolateId::new(999));
+    let stale: Address<()> = Address::new_in(
+        runtime.system_incarnation(),
+        SingleShard.id(),
+        tina::IsolateId::new(999),
+    );
     let outcome = runtime.try_supervise(
         stale,
         SupervisorConfig::new(RestartPolicy::OneForOne, RestartBudget::new(1)),
@@ -77,7 +81,11 @@ fn explicit_runtime_try_supervise_succeeds_for_registered_address() {
 fn explicit_runtime_supervise_panics_on_unknown_parent() {
     let factory = tina_runtime::DefaultMailboxFactory;
     let mut runtime = Runtime::new(SingleShard, factory);
-    let stale: Address<()> = Address::new(SingleShard.id(), tina::IsolateId::new(999));
+    let stale: Address<()> = Address::new_in(
+        runtime.system_incarnation(),
+        SingleShard.id(),
+        tina::IsolateId::new(999),
+    );
     runtime.supervise(
         stale,
         SupervisorConfig::new(RestartPolicy::OneForOne, RestartBudget::new(1)),
@@ -87,7 +95,11 @@ fn explicit_runtime_supervise_panics_on_unknown_parent() {
 #[test]
 fn threaded_try_supervise_returns_unknown_parent_without_crashing_worker() {
     let runtime = make_threaded();
-    let stale: Address<()> = Address::new(SingleShard.id(), tina::IsolateId::new(999));
+    let stale: Address<()> = Address::new_in(
+        runtime.system_incarnation(),
+        SingleShard.id(),
+        tina::IsolateId::new(999),
+    );
     let outcome = runtime
         .try_supervise(
             stale,

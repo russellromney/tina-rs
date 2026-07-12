@@ -315,6 +315,7 @@ pub struct HttpConnection<S: Shard, M: FromHttpRequest + Send + 'static = HttpRe
 
     // Captured at the first handler turn (`start()`), used to construct
     // the typed self-address for streaming-body dispatch.
+    self_system: Option<tina::SystemIncarnation>,
     self_shard_id: Option<tina::ShardId>,
     self_isolate_id: Option<tina::IsolateId>,
     self_generation: Option<tina::AddressGeneration>,
@@ -432,6 +433,7 @@ impl<S: Shard, M: FromHttpRequest + Send + 'static> HttpConnection<S, M> {
             chunked_decoder: None,
             chunked_raw_buffer: Vec::new(),
             inbound_chunked: false,
+            self_system: None,
             self_shard_id: None,
             self_isolate_id: None,
             self_generation: None,
@@ -470,6 +472,7 @@ impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> Isolate for HttpCo
             let me = ctx
                 .me::<HttpConnectionMsg>()
                 .with_reply::<RequestChunkReply>();
+            self.self_system = Some(me.system());
             self.self_shard_id = Some(me.shard());
             self.self_isolate_id = Some(me.isolate());
             self.self_generation = Some(me.generation());
@@ -556,6 +559,7 @@ impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> Isolate for HttpCo
     fn handle_call(&mut self, msg: HttpConnectionMsg, call: CallContext<'_, Self>) -> Effect<Self> {
         if self.self_isolate_id.is_none() {
             let me = call.me();
+            self.self_system = Some(me.system());
             self.self_shard_id = Some(me.shard());
             self.self_isolate_id = Some(me.isolate());
             self.self_generation = Some(me.generation());
@@ -888,10 +892,12 @@ impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> HttpConnection<S, 
                     }
                 }
                 let me_chunk: Address<HttpConnectionMsg, RequestChunkReply> =
-                    tina::Address::new_with_generation(
+                    tina::Address::new_with_generation_in(
+                        self.self_system.expect("system captured at start()"),
                         self.shard_id_for_self(),
                         self.isolate_id_for_self(),
-                        tina::AddressGeneration::new(0),
+                        self.self_generation
+                            .expect("generation captured at start()"),
                     );
                 let stream = RequestStream {
                     content_length: self.inbound_total,
@@ -1951,8 +1957,11 @@ impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> HttpConnection<S, 
         let shard = self.self_shard_id?;
         let isolate = self.self_isolate_id?;
         let generation = self.self_generation?;
-        let target = Address::<HttpConnectionMsg, RequestChunkReply>::new_with_generation(
-            shard, isolate, generation,
+        let target = Address::<HttpConnectionMsg, RequestChunkReply>::new_with_generation_in(
+            self.self_system?,
+            shard,
+            isolate,
+            generation,
         );
         Some(WebSocketSessionHandle::new(ws.session_id, target))
     }

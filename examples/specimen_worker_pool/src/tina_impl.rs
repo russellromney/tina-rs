@@ -418,6 +418,8 @@ mod tests {
 
     #[test]
     fn worker_terminal_outcomes_remain_distinct_frontend_replies() {
+        let expected = tina::SystemIncarnation::new(1);
+        let actual = tina::SystemIncarnation::new(2);
         assert_eq!(
             frontend_reply_from_worker(CallOutcome::Replied(WorkerReply::Result(42))),
             FrontendReply::Result(42)
@@ -441,6 +443,7 @@ mod tests {
             FrontendReply::WorkerTimeout
         );
         for reason in [
+            CallRejectedReason::ForeignSystem { expected, actual },
             CallRejectedReason::ReplyAbandoned,
             CallRejectedReason::HandlerPanicked,
             CallRejectedReason::UnsupportedMessage,
