@@ -1205,7 +1205,11 @@ impl TlsLane {
         for pending in &mut self.pending {
             pending.cancelled = true;
         }
-        let cancel_result = self.io_loop.cancel_pending_completions();
+        let cancel_result = if self.has_live_socket_work() {
+            self.io_loop.cancel_pending_completions()
+        } else {
+            Ok(())
+        };
         while Instant::now() < deadline && self.has_live_socket_work() {
             let _ = self.io_loop.step();
             self.reap_cancelled_tombstones();

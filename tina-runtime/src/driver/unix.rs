@@ -522,10 +522,13 @@ mod imp {
             for op in &mut self.pending {
                 op.shutdown_marked = true;
             }
-            let cancel_result = self
-                .io_loop
-                .cancel_pending_completions()
-                .map_err(|_| DriverShutdownError::BackendStillOwnsCompletions);
+            let cancel_result = if self.pending.is_empty() {
+                Ok(())
+            } else {
+                self.io_loop
+                    .cancel_pending_completions()
+                    .map_err(|_| DriverShutdownError::BackendStillOwnsCompletions)
+            };
             self.close_all_resources();
             self.drain_marked_pending_for_shutdown(deadline);
             if cancel_result.is_err() || !self.pending.is_empty() {

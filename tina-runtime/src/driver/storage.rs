@@ -353,7 +353,9 @@ impl ReactorStorage {
         // then drain until no job owns an outstanding Betelgeuse completion or
         // the budget elapses. Whatever remains is stuck work that stays
         // visible in `physical_pending_count`.
-        let _ = self.io_loop.cancel_pending_completions();
+        if !self.jobs.is_empty() {
+            let _ = self.io_loop.cancel_pending_completions();
+        }
         self.fallback.shutdown();
         loop {
             let _ = self.io_loop.step();

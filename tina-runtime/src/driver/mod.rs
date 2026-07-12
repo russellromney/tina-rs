@@ -921,6 +921,7 @@ mod tests {
         cancel_calls: std::cell::Cell<usize>,
         backend_drops: std::cell::Cell<usize>,
         panic_on_cancel: std::cell::Cell<bool>,
+        injected_pending_count: std::cell::Cell<usize>,
         slots_released: std::rc::Rc<std::cell::Cell<bool>>,
     }
 
@@ -977,7 +978,7 @@ mod tests {
         }
 
         fn pending_completion_count(&self) -> usize {
-            self.inner.pending_completion_count()
+            self.inner.pending_completion_count() + self.metrics.injected_pending_count.get()
         }
 
         fn cancel_pending_completions(&self) -> std::io::Result<()> {
@@ -2005,6 +2006,41 @@ mod tests {
         assert!(!metrics.slots_released.get());
         assert_eq!(metrics.steps.get(), steps_before_drop);
         assert_eq!(metrics.steps_after_slots_released.get(), 0);
+        assert_eq!(metrics.backend_drops.get(), 0);
+    }
+
+    #[test]
+    fn empty_shared_io_shutdown_does_not_call_backend_cancellation() {
+        let (io_loop, backend, metrics) = tracked_cancel_loop(false);
+        let mut driver = BetelgeuseDriver::with_io_loop_and_capacities(io_loop, 1, 1, 1, 1, 1, 1);
+
+        assert_eq!(driver.cancel_pending(Instant::now()), Ok(()));
+        assert_eq!(metrics.cancel_calls.get(), 0);
+        drop(driver);
+        assert!(backend.upgrade().is_none());
+    }
+
+    #[test]
+    fn backend_wide_pending_count_prevents_empty_lane_release() {
+        let (io_loop, backend, metrics) = tracked_cancel_loop(true);
+        metrics.injected_pending_count.set(1);
+        let mut driver = BetelgeuseDriver::with_io_loop_and_capacities(io_loop, 1, 1, 1, 1, 1, 1);
+        driver
+            .shared_io
+            .set_slots_released_probe(std::rc::Rc::clone(&metrics.slots_released));
+
+        assert_eq!(
+            driver.cancel_pending(Instant::now()),
+            Err(DriverShutdownError::BackendStillOwnsCompletions)
+        );
+        assert_eq!(metrics.cancel_calls.get(), 1);
+        assert_eq!(driver.shared_io.drop_state, SharedIoDropState::Quarantined);
+        drop(driver);
+        assert!(
+            backend.upgrade().is_some(),
+            "backend-wide ownership must quarantine the shared I/O unit"
+        );
+        assert!(!metrics.slots_released.get());
         assert_eq!(metrics.backend_drops.get(), 0);
     }
 

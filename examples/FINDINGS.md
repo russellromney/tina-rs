@@ -30,6 +30,15 @@ scope snapshot proves admitted equals released with zero current authority.
 This applies the request-aware flow to the first service new users are told to
 copy.
 
+Post-merge stress exposed a lower driver defect in the new owner-stop proof:
+empty storage, TLS, Unix, and TCP lanes still invoked whole-loop backend
+cancellation. A timer-only shutdown could therefore fail spuriously with
+`DriverShutdownFailed` even though no I/O completion slot existed. Empty lanes
+now skip backend cancellation while non-empty lanes retain the bounded
+drain/quarantine contract. A tracked-backend regression proves zero cancel
+calls for empty shared I/O; retained-completion quarantine tests and 200
+consecutive copied-path owner-stop runs prove both sides of the boundary.
+
 ### 2026-07-12 Request-aware raw flow prerequisite
 
 `flow!` now accepts `-> raw request T` for typed timer and runtime-I/O
