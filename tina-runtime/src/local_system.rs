@@ -865,6 +865,38 @@ where
             .register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
     }
 
+    /// Registers one root isolate and atomically prefills its bootstrap message.
+    ///
+    /// The address is returned only after the bootstrap message has been
+    /// admitted to the new bounded mailbox. The lower threaded owner preserves
+    /// bootstrap authority on pre-admission failures and publishes no isolate
+    /// entry when mailbox prefill is refused.
+    #[allow(private_bounds, clippy::type_complexity)]
+    pub fn register_root_with_bootstrap<I, Outbound>(
+        &self,
+        isolate: I,
+        mailbox_capacity: usize,
+        bootstrap: I::Message,
+    ) -> Result<Address<I::Message, I::Reply>, crate::ThreadedRegisterBootstrapError<I::Message>>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
+        I::Message: Send + 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: 'static,
+    {
+        self.runtime()
+            .register_with_capacity_and_bootstrap::<I, Outbound>(
+                isolate,
+                mailbox_capacity,
+                bootstrap,
+            )
+    }
+
     /// Registers one split event/request root service.
     #[allow(private_bounds)]
     pub fn register_split_service<I, Event, Request, Outbound>(
@@ -1602,6 +1634,40 @@ where
     {
         self.runtime()
             .register_with_capacity_on::<I, Outbound>(shard, isolate, mailbox_capacity)
+    }
+
+    /// Registers one root isolate on `shard` and atomically prefills its
+    /// bootstrap message.
+    ///
+    /// Unknown-shard, bounded command-admission, worker-lifecycle, and mailbox
+    /// prefill failures retain the exact authority semantics of
+    /// [`ThreadedMultiShardRuntime::register_with_capacity_and_bootstrap_on`].
+    #[allow(private_bounds, clippy::type_complexity)]
+    pub fn register_root_with_bootstrap_on<I, Outbound>(
+        &self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+        bootstrap: I::Message,
+    ) -> Result<Address<I::Message, I::Reply>, crate::ThreadedRegisterBootstrapError<I::Message>>
+    where
+        I: Isolate<Shard = S, Send = TinaOutbound<Outbound>> + Send + 'static,
+        I::Message: Send + 'static,
+        I::Reply: Send + 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: Send + 'static,
+    {
+        self.runtime()
+            .register_with_capacity_and_bootstrap_on::<I, Outbound>(
+                shard,
+                isolate,
+                mailbox_capacity,
+                bootstrap,
+            )
     }
 
     /// Registers one split event/request root service on the chosen shard.

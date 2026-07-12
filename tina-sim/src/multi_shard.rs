@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use tina::{Address, Isolate, Outbound as TinaOutbound, Shard, ShardId};
 use tina_runtime::sharded::ReplyAdapter;
-use tina_runtime::{RuntimeCall, RuntimeCallable, RuntimeEvent, SendRejectedReason};
+use tina_runtime::{
+    RegisterBootstrapError, RuntimeCall, RuntimeCallable, RuntimeEvent, SendRejectedReason,
+};
 use tina_supervisor::SupervisorConfig;
 
 use crate::config::{
@@ -241,6 +243,46 @@ where
     {
         self.simulator_mut(shard)
             .register_with_mailbox_capacity::<I, Msg, Outbound>(isolate, mailbox_capacity)
+    }
+
+    /// Registers one root isolate on `shard` and atomically prefills its
+    /// bounded mailbox with `bootstrap`.
+    ///
+    /// This mirrors
+    /// [`tina_runtime::MultiShardRuntime::register_with_capacity_and_bootstrap_on`].
+    /// Mailbox refusal returns the bootstrap message and publishes no isolate
+    /// entry or address.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `shard` is not owned by this simulator, matching the other
+    /// simulator registration APIs.
+    #[allow(private_bounds, clippy::type_complexity)]
+    pub fn register_with_capacity_and_bootstrap_on<I, Msg, Outbound>(
+        &mut self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+        bootstrap: Msg,
+    ) -> Result<Address<Msg, I::Reply>, RegisterBootstrapError<Msg>>
+    where
+        I: Isolate<Message = Msg, Shard = S, Send = TinaOutbound<Outbound>, Io = RuntimeCall<Msg>>
+            + 'static,
+        I::Io: RuntimeCallable,
+        I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
+        I::Reply: 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
+        Msg: 'static,
+        Outbound: 'static,
+    {
+        self.simulator_mut(shard)
+            .register_with_capacity_and_bootstrap::<I, Msg, Outbound>(
+                isolate,
+                mailbox_capacity,
+                bootstrap,
+            )
     }
 
     /// Registers one split event/request service on the requested shard.

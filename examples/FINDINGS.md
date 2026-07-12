@@ -11,6 +11,29 @@ valid; the long-form history lives in
 
 ## Active
 
+### 2026-07-12 LocalSystem atomic root bootstrap parity
+
+`system_job_queue` exposed a facade gap during its `LocalSystem` migration:
+the lower explicit, threaded, and multi-shard owners could atomically register
+and bootstrap the queue, but the preferred application owner could not. A
+manual `register_root` followed by `try_send(Bootstrap)` would weaken the
+required first-message ordering and turn startup into a cleanup protocol.
+
+`LocalSystem::register_root_with_bootstrap` and
+`LocalMultiShardSystem::register_root_with_bootstrap_on` now forward the
+existing atomic threaded contract. Their typed
+`ThreadedRegisterBootstrapError` preserves the bootstrap message on mailbox
+`Full`/`Closed`, command `Full`/`Closed`, and unknown-shard failures; an
+accepted command followed by worker failure does not counterfeit authority,
+and `WorkerUnresponsive` remains distinct from `WorkerStopped` because a
+timed-out accepted command may still register later.
+The simulator now has matching single- and multi-shard
+`register_with_capacity_and_bootstrap[_on]` vocabulary, with prefill before
+entry/address publication. Focused tests prove first delivery, typed host-call
+visibility, exact authority settlement, rollback, bounded refusal, closed
+startup lanes, and owner parity. Migrating `system_job_queue` remains a
+separate dependent example cohort.
+
 ### 2026-07-12 Copied service path flow migration
 
 The canonical `system_copied_service_path` now uses `LocalSystem` and a
@@ -1570,9 +1593,13 @@ silent.
 `register_with_capacity_and_bootstrap` (and `_on` / `_using` siblings)
 ship in `tina-runtime/src/registration.rs`,
 `tina-runtime/src/threaded.rs`, `tina-runtime/src/multi_shard.rs`, and
-`tina-runtime/src/threaded_multi_shard.rs`, prefilling the mailbox with
-the bootstrap message before the address is returned, with a typed
-`RegisterBootstrapError` on prefill refusal (`tina-runtime/src/errors.rs`).
+`tina-runtime/src/threaded_multi_shard.rs`. The preferred application owners
+expose the same contract as `LocalSystem::register_root_with_bootstrap` and
+`LocalMultiShardSystem::register_root_with_bootstrap_on`; `tina-sim` mirrors
+the explicit single- and multi-shard vocabulary. All forms prefill the mailbox
+before the address is published, with a typed `RegisterBootstrapError` or
+`ThreadedRegisterBootstrapError` preserving honest authority on failure
+(`tina-runtime/src/errors.rs`).
 
 **Closed at the example level (2026-07 examples canonicalization pass):**
 both surfacing specimens now use the bootstrap-prefill form.

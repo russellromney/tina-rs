@@ -336,7 +336,9 @@ impl Error for ThreadedRuntimeError {}
 ///
 /// No isolate is registered and no address is returned. The bootstrap message
 /// is returned to the caller so it can decide whether to retry with a larger
-/// mailbox capacity or surface the failure.
+/// mailbox capacity or surface the failure. The reserved isolate identifier is
+/// not reused, matching failed constructor registration and simulator replay
+/// determinism.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegisterBootstrapError<M> {
     /// The mailbox refused the bootstrap message because it was already full.
@@ -352,10 +354,7 @@ pub enum RegisterBootstrapError<M> {
 impl<M> fmt::Display for RegisterBootstrapError<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Full(_) => write!(
-                f,
-                "bootstrap prefill refused: mailbox full (capacity must be >= 1)"
-            ),
+            Self::Full(_) => write!(f, "bootstrap prefill refused: mailbox reported full"),
             Self::Closed(_) => write!(
                 f,
                 "bootstrap prefill refused: mailbox already closed before registration"
@@ -370,8 +369,9 @@ impl<M: fmt::Debug> Error for RegisterBootstrapError<M> {}
 ///
 /// Adds host-control admission and worker-lifecycle outcomes to the typed
 /// mailbox-prefill refusals. Every failure before command admission returns the
-/// untouched bootstrap message. [`Self::WorkerStopped`] is message-less only
-/// after admission, when the worker may already have consumed the authority.
+/// untouched bootstrap message. [`Self::WorkerStopped`] and
+/// [`Self::WorkerUnresponsive`] are message-less only after admission, when
+/// the worker may already have consumed the authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThreadedRegisterBootstrapError<M> {
     /// The mailbox refused the bootstrap message because it was already full.
@@ -389,6 +389,10 @@ pub enum ThreadedRegisterBootstrapError<M> {
     /// a reply. The command may already have consumed the isolate and
     /// bootstrap message, so no message authority can be returned.
     WorkerStopped,
+    /// The worker accepted the command but did not answer within the bounded
+    /// control-call timeout. The command may still register and bootstrap the
+    /// isolate later, so no message authority can be returned.
+    WorkerUnresponsive,
     /// A multi-shard operation targeted a shard this runtime does not own.
     UnknownShard(ShardId, M),
 }
@@ -396,10 +400,7 @@ pub enum ThreadedRegisterBootstrapError<M> {
 impl<M> fmt::Display for ThreadedRegisterBootstrapError<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Full(_) => write!(
-                f,
-                "bootstrap prefill refused: mailbox full (capacity must be >= 1)"
-            ),
+            Self::Full(_) => write!(f, "bootstrap prefill refused: mailbox reported full"),
             Self::Closed(_) => write!(
                 f,
                 "bootstrap prefill refused: mailbox already closed before registration"
@@ -414,7 +415,11 @@ impl<M> fmt::Display for ThreadedRegisterBootstrapError<M> {
             ),
             Self::WorkerStopped => write!(
                 f,
-                "worker thread stopped before it could process register-and-bootstrap"
+                "worker stopped before answering accepted register-and-bootstrap"
+            ),
+            Self::WorkerUnresponsive => write!(
+                f,
+                "worker did not answer register-and-bootstrap within the control-call timeout"
             ),
             Self::UnknownShard(shard, _) => write!(
                 f,

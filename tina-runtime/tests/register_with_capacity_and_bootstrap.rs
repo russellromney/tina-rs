@@ -5,12 +5,13 @@
 //! and a custom mailbox that refuses the prefill leaves no registered isolate.
 
 use std::convert::Infallible;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use tina::Mailbox;
 use tina::prelude::*;
+use tina::{Mailbox, TrySendError};
 use tina_runtime::{
     CallOutcome, DefaultMailboxFactory, DefaultThreadedMailboxFactory, MailboxFactory,
     MultiShardRuntime, RegisterBootstrapError, Runtime, ThreadedMultiShardRuntime,
@@ -148,6 +149,43 @@ impl FailureGate {
 #[derive(Debug, Clone)]
 struct TransitionPanicMailboxFactory {
     gate: Arc<FailureGate>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PrefillPanicMailboxFactory;
+
+struct PrefillPanicMailbox<T> {
+    capacity: usize,
+    marker: std::marker::PhantomData<T>,
+}
+
+impl<T> Mailbox<T> for PrefillPanicMailbox<T> {
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn try_send(&self, _message: T) -> Result<(), TrySendError<T>> {
+        panic!("intentional bootstrap prefill panic")
+    }
+
+    fn recv(&self) -> Option<T> {
+        None
+    }
+
+    fn is_empty(&self) -> bool {
+        true
+    }
+
+    fn close(&self) {}
+}
+
+impl MailboxFactory for PrefillPanicMailboxFactory {
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        Box::new(PrefillPanicMailbox {
+            capacity,
+            marker: std::marker::PhantomData,
+        })
+    }
 }
 
 impl MailboxFactory for TransitionPanicMailboxFactory {
@@ -354,6 +392,56 @@ fn threaded_bootstrap_closed_command_channel_returns_message() {
 }
 
 #[test]
+fn threaded_bootstrap_timeout_reports_unresponsive_and_may_register_late() {
+    let runtime = ThreadedRuntime::with_config(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            control_call_timeout: Duration::from_millis(20),
+            ..Default::default()
+        },
+    );
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let gate = runtime
+        .register_with_capacity::<Gate, Infallible>(
+            Gate {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+            1,
+        )
+        .expect("register gate");
+    runtime
+        .try_send(gate, GateMsg::Hold)
+        .expect("occupy worker");
+    while !entered.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+
+    let (service, delivered, _) = fresh_service();
+    assert!(matches!(
+        runtime.register_with_capacity_and_bootstrap::<_, Infallible>(service, 4, Msg::Bootstrap,),
+        Err(ThreadedRegisterBootstrapError::WorkerUnresponsive)
+    ));
+    assert_eq!(delivered.load(Ordering::Acquire), 0);
+
+    release.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while delivered.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        delivered.load(Ordering::Acquire),
+        1,
+        "accepted timed-out registration may execute after the host returns"
+    );
+    runtime
+        .shutdown()
+        .expect("clean shutdown after worker refill");
+}
+
+#[test]
 fn threaded_bootstrap_accepted_before_worker_failure_does_not_return_message_authority() {
     let gate = Arc::new(FailureGate::default());
     let runtime = Arc::new(ThreadedRuntime::with_config(
@@ -553,6 +641,65 @@ fn threaded_multi_shard_register_with_capacity_and_bootstrap_on() {
 }
 
 #[test]
+fn threaded_multi_bootstrap_timeout_reports_unresponsive_and_may_register_late() {
+    let runtime = ThreadedMultiShardRuntime::with_config(
+        [TestShard(11), TestShard(22)],
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            control_call_timeout: Duration::from_millis(20),
+            ..Default::default()
+        },
+    );
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let gate = runtime
+        .register_with_capacity_on::<MsGate, Infallible>(
+            ShardId::new(22),
+            MsGate {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+            1,
+        )
+        .expect("register shard gate");
+    runtime.try_send(gate, MsMsg::Tick).expect("occupy shard");
+    while !entered.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+
+    let delivered = Arc::new(AtomicU32::new(0));
+    let service = MsService {
+        shard: TestShard(22),
+        delivered: Arc::clone(&delivered),
+        first_was_bootstrap: Arc::new(AtomicBool::new(false)),
+    };
+    assert!(matches!(
+        runtime.register_with_capacity_and_bootstrap_on::<_, Infallible>(
+            ShardId::new(22),
+            service,
+            4,
+            MsMsg::Bootstrap,
+        ),
+        Err(ThreadedRegisterBootstrapError::WorkerUnresponsive)
+    ));
+    assert_eq!(delivered.load(Ordering::Acquire), 0);
+
+    release.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while delivered.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        delivered.load(Ordering::Acquire),
+        1,
+        "accepted timed-out shard registration may execute after the host returns"
+    );
+    runtime
+        .shutdown()
+        .expect("clean multi shutdown after refill");
+}
+
+#[test]
 fn threaded_multi_shard_bootstrap_full_returns_message_without_late_registration() {
     let runtime = Arc::new(ThreadedMultiShardRuntime::with_config(
         [TestShard(11), TestShard(22)],
@@ -744,6 +891,38 @@ fn capacity_zero_mailbox_refuses_prefill_and_leaves_no_address() {
         0,
         "no message should be delivered after failed bootstrap prefill"
     );
+
+    let (retry, _, _) = fresh_service();
+    let retry = runtime
+        .register_with_capacity_and_bootstrap::<_, Infallible>(retry, 1, Msg::Bootstrap)
+        .expect("registration after refused prefill");
+    assert_eq!(
+        retry.isolate(),
+        IsolateId::new(2),
+        "refused prefill reserves identity without publishing an entry"
+    );
+}
+
+#[test]
+fn prefill_panic_leaves_no_entry_and_drops_owned_inputs_once() {
+    let mut runtime = Runtime::new(SingleShard, PrefillPanicMailboxFactory);
+    let service_drops = Arc::new(AtomicU32::new(0));
+    let message_drops = Arc::new(AtomicU32::new(0));
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        let _ = runtime.register_with_capacity_and_bootstrap::<_, Infallible>(
+            OwnedBootstrapService {
+                drops: Arc::clone(&service_drops),
+            },
+            4,
+            OwnedBootstrapMsg::Bootstrap(DropProbe(Arc::clone(&message_drops))),
+        );
+    }));
+
+    assert!(panic.is_err());
+    assert_eq!(service_drops.load(Ordering::Acquire), 1);
+    assert_eq!(message_drops.load(Ordering::Acquire), 1);
+    assert!(runtime.trace().is_empty());
 }
 
 #[test]
