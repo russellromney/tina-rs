@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, CapacitySummary, DefaultThreadedMailboxFactory, RateLimit, RateLimitConfig,
-    RateLimitDecision, ServiceHandle, ThreadedRuntime, format_discovery_line,
+    CallOutcome, CapacitySummary, DefaultThreadedMailboxFactory, LocalSystem, RateLimit,
+    RateLimitConfig, RateLimitDecision, format_discovery_line,
 };
 
 /// Tenant identifier. Static strings keep the specimen allocation-free
@@ -199,10 +199,9 @@ pub struct RunReport {
 
 /// Drive the specimen with `config`.
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
+    let runtime = Arc::new(
+        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
+    );
     let shutdown = runtime.shutdown_handle();
 
     let rate = RateLimit::<TenantId>::new(
@@ -214,8 +213,8 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         },
     );
 
-    let gateway: ServiceHandle<GatewayMsg, GatewayReply> = runtime
-        .register_service::<_, Infallible>(Gateway::new(rate), config.mailbox)
+    let gateway = runtime
+        .register_root::<_, Infallible>(Gateway::new(rate), config.mailbox)
         .map_err(|e| anyhow::anyhow!("register gateway: {e:?}"))?;
 
     let timeout = Duration::from_millis(config.call_timeout_ms);
@@ -224,8 +223,8 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     let mut hot_retry_afters_ms: Vec<u128> = Vec::with_capacity(config.hot_requests);
     for _ in 0..config.hot_requests {
         let outcome = runtime
-            .call_blocking_typed(
-                gateway.call,
+            .call_blocking(
+                gateway,
                 GatewayMsg::Request {
                     tenant: "tenant.hot",
                 },
@@ -247,8 +246,8 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     let mut cold_limited = 0usize;
     for _ in 0..config.cold_requests {
         let outcome = runtime
-            .call_blocking_typed(
-                gateway.call,
+            .call_blocking(
+                gateway,
                 GatewayMsg::Request {
                     tenant: "tenant.cold",
                 },
@@ -264,7 +263,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     }
 
     let snap_outcome = runtime
-        .call_blocking_typed(gateway.call, GatewayMsg::Snapshot, timeout)
+        .call_blocking(gateway, GatewayMsg::Snapshot, timeout)
         .map_err(|e| anyhow::anyhow!("snapshot call: {e:?}"))?;
     let snapshot = match snap_outcome {
         CallOutcome::Replied(GatewayReply::Snapshot(s)) => s,

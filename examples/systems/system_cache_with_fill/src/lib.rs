@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, SharedWork, SharedWorkError, SleepReply,
-    SplitServiceHandle, ThreadedRuntime, request_effect_after_shared_wait, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, SharedWork, SharedWorkError,
+    SleepReply, SplitServiceHandle, request_effect_after_shared_wait, sleep,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -301,10 +301,9 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
 }
 
 pub fn run_single_flight(config: RunConfig) -> anyhow::Result<SingleFlightReport> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
+    let runtime = Arc::new(
+        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
+    );
     let shutdown = runtime.shutdown_handle();
     let cache = register_cache(&runtime, config)?;
 
@@ -376,10 +375,9 @@ pub fn run_single_flight(config: RunConfig) -> anyhow::Result<SingleFlightReport
 }
 
 pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalidationReport> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
+    let runtime = Arc::new(
+        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
+    );
     let shutdown = runtime.shutdown_handle();
     let cache = register_cache(&runtime, config)?;
     let timeout = Duration::from_millis(config.call_timeout_ms);
@@ -435,7 +433,7 @@ pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalida
 }
 
 fn register_cache(
-    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
+    runtime: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
     config: RunConfig,
 ) -> anyhow::Result<SplitServiceHandle<CacheEvent, CacheRequest, CacheReply>> {
     runtime
@@ -450,7 +448,7 @@ fn register_cache(
 }
 
 fn stats(
-    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
+    runtime: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
     cache: tina::ServiceRequestAddress<CacheEvent, CacheRequest, CacheReply>,
 ) -> anyhow::Result<CacheStats> {
     match runtime.call_blocking_request(cache, CacheRequest::Stats, Duration::from_secs(1))? {
@@ -461,7 +459,7 @@ fn stats(
 
 fn shutdown_runtime(
     shutdown: tina_runtime::ThreadedShutdownHandle,
-    runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
+    runtime: Arc<LocalSystem<SingleShard, DefaultThreadedMailboxFactory>>,
 ) -> anyhow::Result<()> {
     let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
     drop(runtime);

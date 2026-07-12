@@ -17,8 +17,8 @@ use std::time::Duration;
 use tina::prelude::*;
 use tina_runtime::{
     CallOutcome, CapacitySummary, ConcurrencyGuardedInsertError, ConcurrencyPendingReplies,
-    DefaultThreadedMailboxFactory, SharedCapacityReservation, SharedCapacityScope, SleepReply,
-    SplitServiceHandle, ThreadedRuntime, format_assertion_failure, format_discovery_line, sleep,
+    DefaultThreadedMailboxFactory, LocalSystem, SharedCapacityReservation, SharedCapacityScope,
+    SleepReply, SplitServiceHandle, format_assertion_failure, format_discovery_line, sleep,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -292,10 +292,9 @@ impl Gateway {
 }
 
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
+    let runtime = Arc::new(
+        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
+    );
     let shutdown = runtime.shutdown_handle();
     let scope = SharedCapacityScope::new("gateway.in_flight", "weight", config.shared_cap);
     let body_scope = SharedCapacityScope::new("gateway.body_bytes", "bytes", config.body_cap);
@@ -456,7 +455,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
 
 fn shutdown_runtime(
     shutdown: tina_runtime::ThreadedShutdownHandle,
-    runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
+    runtime: Arc<LocalSystem<SingleShard, DefaultThreadedMailboxFactory>>,
 ) -> anyhow::Result<()> {
     let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
     drop(runtime);

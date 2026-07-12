@@ -27,7 +27,9 @@ use tina_aws_bridge::{
     BridgeFatal, BridgeOutcomeClass, BridgeRetryable, BridgeUnavailable, SqsAddress, SqsError,
     SqsRequest, SqsResponse, SqsSendMessage, send_sqs,
 };
-use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime};
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, LocalSystem};
+
+type RelaySystem = LocalSystem<SingleShard, DefaultThreadedMailboxFactory>;
 
 /// Outbound port the relay calls. Mirrors the bridge two-layer shape.
 pub type OutboundOutcome = CallOutcome<Result<OutboundReply, OutboundError>>;
@@ -457,32 +459,35 @@ pub struct RunReport {
 
 /// Run the hermetic relay with the supplied fake-outbound script.
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
+    let runtime = Arc::new(
+        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
+    );
+    let shutdown = runtime.shutdown_handle();
 
-    let outbound_addr = runtime
-        .register_with_capacity::<_, Infallible>(
-            FakeOutbound {
-                program: config.program.into(),
-            },
-            64,
-        )
-        .map_err(|e| anyhow::anyhow!("register fake outbound: {e:?}"))?;
+    let result = (|| {
+        let outbound_addr = runtime
+            .register_root::<_, Infallible>(
+                FakeOutbound {
+                    program: config.program.into(),
+                },
+                64,
+            )
+            .map_err(|e| anyhow::anyhow!("register fake outbound: {e:?}"))?;
 
-    let relay = runtime
-        .register_split_service::<Relay, RelayEvent, RelayRequest, Infallible>(
-            Relay {
-                outbound: OutboundPort::Fake(outbound_addr),
-                timeout: Duration::from_millis(config.call_timeout_ms),
-                stats: RelayStats::default(),
-            },
-            64,
-        )
-        .map_err(|e| anyhow::anyhow!("register relay: {e:?}"))?;
+        let relay = runtime
+            .register_split_service::<Relay, RelayEvent, RelayRequest, Infallible>(
+                Relay {
+                    outbound: OutboundPort::Fake(outbound_addr),
+                    timeout: Duration::from_millis(config.call_timeout_ms),
+                    stats: RelayStats::default(),
+                },
+                64,
+            )
+            .map_err(|e| anyhow::anyhow!("register relay: {e:?}"))?;
 
-    drive_relay(&runtime, relay.requests, config.events, config.call_timeout_ms)
+        drive_relay(&runtime, relay.requests, config.events, config.call_timeout_ms)
+    })();
+    finish_after_shutdown(result, shutdown, runtime)
 }
 
 /// Run the relay against a `tina-aws-bridge` SQS worker. The caller
@@ -501,30 +506,33 @@ pub fn run_against_sqs(
     queue_url: String,
     bridge_timeout: Duration,
 ) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
+    let runtime = Arc::new(
+        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
+    );
+    let shutdown = runtime.shutdown_handle();
 
-    let relay = runtime
-        .register_split_service::<Relay, RelayEvent, RelayRequest, Infallible>(
-            Relay::new(
-                OutboundPort::Sqs(SqsOutbound {
-                    address: sqs_address,
-                    queue_url,
-                    timeout: bridge_timeout,
-                }),
-                Duration::from_millis(call_timeout_ms),
-            ),
-            64,
-        )
-        .map_err(|e| anyhow::anyhow!("register relay: {e:?}"))?;
+    let result = (|| {
+        let relay = runtime
+            .register_split_service::<Relay, RelayEvent, RelayRequest, Infallible>(
+                Relay::new(
+                    OutboundPort::Sqs(SqsOutbound {
+                        address: sqs_address,
+                        queue_url,
+                        timeout: bridge_timeout,
+                    }),
+                    Duration::from_millis(call_timeout_ms),
+                ),
+                64,
+            )
+            .map_err(|e| anyhow::anyhow!("register relay: {e:?}"))?;
 
-    drive_relay(&runtime, relay.requests, events, call_timeout_ms)
+        drive_relay(&runtime, relay.requests, events, call_timeout_ms)
+    })();
+    finish_after_shutdown(result, shutdown, runtime)
 }
 
 fn drive_relay(
-    runtime: &Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
+    runtime: &Arc<RelaySystem>,
     relay_requests: tina::ServiceRequestAddress<RelayEvent, RelayRequest, RelayReply>,
     events: usize,
     call_timeout_ms: u64,
@@ -563,4 +571,26 @@ fn drive_relay(
     };
 
     Ok(RunReport { replies, stats })
+}
+
+fn finish_after_shutdown<T>(
+    result: anyhow::Result<T>,
+    shutdown: tina_runtime::ThreadedShutdownHandle,
+    runtime: Arc<RelaySystem>,
+) -> anyhow::Result<T> {
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5));
+    drop(runtime);
+    let shutdown_result: anyhow::Result<()> = match terminal {
+        Ok(report) => report.ensure_clean().map_err(Into::into),
+        Err(error) => Err(error.into()),
+    };
+
+    match (result, shutdown_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(shutdown_error)) => Err(anyhow::anyhow!(
+            "{error:#}; shutdown also failed: {shutdown_error}"
+        )),
+    }
 }

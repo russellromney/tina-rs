@@ -270,6 +270,17 @@ framework helper was added: `SharedWork::reply_all_clone` and
 split-service declaration now uses `ServiceOutbound`, so the motivating
 example contains no direct service-envelope vocabulary.
 
+### 2026-07-12 LocalSystem default-host application cohort
+
+`system_api_gateway_limits`, `system_bounded_object_lane`,
+`system_cache_with_fill`, `system_tenant_rate_limiter`, and
+`system_webhook_relay` now construct through fallible `LocalSystem` builders
+and use its typed registration and host-call facade instead of naming the
+lower-level threaded runner. The follow-up ergonomics pass still needs to
+replace their shared-owner/manual terminal combiners with the consuming
+reported runner and close the authority, outcome, configuration, and
+request-only authoring findings recorded by these systems.
+
 ### 2026-07-12 Request-aware raw flow prerequisite
 
 `flow!` now accepts `-> raw request T` for typed timer and runtime-I/O

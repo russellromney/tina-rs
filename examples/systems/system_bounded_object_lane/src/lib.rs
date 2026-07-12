@@ -5,7 +5,7 @@ use std::time::Duration;
 use tina::prelude::*;
 use tina_runtime::{
     CallError, CallOutcome, DefaultThreadedMailboxFactory, LocalPermitGate, LocalPermitName,
-    Permit, SleepReply, ThreadedRuntime, sleep,
+    LocalSystem, Permit, SleepReply, sleep,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -233,10 +233,9 @@ pub fn run_against_s3(
     key_prefix: String,
     bridge_timeout: Duration,
 ) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
+    let runtime = Arc::new(
+        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
+    );
     let shutdown = runtime.shutdown_handle();
     let lane = runtime
         .register_split_service::<ObjectLane, LaneEvent, LaneRequest, std::convert::Infallible>(
@@ -267,10 +266,9 @@ pub fn run_against_s3(
 }
 
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
+    let runtime = Arc::new(
+        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
+    );
     let shutdown = runtime.shutdown_handle();
     let lane = runtime
         .register_split_service::<ObjectLane, LaneEvent, LaneRequest, std::convert::Infallible>(
@@ -298,7 +296,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
 }
 
 fn drive_callers(
-    runtime: &Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
+    runtime: &Arc<LocalSystem<SingleShard, DefaultThreadedMailboxFactory>>,
     lane: tina::ServiceRequestAddress<LaneEvent, LaneRequest, LaneReply>,
     config: RunConfig,
 ) -> anyhow::Result<RunReport> {
