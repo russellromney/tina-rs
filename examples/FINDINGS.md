@@ -67,6 +67,17 @@ This closes the framework prerequisite found by
 `tina-extension-custom-codec`. Migrating that extension to event-only service
 registration and exhaustive Unix outcomes remains a separate example commit.
 
+### 2026-07-12 Typed sharded request-service table prerequisite
+
+`ShardRequestServiceTable<Request, Reply>` preserves canonical request-only
+service capabilities through `new`, `from_placement`,
+`try_from_placement`, `address_for`, and key-owner lookup. It shares the
+existing placement-order, typed missing-shard, and fallible-registration
+contracts without exposing the internal `ServiceMessage<Infallible, Request>`
+envelope. This is the narrow prerequisite surfaced by
+`specimen_sharded_fanout_read`; the motivating example migration remains a
+separate cohort.
+
 ### 2026-07-12 Lock-manager keyed FIFO canonicalization
 
 Migrated `system_lock_manager` from the historical
