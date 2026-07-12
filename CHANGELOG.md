@@ -14,6 +14,14 @@ This file records completed work.
   load-shed tests. Documented in a new README section after "Bounded By
   Construction".
 
+### Truthful observed send after worker failure
+
+- `ThreadedRuntime::try_send_and_observe_with` and `try_send_outcome` now
+  reject a worker already known failed before enqueueing an observer command,
+  matching `try_send`. `WorkerStopped` can no longer be reported as accepted
+  work whose observer never fires; host-burst accounting still settles the
+  rejection exactly once.
+
 ### Authoritative child-restart observation
 
 - Child-restart waiters now match the complete parent address identity

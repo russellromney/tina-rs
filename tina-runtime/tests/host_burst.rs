@@ -16,7 +16,8 @@ use tina::prelude::*;
 use tina::{Mailbox, TrySendError};
 use tina_runtime::{
     DefaultThreadedMailboxFactory, HostBurstOutcomes, HostBurstWaitError, MailboxFactory,
-    SendObservedUntilError, ThreadedRuntime, ThreadedRuntimeConfig,
+    SendObservedUntilError, ThreadedRuntime, ThreadedRuntimeConfig, ThreadedRuntimeError,
+    ThreadedTrySendError,
 };
 
 /// A mailbox that accepts up to `capacity` and then never yields anything: it
@@ -71,6 +72,16 @@ impl MailboxFactory for NonDrainingMailboxFactory {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct CapacityPanicMailboxFactory;
+
+impl MailboxFactory for CapacityPanicMailboxFactory {
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        assert_ne!(capacity, 13, "intentional worker failure");
+        DefaultThreadedMailboxFactory.create(capacity)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct TestShard;
 
 impl Shard for TestShard {
@@ -83,8 +94,18 @@ impl Shard for TestShard {
 #[allow(dead_code)]
 enum SlowMsg {
     Job(u32),
+    Owned(DropProbe),
     /// Stop the isolate cleanly so its mailbox closes.
     Stop,
+}
+
+#[derive(Debug)]
+struct DropProbe(Arc<AtomicU32>);
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Release);
+    }
 }
 
 struct Slow {
@@ -99,6 +120,7 @@ impl Slow {
                 self.processed.fetch_add(1, Ordering::Release);
                 noop()
             }
+            SlowMsg::Owned(_probe) => noop(),
             SlowMsg::Stop => stop(),
         }
     }
@@ -249,6 +271,105 @@ fn try_send_outcome_marks_mailbox_closed_after_stop() {
     assert_eq!(snap.mailbox_closed, 4);
 
     let _ = runtime.shutdown();
+}
+
+#[test]
+fn observed_send_rejects_known_failed_worker_before_enqueue() {
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        CapacityPanicMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 16,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let processed = Arc::new(AtomicU32::new(0));
+    let worker = runtime
+        .register_with_capacity::<Slow, Infallible>(
+            Slow {
+                processed: Arc::clone(&processed),
+            },
+            4,
+        )
+        .expect("register root before worker failure");
+
+    assert!(matches!(
+        runtime.register_with_capacity::<Slow, Infallible>(
+            Slow {
+                processed: Arc::new(AtomicU32::new(0)),
+            },
+            13,
+        ),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    ));
+    let ingress_before = runtime.topology().shards()[0]
+        .ingress()
+        .accepted()
+        .expect("accepted ingress is measured");
+    let observer_calls = Arc::new(AtomicU32::new(0));
+    let message_drops = Arc::new(AtomicU32::new(0));
+    let observer_calls_for_send = Arc::clone(&observer_calls);
+    assert_eq!(
+        runtime.try_send_and_observe_with(
+            worker,
+            SlowMsg::Owned(DropProbe(Arc::clone(&message_drops))),
+            move |_| {
+                observer_calls_for_send.fetch_add(1, Ordering::Release);
+            },
+        ),
+        Err(ThreadedTrySendError::WorkerStopped)
+    );
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(observer_calls.load(Ordering::Acquire), 0);
+    assert_eq!(message_drops.load(Ordering::Acquire), 1);
+    assert_eq!(processed.load(Ordering::Acquire), 0);
+    assert_eq!(
+        runtime.try_send(worker, SlowMsg::Job(1)),
+        Err(ThreadedTrySendError::WorkerStopped),
+        "ordinary and observed ingress must have worker-stop parity"
+    );
+    assert_eq!(
+        runtime.topology().shards()[0].ingress().accepted(),
+        Some(ingress_before),
+        "failed-state rejection must not accept another command"
+    );
+
+    let outcomes = HostBurstOutcomes::new();
+    assert_eq!(
+        runtime.try_send_outcome(worker, SlowMsg::Job(3), &outcomes),
+        Err(ThreadedTrySendError::WorkerStopped)
+    );
+    outcomes
+        .wait_complete(Duration::from_millis(100))
+        .expect("host-side worker-stop settles the burst");
+    let snapshot = outcomes.snapshot();
+    assert_eq!(snapshot.submitted, 1);
+    assert_eq!(snapshot.observed, 1);
+    assert_eq!(snapshot.worker_stopped, 1);
+    assert_eq!(snapshot.admitted, 0);
+    assert_eq!(
+        runtime.topology().shards()[0].ingress().accepted(),
+        Some(ingress_before),
+        "host-burst rejection must not accept another command"
+    );
+
+    let factory_calls = Arc::new(AtomicU32::new(0));
+    assert_eq!(
+        runtime.send_observed_until(
+            worker,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(1),
+            || {
+                factory_calls.fetch_add(1, Ordering::Release);
+                SlowMsg::Job(4)
+            },
+        ),
+        Err(SendObservedUntilError::WorkerStopped)
+    );
+    assert_eq!(factory_calls.load(Ordering::Acquire), 0);
+
+    assert_eq!(runtime.shutdown(), Err(ThreadedRuntimeError::WorkerStopped));
 }
 
 // ---------- send_observed_until (Rock 4) ----------

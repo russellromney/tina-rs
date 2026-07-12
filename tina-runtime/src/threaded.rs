@@ -1412,7 +1412,9 @@ where
     /// `Err(WorkerStopped)` mean the host-side handoff failed and the
     /// observer will *not* fire — these errors are also folded into the
     /// shared counters so [`HostBurstOutcomes::wait_complete`] still drains
-    /// cleanly.
+    /// cleanly. A worker already known failed is rejected before command
+    /// enqueue, matching [`Self::try_send`]; no observer or late mailbox side
+    /// effect can remain behind that rejection.
     ///
     /// **Message ownership.** This helper consumes `message` and does not
     /// return it on rejection — same as the underlying
@@ -1460,6 +1462,14 @@ where
         P: FnOnce(&M) -> Option<ThreadedSendObservedError> + Send + 'static,
         O: FnOnce(Result<(), ThreadedSendObservedError>) + Send + 'static,
     {
+        // Match `try_send`: once the worker is known failed, do not enqueue a
+        // command into the still-live dispatcher channel. Such a command can
+        // never run, so accepting it would strand the observer indefinitely.
+        if self.metrics.state() == LiveShardState::Failed {
+            self.metrics.ingress.rejected_closed();
+            return Err(ThreadedTrySendError::WorkerStopped);
+        }
+
         let command = ThreadedCommand::Run(Box::new(move |runtime| {
             if let Some(error) = preflight(&message) {
                 observer(Err(error));
