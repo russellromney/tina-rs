@@ -4,6 +4,13 @@ This file records completed work.
 
 ## Unreleased
 
+### LocalSystem host-control parity
+
+- `LocalSystem` and `LocalMultiShardSystem` now forward typed terminal-result
+  observation and cloneable runtime shutdown control. Shared app hosts can
+  retain `Arc` owners, observe exact `stop_with` values, and obtain cached
+  terminal truth without exposing or unwrapping the lower threaded runtime.
+
 ### Typed clean-shutdown check
 
 - Added `LocalSystemTerminalReport::ensure_clean` and
