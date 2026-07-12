@@ -819,7 +819,9 @@ is move-only and its fields are crate-private, so a `RequestEffect` from
 For one-at-a-time FIFO handoff, `shared.take_next(&key)` returns the oldest
 live caller's `DeferredReply` and skips cancelled or timed-out callers. This
 replaces a parallel `VecDeque<waiter_id>` plus `PendingReplies` table while
-leaving the domain reply and follow-up effects visible.
+leaving the domain reply and follow-up effects visible. It proves the caller
+was open at selection, not that the later reply was delivered; exclusive
+resource handoff still needs its normal expiry or rollback path.
 
 ### Bounded pending replies
 

@@ -512,17 +512,32 @@ where
     /// returning. Any ticket for a removed entry becomes stale.
     pub(crate) fn take_next(&mut self, key: &K) -> Option<DeferredReply<R>> {
         loop {
-            let oldest = self
-                .slots
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, slot)| {
-                    slot.as_ref()
-                        .filter(|entry| &entry.key == key)
-                        .map(|entry| (idx, entry.seq))
-                })
-                .min_by_key(|(_, seq)| *seq)
-                .map(|(idx, _)| idx)?;
+            let mut oldest_open: Option<(usize, u64)> = None;
+            for idx in 0..self.slots.len() {
+                let state_and_seq = self.slots[idx]
+                    .as_ref()
+                    .filter(|entry| &entry.key == key)
+                    .map(|entry| (entry.reply.state(), entry.seq));
+                match state_and_seq {
+                    Some((DeferredSlotState::Open, seq)) => {
+                        if oldest_open.is_none_or(|(_, oldest_seq)| seq < oldest_seq) {
+                            oldest_open = Some((idx, seq));
+                        }
+                    }
+                    Some((DeferredSlotState::Closed, _)) => {
+                        self.remove_slot(idx)
+                            .expect("selected closed waiter slot must remain occupied");
+                        self.reclaimed += 1;
+                    }
+                    Some((DeferredSlotState::Replied, _)) => {
+                        self.remove_slot(idx)
+                            .expect("selected replied waiter slot must remain occupied");
+                    }
+                    None => {}
+                }
+            }
+
+            let (oldest, _) = oldest_open?;
 
             let entry = self
                 .remove_slot(oldest)
@@ -667,6 +682,17 @@ mod tests {
         deferred_from_handle(handle_from_shared(shared))
     }
 
+    fn fake_slot_with_state(
+        id: u64,
+        state: DeferredSlotState,
+    ) -> (DeferredReply<u32>, std::sync::Arc<DeferredSlotShared>) {
+        let shared =
+            std::sync::Arc::new(DeferredSlotShared::new(id, std::any::TypeId::of::<u32>()));
+        shared.set_state(state);
+        let slot = deferred_from_handle(handle_from_shared(std::sync::Arc::clone(&shared)));
+        (slot, shared)
+    }
+
     // Test-only constructor on WaitList to push pre-built request
     // contexts without going through a live runtime. We bypass admission
     // for the FIFO/ticket tests; admission checks have their own paths.
@@ -804,6 +830,40 @@ mod tests {
         assert_eq!(list.len(), 3);
         assert_eq!(list.take_next(&1).unwrap().slot_id(), 12);
         assert_eq!(list.take_next(&1).unwrap().slot_id(), 13);
+    }
+
+    #[test]
+    fn take_next_retires_terminal_slots_in_one_pass_and_counts_only_closed() {
+        let mut list = WaitList::<u32, u32>::with_capacity(5);
+        list.store_entry(1, fake_slot(10));
+        let (closed, _) = fake_slot_with_state(11, DeferredSlotState::Closed);
+        list.store_entry(1, closed);
+        let (replied, _) = fake_slot_with_state(12, DeferredSlotState::Replied);
+        list.store_entry(1, replied);
+        list.store_entry(1, fake_slot(13));
+        let (other_closed, _) = fake_slot_with_state(20, DeferredSlotState::Closed);
+        list.store_entry(2, other_closed);
+
+        assert_eq!(list.take_next(&1).unwrap().slot_id(), 10);
+        assert_eq!(list.reclaimed(), 1, "Replied is not caller-gone");
+        assert_eq!(list.len(), 2, "all terminal key-1 slots retire together");
+        assert_eq!(list.take_next(&1).unwrap().slot_id(), 13);
+        assert!(list.take_next(&1).is_none());
+        assert!(list.take_next(&2).is_none());
+        assert_eq!(list.reclaimed(), 2);
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn take_next_fifo_uses_admission_sequence_after_slot_reuse() {
+        let mut list = WaitList::<u32, u32>::with_capacity(2);
+        let removed = list.admit_request(1, fake_request(10)).unwrap();
+        list.admit_request(1, fake_request(11)).unwrap();
+        let _: Effect<TestIso> = list.reply_one(removed, 1).unwrap();
+        list.admit_request(1, fake_request(12)).unwrap();
+
+        assert_eq!(list.take_next(&1).unwrap().slot_id(), 11);
+        assert_eq!(list.take_next(&1).unwrap().slot_id(), 12);
     }
 
     #[test]

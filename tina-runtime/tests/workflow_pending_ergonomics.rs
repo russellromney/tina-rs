@@ -511,6 +511,119 @@ fn shared_work_e2e_three_callers_get_same_reply_on_resolution() {
 }
 
 // ---------------------------------------------------------------------------
+// SharedWork FIFO handoff: a timed-out caller is skipped and the next live
+// caller receives the one-shot reply. A later caller proves both caps refill.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+enum HandoffMsg {
+    Wait,
+    Grant,
+}
+
+struct HandoffSvc {
+    waiters: SharedWork<u32, u64>,
+    parked_total: Arc<AtomicUsize>,
+}
+
+#[tina_runtime::isolate(message = HandoffMsg, reply = u64)]
+impl HandoffSvc {
+    fn handle(
+        &mut self,
+        msg: HandoffMsg,
+        _ctx: &mut Context<'_, SingleShard, u64>,
+    ) -> Effect<Self> {
+        match msg {
+            HandoffMsg::Wait => noop(),
+            HandoffMsg::Grant => match self.waiters.take_next(&1) {
+                Some(caller) => reply_to::<Self>(caller, 77),
+                None => noop(),
+            },
+        }
+    }
+
+    fn handle_call(&mut self, msg: HandoffMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            HandoffMsg::Wait => match self.waiters.wait_call(1, call) {
+                Ok(_ticket) => {
+                    self.parked_total.fetch_add(1, Ordering::Release);
+                    noop()
+                }
+                Err(SharedWorkCallError::Full { call, .. })
+                | Err(SharedWorkCallError::KeyFull { call, .. }) => call.reply(0),
+                Err(SharedWorkCallError::NoCaller { call, .. })
+                | Err(SharedWorkCallError::CrossShardUnsupported { call, .. }) => {
+                    call.reject(CallRejectedReason::UnsupportedMessage)
+                }
+            },
+            HandoffMsg::Grant => call.reject(CallRejectedReason::UnsupportedMessage),
+        }
+    }
+}
+
+#[test]
+fn shared_work_take_next_skips_timed_out_caller_and_refills_live_path() {
+    let runtime = Arc::new(ThreadedRuntime::new(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+    ));
+    let parked_total = Arc::new(AtomicUsize::new(0));
+    let svc = runtime
+        .register_service::<_, Infallible>(
+            HandoffSvc {
+                waiters: SharedWork::with_key_limit(2, 2).named("wait.handoff"),
+                parked_total: Arc::clone(&parked_total),
+            },
+            16,
+        )
+        .expect("register");
+
+    assert_eq!(
+        runtime
+            .call_blocking_typed(svc.call, HandoffMsg::Wait, Duration::from_millis(30))
+            .expect("first call admission"),
+        CallOutcome::Timeout
+    );
+
+    for expected_parked in 2..=3 {
+        let caller_runtime = Arc::clone(&runtime);
+        let caller = thread::spawn(move || {
+            caller_runtime
+                .call_blocking_typed(svc.call, HandoffMsg::Wait, Duration::from_secs(1))
+                .expect("live call admission")
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while parked_total.load(Ordering::Acquire) < expected_parked {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "live caller did not park"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        runtime
+            .send_and_observe(svc.send.address(), HandoffMsg::Grant)
+            .expect("grant event reaches service");
+        assert_eq!(
+            caller.join().expect("caller joins"),
+            CallOutcome::Replied(77)
+        );
+    }
+
+    let runtime = Arc::try_unwrap(runtime).unwrap_or_else(|_| panic!("release runtime clones"));
+    let trace = runtime.shutdown().expect("clean runtime shutdown");
+    let timed_out = trace.iter().filter(|event| {
+        matches!(
+            event.kind(),
+            tina_runtime::RuntimeEventKind::DeferredReplyRejected {
+                reason: tina_runtime::DeferredReplyRejectedReason::CallerTimedOut,
+                ..
+            }
+        )
+    });
+    assert_eq!(timed_out.count(), 1);
+}
+
+// ---------------------------------------------------------------------------
 // SharedWork: per-key cap full returns typed KeyFull reply.
 // ---------------------------------------------------------------------------
 

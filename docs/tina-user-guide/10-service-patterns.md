@@ -612,7 +612,10 @@ if let Some(caller) = shared.take_next(&key) {
 
 `take_next` skips callers that cancelled or timed out and reclaims their
 capacity. It returns one-shot reply authority so lease construction and any
-accompanying timer remain explicit in the service.
+accompanying timer remain explicit in the service. The caller can still close
+after selection or a cross-shard reply can be rejected, so selection is not
+proof that the lease reached the caller. Keep the lease's ordinary expiry or
+rollback path.
 
 For split services, continuation builders keep the domain event visible and
 wrap the routing envelope themselves. Use `then_service_event` for ordinary

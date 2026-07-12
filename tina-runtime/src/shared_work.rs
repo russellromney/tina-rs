@@ -325,6 +325,14 @@ where
     ///
     /// Any [`SharedWorkTicket`] for a removed caller can no longer settle an
     /// entry. Capacity is available for refill as soon as this method returns.
+    /// Selection performs one allocation-free scan bounded by the configured
+    /// global capacity, including cleanup of terminal callers under this key.
+    ///
+    /// `take_next` proves that the slot was open when selected, not that a
+    /// later reply reaches the caller. The caller or a cross-shard reply path
+    /// can still close before [`tina::reply_to`] executes. Services handing
+    /// off exclusive resources must retain their normal expiry or rollback
+    /// policy for that terminal rejection.
     pub fn take_next(&mut self, key: &K) -> Option<tina::DeferredReply<R>> {
         self.inner.take_next(key)
     }
@@ -651,6 +659,21 @@ mod tests {
         assert_eq!(work.take_next(&1).unwrap().slot_id(), 12);
         assert_eq!(work.take_next(&1).unwrap().slot_id(), 13);
         assert!(work.take_next(&1).is_none());
+    }
+
+    #[test]
+    fn take_next_ticket_is_stale_after_removed_slot_refills() {
+        let mut work = SharedWork::<u32, u32>::with_capacity(1);
+        let removed = work.admit_request_for_test(1, fake_request(10)).unwrap();
+        assert_eq!(work.take_next(&1).unwrap().slot_id(), 10);
+        work.admit_request_for_test(1, fake_request(11))
+            .expect("removed slot refills");
+
+        assert!(matches!(
+            work.reply_one::<TestIso>(removed, 99),
+            Err(WaitReplyError::StaleTicket { reply: 99, .. })
+        ));
+        assert_eq!(work.take_next(&1).unwrap().slot_id(), 11);
     }
 
     #[test]
