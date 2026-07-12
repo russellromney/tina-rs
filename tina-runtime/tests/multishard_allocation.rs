@@ -52,11 +52,11 @@ const EXPECTED_BATCH_TWO_SEND_HOT_PATH: AllocationSnapshot = AllocationSnapshot 
     reallocations: 0,
 };
 const EXPECTED_SPAWN_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
-    allocations: 6,
+    allocations: 7,
     reallocations: 0,
 };
 const EXPECTED_RESTART_HOT_PATH: AllocationSnapshot = AllocationSnapshot {
-    allocations: 4,
+    allocations: 5,
     reallocations: 0,
 };
 const EXPECTED_TRACE_PRESSURE_HOT_PATH: AllocationSnapshot = AllocationSnapshot {

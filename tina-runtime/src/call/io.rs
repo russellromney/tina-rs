@@ -1173,6 +1173,14 @@ pub enum CallError {
 /// policy in normal isolate message flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SendOutcome {
+    /// The target address belongs to another runtime/system incarnation.
+    ForeignSystem {
+        /// Incarnation owned by the routing runtime.
+        expected: tina::SystemIncarnation,
+        /// Incarnation carried by the target address.
+        actual: tina::SystemIncarnation,
+    },
+
     /// The runtime accepted the send into the destination mailbox or, for a
     /// remote shard, into the bounded transport toward that shard.
     Accepted,

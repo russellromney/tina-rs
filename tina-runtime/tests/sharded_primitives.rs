@@ -1256,6 +1256,9 @@ impl Isolate for ScatterCoordObs {
                     SendOutcome::Closed => {
                         self.cancel_pending(shard, ScatterGatherTargetOutcome::Closed);
                     }
+                    SendOutcome::ForeignSystem { .. } => {
+                        self.cancel_pending(shard, ScatterGatherTargetOutcome::Closed);
+                    }
                 }
                 self.maybe_emit_report();
                 noop()

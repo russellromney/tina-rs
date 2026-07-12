@@ -181,6 +181,7 @@ enum RuntimeCallKind<M> {
         translator: Box<dyn FnOnce(CallOutput) -> RuntimeCallCompletion<M>>,
     },
     ObservedSend {
+        target_system: tina::SystemIncarnation,
         target_shard: ShardId,
         target_isolate: IsolateId,
         target_generation: AddressGeneration,
@@ -188,6 +189,7 @@ enum RuntimeCallKind<M> {
         translator: Box<dyn FnOnce(SendOutcome) -> M>,
     },
     IsolateCall {
+        target_system: tina::SystemIncarnation,
         target_shard: ShardId,
         target_isolate: IsolateId,
         target_generation: AddressGeneration,
@@ -279,6 +281,7 @@ impl<M> RuntimeCall<M> {
     {
         Self {
             kind: RuntimeCallKind::ObservedSend {
+                target_system: destination.system(),
                 target_shard: destination.shard(),
                 target_isolate: destination.isolate(),
                 target_generation: destination.generation(),
@@ -314,6 +317,7 @@ impl<M> RuntimeCall<M> {
     {
         Self {
             kind: RuntimeCallKind::IsolateCall {
+                target_system: destination.system(),
                 target_shard: destination.shard(),
                 target_isolate: destination.isolate(),
                 target_generation: destination.generation(),
@@ -343,6 +347,7 @@ impl<M> RuntimeCall<M> {
     {
         Self {
             kind: RuntimeCallKind::IsolateCall {
+                target_system: destination.system(),
                 target_shard: destination.shard(),
                 target_isolate: destination.isolate(),
                 target_generation: destination.generation(),
@@ -477,12 +482,14 @@ impl<M> RuntimeCall<M> {
                 translator,
             },
             RuntimeCallKind::ObservedSend {
+                target_system,
                 target_shard,
                 target_isolate,
                 target_generation,
                 message,
                 translator,
             } => RuntimeCallParts::ObservedSend {
+                target_system,
                 target_shard,
                 target_isolate,
                 target_generation,
@@ -490,6 +497,7 @@ impl<M> RuntimeCall<M> {
                 translator,
             },
             RuntimeCallKind::IsolateCall {
+                target_system,
                 target_shard,
                 target_isolate,
                 target_generation,
@@ -499,6 +507,7 @@ impl<M> RuntimeCall<M> {
                 expected_reply_type_id,
                 handle_shared,
             } => RuntimeCallParts::IsolateCall {
+                target_system,
                 target_shard,
                 target_isolate,
                 target_generation,
@@ -536,6 +545,8 @@ pub enum RuntimeCallParts<M> {
     },
     /// Runtime-observed send request.
     ObservedSend {
+        /// Destination runtime/system incarnation.
+        target_system: tina::SystemIncarnation,
         /// Destination shard.
         target_shard: ShardId,
         /// Destination isolate.
@@ -549,6 +560,8 @@ pub enum RuntimeCallParts<M> {
     },
     /// Isolate-to-isolate call request.
     IsolateCall {
+        /// Destination runtime/system incarnation.
+        target_system: tina::SystemIncarnation,
         /// Destination shard.
         target_shard: ShardId,
         /// Destination isolate.
@@ -703,6 +716,7 @@ where
                 },
             },
             RuntimeCallParts::ObservedSend {
+                target_system,
                 target_shard,
                 target_isolate,
                 target_generation,
@@ -711,6 +725,7 @@ where
             } => ErasedCall {
                 kind: ErasedCallKind::ObservedSend {
                     send: crate::ErasedSend {
+                        target_system,
                         target_shard,
                         target_isolate,
                         target_generation,
@@ -722,6 +737,7 @@ where
                 },
             },
             RuntimeCallParts::IsolateCall {
+                target_system,
                 target_shard,
                 target_isolate,
                 target_generation,
@@ -733,6 +749,7 @@ where
             } => ErasedCall {
                 kind: ErasedCallKind::IsolateCall {
                     send: crate::ErasedSend {
+                        target_system,
                         target_shard,
                         target_isolate,
                         target_generation,

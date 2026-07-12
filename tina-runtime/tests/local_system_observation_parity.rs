@@ -264,16 +264,18 @@ fn local_system_try_supervise_keeps_unknown_parent_typed_and_worker_alive() {
     let app = LocalSystem::single_shard(AppShard(4), DefaultThreadedMailboxFactory)
         .try_build()
         .expect("start local system");
-    let unknown: Address<StopMsg> = Address::new(AppShard(4).id(), tina::IsolateId::new(999));
+    let parent = app
+        .register_root::<Stopper, Infallible>(Stopper, 4)
+        .expect("register parent");
+    let unknown: Address<StopMsg> =
+        Address::new_in(parent.system(), AppShard(4).id(), tina::IsolateId::new(999));
     assert_eq!(
         app.try_supervise(unknown, supervisor_config()),
         Ok(Err(SuperviseError::UnknownParent))
     );
 
-    let parent = app
-        .register_root::<Stopper, Infallible>(Stopper, 4)
-        .expect("worker remains alive");
-    let stale_parent = Address::<StopMsg>::new_with_generation(
+    let stale_parent = Address::<StopMsg>::new_with_generation_in(
+        parent.system(),
         parent.shard(),
         parent.isolate(),
         AddressGeneration::new(parent.generation().get() + 1),
@@ -307,12 +309,14 @@ fn local_system_child_restart_waiter_reports_replacement_truth() {
     app.try_send(parent, ParentMsg::Spawn).expect("spawn child");
     let original = wait_for_spawn(|| app.trace());
 
-    let stale_parent = Address::<ParentMsg>::new_with_generation(
+    let stale_parent = Address::<ParentMsg>::new_with_generation_in(
+        parent.system(),
         parent.shard(),
         parent.isolate(),
         AddressGeneration::new(parent.generation().get() + 1),
     );
-    let foreign_parent = Address::<ParentMsg>::new_with_generation(
+    let foreign_parent = Address::<ParentMsg>::new_with_generation_in(
+        parent.system(),
         AppShard(500).id(),
         parent.isolate(),
         parent.generation(),
@@ -391,7 +395,8 @@ fn local_multi_shard_child_restart_routes_and_rejects_foreign_owner() {
         .expect("start foreign owner");
     assert!(matches!(
         foreign.observe_child_restarted(parent),
-        Err(ThreadedRuntimeError::UnknownShard(shard)) if shard == AppShard(20).id()
+        Err(ThreadedRuntimeError::ForeignSystem { expected, actual })
+            if expected != actual && actual == parent.system()
     ));
     foreign
         .shutdown()

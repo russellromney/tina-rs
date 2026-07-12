@@ -7,7 +7,10 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use tina::{Address, Isolate, Mailbox, Outbound as TinaOutbound, Shard, ShardId, TrySendError};
+use tina::{
+    Address, Isolate, Mailbox, Outbound as TinaOutbound, Shard, ShardId, SystemIncarnation,
+    TrySendError,
+};
 use tina_supervisor::SupervisorConfig;
 
 use crate::call::{IntoErasedCall, RuntimeCall};
@@ -43,6 +46,7 @@ where
     terminal_remote_queues: RemoteQueues,
     next_terminal_remote_queues: RemoteQueues,
     terminal_overflow_queues: RemoteQueues,
+    system_incarnation: SystemIncarnation,
 }
 
 /// Bounded coordinator config for additive multi-shard runtime shells.
@@ -65,6 +69,11 @@ where
     S: Shard + 'static,
     F: MailboxFactory + Clone + 'static,
 {
+    /// Returns the provenance shared by every owned shard runtime.
+    pub const fn system_incarnation(&self) -> SystemIncarnation {
+        self.system_incarnation
+    }
+
     /// Creates one additive multi-shard coordinator over the provided shards.
     ///
     /// Shards are stepped in ascending [`ShardId`] order, regardless of input
@@ -80,6 +89,24 @@ where
     /// Creates one additive multi-shard coordinator with explicit shard-pair
     /// queue boundedness.
     pub fn with_config<I>(shards: I, mailbox_factory: F, config: MultiShardRuntimeConfig) -> Self
+    where
+        I: IntoIterator<Item = S>,
+    {
+        Self::with_config_and_system(
+            shards,
+            mailbox_factory,
+            config,
+            crate::fresh_system_incarnation(),
+        )
+    }
+
+    /// Creates a deterministic multi-shard owner with explicit provenance.
+    pub fn with_config_and_system<I>(
+        shards: I,
+        mailbox_factory: F,
+        config: MultiShardRuntimeConfig,
+        system_incarnation: SystemIncarnation,
+    ) -> Self
     where
         I: IntoIterator<Item = S>,
     {
@@ -114,7 +141,8 @@ where
                 mailbox_factory.clone(),
                 Box::new(MonotonicClock),
                 ids.clone(),
-            );
+            )
+            .with_system_incarnation(system_incarnation);
             runtime.remote_child_control_capacity = config.shard_pair_capacity;
             runtimes.push(runtime);
         }
@@ -139,6 +167,7 @@ where
             terminal_remote_queues,
             next_terminal_remote_queues,
             terminal_overflow_queues,
+            system_incarnation,
         }
     }
 
@@ -426,6 +455,9 @@ where
         address: Address<M, R>,
         message: M,
     ) -> Result<(), TrySendError<M>> {
+        if address.system() != self.system_incarnation {
+            return Err(TrySendError::Closed(message));
+        }
         self.runtime(address.shard()).try_send(address, message)
     }
 

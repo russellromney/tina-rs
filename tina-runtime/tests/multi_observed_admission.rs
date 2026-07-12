@@ -849,7 +849,7 @@ fn multi_accepted_observer_settles_when_owning_worker_fails() {
 }
 
 #[test]
-fn multi_observed_admission_rejects_unknown_shard() {
+fn multi_observed_admission_rejects_foreign_system_before_shard_routing() {
     let owner = runtime(8);
     let foreign = ThreadedMultiShardRuntime::new([TestShard(99)], DefaultThreadedMailboxFactory);
     let address = foreign
@@ -863,34 +863,34 @@ fn multi_observed_admission_rejects_unknown_shard() {
         .expect("register foreign isolate");
     let outcomes = HostBurstOutcomes::new();
     let rejected_drops = Arc::new(AtomicU32::new(0));
-    assert_eq!(
+    assert!(matches!(
         owner.try_send_outcome(
             address,
             TestMsg::Owned(DropProbe(Arc::clone(&rejected_drops))),
             &outcomes,
         ),
-        Err(ThreadedTrySendError::UnknownShard(ShardId::new(99)))
-    );
+        Err(ThreadedTrySendError::ForeignSystem { .. })
+    ));
     assert_eq!(rejected_drops.load(Ordering::Acquire), 1);
     assert_eq!(outcomes.snapshot().submitted, 0);
     assert_eq!(outcomes.snapshot().observed, 0);
 
     let drops = Arc::new(AtomicU32::new(0));
-    assert_eq!(
+    assert!(matches!(
         owner.send_observed_until(
             address,
             Instant::now() + Duration::from_secs(1),
             Duration::from_millis(1),
             || TestMsg::Owned(DropProbe(Arc::clone(&drops))),
         ),
-        Err(SendObservedUntilError::UnknownShard(ShardId::new(99)))
-    );
+        Err(SendObservedUntilError::ForeignSystem { .. })
+    ));
     assert_eq!(drops.load(Ordering::Acquire), 0, "factory must not run");
 
     let observer_calls = Arc::new(AtomicU32::new(0));
     let observer_calls_for_send = Arc::clone(&observer_calls);
     let observed_drops = Arc::new(AtomicU32::new(0));
-    assert_eq!(
+    assert!(matches!(
         owner.try_send_and_observe_with(
             address,
             TestMsg::Owned(DropProbe(Arc::clone(&observed_drops))),
@@ -898,19 +898,19 @@ fn multi_observed_admission_rejects_unknown_shard() {
                 observer_calls_for_send.fetch_add(1, Ordering::Release);
             },
         ),
-        Err(ThreadedTrySendError::UnknownShard(ShardId::new(99)))
-    );
+        Err(ThreadedTrySendError::ForeignSystem { .. })
+    ));
     assert_eq!(observed_drops.load(Ordering::Acquire), 1);
     assert_eq!(observer_calls.load(Ordering::Acquire), 0);
 
     let synchronous_drops = Arc::new(AtomicU32::new(0));
-    assert_eq!(
+    assert!(matches!(
         owner.send_and_observe(
             address,
             TestMsg::Owned(DropProbe(Arc::clone(&synchronous_drops))),
         ),
-        Err(ThreadedSendObservedError::UnknownShard(ShardId::new(99)))
-    );
+        Err(ThreadedSendObservedError::ForeignSystem { .. })
+    ));
     assert_eq!(synchronous_drops.load(Ordering::Acquire), 1);
 
     assert!(foreign.shutdown().is_ok());

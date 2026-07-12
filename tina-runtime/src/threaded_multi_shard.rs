@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use betelgeuse::io_loop;
 use tina::{
-    Address, Context, Effect, Isolate, Outbound as TinaOutbound, Shard, ShardId,
+    Address, Context, Effect, Isolate, Outbound as TinaOutbound, Shard, ShardId, SystemIncarnation,
     TrySendError as TinaTrySendError,
 };
 use tina_supervisor::SupervisorConfig;
@@ -69,6 +69,7 @@ where
     shutdown: Arc<SharedShutdownState<S, F>>,
     /// Upper bound on a per-shard host-control `call_on` awaiting the reply.
     control_call_timeout: Duration,
+    system_incarnation: SystemIncarnation,
 }
 
 struct ThreadedRemoteWiring {
@@ -143,6 +144,11 @@ where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + Clone + 'static,
 {
+    /// Returns the provenance shared by every owned shard worker.
+    pub const fn system_incarnation(&self) -> SystemIncarnation {
+        self.system_incarnation
+    }
+
     /// Starts one live worker thread per shard.
     pub fn new<I>(shards: I, mailbox_factory: F) -> Self
     where
@@ -226,6 +232,13 @@ where
         I: IntoIterator<Item = S>,
     {
         config.validate()?;
+        let system_incarnation = config
+            .system_incarnation
+            .unwrap_or_else(crate::fresh_system_incarnation);
+        let config = ThreadedRuntimeConfig {
+            system_incarnation: Some(system_incarnation),
+            ..config
+        };
 
         let mut shards: Vec<S> = shards.into_iter().collect();
         if shards.is_empty() {
@@ -366,7 +379,8 @@ where
                                     worker_config.timer_capacity,
                                 )),
                                 worker_config.preallocation,
-                            );
+                            )
+                            .with_system_incarnation(system_incarnation);
                             let mut runtime = runtime;
                             runtime.set_trace_retention(worker_config.trace_retention);
                             runtime.set_driver_completion_drain_budget(
@@ -481,6 +495,7 @@ where
             remote_metrics,
             shutdown,
             control_call_timeout: config.control_call_timeout,
+            system_incarnation,
         })
     }
 
@@ -716,6 +731,7 @@ where
         parent: Address<M, R>,
         config: SupervisorConfig,
     ) -> Result<(), ThreadedRuntimeError> {
+        self.ensure_local_system(parent)?;
         self.call_on(parent.shard(), move |runtime| {
             runtime.supervise(parent, config)
         })
@@ -726,6 +742,7 @@ where
         &self,
         parent: Address<M, R>,
     ) -> Result<ChildLifecycleReport, ThreadedRuntimeError> {
+        self.ensure_local_system(parent)?;
         self.call_on(parent.shard(), move |runtime| {
             runtime.child_lifecycle_report(parent)
         })
@@ -739,6 +756,7 @@ where
         &self,
         parent: Address<M, R>,
     ) -> Result<observation::ChildRestartedWaiter, ThreadedRuntimeError> {
+        self.ensure_local_system(parent)?;
         self.call_on(parent.shard(), move |runtime| {
             runtime.observe_child_restarted(parent)
         })
@@ -753,6 +771,12 @@ where
         address: Address<M, R>,
         message: M,
     ) -> Result<(), ThreadedTrySendError> {
+        if address.system() != self.system_incarnation {
+            return Err(ThreadedTrySendError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
         let Some(sender) = self.commands.get(&address.shard()) else {
             return Err(ThreadedTrySendError::UnknownShard(address.shard()));
         };
@@ -828,6 +852,12 @@ where
         address: Address<M, R>,
         message: M,
     ) -> Result<(), ThreadedSendObservedError> {
+        if address.system() != self.system_incarnation {
+            return Err(ThreadedSendObservedError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
         let Some(sender) = self.commands.get(&address.shard()) else {
             return Err(ThreadedSendObservedError::UnknownShard(address.shard()));
         };
@@ -929,6 +959,12 @@ where
         P: FnOnce(&M) -> Option<ThreadedSendObservedError> + Send + 'static,
         O: FnOnce(Result<(), ThreadedSendObservedError>) + Send + 'static,
     {
+        if address.system() != self.system_incarnation {
+            return Err(ThreadedTrySendError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
         let Some(sender) = self.commands.get(&address.shard()) else {
             return Err(ThreadedTrySendError::UnknownShard(address.shard()));
         };
@@ -977,6 +1013,12 @@ where
         M: Send + 'static,
         R: 'static,
     {
+        if address.system() != self.system_incarnation {
+            return Err(ThreadedTrySendError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
         if !self.commands.contains_key(&address.shard()) {
             return Err(ThreadedTrySendError::UnknownShard(address.shard()));
         }
@@ -1009,6 +1051,12 @@ where
         R: 'static,
         MakeMessage: FnMut() -> M,
     {
+        if address.system() != self.system_incarnation {
+            return Err(SendObservedUntilError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
         let Some(sender) = self.commands.get(&address.shard()) else {
             return Err(SendObservedUntilError::UnknownShard(address.shard()));
         };
@@ -1083,6 +1131,9 @@ where
                 Err(ThreadedSendObservedError::UnknownShard(shard)) => {
                     return Err(SendObservedUntilError::UnknownShard(shard));
                 }
+                Err(ThreadedSendObservedError::ForeignSystem { expected, actual }) => {
+                    return Err(SendObservedUntilError::ForeignSystem { expected, actual });
+                }
             }
         }
     }
@@ -1128,11 +1179,14 @@ where
         &self,
         address: Address<M, R>,
     ) -> Result<observation::IsolateResultWaiter<T>, observation::ResultWaitError> {
+        if address.system() != self.system_incarnation {
+            return Err(observation::ResultWaitError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
         if !self.commands.contains_key(&address.shard()) {
-            panic!(
-                "ThreadedMultiShardRuntime::observe_result targeted unknown shard {}",
-                address.shard().get()
-            );
+            return Err(observation::ResultWaitError::UnknownShard(address.shard()));
         }
         match self.call_on(address.shard(), move |runtime| {
             runtime.observe_result::<T, M, R>(address)
@@ -1141,7 +1195,27 @@ where
             Err(ThreadedRuntimeError::CommandFull) => {
                 Err(observation::ResultWaitError::CommandFull)
             }
+            Err(ThreadedRuntimeError::ForeignSystem { expected, actual }) => {
+                Err(observation::ResultWaitError::ForeignSystem { expected, actual })
+            }
+            Err(ThreadedRuntimeError::UnknownShard(shard)) => {
+                Err(observation::ResultWaitError::UnknownShard(shard))
+            }
             Err(_) => Err(observation::ResultWaitError::RuntimeStopped),
+        }
+    }
+
+    fn ensure_local_system<M, R>(
+        &self,
+        address: Address<M, R>,
+    ) -> Result<(), ThreadedRuntimeError> {
+        if address.system() == self.system_incarnation {
+            Ok(())
+        } else {
+            Err(ThreadedRuntimeError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            })
         }
     }
 
@@ -1327,11 +1401,14 @@ where
         R: Send + 'static,
     {
         let shard = address.shard();
+        if address.system() != self.system_incarnation {
+            return Err(ThreadedRuntimeError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
         if !self.commands.contains_key(&shard) {
-            panic!(
-                "ThreadedMultiShardRuntime::call_blocking targeted unknown shard {}",
-                shard.get()
-            );
+            return Err(ThreadedRuntimeError::UnknownShard(shard));
         }
         let (reply_tx, reply_rx) = mpsc::channel();
         let driver = HostCallDriverMS::<S, M, R> {
@@ -1339,10 +1416,7 @@ where
             _marker: PhantomData,
         };
         let Some(sender) = self.commands.get(&shard) else {
-            panic!(
-                "ThreadedMultiShardRuntime::call_blocking targeted unknown shard {}",
-                shard.get()
-            );
+            return Err(ThreadedRuntimeError::UnknownShard(shard));
         };
         let command = ThreadedCommand::Run(Box::new(move |runtime| {
             let driver_addr = runtime

@@ -1533,6 +1533,7 @@ fn call_error_tag(error: CallError) -> u8 {
             tina::CallRejectedReason::ReplyAbandoned => 25,
             tina::CallRejectedReason::HandlerPanicked => 26,
             tina::CallRejectedReason::UnsupportedMessage => 27,
+            tina::CallRejectedReason::ForeignSystem { .. } => 31,
         },
         // Appended after the existing tags; never renumber.
         CallError::TlsAlpnMismatch => 28,
@@ -1605,6 +1606,7 @@ fn call_rejected_reason_tag(reason: CallRejectedReason) -> u8 {
         CallRejectedReason::ReplyAbandoned => 1,
         CallRejectedReason::HandlerPanicked => 2,
         CallRejectedReason::UnsupportedMessage => 3,
+        CallRejectedReason::ForeignSystem { .. } => 4,
     }
 }
 

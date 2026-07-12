@@ -546,7 +546,9 @@ impl StaleProbe {
                     .push(ServerObservation::StaleClosed);
                 noop()
             }
-            StaleProbeMsg::Observed(SendOutcome::Accepted | SendOutcome::Full) => {
+            StaleProbeMsg::Observed(
+                SendOutcome::Accepted | SendOutcome::Full | SendOutcome::ForeignSystem { .. },
+            ) => {
                 panic!("stale worker address must reject as closed")
             }
         }

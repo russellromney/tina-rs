@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use tina::{AddressGeneration, DeferredSlotRegistry, IsolateId, Shard};
+use tina::{AddressGeneration, DeferredSlotRegistry, IsolateId, Shard, SystemIncarnation};
 
 use betelgeuse::IOLoopHandle;
 
@@ -427,6 +427,17 @@ impl IdSource {
 /// an unbounded delivery loop. The remainder carries over to the next step.
 pub const DEFAULT_DRIVER_COMPLETION_DRAIN_BUDGET: usize = 64;
 
+/// Allocates a nonzero process-unique system incarnation from OS randomness.
+///
+/// Deterministic/replay owners may instead configure a fixed
+/// [`tina::SystemIncarnation`] explicitly.
+pub fn fresh_system_incarnation() -> SystemIncarnation {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).expect("OS randomness unavailable for runtime provenance");
+    let raw = u64::from_le_bytes(bytes);
+    SystemIncarnation::new(if raw == 0 { 1 } else { raw })
+}
+
 /// Small deterministic single-shard runtime.
 ///
 /// The runtime owns one shard value plus a private registry of isolates and
@@ -437,6 +448,7 @@ where
     S: Shard,
     F: MailboxFactory,
 {
+    pub(crate) system_incarnation: SystemIncarnation,
     pub(crate) shard: S,
     pub(crate) mailbox_factory: F,
     pub(crate) entries: Vec<RegisteredEntry<S, F>>,
@@ -920,6 +932,7 @@ where
         preallocation: PreallocationConfig,
     ) -> Self {
         Self {
+            system_incarnation: fresh_system_incarnation(),
             shard,
             mailbox_factory,
             entries: Vec::with_capacity(preallocation.entry_capacity),
@@ -960,6 +973,21 @@ where
     /// Returns a shared reference to the shard.
     pub const fn shard(&self) -> &S {
         &self.shard
+    }
+
+    /// Overrides the deterministic system incarnation before addresses are issued.
+    pub fn with_system_incarnation(mut self, system_incarnation: SystemIncarnation) -> Self {
+        assert!(
+            self.entries.is_empty(),
+            "system incarnation must be set before registration"
+        );
+        self.system_incarnation = system_incarnation;
+        self
+    }
+
+    /// Returns the provenance stamped into addresses issued by this runtime.
+    pub const fn system_incarnation(&self) -> SystemIncarnation {
+        self.system_incarnation
     }
 
     /// Returns the active trace retention policy.

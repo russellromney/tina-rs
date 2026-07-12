@@ -190,6 +190,13 @@ impl From<crate::LocalSystemConfigError> for StartupError {
 /// Error returned by setup/control operations on [`crate::ThreadedRuntime`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadedRuntimeError {
+    /// The target address belongs to another runtime/system incarnation.
+    ForeignSystem {
+        /// Incarnation owned by this runtime.
+        expected: tina::SystemIncarnation,
+        /// Incarnation carried by the target.
+        actual: tina::SystemIncarnation,
+    },
     /// The worker thread stopped before it could accept or answer the command.
     WorkerStopped,
     /// A multi-shard owner operation targeted a shard this local system does
@@ -220,6 +227,12 @@ pub enum ThreadedRuntimeError {
 impl fmt::Display for ThreadedRuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ForeignSystem { expected, actual } => write!(
+                f,
+                "address system {} does not match runtime system {}",
+                actual.get(),
+                expected.get()
+            ),
             Self::WorkerStopped => {
                 write!(
                     f,
@@ -399,6 +412,13 @@ impl Error for SuperviseError {}
 /// Error returned by threaded bounded ingress sends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadedTrySendError {
+    /// The target address belongs to another runtime/system incarnation.
+    ForeignSystem {
+        /// Incarnation owned by this runtime.
+        expected: tina::SystemIncarnation,
+        /// Incarnation carried by the target.
+        actual: tina::SystemIncarnation,
+    },
     /// The address names a shard not owned by the multi-shard runtime.
     UnknownShard(ShardId),
 
@@ -412,6 +432,12 @@ pub enum ThreadedTrySendError {
 impl fmt::Display for ThreadedTrySendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ForeignSystem { expected, actual } => write!(
+                f,
+                "address system {} does not match runtime system {}",
+                actual.get(),
+                expected.get()
+            ),
             Self::UnknownShard(shard) => {
                 write!(
                     f,
@@ -430,6 +456,13 @@ impl Error for ThreadedTrySendError {}
 /// Error returned by threaded observed ingress sends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadedSendObservedError {
+    /// The target address belongs to another runtime/system incarnation.
+    ForeignSystem {
+        /// Incarnation owned by this runtime.
+        expected: tina::SystemIncarnation,
+        /// Incarnation carried by the target.
+        actual: tina::SystemIncarnation,
+    },
     /// The address names a shard not owned by the multi-shard runtime.
     UnknownShard(ShardId),
 
@@ -449,6 +482,12 @@ pub enum ThreadedSendObservedError {
 impl fmt::Display for ThreadedSendObservedError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ForeignSystem { expected, actual } => write!(
+                f,
+                "address system {} does not match runtime system {}",
+                actual.get(),
+                expected.get()
+            ),
             Self::UnknownShard(shard) => {
                 write!(
                     f,
@@ -476,6 +515,13 @@ impl Error for ThreadedSendObservedError {}
 /// is no longer accepting at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendObservedUntilError {
+    /// The target address belongs to another runtime/system incarnation.
+    ForeignSystem {
+        /// Incarnation owned by this runtime.
+        expected: tina::SystemIncarnation,
+        /// Incarnation carried by the target.
+        actual: tina::SystemIncarnation,
+    },
     /// The address names a shard not owned by the multi-shard runtime.
     UnknownShard(ShardId),
     /// Deadline elapsed while still racing the mailbox/ingress for a slot.
@@ -491,6 +537,12 @@ pub enum SendObservedUntilError {
 impl fmt::Display for SendObservedUntilError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ForeignSystem { expected, actual } => write!(
+                f,
+                "address system {} does not match runtime system {}",
+                actual.get(),
+                expected.get()
+            ),
             Self::UnknownShard(shard) => {
                 write!(
                     f,

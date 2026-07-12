@@ -88,6 +88,13 @@ where
     where
         I: IntoIterator<Item = S>,
     {
+        let system_incarnation = config
+            .system_incarnation
+            .unwrap_or_else(tina_runtime::fresh_system_incarnation);
+        let config = SimulatorConfig {
+            system_incarnation: Some(system_incarnation),
+            ..config
+        };
         let mut shards: Vec<S> = shards.into_iter().collect();
         if shards.is_empty() {
             panic!("multi-shard simulator requires at least one shard");
@@ -379,6 +386,10 @@ where
         address: Address<M, R>,
         message: M,
     ) -> Result<(), TrySendError<M>> {
+        let expected = self.simulators[0].system_incarnation;
+        if address.system() != expected {
+            return Err(TrySendError::Closed(message));
+        }
         self.simulator(address.shard()).try_send(address, message)
     }
 

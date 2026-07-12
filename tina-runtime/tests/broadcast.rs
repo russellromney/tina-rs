@@ -66,7 +66,11 @@ fn broadcast_observed_reports_accepted_full_and_closed() {
     let sink = runtime
         .register_with_capacity::<SlowSink, Infallible>(SlowSink, 1)
         .expect("register sink");
-    let closed = Address::<DeliverMsg>::new(tina::ShardId::new(0), tina::IsolateId::new(99));
+    let closed = Address::<DeliverMsg>::new_in(
+        sink.system(),
+        tina::ShardId::new(0),
+        tina::IsolateId::new(99),
+    );
     let targets = BroadcastTargets::try_from_iter(3, [(0, sink), (1, sink), (2, closed)]).unwrap();
     let tracker = targets.tracker();
     let driver = runtime

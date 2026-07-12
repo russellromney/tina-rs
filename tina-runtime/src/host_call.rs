@@ -169,6 +169,7 @@ where
         ChildLifecycleReport::from_runtime(
             self,
             RegisteredAddress {
+                system: parent_address.system(),
                 shard: parent_address.shard(),
                 isolate: parent_address.isolate(),
                 generation: parent_address.generation(),
@@ -244,6 +245,9 @@ where
         address: Address<M, R>,
         message: M,
     ) -> Result<(), TrySendError<M>> {
+        if address.system() != self.system_incarnation {
+            return Err(TrySendError::Closed(message));
+        }
         if address.shard() != self.shard.id() {
             panic!(
                 "cross-shard runtime ingress is out of scope in this slice: target shard {} != runtime shard {}",
@@ -258,6 +262,7 @@ where
         // previous code scanned `self.entries` twice (once via `find`, once
         // via `position`) to recover the same index.
         let Some(entry_index) = self.entry_index(RegisteredAddress {
+            system: address.system(),
             shard: address.shard(),
             isolate: address.isolate(),
             generation: address.generation(),

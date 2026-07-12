@@ -129,7 +129,12 @@ where
         Outbound: 'static,
     {
         let address = self.register_entry::<I, Msg, Outbound>(isolate, None, usize::MAX);
-        Address::new_with_generation(address.shard, address.isolate, address.generation)
+        Address::new_with_generation_in(
+            self.system_incarnation,
+            address.shard,
+            address.isolate,
+            address.generation,
+        )
     }
 
     /// Registers one isolate with an explicit simulator mailbox capacity.
@@ -161,7 +166,12 @@ where
         Outbound: 'static,
     {
         let address = self.register_entry::<I, Msg, Outbound>(isolate, None, mailbox_capacity);
-        Address::new_with_generation(address.shard, address.isolate, address.generation)
+        Address::new_with_generation_in(
+            self.system_incarnation,
+            address.shard,
+            address.isolate,
+            address.generation,
+        )
     }
 
     /// Registers one split event/request isolate and returns split
@@ -299,6 +309,9 @@ where
         address: Address<M, R>,
         message: M,
     ) -> Result<(), TrySendError<M>> {
+        if address.system() != self.system_incarnation {
+            return Err(TrySendError::Closed(message));
+        }
         if address.shard() != self.shard.id() {
             panic!(
                 "cross-shard simulator ingress is out of scope in this slice: target shard {} != simulator shard {}",
@@ -540,6 +553,7 @@ where
                     self.stop_entry(index, isolate_id, panicked.into());
                     self.supervise_failed_child(
                         RegisteredAddress {
+                            system: self.system_incarnation,
                             shard: self.shard.id(),
                             isolate: isolate_id,
                             generation: self.entries[index].generation,
@@ -742,6 +756,7 @@ where
                 self.stop_entry(index, isolate_id, failed.into());
                 self.supervise_failed_child(
                     RegisteredAddress {
+                        system: self.system_incarnation,
                         shard: self.shard.id(),
                         isolate: isolate_id,
                         generation,
@@ -842,6 +857,7 @@ where
                 };
                 if let Some(message) = continuation {
                     let send = ErasedSend {
+                        target_system: self.system_incarnation,
                         target_shard: self.shard.id(),
                         target_isolate: isolate_id,
                         target_generation: self.entries[index].generation,
@@ -886,6 +902,7 @@ where
             }
             ErasedEffect::SpawnObservedOn(parts) => {
                 let owner = RegisteredAddress {
+                    system: self.system_incarnation,
                     shard: self.shard.id(),
                     isolate: isolate_id,
                     generation: self.entries[index].generation,
@@ -931,6 +948,7 @@ where
             }
             ErasedEffect::Io(call) => {
                 let requester = RegisteredAddress {
+                    system: self.system_incarnation,
                     shard: self.shard.id(),
                     isolate: isolate_id,
                     generation: self.entries[index].generation,
@@ -1131,7 +1149,9 @@ where
     ) {
         let kind = match reason {
             CallRejectedReason::ReplyAbandoned => RuntimeEventKind::CallReplyAbandoned { call_id },
-            CallRejectedReason::HandlerPanicked | CallRejectedReason::UnsupportedMessage => {
+            CallRejectedReason::ForeignSystem { .. }
+            | CallRejectedReason::HandlerPanicked
+            | CallRejectedReason::UnsupportedMessage => {
                 RuntimeEventKind::CallRejected { call_id, reason }
             }
         };
@@ -1277,11 +1297,13 @@ where
             inbox: LocalInbox::new(mailbox_capacity),
             handler: RefCell::new(Box::new(HandlerAdapter::<I, Outbound> {
                 isolate,
+                system_incarnation: self.system_incarnation,
                 marker: PhantomData,
             })),
         });
 
         RegisteredAddress {
+            system: self.system_incarnation,
             shard: self.shard.id(),
             isolate: isolate_id,
             generation,
@@ -1495,6 +1517,7 @@ where
             },
         );
         match self.dispatch_local_send(ErasedSend {
+            target_system: owner.system,
             target_shard: owner.shard,
             target_isolate: owner.isolate,
             target_generation: owner.generation,
@@ -1691,6 +1714,9 @@ where
         address: Address<M, R>,
         operation: &str,
     ) -> RegisteredAddress {
+        if address.system() != self.system_incarnation {
+            panic!("{operation} targeted a parent from another system");
+        }
         if address.shard() != self.shard.id() {
             panic!(
                 "{operation} targeted a parent on another shard: target shard {} != simulator shard {}",
@@ -1721,6 +1747,7 @@ where
         }
 
         RegisteredAddress {
+            system: address.system(),
             shard: address.shard(),
             isolate: address.isolate(),
             generation: address.generation(),
@@ -1728,6 +1755,9 @@ where
     }
 
     pub(crate) fn entry_index(&self, address: RegisteredAddress) -> Option<usize> {
+        if address.system != self.system_incarnation || address.shard != self.shard.id() {
+            return None;
+        }
         self.entries
             .iter()
             .position(|entry| entry.id == address.isolate && entry.generation == address.generation)
@@ -2017,6 +2047,20 @@ where
         translator: Box<dyn FnOnce(SendOutcome) -> Box<dyn Any>>,
         route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     ) {
+        if send.target_system != self.system_incarnation {
+            self.deliver_observed_send_outcome(
+                context.call_id,
+                context.requester,
+                context.cause,
+                SendOutcome::ForeignSystem {
+                    expected: self.system_incarnation,
+                    actual: send.target_system,
+                },
+                translator,
+                context.continuation_context,
+            );
+            return;
+        }
         let target_shard = send.target_shard;
         let target_isolate = send.target_isolate;
         let target_generation = send.target_generation;
@@ -2095,6 +2139,28 @@ where
         handle_shared: Option<std::sync::Arc<tina::CallHandleShared>>,
         route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     ) {
+        if send.target_system != self.system_incarnation {
+            if let Some(shared) = &handle_shared {
+                shared.set_call_id(context.call_id.get());
+                shared.set_shard_id(self.shard.id().get());
+                shared.set_state(tina::CallHandleState::Settled);
+            }
+            self.deliver_isolate_call_outcome(
+                IsolateCallDeliveryContext {
+                    call_id: context.call_id,
+                    requester: context.requester,
+                    cause: context.cause,
+                    continuation_context: context.continuation_context,
+                    visible_at_step: self.step_ordinal,
+                },
+                CallOutcome::Rejected(CallRejectedReason::ForeignSystem {
+                    expected: self.system_incarnation,
+                    actual: send.target_system,
+                }),
+                translator,
+            );
+            return;
+        }
         let target_shard = send.target_shard;
         let target_isolate = send.target_isolate;
         let target_generation = send.target_generation;
@@ -5492,6 +5558,7 @@ where
             } => (
                 call_id,
                 CallRouting::Remote {
+                    requester_system: requester.system,
                     requester_shard: requester.shard,
                     requester_isolate: requester.isolate,
                     requester_generation: requester.generation,
@@ -5532,12 +5599,14 @@ where
             let routing = match capture.routing {
                 CallRouting::Local => deferred::DeferredRouting::Local,
                 CallRouting::Remote {
+                    requester_system,
                     requester_shard,
                     requester_isolate,
                     requester_generation,
                     cause: remote_cause,
                 } => deferred::DeferredRouting::Remote {
                     requester: RegisteredAddress {
+                        system: requester_system,
                         shard: requester_shard,
                         isolate: requester_isolate,
                         generation: requester_generation,
@@ -6066,6 +6135,9 @@ where
         send: ErasedSend,
         call_context: Option<MessageCallContext>,
     ) -> Result<(), SendRejectedReason> {
+        if send.target_system != self.system_incarnation {
+            return Err(SendRejectedReason::Closed);
+        }
         if send.target_shard != self.shard.id() {
             panic!(
                 "cross-shard simulation is out of scope in this slice: target shard {} != simulator shard {}",
@@ -6357,6 +6429,7 @@ where
         let stopped = self.push_event(isolate_id, Some(cause), RuntimeEventKind::IsolateStopped);
         self.entries[index].stopped_event.set(Some(stopped));
         self.cancel_backend_calls_for_requester(RegisteredAddress {
+            system: self.system_incarnation,
             shard: self.shard.id(),
             isolate: isolate_id,
             generation: self.entries[index].generation,
@@ -6687,7 +6760,8 @@ where
         let (spawn, continuation) = self.inner.into_parts();
         match spawn.into_erased_spawn().try_spawn_observed(sim, parent) {
             Ok(outcome) => {
-                let child_address = Address::<ChildMessage, ChildReply>::new_with_generation(
+                let child_address = Address::<ChildMessage, ChildReply>::new_with_generation_in(
+                    outcome.child.system,
                     outcome.child.shard,
                     outcome.child.isolate,
                     outcome.child.generation,
@@ -6891,7 +6965,8 @@ where
         let continuation = Box::new(
             move |result: Result<RegisteredAddress, SpawnObservedError>| -> Box<dyn Any> {
                 let typed = result.map(|address| {
-                    ChildRef::new(Address::<ChildMessage, ChildReply>::new_with_generation(
+                    ChildRef::new(Address::<ChildMessage, ChildReply>::new_with_generation_in(
+                        address.system,
                         address.shard,
                         address.isolate,
                         address.generation,

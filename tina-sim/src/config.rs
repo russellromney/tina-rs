@@ -24,6 +24,10 @@ use crate::MultiShardSimulatorConfig;
 /// fields here must carry a `Default`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SimulatorConfig {
+    /// Address provenance for this simulation. `None` allocates a fresh
+    /// incarnation; set `Some` when comparing live and simulated addresses.
+    pub system_incarnation: Option<tina::SystemIncarnation>,
+
     /// Replay seed that drives the simulator's narrow seeded perturbation
     /// surface.
     pub seed: u64,

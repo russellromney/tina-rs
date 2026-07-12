@@ -85,6 +85,7 @@ pub struct Simulator<S>
 where
     S: Shard,
 {
+    pub(crate) system_incarnation: tina::SystemIncarnation,
     pub(crate) shard: S,
     pub(crate) config: SimulatorConfig,
     pub(crate) entries: Vec<RegisteredEntry<S>>,
@@ -183,6 +184,9 @@ where
     }
 
     pub(crate) fn with_ids(shard: S, config: SimulatorConfig, ids: IdSource) -> Self {
+        let system_incarnation = config
+            .system_incarnation
+            .unwrap_or_else(tina_runtime::fresh_system_incarnation);
         // Advance the user-visible `IsolateId` counter past the system isolates
         // a live `ThreadedRuntime` registers at startup (e.g. its host-call
         // dispatcher pool). The simulator never registers those isolates
@@ -194,6 +198,7 @@ where
             .checked_add(1)
             .expect("reserved system isolate count leaves no user id space");
         Self {
+            system_incarnation,
             shard,
             config,
             entries: Vec::with_capacity(INITIAL_ENTRY_CAPACITY),

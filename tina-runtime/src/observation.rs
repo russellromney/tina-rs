@@ -54,6 +54,15 @@ pub enum WaitError {
 /// only fire while waiting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultWaitError {
+    /// The address belongs to another runtime/system incarnation.
+    ForeignSystem {
+        /// Incarnation owned by this runtime.
+        expected: tina::SystemIncarnation,
+        /// Incarnation carried by the address.
+        actual: tina::SystemIncarnation,
+    },
+    /// The address targets a shard this multi-shard runtime does not own.
+    UnknownShard(ShardId),
     /// `wait` timed out before the isolate stopped.
     Timeout,
     /// Runtime dropped or shut down before delivery.

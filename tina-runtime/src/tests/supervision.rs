@@ -64,7 +64,7 @@ fn supervised_one_for_one_restarts_only_failed_child() {
     let second_child = last_spawned_child(runtime.trace());
 
     assert_eq!(
-        runtime.try_send(lineage_address(first_child), LineageMsg::Panic),
+        runtime.try_send(lineage_address(&runtime, first_child), LineageMsg::Panic),
         Ok(())
     );
     assert_eq!(runtime.step(), 1);
@@ -78,7 +78,10 @@ fn supervised_one_for_one_restarts_only_failed_child() {
     );
     assert_eq!(factory_calls.get(), 3);
     assert_eq!(
-        runtime.try_send(lineage_address(first_child), LineageMsg::SpawnChild),
+        runtime.try_send(
+            lineage_address(&runtime, first_child),
+            LineageMsg::SpawnChild
+        ),
         Err(TrySendError::Closed(LineageMsg::SpawnChild))
     );
     assert!(
@@ -145,7 +148,7 @@ fn supervised_restart_factory_panic_is_contained_and_skipped() {
     let child = last_spawned_child(runtime.trace());
 
     assert_eq!(
-        runtime.try_send(lineage_address(child), LineageMsg::Panic),
+        runtime.try_send(lineage_address(&runtime, child), LineageMsg::Panic),
         Ok(())
     );
     let step_result = catch_unwind(AssertUnwindSafe(|| runtime.step()));
@@ -198,7 +201,7 @@ fn supervised_one_for_all_restarts_every_direct_restartable_child() {
     let second_child = last_spawned_child(runtime.trace());
 
     assert_eq!(
-        runtime.try_send(lineage_address(first_child), LineageMsg::Panic),
+        runtime.try_send(lineage_address(&runtime, first_child), LineageMsg::Panic),
         Ok(())
     );
     assert_eq!(runtime.step(), 1);
@@ -235,7 +238,7 @@ fn supervised_rest_for_one_restarts_failed_and_younger_children_only() {
     let third_child = last_spawned_child(runtime.trace());
 
     assert_eq!(
-        runtime.try_send(lineage_address(second_child), LineageMsg::Panic),
+        runtime.try_send(lineage_address(&runtime, second_child), LineageMsg::Panic),
         Ok(())
     );
     assert_eq!(runtime.step(), 1);
@@ -266,7 +269,7 @@ fn supervised_restart_skips_selected_non_restartable_child() {
     let child = last_spawned_child(runtime.trace());
 
     assert_eq!(
-        runtime.try_send(lineage_address(child), LineageMsg::Panic),
+        runtime.try_send(lineage_address(&runtime, child), LineageMsg::Panic),
         Ok(())
     );
     assert_eq!(runtime.step(), 1);
@@ -306,7 +309,7 @@ fn supervised_restart_budget_exhaustion_is_visible_and_creates_no_replacement() 
     assert_eq!(runtime.step(), 1);
     let child = last_spawned_child(runtime.trace());
     assert_eq!(
-        runtime.try_send(lineage_address(child), LineageMsg::Panic),
+        runtime.try_send(lineage_address(&runtime, child), LineageMsg::Panic),
         Ok(())
     );
     assert_eq!(runtime.step(), 1);
@@ -353,7 +356,7 @@ fn windowed_restart_budget_resets_after_period() {
     assert_eq!(runtime.step(), 1);
     let first_child = last_spawned_child(runtime.trace());
     assert_eq!(
-        runtime.try_send(lineage_address(first_child), LineageMsg::Panic),
+        runtime.try_send(lineage_address(&runtime, first_child), LineageMsg::Panic),
         Ok(())
     );
     assert_eq!(runtime.step(), 1);
@@ -361,7 +364,10 @@ fn windowed_restart_budget_resets_after_period() {
 
     clock.advance(Duration::from_secs(10));
     assert_eq!(
-        runtime.try_send(lineage_address(first_replacement), LineageMsg::Panic),
+        runtime.try_send(
+            lineage_address(&runtime, first_replacement),
+            LineageMsg::Panic
+        ),
         Ok(())
     );
     assert_eq!(runtime.step(), 1);
@@ -408,7 +414,7 @@ fn stopped_supervisor_rejects_later_child_failure_without_replacement() {
     assert_eq!(runtime.step(), 1);
 
     assert_eq!(
-        runtime.try_send(lineage_address(child), LineageMsg::Panic),
+        runtime.try_send(lineage_address(&runtime, child), LineageMsg::Panic),
         Ok(())
     );
     assert_eq!(runtime.step(), 1);
@@ -445,11 +451,14 @@ fn unsupervised_child_panic_and_normal_child_stop_do_not_trigger_supervision() {
     let stopping_child = last_spawned_child(runtime.trace());
 
     assert_eq!(
-        runtime.try_send(lineage_address(panicking_child), LineageMsg::Panic),
+        runtime.try_send(
+            lineage_address(&runtime, panicking_child),
+            LineageMsg::Panic
+        ),
         Ok(())
     );
     assert_eq!(
-        runtime.try_send(lineage_address(stopping_child), LineageMsg::Stop),
+        runtime.try_send(lineage_address(&runtime, stopping_child), LineageMsg::Stop),
         Ok(())
     );
     assert_eq!(runtime.step(), 2);
@@ -477,7 +486,7 @@ fn supervise_before_children_and_reconfigure_reset_budget_are_supported() {
     assert_eq!(runtime.step(), 1);
     let child = last_spawned_child(runtime.trace());
     assert_eq!(
-        runtime.try_send(lineage_address(child), LineageMsg::Panic),
+        runtime.try_send(lineage_address(&runtime, child), LineageMsg::Panic),
         Ok(())
     );
     assert_eq!(runtime.step(), 1);
@@ -488,7 +497,7 @@ fn supervise_before_children_and_reconfigure_reset_budget_are_supported() {
         SupervisorConfig::new(RestartPolicy::OneForOne, tina::RestartBudget::new(1)),
     );
     assert_eq!(
-        runtime.try_send(lineage_address(replacement), LineageMsg::Panic),
+        runtime.try_send(lineage_address(&runtime, replacement), LineageMsg::Panic),
         Ok(())
     );
     assert_eq!(runtime.step(), 1);
@@ -516,7 +525,7 @@ fn supervisor_report_summarizes_restart_history_for_one_owner() {
     assert_eq!(runtime.step(), 1);
     let child = last_spawned_child(runtime.trace());
     assert_eq!(
-        runtime.try_send(lineage_address(child), LineageMsg::Panic),
+        runtime.try_send(lineage_address(&runtime, child), LineageMsg::Panic),
         Ok(())
     );
     assert_eq!(runtime.step(), 1);
@@ -562,7 +571,7 @@ fn supervisor_report_names_budget_exhaustion_as_terminal_halt() {
     assert_eq!(runtime.step(), 1);
     let child = last_spawned_child(runtime.trace());
     assert_eq!(
-        runtime.try_send(lineage_address(child), LineageMsg::Panic),
+        runtime.try_send(lineage_address(&runtime, child), LineageMsg::Panic),
         Ok(())
     );
     assert_eq!(runtime.step(), 1);
@@ -602,7 +611,7 @@ fn non_panic_child_failure_restarts_with_new_incarnation_and_rejects_stale_addre
 
     // The child fails as a typed, non-panic outcome.
     assert_eq!(
-        runtime.try_send(lineage_address(child), LineageMsg::Fail),
+        runtime.try_send(lineage_address(&runtime, child), LineageMsg::Fail),
         Ok(())
     );
     assert_eq!(runtime.step(), 1);
@@ -628,7 +637,7 @@ fn non_panic_child_failure_restarts_with_new_incarnation_and_rejects_stale_addre
 
     // The stale pre-restart address rejects loudly.
     assert_eq!(
-        runtime.try_send(lineage_address(child), LineageMsg::SpawnChild),
+        runtime.try_send(lineage_address(&runtime, child), LineageMsg::SpawnChild),
         Err(TrySendError::Closed(LineageMsg::SpawnChild))
     );
 
@@ -656,11 +665,17 @@ fn stop_children_closes_owned_children_and_reports_them_without_stopping_owner()
 
     // Both children accept messages before shutdown.
     assert_eq!(
-        runtime.try_send(lineage_address(first_child), LineageMsg::SpawnChild),
+        runtime.try_send(
+            lineage_address(&runtime, first_child),
+            LineageMsg::SpawnChild
+        ),
         Ok(())
     );
     assert_eq!(
-        runtime.try_send(lineage_address(second_child), LineageMsg::SpawnChild),
+        runtime.try_send(
+            lineage_address(&runtime, second_child),
+            LineageMsg::SpawnChild
+        ),
         Ok(())
     );
 
@@ -670,11 +685,17 @@ fn stop_children_closes_owned_children_and_reports_them_without_stopping_owner()
 
     // Both children are now closed; their pending messages were abandoned.
     assert_eq!(
-        runtime.try_send(lineage_address(first_child), LineageMsg::SpawnChild),
+        runtime.try_send(
+            lineage_address(&runtime, first_child),
+            LineageMsg::SpawnChild
+        ),
         Err(TrySendError::Closed(LineageMsg::SpawnChild))
     );
     assert_eq!(
-        runtime.try_send(lineage_address(second_child), LineageMsg::SpawnChild),
+        runtime.try_send(
+            lineage_address(&runtime, second_child),
+            LineageMsg::SpawnChild
+        ),
         Err(TrySendError::Closed(LineageMsg::SpawnChild))
     );
 
@@ -711,7 +732,7 @@ fn unsupervised_isolate_failure_stops_without_restart() {
     let child = last_spawned_child(runtime.trace());
 
     assert_eq!(
-        runtime.try_send(lineage_address(child), LineageMsg::Fail),
+        runtime.try_send(lineage_address(&runtime, child), LineageMsg::Fail),
         Ok(())
     );
     assert_eq!(runtime.step(), 1);
@@ -723,7 +744,7 @@ fn unsupervised_isolate_failure_stops_without_restart() {
         && matches!(event.kind(), RuntimeEventKind::HandlerReportedFailure)),);
     assert_eq!(supervisor_events(runtime.trace()), Vec::new());
     assert_eq!(
-        runtime.try_send(lineage_address(child), LineageMsg::SpawnChild),
+        runtime.try_send(lineage_address(&runtime, child), LineageMsg::SpawnChild),
         Err(TrySendError::Closed(LineageMsg::SpawnChild))
     );
 }

@@ -205,6 +205,27 @@ one-shot server now closes both its stream and listener instead of relying on
 simulator teardown to hide the listener. The fake bridge now reserves its
 installed in-flight cap before dispatch, and the custom policy rejects
 self-contradictory zero configurations. The extension sweep is now complete.
+### 2026-07-12 Runtime address provenance prerequisite
+
+Address identity now includes an opaque `SystemIncarnation` ahead of shard,
+isolate, and generation. Every live or simulated owner stamps one incarnation
+across all of its shards, while independently constructed owners receive
+distinct nonzero incarnations. Deterministic owners can configure the value
+explicitly, including matching live/simulator fixtures without relying on
+process-global construction order. Address capability wrappers, contexts,
+typed continuations, erased sends, remote envelopes, observation keys, and
+host call routing all preserve and validate the stamp before shard or isolate
+routing.
+
+Typed threaded and call surfaces report `ForeignSystem` without claiming call
+or observation authority. Explicit-step `try_send` retains message ownership
+through its existing `Closed(message)` rail. Focused tests cover coincident
+foreign address tuples, exact message drop settlement, same-owner cross-shard
+identity, preferred `LocalSystem` routing, deterministic replay, configured
+live/simulator parity, stale post-restart addresses, and replacement delivery
+within the original system incarnation. This prerequisite prevents an address
+from one example-owned runtime from accidentally targeting a coincident tuple
+in another as the corpus moves onto `LocalSystem`.
 
 ### 2026-07-12 Lock-manager keyed FIFO canonicalization
 

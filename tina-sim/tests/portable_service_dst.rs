@@ -116,6 +116,9 @@ impl Worker {
             WorkerMsg::Audited(SendOutcome::Closed, _) => {
                 reply(WorkerReply::DurableFailure(CallError::TargetClosed))
             }
+            WorkerMsg::Audited(SendOutcome::ForeignSystem { .. }, _) => {
+                reply(WorkerReply::DurableFailure(CallError::TargetClosed))
+            }
             WorkerMsg::AuditedForCall(req, SendOutcome::Accepted, request) => {
                 let index = self.next_index;
                 journal_append(
@@ -129,6 +132,9 @@ impl Worker {
                 tina::reply_to(req, WorkerReply::DurableFailure(CallError::TargetFull))
             }
             WorkerMsg::AuditedForCall(req, SendOutcome::Closed, _) => {
+                tina::reply_to(req, WorkerReply::DurableFailure(CallError::TargetClosed))
+            }
+            WorkerMsg::AuditedForCall(req, SendOutcome::ForeignSystem { .. }, _) => {
                 tina::reply_to(req, WorkerReply::DurableFailure(CallError::TargetClosed))
             }
             WorkerMsg::Durable(Ok(()), request, index) => {

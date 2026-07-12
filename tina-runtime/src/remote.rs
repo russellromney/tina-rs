@@ -136,6 +136,7 @@ pub(crate) struct QueuedRemoteSend {
 }
 
 pub(crate) struct SendableQueuedRemoteSend {
+    pub(crate) target_system: tina::SystemIncarnation,
     pub(crate) target_shard: ShardId,
     pub(crate) target_isolate: tina::IsolateId,
     pub(crate) target_generation: AddressGeneration,
@@ -151,6 +152,7 @@ impl SendableQueuedRemoteSend {
         cause: CauseId,
     ) -> Self {
         Self {
+            target_system: send.target_system,
             target_shard: send.target_shard,
             target_isolate: send.target_isolate,
             target_generation: send.target_generation,
@@ -163,6 +165,7 @@ impl SendableQueuedRemoteSend {
     pub(crate) fn into_queued_remote_send(self) -> QueuedRemoteSend {
         QueuedRemoteSend {
             send: ErasedSend {
+                target_system: self.target_system,
                 target_shard: self.target_shard,
                 target_isolate: self.target_isolate,
                 target_generation: self.target_generation,
@@ -316,6 +319,9 @@ where
         send: ErasedSend,
         call_context: Option<MessageCallContext>,
     ) -> Result<(), SendRejectedReason> {
+        if send.target_system != self.system_incarnation {
+            return Err(SendRejectedReason::Closed);
+        }
         if send.target_shard != self.shard.id() {
             panic!(
                 "cross-shard send is out of scope in this slice: target shard {} != runtime shard {}",

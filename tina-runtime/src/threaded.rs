@@ -14,7 +14,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use betelgeuse::{IOLoopHandle, io_loop};
-use tina::{Address, Isolate, Outbound as TinaOutbound, Shard, ShardId, TrySendError};
+use tina::{
+    Address, Isolate, Outbound as TinaOutbound, Shard, ShardId, SystemIncarnation, TrySendError,
+};
 use tina_supervisor::SupervisorConfig;
 
 use crate::call::{CallOutcome, IntoErasedCall};
@@ -49,6 +51,10 @@ use crate::{
 /// Configuration for [`ThreadedRuntime`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ThreadedRuntimeConfig {
+    /// Address provenance for this live owner. `None` allocates a fresh
+    /// nonzero incarnation once at startup. Set `Some` for live/sim parity.
+    pub system_incarnation: Option<SystemIncarnation>,
+
     /// Capacity of the bounded control/ingress queue feeding the shard worker.
     pub command_capacity: usize,
 
@@ -150,6 +156,7 @@ pub struct ThreadedRuntimeConfig {
 impl Default for ThreadedRuntimeConfig {
     fn default() -> Self {
         Self {
+            system_incarnation: None,
             command_capacity: 64,
             shard_pair_capacity: 64,
             remote_inbound_drain_budget: 64,
@@ -687,6 +694,7 @@ where
     shutdown: Arc<SharedShutdownState<S, F>>,
     /// Upper bound on a host-control `call` awaiting the worker's reply.
     control_call_timeout: Duration,
+    system_incarnation: SystemIncarnation,
 }
 
 impl<S, F> ThreadedRuntime<S, F>
@@ -856,6 +864,13 @@ where
         J: FnOnce(),
     {
         config.validate()?;
+        let system_incarnation = config
+            .system_incarnation
+            .unwrap_or_else(crate::fresh_system_incarnation);
+        let config = ThreadedRuntimeConfig {
+            system_incarnation: Some(system_incarnation),
+            ..config
+        };
 
         let (commands, receiver) = std::sync::mpsc::sync_channel(config.command_capacity);
         let shard_id = shard.id();
@@ -937,6 +952,7 @@ where
             metrics,
             shutdown,
             control_call_timeout: config.control_call_timeout,
+            system_incarnation,
         })
     }
 
@@ -1211,6 +1227,7 @@ where
         parent: Address<M, R>,
         config: SupervisorConfig,
     ) -> Result<(), ThreadedRuntimeError> {
+        self.ensure_local_system(parent)?;
         self.call(move |runtime| runtime.supervise(parent, config))
     }
 
@@ -1226,6 +1243,7 @@ where
         parent: Address<M, R>,
         config: SupervisorConfig,
     ) -> Result<Result<(), SuperviseError>, ThreadedRuntimeError> {
+        self.ensure_local_system(parent)?;
         self.call(move |runtime| runtime.try_supervise(parent, config))
     }
 
@@ -1263,6 +1281,7 @@ where
         &self,
         address: Address<M, R>,
     ) -> Result<observation::IsolateCompleteWaiter, ThreadedRuntimeError> {
+        self.ensure_local_system(address)?;
         self.call(move |runtime| runtime.observe_isolate_complete(address))
     }
 
@@ -1275,6 +1294,7 @@ where
         address: Address<M, R>,
         call_kind: CallKind,
     ) -> Result<observation::OperationDoneWaiter, ThreadedRuntimeError> {
+        self.ensure_local_system(address)?;
         self.call(move |runtime| runtime.observe_operation_done(address, call_kind))
     }
 
@@ -1286,6 +1306,7 @@ where
         &self,
         parent_address: Address<M, R>,
     ) -> Result<observation::ChildRestartedWaiter, ThreadedRuntimeError> {
+        self.ensure_local_system(parent_address)?;
         self.call(move |runtime| runtime.observe_child_restarted(parent_address))
     }
 
@@ -1294,6 +1315,7 @@ where
         &self,
         parent_address: Address<M, R>,
     ) -> Result<ChildLifecycleReport, ThreadedRuntimeError> {
+        self.ensure_local_system(parent_address)?;
         self.call(move |runtime| runtime.child_lifecycle_report(parent_address))
             .and_then(|report| report.map_err(|_| ThreadedRuntimeError::WorkerStopped))
     }
@@ -1306,12 +1328,32 @@ where
         &self,
         address: Address<M, R>,
     ) -> Result<observation::IsolateResultWaiter<T>, observation::ResultWaitError> {
+        if address.system() != self.system_incarnation {
+            return Err(observation::ResultWaitError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
         match self.call(move |runtime| runtime.observe_result::<T, M, R>(address)) {
             Ok(result) => result,
             Err(ThreadedRuntimeError::CommandFull) => {
                 Err(observation::ResultWaitError::CommandFull)
             }
             Err(_) => Err(observation::ResultWaitError::RuntimeStopped),
+        }
+    }
+
+    fn ensure_local_system<M, R>(
+        &self,
+        address: Address<M, R>,
+    ) -> Result<(), ThreadedRuntimeError> {
+        if address.system() == self.system_incarnation {
+            Ok(())
+        } else {
+            Err(ThreadedRuntimeError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            })
         }
     }
 
@@ -1340,6 +1382,12 @@ where
         address: Address<M, R>,
         message: M,
     ) -> Result<(), ThreadedTrySendError> {
+        if address.system() != self.system_incarnation {
+            return Err(ThreadedTrySendError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
         // A Failed worker rejects ingress immediately
         // even before the bounded sync_channel has observed Disconnected,
         // so callers cannot enqueue work into a quarantined shard.
@@ -1458,6 +1506,12 @@ where
         address: Address<M, R>,
         message: M,
     ) -> Result<(), ThreadedSendObservedError> {
+        if address.system() != self.system_incarnation {
+            return Err(ThreadedSendObservedError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         let command = ThreadedCommand::Run(Box::new(move |runtime| {
             let result = runtime
@@ -1578,6 +1632,12 @@ where
         R: 'static,
         MakeMsg: FnMut() -> M,
     {
+        if address.system() != self.system_incarnation {
+            return Err(SendObservedUntilError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
         loop {
             // Past-deadline check up-front: don't enqueue a command we
             // can't bound. Avoids the "delivered but reported Timeout"
@@ -1653,6 +1713,9 @@ where
                 }
                 Err(ThreadedSendObservedError::UnknownShard(shard)) => {
                     return Err(SendObservedUntilError::UnknownShard(shard));
+                }
+                Err(ThreadedSendObservedError::ForeignSystem { expected, actual }) => {
+                    return Err(SendObservedUntilError::ForeignSystem { expected, actual });
                 }
             }
         }
@@ -1927,6 +1990,12 @@ where
         M: Send + 'static,
         R: Send + 'static,
     {
+        if address.system() != self.system_incarnation {
+            return Err(ThreadedRuntimeError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
         // If the worker died before publishing the dispatcher pool (e.g. a
         // panicking mailbox factory blew up registration), the runtime has
         // no usable host-call path. Surface that as `WorkerStopped` instead of
@@ -2267,6 +2336,11 @@ where
                 config.timer_capacity,
             )),
             config.preallocation,
+        )
+        .with_system_incarnation(
+            config
+                .system_incarnation
+                .unwrap_or_else(crate::fresh_system_incarnation),
         );
         runtime.set_trace_retention(config.trace_retention);
         runtime.set_driver_completion_drain_budget(config.driver_completion_drain_budget);

@@ -521,12 +521,14 @@ fn child_restarted_waiter_resolves_after_panic_and_restart() {
         )
         .expect("supervise");
 
-    let stale_parent = Address::<ParentMsg>::new_with_generation(
+    let stale_parent = Address::<ParentMsg>::new_with_generation_in(
+        parent.system(),
         parent.shard(),
         parent.isolate(),
         AddressGeneration::new(parent.generation().get() + 1),
     );
-    let foreign_parent = Address::<ParentMsg>::new_with_generation(
+    let foreign_parent = Address::<ParentMsg>::new_with_generation_in(
+        parent.system(),
         ShardId::new(parent.shard().get() + 1),
         parent.isolate(),
         parent.generation(),
@@ -580,7 +582,7 @@ fn child_restarted_waiter_resolves_after_panic_and_restart() {
         })
         .expect("initial child spawn traced");
     assert_ne!(old_child, restarted.new_isolate);
-    let stale = Address::<CrashMsg>::new(parent.shard(), old_child);
+    let stale = Address::<CrashMsg>::new_in(parent.system(), parent.shard(), old_child);
     assert!(matches!(
         runtime.send_and_observe(stale, CrashMsg::Boom),
         Err(ThreadedSendObservedError::MailboxClosed)
@@ -619,9 +621,18 @@ fn child_restarted_waiter_reports_runtime_stopped() {
 #[test]
 fn abandoned_child_restart_authorities_do_not_exhaust_observation_capacity() {
     let runtime = make_runtime();
+    let parent = runtime
+        .register_with_capacity::<Parent, Infallible>(
+            Parent {
+                crashed: Arc::new(AtomicU32::new(0)),
+            },
+            8,
+        )
+        .expect("register parent");
 
     for isolate in 1..=(2 * 1024) {
-        let forged = Address::<ParentMsg>::new_with_generation(
+        let forged = Address::<ParentMsg>::new_with_generation_in(
+            parent.system(),
             ShardId::new(99),
             tina::IsolateId::new(isolate),
             AddressGeneration::new(7),

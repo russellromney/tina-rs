@@ -1197,6 +1197,7 @@ mod pending_replies_tests {
             42,
             DeferredRouting::Remote {
                 requester: RegisteredAddress {
+                    system: tina::SystemIncarnation::DEFAULT,
                     shard: ShardId::new(2),
                     isolate: IsolateId::new(3),
                     generation: AddressGeneration::new(4),

@@ -561,12 +561,14 @@ fn cross_shard_restartable_child_restarts_on_remote_shard_and_reports_replacemen
         runtime.step();
     }
     let old_child = learned.borrow().expect("remote child address learned");
-    let stale_parent = Address::<RestartParentMsg>::new_with_generation(
+    let stale_parent = Address::<RestartParentMsg>::new_with_generation_in(
+        parent.system(),
         parent.shard(),
         parent.isolate(),
         AddressGeneration::new(parent.generation().get() + 1),
     );
-    let foreign_parent = Address::<RestartParentMsg>::new_with_generation(
+    let foreign_parent = Address::<RestartParentMsg>::new_with_generation_in(
+        parent.system(),
         ShardId::new(22),
         parent.isolate(),
         parent.generation(),
@@ -612,7 +614,8 @@ fn cross_shard_restartable_child_restarts_on_remote_shard_and_reports_replacemen
         "cross-shard restart facts are not replayed"
     );
 
-    let replacement = tina::Address::<CrossChildMsg>::new_with_generation(
+    let replacement = tina::Address::<CrossChildMsg>::new_with_generation_in(
+        parent.system(),
         restarted.new_shard,
         restarted.new_isolate,
         restarted.new_generation,
