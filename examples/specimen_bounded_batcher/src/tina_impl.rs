@@ -6,10 +6,10 @@ use std::time::Duration;
 use tina::prelude::*;
 use tina_runtime::{
     CallError, CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, SharedWork,
-    SharedWorkError, SleepReply, request_effect_after_shared_wait, sleep,
+    SharedWorkError, SleepReply, ThreadedRuntimeError, request_effect_after_shared_wait, sleep,
 };
 
-use crate::{BATCH_SIZE, BATCH_TIMEOUT_MS, CALLERS, MAX_PENDING, Report};
+use crate::{BATCH_SIZE, BATCH_TIMEOUT_MS, CALLERS, MAX_PENDING, Report, SUBMISSION_CAPACITY};
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -187,7 +187,7 @@ pub fn run() -> anyhow::Result<Report> {
                 Duration::from_millis(BATCH_TIMEOUT_MS),
                 MAX_PENDING,
             ),
-            64,
+            SUBMISSION_CAPACITY,
         )
         .map_err(|error| anyhow::anyhow!("register batcher: {error:?}"))?;
 
@@ -207,29 +207,35 @@ pub fn run() -> anyhow::Result<Report> {
     for caller in callers {
         match caller
             .join()
-            .map_err(|_| anyhow::anyhow!("batcher caller thread panicked"))??
+            .map_err(|_| anyhow::anyhow!("batcher caller thread panicked"))?
         {
-            CallOutcome::Replied(BatcherReply::Batched(_)) => report.successes += 1,
-            CallOutcome::Replied(BatcherReply::Full) => report.full_rejects += 1,
-            CallOutcome::Replied(BatcherReply::TimerFailed(_)) => {
-                report.timer_failures += 1;
-                report.failed += 1;
-            }
-            CallOutcome::Replied(BatcherReply::Stats(_)) => report.failed += 1,
-            CallOutcome::Full => {
-                report.transport_full += 1;
-                report.failed += 1;
-            }
-            CallOutcome::Closed => {
-                report.closed += 1;
-                report.failed += 1;
-            }
-            CallOutcome::Timeout => {
-                report.timeouts += 1;
-                report.failed += 1;
-            }
-            CallOutcome::Rejected(_) => {
-                report.rejected += 1;
+            Ok(outcome) => match outcome {
+                CallOutcome::Replied(BatcherReply::Batched(_)) => report.successes += 1,
+                CallOutcome::Replied(BatcherReply::Full) => report.full_rejects += 1,
+                CallOutcome::Replied(BatcherReply::TimerFailed(_)) => {
+                    report.timer_failures += 1;
+                    report.failed += 1;
+                }
+                CallOutcome::Replied(BatcherReply::Stats(_)) => report.failed += 1,
+                CallOutcome::Full => {
+                    report.transport_full += 1;
+                    report.failed += 1;
+                }
+                CallOutcome::Closed => {
+                    report.closed += 1;
+                    report.failed += 1;
+                }
+                CallOutcome::Timeout => {
+                    report.timeouts += 1;
+                    report.failed += 1;
+                }
+                CallOutcome::Rejected(_) => {
+                    report.rejected += 1;
+                    report.failed += 1;
+                }
+            },
+            Err(error) => {
+                record_host_error(&mut report, error);
                 report.failed += 1;
             }
         }
@@ -251,6 +257,18 @@ pub fn run() -> anyhow::Result<Report> {
     terminal.ensure_clean()?;
     report.exit_clean = true;
     Ok(report)
+}
+
+fn record_host_error(report: &mut Report, error: ThreadedRuntimeError) {
+    match error {
+        ThreadedRuntimeError::CommandFull => report.host_command_full += 1,
+        ThreadedRuntimeError::WorkerStopped => report.host_worker_stopped += 1,
+        ThreadedRuntimeError::HostWaitTimeout => report.host_wait_timeout += 1,
+        ThreadedRuntimeError::WorkerUnresponsive => report.host_worker_unresponsive += 1,
+        ThreadedRuntimeError::UnknownShard(_) => report.host_unknown_shard += 1,
+        ThreadedRuntimeError::DriverShutdownFailed => report.host_driver_shutdown_failed += 1,
+        ThreadedRuntimeError::DriverParkFailed => report.host_driver_park_failed += 1,
+    }
 }
 
 #[cfg(test)]
@@ -409,6 +427,20 @@ mod tests {
         assert_eq!(settled.timer_flushes, 1);
         assert_eq!(settled.reclaimed_callers, 1);
         assert_eq!(settled.full_rejects, 1);
+
+        let refilled = harness.spawn_call(5, CALL_TIMEOUT);
+        harness.wait_for(|stats| stats.current_generation == 2 && stats.waiters == 1);
+        harness
+            .app
+            .try_send_event(harness.service.events, BatcherEvent::Tick(2, Ok(())))
+            .expect("post-full refill tick");
+        assert_eq!(
+            refilled.join().expect("refilled caller joins"),
+            CallOutcome::Replied(BatcherReply::Batched(5))
+        );
+        let refilled_stats = harness.stats();
+        assert_eq!(refilled_stats.waiters, 0);
+        assert_eq!(refilled_stats.current_generation, 3);
         harness.shutdown();
     }
 
@@ -431,12 +463,16 @@ mod tests {
         harness.wait_for(|stats| stats.current_generation == 2 && stats.waiters == 1);
         harness
             .app
-            .try_send_event(harness.service.events, BatcherEvent::Tick(1, Ok(())))
-            .expect("stale tick admission");
+            .try_send_event(
+                harness.service.events,
+                BatcherEvent::Tick(1, Err(CallError::TargetFull)),
+            )
+            .expect("stale failed tick admission");
         let stale = harness.wait_for(|stats| stats.stale_ticks == 1);
         assert_eq!(stale.waiters, 1);
         assert_eq!(stale.items, 1);
         assert_eq!(stale.timer_flushes, 0);
+        assert_eq!(stale.timer_failures, 0);
 
         harness
             .app
@@ -503,5 +539,28 @@ mod tests {
             .expect("shutdown succeeds");
         drop(harness.app);
         terminal.ensure_clean().expect("clean shutdown");
+    }
+
+    #[test]
+    fn host_control_errors_remain_exhaustive_and_distinct() {
+        let mut report = Report::default();
+        for error in [
+            ThreadedRuntimeError::CommandFull,
+            ThreadedRuntimeError::WorkerStopped,
+            ThreadedRuntimeError::HostWaitTimeout,
+            ThreadedRuntimeError::WorkerUnresponsive,
+            ThreadedRuntimeError::UnknownShard(ShardId::new(99)),
+            ThreadedRuntimeError::DriverShutdownFailed,
+            ThreadedRuntimeError::DriverParkFailed,
+        ] {
+            record_host_error(&mut report, error);
+        }
+        assert_eq!(report.host_command_full, 1);
+        assert_eq!(report.host_worker_stopped, 1);
+        assert_eq!(report.host_wait_timeout, 1);
+        assert_eq!(report.host_worker_unresponsive, 1);
+        assert_eq!(report.host_unknown_shard, 1);
+        assert_eq!(report.host_driver_shutdown_failed, 1);
+        assert_eq!(report.host_driver_park_failed, 1);
     }
 }

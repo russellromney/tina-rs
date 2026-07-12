@@ -977,9 +977,9 @@ silently retracting accepted work.
 
 The specimen also moved from a driver isolate over raw `ThreadedRuntime` to
 typed host requests through fallibly built `LocalSystem`, exhaustive
-`CallOutcome` accounting, and bounded terminal-report shutdown. Direct tests
+`CallOutcome` and outer host-control accounting, and bounded terminal-report shutdown. Direct tests
 cover size/timer flushes, global `Full`, caller-gone reclamation and refill,
-stale-timer invalidation, typed timer-failure settlement and refill, exact
+post-`Full` refill, stale success/error invalidation, typed timer-failure settlement and refill, exact
 capacity counters, and clean shutdown. This also closes the old timer-error
 `noop` path that abandoned accepted callers until their individual deadlines.
 

@@ -17,6 +17,7 @@ pub const CALLERS: usize = 12;
 pub const BATCH_SIZE: usize = 4;
 pub const BATCH_TIMEOUT_MS: u64 = 30;
 pub const MAX_PENDING: usize = 16;
+pub const SUBMISSION_CAPACITY: usize = 64;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Report {
@@ -29,6 +30,13 @@ pub struct Report {
     pub timeouts: usize,
     pub rejected: usize,
     pub timer_failures: usize,
+    pub host_command_full: usize,
+    pub host_worker_stopped: usize,
+    pub host_wait_timeout: usize,
+    pub host_worker_unresponsive: usize,
+    pub host_unknown_shard: usize,
+    pub host_driver_shutdown_failed: usize,
+    pub host_driver_park_failed: usize,
     pub batches_size_flushed: usize,
     pub batches_timer_flushed: usize,
     pub exit_clean: bool,

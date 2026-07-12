@@ -19,8 +19,8 @@ replies to every caller with the batch total when either the batch reaches
   current timer failure settles the batch with typed `TimerFailed(CallError)`
   replies instead of abandoning callers.
 - The live host uses fallible `LocalSystem` startup, typed
-  `call_blocking_request`, exhaustive terminal outcomes, and bounded truthful
-  shutdown observation.
+  `call_blocking_request`, exhaustive inner call and outer host-control
+  outcomes, and bounded truthful shutdown observation.
 
 Caller timeout does not retract submitted work. `SharedWork` reclaims the
 closed reply slot at the next admission, while the accepted item remains in
@@ -31,9 +31,10 @@ cancellation of an already accepted submission.
 
 The Tina tests directly cover size and timer flushes, pending-cap `Full`, a
 timed-out caller followed by capacity refill, exact reclamation and rejection
-counters, stale timer invalidation, timer failure settlement and refill, and
-bounded clean shutdown. The smoke test runs both the Tokio and Tina
-implementations.
+counters, post-`Full` refill, stale successful/failed timer invalidation, timer
+failure settlement and refill, and bounded clean shutdown. The smoke test runs
+both the Tokio and Tina implementations with a producer statically below both
+declared submission caps.
 
 ```sh
 cargo test --manifest-path examples/specimen_bounded_batcher/Cargo.toml --all-targets
