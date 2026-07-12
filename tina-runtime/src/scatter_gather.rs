@@ -23,9 +23,10 @@ struct TargetSlot<K, R> {
 
 /// Opaque identity for one scatter/gather operation.
 ///
-/// Carry this token in the aggregate-timer event. Since runtime sleeps are
-/// physically non-cancelable, it prevents a completed operation's late timer
-/// from expiring a newer operation owned by the same coordinator.
+/// Carry this token in every child-reply, aggregate-timer, and cancellation
+/// event. It routes concurrent operations without application qids and, since
+/// runtime sleeps are physically non-cancelable, prevents a completed
+/// operation's late timer from expiring a newer operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[must_use = "carry the token into the aggregate-timeout continuation"]
 pub struct ScatterGatherToken(u64);
@@ -183,7 +184,8 @@ where
         Payload: Send + 'static,
         M: 'static,
         Build: FnMut(Target, std::time::Duration) -> CancelableCall<Payload, R>,
-        ReplyEvent: Fn(K, CallGroupToken, CallOutcome<R>) -> M + Clone + 'static,
+        ReplyEvent:
+            Fn(ScatterGatherToken, K, CallGroupToken, CallOutcome<R>) -> M + Clone + 'static,
         TimeoutEvent: FnOnce(ScatterGatherToken) -> M + 'static,
     {
         if let Err(error) = config.validate() {
@@ -217,6 +219,7 @@ where
                 error: ScatterGatherStartError::EffectCapacityOverflow,
             });
         };
+        let token = ScatterGatherToken::alloc();
         let mut calls = CallJoinSet::with_capacity(config.max_targets);
         let mut rows = Vec::with_capacity(config.max_targets);
         let mut effects = Vec::with_capacity(effect_cap);
@@ -224,11 +227,15 @@ where
             match target {
                 Some(target) => {
                     let call = build_call(target, config.per_target_timeout);
+                    let operation_token = token;
+                    let translator = reply_event.clone();
                     let effect = calls
                         .start_cancelable::<I, M, Payload, _>(
                             key.clone(),
                             call,
-                            reply_event.clone(),
+                            move |key, branch_token, outcome| {
+                                translator(operation_token, key, branch_token, outcome)
+                            },
                         )
                         .unwrap_or_else(|error| match error {
                             CallSetStartError::DuplicateKey { .. } => {
@@ -253,7 +260,6 @@ where
             }
         }
 
-        let token = ScatterGatherToken::alloc();
         let mut operation = Self {
             token,
             config,
@@ -297,7 +303,8 @@ where
         Event: 'static,
         Request: 'static,
         Build: FnMut(Target, std::time::Duration) -> CancelableCall<Payload, R>,
-        ReplyEvent: Fn(K, CallGroupToken, CallOutcome<R>) -> Event + Clone + 'static,
+        ReplyEvent:
+            Fn(ScatterGatherToken, K, CallGroupToken, CallOutcome<R>) -> Event + Clone + 'static,
         TimeoutEvent: FnOnce(ScatterGatherToken) -> Event + 'static,
     {
         Self::start(
@@ -305,8 +312,8 @@ where
             config,
             targets,
             build_call,
-            move |key, token, outcome| {
-                tina::ServiceMessage::Event(reply_event(key, token, outcome))
+            move |operation, key, token, outcome| {
+                tina::ServiceMessage::Event(reply_event(operation, key, token, outcome))
             },
             move |token| tina::ServiceMessage::Event(aggregate_timeout_event(token)),
         )
@@ -346,7 +353,8 @@ where
     where
         I: Isolate<Message = M, Io = RuntimeCall<M>>,
         M: 'static,
-        CancelEvent: Fn(K, CallGroupToken, CancelOutcome) -> M + Clone + 'static,
+        CancelEvent:
+            Fn(ScatterGatherToken, K, CallGroupToken, CancelOutcome) -> M + Clone + 'static,
     {
         if token != self.token {
             return Ok(None);
@@ -365,11 +373,13 @@ where
             }
         }
         let cancels = self.calls_mut()?.drain_pending_for_cancel();
+        let operation_token = self.token;
         let effects = cancels.into_iter().map(|request| {
             let (key, token, handle) = request.into_parts();
             let event_key = key.clone();
             let translator = cancel_event.clone();
-            cancel_call(handle).then(move |outcome| translator(event_key, token, outcome))
+            cancel_call(handle)
+                .then(move |outcome| translator(operation_token, event_key, token, outcome))
         });
         let effects = BoundedEffects::try_from_iter(self.config.max_targets, effects)
             .expect("cancel count cannot exceed max_targets");
@@ -393,10 +403,11 @@ where
             >,
         Event: 'static,
         Request: 'static,
-        CancelEvent: Fn(K, CallGroupToken, CancelOutcome) -> Event + Clone + 'static,
+        CancelEvent:
+            Fn(ScatterGatherToken, K, CallGroupToken, CancelOutcome) -> Event + Clone + 'static,
     {
-        self.aggregate_timeout(token, move |key, token, outcome| {
-            tina::ServiceMessage::Event(cancel_event(key, token, outcome))
+        self.aggregate_timeout(token, move |operation, key, token, outcome| {
+            tina::ServiceMessage::Event(cancel_event(operation, key, token, outcome))
         })
     }
 
@@ -492,9 +503,9 @@ mod tests {
 
     #[derive(Debug)]
     enum TestMessage {
-        Reply(u8, CallGroupToken, CallOutcome<u32>),
+        Reply(ScatterGatherToken, u8, CallGroupToken, CallOutcome<u32>),
         Aggregate,
-        Cancel(u8, CallGroupToken, CancelOutcome),
+        Cancel(ScatterGatherToken, u8, CallGroupToken, CancelOutcome),
     }
 
     #[derive(Debug)]
@@ -516,12 +527,12 @@ mod tests {
             _ctx: &mut tina::Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
             match message {
-                TestMessage::Reply(key, token, outcome) => {
-                    let _ = (key, token, outcome);
+                TestMessage::Reply(operation, key, token, outcome) => {
+                    let _ = (operation, key, token, outcome);
                 }
                 TestMessage::Aggregate => {}
-                TestMessage::Cancel(key, token, outcome) => {
-                    let _ = (key, token, outcome);
+                TestMessage::Cancel(operation, key, token, outcome) => {
+                    let _ = (operation, key, token, outcome);
                 }
             }
             tina::noop()
@@ -621,9 +632,7 @@ mod tests {
                 .is_none()
         );
         let advance = operation
-            .aggregate_timeout::<TestIsolate, _, _>(operation.token(), |key, token, outcome| {
-                TestMessage::Cancel(key, token, outcome)
-            })
+            .aggregate_timeout::<TestIsolate, _, _>(operation.token(), TestMessage::Cancel)
             .unwrap()
             .expect("current aggregate token advances operation");
         match advance.effect {
@@ -682,9 +691,7 @@ mod tests {
         let (mut current, tokens) = operation(&[1]);
 
         let stale = current
-            .aggregate_timeout::<TestIsolate, _, _>(old_token, |key, token, outcome| {
-                TestMessage::Cancel(key, token, outcome)
-            })
+            .aggregate_timeout::<TestIsolate, _, _>(old_token, TestMessage::Cancel)
             .unwrap();
         assert!(stale.is_none());
 
@@ -764,6 +771,53 @@ mod tests {
         assert!(matches!(
             failure.error,
             ScatterGatherStartError::DuplicateTarget(7)
+        ));
+    }
+
+    #[test]
+    fn config_and_effect_capacity_failures_return_untouched_caller() {
+        let empty = BoundedItems::try_from_iter(1, std::iter::empty::<(u8, Option<Address<()>>)>())
+            .unwrap();
+        let invalid = match ScatterGather::<u8, u32, ()>::start::<TestIsolate, _, (), _, _, _, _>(
+            request(),
+            config(0),
+            empty,
+            |_address, _timeout| unreachable!("invalid config cannot build calls"),
+            TestMessage::Reply,
+            |_| TestMessage::Aggregate,
+        ) {
+            Err(failure) => failure,
+            Ok(_) => panic!("zero max targets unexpectedly started"),
+        };
+        assert!(invalid.request.is_open());
+        assert!(matches!(
+            invalid.error,
+            ScatterGatherStartError::Config(ScatterGatherConfigError::MaxTargetsZero)
+        ));
+
+        let overflow_config = ScatterGatherConfig {
+            max_targets: usize::MAX,
+            collector_capacity: usize::MAX,
+            per_target_timeout: Duration::from_millis(1),
+            aggregate_timeout: Duration::from_millis(1),
+        };
+        let empty = BoundedItems::try_from_iter(1, std::iter::empty::<(u8, Option<Address<()>>)>())
+            .unwrap();
+        let overflow = match ScatterGather::<u8, u32, ()>::start::<TestIsolate, _, (), _, _, _, _>(
+            request(),
+            overflow_config,
+            empty,
+            |_address, _timeout| unreachable!("capacity overflow cannot build calls"),
+            TestMessage::Reply,
+            |_| TestMessage::Aggregate,
+        ) {
+            Err(failure) => failure,
+            Ok(_) => panic!("overflowing effect capacity unexpectedly started"),
+        };
+        assert!(overflow.request.is_open());
+        assert!(matches!(
+            overflow.error,
+            ScatterGatherStartError::EffectCapacityOverflow
         ));
     }
 }

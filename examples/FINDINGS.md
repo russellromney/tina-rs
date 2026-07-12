@@ -43,7 +43,10 @@ deadline cannot drift from the executed call. Missing targets, replies, Full,
 Closed, Timeout, Rejected, and aggregate timeout remain distinct and preserve
 caller order.
 
-Aggregate expiry marks only still-pending rows, emits a bounded cancellation
+Every reply, aggregate timeout, and cancel acknowledgement carries the public
+operation token, so a bounded collection can route concurrent aggregates
+without private qids or colliding per-operation branch generations. Aggregate
+expiry marks only still-pending rows, emits a bounded cancellation
 batch, and withholds caller authority until every cancel acknowledgement is
 recorded. Generation tokens reject duplicate and late overwrites. The aggregate
 timer also carries an operation token, so a physically non-cancelable timer from

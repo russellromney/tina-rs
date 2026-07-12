@@ -1,7 +1,7 @@
 //! The same coordinator authoring form runs on Runtime and Simulator.
 
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -56,17 +56,20 @@ enum CoordRequest {
 
 #[derive(Debug)]
 enum CoordEvent {
-    Target(usize, CallGroupToken, CallOutcome<u32>),
+    Target(ScatterGatherToken, usize, CallGroupToken, CallOutcome<u32>),
     AggregateTimeout(ScatterGatherToken),
-    Cancelled(usize, CallGroupToken, CancelOutcome),
+    Cancelled(ScatterGatherToken, usize, CallGroupToken, CancelOutcome),
     Stop,
 }
 
 struct Coordinator {
     workers: Vec<tina_runtime::RequestServiceHandle<WorkerRequest, u32>>,
-    operation: Option<ScatterGather<usize, u32, CoordReply>>,
+    operations: Vec<ScatterGather<usize, u32, CoordReply>>,
     started: Arc<AtomicBool>,
+    max_live: Arc<AtomicUsize>,
 }
+
+const MAX_IN_FLIGHT: usize = 8;
 
 #[tina_runtime::isolate(event = CoordEvent, request = CoordRequest, reply = CoordReply)]
 impl Coordinator {
@@ -78,37 +81,47 @@ impl Coordinator {
         if matches!(event, CoordEvent::Stop) {
             return stop();
         }
-        let Some(operation) = self.operation.as_mut() else {
+        let operation_token = match &event {
+            CoordEvent::Target(operation, ..)
+            | CoordEvent::AggregateTimeout(operation)
+            | CoordEvent::Cancelled(operation, ..) => *operation,
+            CoordEvent::Stop => unreachable!("stop handled before operation lookup"),
+        };
+        let Some(index) = self
+            .operations
+            .iter()
+            .position(|operation| operation.token() == operation_token)
+        else {
             return noop();
         };
         match event {
-            CoordEvent::Target(key, token, outcome) => {
-                match operation
+            CoordEvent::Target(_, key, token, outcome) => {
+                match self.operations[index]
                     .record_reply(key, token, outcome)
                     .expect("continuation token came from ScatterGather::start")
                 {
-                    Some(completed) => self.complete(completed, noop()),
+                    Some(completed) => self.complete(index, completed, noop()),
                     None => noop(),
                 }
             }
             CoordEvent::AggregateTimeout(token) => {
-                let Some(advance) = operation
+                let Some(advance) = self.operations[index]
                     .aggregate_timeout_service::<Self, _, _, _>(token, CoordEvent::Cancelled)
                     .expect("a current aggregate timer fires once")
                 else {
                     return noop();
                 };
                 match advance.completed {
-                    Some(completed) => self.complete(completed, advance.effect),
+                    Some(completed) => self.complete(index, completed, advance.effect),
                     None => advance.effect,
                 }
             }
-            CoordEvent::Cancelled(key, token, outcome) => {
-                match operation
+            CoordEvent::Cancelled(_, key, token, outcome) => {
+                match self.operations[index]
                     .record_cancel(key, token, outcome)
                     .expect("cancel token came from aggregate expiry")
                 {
-                    Some(completed) => self.complete(completed, noop()),
+                    Some(completed) => self.complete(index, completed, noop()),
                     None => noop(),
                 }
             }
@@ -121,6 +134,11 @@ impl Coordinator {
         _request: CoordRequest,
         call: RequestCall<'_, Self>,
     ) -> RequestEffect<Self> {
+        if self.operations.len() == MAX_IN_FLIGHT {
+            return call.reply(CoordReply::StartRejected(
+                "scatter operation capacity is full".to_owned(),
+            ));
+        }
         let config = ScatterGatherConfig {
             max_targets: self.workers.len() + 1,
             collector_capacity: self.workers.len() + 1,
@@ -139,7 +157,7 @@ impl Coordinator {
         .expect("service-owned target cap covers workers plus missing probe");
 
         call.capture(|request| {
-            match ScatterGather::start_service::<Self, _, _, _, _, _, _, _>(
+            match ScatterGather::start_service(
                 request,
                 config,
                 targets,
@@ -152,7 +170,9 @@ impl Coordinator {
                 }
                 Ok(ScatterGatherStart::Running { operation, effect }) => {
                     self.started.store(true, Ordering::Release);
-                    self.operation = Some(operation);
+                    self.operations.push(operation);
+                    self.max_live
+                        .fetch_max(self.operations.len(), Ordering::AcqRel);
                     effect
                 }
                 Err(failure) => reply_to(
@@ -167,10 +187,11 @@ impl Coordinator {
 impl Coordinator {
     fn complete(
         &mut self,
+        index: usize,
         completed: ScatterGatherCompleted<usize, u32, CoordReply>,
         effect: Effect<Self>,
     ) -> Effect<Self> {
-        self.operation = None;
+        self.operations.swap_remove(index);
         batch([
             reply_to(completed.request, CoordReply::Report(completed.report)),
             effect,
@@ -251,8 +272,9 @@ fn explicit_runtime_and_simulator_use_identical_scatter_authoring() {
         .register_split_service::<Coordinator, CoordEvent, CoordRequest, Infallible>(
             Coordinator {
                 workers,
-                operation: None,
+                operations: Vec::with_capacity(MAX_IN_FLIGHT),
                 started: Arc::new(AtomicBool::new(false)),
+                max_live: Arc::new(AtomicUsize::new(0)),
             },
             16,
         )
@@ -297,8 +319,9 @@ fn explicit_runtime_and_simulator_use_identical_scatter_authoring() {
         .register_split_service::<Coordinator, CoordEvent, CoordRequest, Infallible>(
             Coordinator {
                 workers,
-                operation: None,
+                operations: Vec::with_capacity(MAX_IN_FLIGHT),
                 started: Arc::new(AtomicBool::new(false)),
+                max_live: Arc::new(AtomicUsize::new(0)),
             },
             16,
         )
@@ -310,6 +333,64 @@ fn explicit_runtime_and_simulator_use_identical_scatter_authoring() {
         .unwrap();
     while sim.step() > 0 {}
     assert_report(sim_outcome.lock().unwrap().take().expect("sim report"));
+}
+
+#[test]
+fn public_operation_tokens_route_a_bounded_concurrent_scatter_set() {
+    let mut runtime = Runtime::new(SingleShard, DefaultMailboxFactory);
+    let workers = vec![
+        runtime.register_request_service::<_, _, Infallible>(
+            Worker {
+                value: Some(10),
+                held: Vec::new(),
+            },
+            16,
+        ),
+        runtime.register_request_service::<_, _, Infallible>(
+            Worker {
+                value: Some(20),
+                held: Vec::new(),
+            },
+            16,
+        ),
+    ];
+    let max_live = Arc::new(AtomicUsize::new(0));
+    let coordinator = runtime
+        .register_split_service::<Coordinator, CoordEvent, CoordRequest, Infallible>(
+            Coordinator {
+                workers,
+                operations: Vec::with_capacity(MAX_IN_FLIGHT),
+                started: Arc::new(AtomicBool::new(false)),
+                max_live: Arc::clone(&max_live),
+            },
+            64,
+        )
+        .requests;
+
+    let outcomes: Vec<_> = (0..MAX_IN_FLIGHT)
+        .map(|_| Arc::new(Mutex::new(None)))
+        .collect();
+    for outcome in &outcomes {
+        let client = runtime.register_with_capacity::<_, Infallible>(
+            Client {
+                outcome: Arc::clone(outcome),
+            },
+            4,
+        );
+        runtime
+            .try_send(client, ClientMessage::Start(coordinator))
+            .unwrap();
+    }
+    while runtime.step() > 0 {}
+
+    assert_eq!(
+        max_live.load(Ordering::Acquire),
+        MAX_IN_FLIGHT,
+        "all bounded operations must coexist without private qid correlation"
+    );
+    for outcome in outcomes {
+        assert_report(outcome.lock().unwrap().take().expect("concurrent report"));
+    }
 }
 
 #[test]
@@ -328,8 +409,9 @@ fn owner_stop_closes_original_caller_with_child_authority_pending() {
         .register_split_service::<Coordinator, CoordEvent, CoordRequest, Infallible>(
             Coordinator {
                 workers: vec![worker],
-                operation: None,
+                operations: Vec::with_capacity(MAX_IN_FLIGHT),
                 started: Arc::clone(&started),
+                max_live: Arc::new(AtomicUsize::new(0)),
             },
             8,
         );
@@ -383,8 +465,9 @@ fn threaded_runtime_uses_the_same_scatter_coordinator() {
         .register_split_service::<Coordinator, CoordEvent, CoordRequest, Infallible>(
             Coordinator {
                 workers,
-                operation: None,
+                operations: Vec::with_capacity(MAX_IN_FLIGHT),
                 started: Arc::new(AtomicBool::new(false)),
+                max_live: Arc::new(AtomicUsize::new(0)),
             },
             16,
         )
