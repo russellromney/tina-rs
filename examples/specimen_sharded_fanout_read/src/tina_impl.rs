@@ -238,22 +238,7 @@ pub fn run() -> anyhow::Result<Report> {
         CallOutcome::Rejected(reason) => anyhow::bail!("coordinator rejected request: {reason:?}"),
     };
 
-    let total_sum = report
-        .outcomes
-        .iter()
-        .try_fold(0u64, |sum, (target, outcome)| match outcome {
-            ScatterGatherTargetOutcome::Replied(reply) if reply.shard == *target => {
-                Some(sum + reply.value)
-            }
-            ScatterGatherTargetOutcome::Replied(_)
-            | ScatterGatherTargetOutcome::Full
-            | ScatterGatherTargetOutcome::Closed
-            | ScatterGatherTargetOutcome::Timeout
-            | ScatterGatherTargetOutcome::Rejected(_)
-            | ScatterGatherTargetOutcome::AggregateTimeout
-            | ScatterGatherTargetOutcome::MissingShard => None,
-        })
-        .ok_or_else(|| anyhow::anyhow!("scatter report was partial or misrouted: {report:?}"))?;
+    let total_sum = validated_total(&report)?;
     let shards_replied = report.replied_count() as u32;
 
     runtime.shutdown_report().ensure_clean()?;
@@ -262,4 +247,96 @@ pub fn run() -> anyhow::Result<Report> {
         shards_replied,
         exit_clean: true,
     })
+}
+
+fn validated_total(
+    report: &ScatterGatherReport<ShardCounterReply, ShardId>,
+) -> anyhow::Result<u64> {
+    if report.outcomes.len() != SHARD_RAW_IDS.len() {
+        anyhow::bail!(
+            "scatter report had {} rows for {} targets",
+            report.outcomes.len(),
+            SHARD_RAW_IDS.len()
+        );
+    }
+    report
+        .outcomes
+        .iter()
+        .zip(SHARD_RAW_IDS.iter().zip(SEED_VALUES))
+        .try_fold(
+            0u64,
+            |sum, ((target, outcome), (expected_shard, expected_value))| match outcome {
+                ScatterGatherTargetOutcome::Replied(reply)
+                    if target.get() == *expected_shard
+                        && reply.shard == *target
+                        && reply.value == expected_value =>
+                {
+                    Some(sum + reply.value)
+                }
+                ScatterGatherTargetOutcome::Replied(_)
+                | ScatterGatherTargetOutcome::Full
+                | ScatterGatherTargetOutcome::Closed
+                | ScatterGatherTargetOutcome::Timeout
+                | ScatterGatherTargetOutcome::Rejected(_)
+                | ScatterGatherTargetOutcome::AggregateTimeout
+                | ScatterGatherTargetOutcome::MissingShard => None,
+            },
+        )
+        .ok_or_else(|| anyhow::anyhow!("scatter report was partial or misrouted: {report:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn complete_report() -> ScatterGatherReport<ShardCounterReply, ShardId> {
+        ScatterGatherReport {
+            config: ScatterGatherConfig {
+                max_targets: SHARD_RAW_IDS.len(),
+                collector_capacity: SHARD_RAW_IDS.len(),
+                per_target_timeout: TARGET_TIMEOUT,
+                aggregate_timeout: AGGREGATE_TIMEOUT,
+            },
+            outcomes: SHARD_RAW_IDS
+                .iter()
+                .copied()
+                .zip(SEED_VALUES)
+                .map(|(shard, value)| {
+                    let shard = ShardId::new(shard);
+                    (
+                        shard,
+                        ScatterGatherTargetOutcome::Replied(ShardCounterReply { shard, value }),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn report_validation_rejects_reordering_misrouting_and_wrong_values() {
+        let report = complete_report();
+        assert_eq!(validated_total(&report).unwrap(), SEED_VALUES.iter().sum());
+
+        let mut reordered = complete_report();
+        reordered.outcomes.swap(0, 1);
+        assert!(validated_total(&reordered).is_err());
+
+        let mut misrouted = complete_report();
+        let ScatterGatherTargetOutcome::Replied(reply) = &mut misrouted.outcomes[0].1 else {
+            unreachable!()
+        };
+        reply.shard = ShardId::new(SHARD_RAW_IDS[1]);
+        assert!(validated_total(&misrouted).is_err());
+
+        let mut wrong_value = complete_report();
+        let ScatterGatherTargetOutcome::Replied(reply) = &mut wrong_value.outcomes[0].1 else {
+            unreachable!()
+        };
+        reply.value += 1;
+        assert!(validated_total(&wrong_value).is_err());
+
+        let mut partial = complete_report();
+        partial.outcomes[0].1 = ScatterGatherTargetOutcome::AggregateTimeout;
+        assert!(validated_total(&partial).is_err());
+    }
 }

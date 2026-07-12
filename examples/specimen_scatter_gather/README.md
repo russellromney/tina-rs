@@ -85,10 +85,15 @@ What improves over manual coordination:
   stale continuations.
 - Aggregate expiry marks only unfinished rows and withholds caller authority
   until emitted cancellation work settles.
-- A capacity-one live test proves excess callers receive typed `Full` and no
-  caller remains stranded at shutdown.
+- A capacity-one live test proves excess callers receive typed `Full`, the
+  retired slot admits a refill, and no caller remains stranded at shutdown.
 
 Tina still spells domain messages and reply types that Tokio can leave inside
 task-local channel types. In return, the concurrency cap, authority ownership,
 timeouts, cancellation, and terminal outcomes are all visible in the service
 contract.
+
+The coordinator API is backend-neutral. The repository parity suite runs this
+same `start_service` / `advance_service` authoring form on the live, threaded,
+multi-shard, and simulator owners; this specimen stays focused on the live
+application path instead of duplicating that matrix.

@@ -171,16 +171,18 @@ coordinator contains only the worker list plus `ScatterGatherOperations`; one
 `Scatter` event replaces qids, `PendingReplies`, partial rows, manual batches,
 and terminal folding. The completed typed report reaches the driver without
 collapsing target outcomes. A capacity-one live probe proves one admitted
-operation, typed `Full` for every excess caller, exact caller settlement, and
-clean shutdown.
+operation, typed `Full` for every excess caller, exact caller settlement,
+same-runtime refill, target-order and reply-identity validation, and clean
+shutdown.
 
 `specimen_sharded_fanout_read` now applies both prerequisites. Shard counters
 are request-only services stored in `ShardRequestServiceTable`; the coordinator
 has one request, one scatter event, and one capacity-one operations owner.
 `ReplyAdapter`, `Bind`, `Start`, `pending_targets`, manual sorting, raw outbound
 sends, and service-envelope types are gone. The host uses
-`call_blocking_request`, matches every terminal outcome, and rejects partial or
-misrouted reports before producing the public sum. Together the two specimens
+`call_blocking_request`, matches every terminal outcome, and rejects partial,
+reordered, misrouted, or wrong-value reports before producing the public sum.
+Together the two specimens
 close the motivating scatter/gather example cohort.
 
 ### 2026-07-11 Bounded shutdown truth across the example corpus

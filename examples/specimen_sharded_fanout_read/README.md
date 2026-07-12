@@ -80,7 +80,7 @@ What feels better:
   helper makes that a typed `WrongShard`).
 - **Outcomes are typed for the bad case.** The happy-path here
   fills `Replied`; the typed report still reserves slots for
-  `Full`, `Closed`, `Timeout`, `AggregateTimeout`,
+  `Full`, `Closed`, `Timeout`, `Rejected`, `AggregateTimeout`,
   `MissingShard`. The user can't accidentally smuggle "a slow shard
   is the same as a missing shard" into the aggregate.
 
@@ -89,6 +89,10 @@ What remains explicit:
 - **Targets and time budgets are visible.** The coordinator still builds a
   bounded target list and names per-target plus aggregate deadlines. This is
   intentional pressure policy rather than reply-correlation plumbing.
+
+The same scatter owner and continuation vocabulary is covered across live,
+threaded, multi-shard, and simulator backends by the repository parity suite;
+this specimen exercises the production-shaped threaded multi-shard facade.
 
 ## What this is not
 
