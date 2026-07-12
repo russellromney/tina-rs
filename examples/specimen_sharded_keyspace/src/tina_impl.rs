@@ -245,9 +245,9 @@ pub fn run() -> anyhow::Result<Report> {
 
     // One `Store` per shard, table built over the same ordered shard
     // list. `try_from_placement` runs the registration closure for each
-    // shard and folds any per-shard error into a typed
-    // `ServiceTableBuildError<ThreadedRuntimeError>`, which now impls
-    // `Display + std::error::Error` so `.context(...)` composes cleanly.
+    // shard and folds any per-shard error into a typed table-build error.
+    // The error retains the successfully registered prefix for explicit
+    // settlement and composes with `.context(...)`.
     let placement_for_register = placement.clone();
     let table = ShardServiceTable::try_from_placement(placement.clone(), |shard| {
         runtime.register_with_capacity_on::<Store, Infallible>(

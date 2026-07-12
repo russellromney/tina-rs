@@ -1,15 +1,15 @@
 //! Sharded service contracts.
 //!
 //! Small Seastar-shaped local multi-shard primitives. These helpers are
-//! contracts only: a deterministic key-to-shard map, a typed `ShardId ->
-//! Address` table, a partial-aggregate report shape for bounded
+//! contracts only: a deterministic key-to-shard map, typed raw and
+//! request-service `ShardId -> Address` tables, a partial-aggregate report shape for bounded
 //! scatter/gather, and a caller-owned hot-key attempt report. They do **not**
 //! carry distributed-database, consensus, remoting, retry, or rebalancing
 //! semantics. Placement, pressure, and partial failure stay user-visible.
 //!
 //! See `docs/tina-user-guide/10-service-patterns.md` for the surrounding
 //! shape: the registry maps a service name to one address; the address may
-//! resolve through a [`ShardServiceTable`].
+//! resolve through a [`ShardServiceTable`] or [`ShardRequestServiceTable`].
 //!
 //! Near-grug: key bytes choose shard. Shard owns state. Owner re-checks the
 //! key before mutate. Fanout is bounded. Aggregate says partial truth.
@@ -354,7 +354,7 @@ impl fmt::Display for WrongShard {
 
 impl Error for WrongShard {}
 
-/// Returned when a [`ShardServiceTable`] lookup names a shard that is not in
+/// Returned when a sharded service-table lookup names a shard that is not in
 /// the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MissingShard(pub ShardId);
@@ -367,7 +367,7 @@ impl fmt::Display for MissingShard {
 
 impl Error for MissingShard {}
 
-/// Errors when constructing a [`ShardServiceTable`].
+/// Errors when constructing a sharded service table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShardServiceTableError {
     /// The entries list shard ids did not match the placement shard list,
@@ -377,6 +377,14 @@ pub enum ShardServiceTableError {
         placement: Vec<ShardId>,
         /// The entries' ordered shard list.
         entries: Vec<ShardId>,
+    },
+    /// An entry's declared shard did not match the shard carried by its
+    /// address.
+    AddressShardMismatch {
+        /// The shard declared by the entry.
+        entry: ShardId,
+        /// The shard carried by the address capability.
+        address: ShardId,
     },
 }
 
@@ -389,47 +397,194 @@ impl fmt::Display for ShardServiceTableError {
                     "shard service table entries {entries:?} do not match placement {placement:?}"
                 )
             }
+            Self::AddressShardMismatch { entry, address } => write!(
+                f,
+                "shard service table entry {} carries an address for shard {}",
+                entry.get(),
+                address.get()
+            ),
         }
     }
 }
 
 impl Error for ShardServiceTableError {}
 
-/// Errors returned by [`ShardServiceTable::try_from_placement`].
+/// Errors returned while building a sharded service table from a placement.
 ///
 /// `E` is the registration-closure error type (e.g.
-/// `ThreadedRuntimeError`). `Register(e)` carries it through;
-/// `Table(e)` is a structural mismatch from
-/// [`ShardServiceTable::new`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ServiceTableBuildError<E> {
+/// `ThreadedRuntimeError`) and `A` is its address capability. Both variants
+/// return every capability registered before the failure. Registration has
+/// runtime effects that a table helper cannot roll back; retaining the partial
+/// entries lets the caller stop or otherwise settle those services.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ServiceTableBuildError<E, A> {
     /// One of the per-shard registrations failed.
-    Register(E),
-    /// The structural `new` invariant rejected the assembled entries.
-    Table(ShardServiceTableError),
+    Register {
+        /// The shard whose registration failed.
+        shard: ShardId,
+        /// The registration error.
+        source: E,
+        /// Successfully registered capabilities, in placement order.
+        registered: Vec<(ShardId, A)>,
+    },
+    /// A structural table invariant rejected the assembled entries.
+    Table {
+        /// The structural error.
+        source: ShardServiceTableError,
+        /// Every capability produced by the registration closure.
+        registered: Vec<(ShardId, A)>,
+    },
 }
 
-impl<E: fmt::Display> fmt::Display for ServiceTableBuildError<E> {
+impl<E: fmt::Debug, A> fmt::Debug for ServiceTableBuildError<E, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Register(e) => write!(f, "shard registration failed: {e}"),
-            Self::Table(e) => write!(f, "{e}"),
+            Self::Register {
+                shard,
+                source,
+                registered,
+            } => f
+                .debug_struct("Register")
+                .field("shard", shard)
+                .field("source", source)
+                .field(
+                    "registered_shards",
+                    &registered
+                        .iter()
+                        .map(|(shard, _)| shard)
+                        .collect::<Vec<_>>(),
+                )
+                .finish(),
+            Self::Table { source, registered } => f
+                .debug_struct("Table")
+                .field("source", source)
+                .field(
+                    "registered_shards",
+                    &registered
+                        .iter()
+                        .map(|(shard, _)| shard)
+                        .collect::<Vec<_>>(),
+                )
+                .finish(),
         }
     }
 }
 
-impl<E: Error + 'static> Error for ServiceTableBuildError<E> {
+impl<E: fmt::Display, A> fmt::Display for ServiceTableBuildError<E, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Register { shard, source, .. } => {
+                write!(f, "registration on shard {} failed: {source}", shard.get())
+            }
+            Self::Table { source, .. } => write!(f, "{source}"),
+        }
+    }
+}
+
+impl<E: Error + 'static, A> Error for ServiceTableBuildError<E, A> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Register(e) => Some(e),
-            Self::Table(e) => Some(e),
+            Self::Register { source, .. } => Some(source),
+            Self::Table { source, .. } => Some(source),
         }
     }
 }
 
-impl<E> From<ShardServiceTableError> for ServiceTableBuildError<E> {
-    fn from(err: ShardServiceTableError) -> Self {
-        Self::Table(err)
+#[derive(Debug, Clone)]
+struct OrderedShardTable<A> {
+    placement: ShardPlacement,
+    addresses: Vec<A>,
+    index: BTreeMap<ShardId, usize>,
+}
+
+impl<A> OrderedShardTable<A> {
+    fn new(
+        placement: ShardPlacement,
+        entries: Vec<(ShardId, A)>,
+        address_shard: impl Fn(&A) -> ShardId,
+    ) -> Result<Self, ShardServiceTableError> {
+        let entry_shards: Vec<ShardId> = entries.iter().map(|(shard, _)| *shard).collect();
+        if entry_shards != placement.shards() {
+            return Err(ShardServiceTableError::ShardListMismatch {
+                placement: placement.shards().to_vec(),
+                entries: entry_shards,
+            });
+        }
+        for (entry, address) in &entries {
+            let address = address_shard(address);
+            if *entry != address {
+                return Err(ShardServiceTableError::AddressShardMismatch {
+                    entry: *entry,
+                    address,
+                });
+            }
+        }
+
+        let mut addresses = Vec::with_capacity(entries.len());
+        let mut index = BTreeMap::new();
+        for (offset, (shard, address)) in entries.into_iter().enumerate() {
+            addresses.push(address);
+            index.insert(shard, offset);
+        }
+        Ok(Self {
+            placement,
+            addresses,
+            index,
+        })
+    }
+
+    fn address_for(&self, shard: ShardId) -> Result<&A, MissingShard> {
+        self.index
+            .get(&shard)
+            .map(|offset| &self.addresses[*offset])
+            .ok_or(MissingShard(shard))
+    }
+
+    fn address_for_bytes(&self, key: &[u8]) -> &A {
+        let owner = self.placement.owner_for_bytes(key);
+        self.address_for(owner)
+            .expect("placement owner is in service table index")
+    }
+
+    fn from_placement(
+        placement: ShardPlacement,
+        mut register: impl FnMut(ShardId) -> A,
+        address_shard: impl Fn(&A) -> ShardId,
+    ) -> Result<Self, ServiceTableBuildError<Infallible, A>>
+    where
+        A: Clone,
+    {
+        Self::try_from_placement(placement, |shard| Ok(register(shard)), address_shard)
+    }
+
+    fn try_from_placement<E>(
+        placement: ShardPlacement,
+        mut register: impl FnMut(ShardId) -> Result<A, E>,
+        address_shard: impl Fn(&A) -> ShardId,
+    ) -> Result<Self, ServiceTableBuildError<E, A>>
+    where
+        A: Clone,
+    {
+        let mut entries = Vec::with_capacity(placement.shards().len());
+        for shard in placement.shards().iter().copied() {
+            match register(shard) {
+                Ok(address) => entries.push((shard, address)),
+                Err(source) => {
+                    return Err(ServiceTableBuildError::Register {
+                        shard,
+                        source,
+                        registered: entries,
+                    });
+                }
+            }
+        }
+        match Self::new(placement, entries.clone(), address_shard) {
+            Ok(table) => Ok(table),
+            Err(source) => Err(ServiceTableBuildError::Table {
+                source,
+                registered: entries,
+            }),
+        }
     }
 }
 
@@ -450,39 +605,22 @@ impl<E> From<ShardServiceTableError> for ServiceTableBuildError<E> {
 /// refactor that breaks the parallel-array invariant fails loudly.
 #[derive(Debug, Clone)]
 pub struct ShardServiceTable<M: 'static, R: 'static = ()> {
-    placement: ShardPlacement,
-    addresses: Vec<Address<M, R>>,
-    index: BTreeMap<ShardId, usize>,
+    inner: OrderedShardTable<Address<M, R>>,
 }
 
 impl<M: 'static, R: 'static> ShardServiceTable<M, R> {
     /// Creates a service table over the given placement and entries.
     ///
     /// The entries' shard ids must match the placement's shard list in the
-    /// same order. Returns [`ShardServiceTableError::ShardListMismatch`]
-    /// otherwise. This is a build-time invariant, not a runtime probe.
+    /// same order, and each address must carry the shard declared by its
+    /// entry. Returns a typed [`ShardServiceTableError`] otherwise. This is a
+    /// build-time invariant, not a runtime probe.
     pub fn new(
         placement: ShardPlacement,
         entries: Vec<(ShardId, Address<M, R>)>,
     ) -> Result<Self, ShardServiceTableError> {
-        let entry_shards: Vec<ShardId> = entries.iter().map(|(s, _)| *s).collect();
-        if entry_shards != placement.shards() {
-            return Err(ShardServiceTableError::ShardListMismatch {
-                placement: placement.shards().to_vec(),
-                entries: entry_shards,
-            });
-        }
-        let mut addresses = Vec::with_capacity(entries.len());
-        let mut index = BTreeMap::new();
-        for (i, (shard, address)) in entries.into_iter().enumerate() {
-            addresses.push(address);
-            index.insert(shard, i);
-        }
-        Ok(Self {
-            placement,
-            addresses,
-            index,
-        })
+        OrderedShardTable::new(placement, entries, |address| address.shard())
+            .map(|inner| Self { inner })
     }
 
     /// Builds a service table by registering one address per shard via
@@ -495,20 +633,19 @@ impl<M: 'static, R: 'static> ShardServiceTable<M, R> {
     ///     runtime.register_with_capacity_on::<Store, _>(shard, Store::new(), 32)
     /// })?;
     /// ```
+    ///
+    /// Structural failure returns every registered address through
+    /// [`ServiceTableBuildError::Table`]; registration cannot be rolled back
+    /// by this helper.
     pub fn from_placement<F>(
         placement: ShardPlacement,
-        mut register: F,
-    ) -> Result<Self, ShardServiceTableError>
+        register: F,
+    ) -> Result<Self, ServiceTableBuildError<Infallible, Address<M, R>>>
     where
         F: FnMut(ShardId) -> Address<M, R>,
     {
-        let entries: Vec<(ShardId, Address<M, R>)> = placement
-            .shards()
-            .iter()
-            .copied()
-            .map(|s| (s, register(s)))
-            .collect();
-        Self::new(placement, entries)
+        OrderedShardTable::from_placement(placement, register, |address| address.shard())
+            .map(|inner| Self { inner })
     }
 
     /// Same as [`Self::from_placement`] but the registration closure
@@ -521,30 +658,29 @@ impl<M: 'static, R: 'static> ShardServiceTable<M, R> {
     ///     runtime.register_with_capacity_on::<Store, _>(shard, Store::new(), 32)
     /// })?;
     /// ```
+    ///
+    /// Either failure variant returns the successfully registered prefix so
+    /// the caller can settle those services.
     pub fn try_from_placement<F, E>(
         placement: ShardPlacement,
-        mut register: F,
-    ) -> Result<Self, ServiceTableBuildError<E>>
+        register: F,
+    ) -> Result<Self, ServiceTableBuildError<E, Address<M, R>>>
     where
         F: FnMut(ShardId) -> Result<Address<M, R>, E>,
     {
-        let mut entries = Vec::with_capacity(placement.shards().len());
-        for shard in placement.shards().iter().copied() {
-            let address = register(shard).map_err(ServiceTableBuildError::Register)?;
-            entries.push((shard, address));
-        }
-        Self::new(placement, entries).map_err(ServiceTableBuildError::Table)
+        OrderedShardTable::try_from_placement(placement, register, |address| address.shard())
+            .map(|inner| Self { inner })
     }
 
     /// Returns the underlying placement.
     pub fn placement(&self) -> &ShardPlacement {
-        &self.placement
+        &self.inner.placement
     }
 
     /// Returns the ordered address list, parallel to
     /// `placement().shards()`.
     pub fn addresses(&self) -> &[Address<M, R>] {
-        &self.addresses
+        &self.inner.addresses
     }
 
     /// Looks up the address for `shard`, or returns [`MissingShard`].
@@ -552,10 +688,7 @@ impl<M: 'static, R: 'static> ShardServiceTable<M, R> {
     where
         Address<M, R>: Copy,
     {
-        match self.index.get(&shard) {
-            Some(i) => Ok(self.addresses[*i]),
-            None => Err(MissingShard(shard)),
-        }
+        self.inner.address_for(shard).copied()
     }
 
     /// Returns the service address that owns the given byte key.
@@ -571,12 +704,7 @@ impl<M: 'static, R: 'static> ShardServiceTable<M, R> {
     where
         Address<M, R>: Copy,
     {
-        let owner = self.placement.owner_for_bytes(key);
-        let i = *self
-            .index
-            .get(&owner)
-            .expect("placement owner is in service table index");
-        self.addresses[i]
+        *self.inner.address_for_bytes(key)
     }
 
     /// Returns the service address that owns the given string key.
@@ -584,6 +712,101 @@ impl<M: 'static, R: 'static> ShardServiceTable<M, R> {
     where
         Address<M, R>: Copy,
     {
+        self.address_for_bytes(key.as_bytes())
+    }
+}
+
+/// Ordered shard map for typed request-service capabilities.
+///
+/// This is the request-only companion to [`ShardServiceTable`]. It preserves
+/// [`tina::ServiceRequestAddress`] through placement lookup, so application
+/// code never has to expose the internal [`tina::ServiceMessage`] envelope or
+/// downgrade a request service to a raw [`Address`]. The default `Event =
+/// Infallible` is the canonical request-only form; the third generic preserves
+/// the request lane of a split service when needed. The table has the same
+/// fixed construction, lookup, and restart-generation contract as
+/// [`ShardServiceTable`].
+#[derive(Debug, Clone)]
+pub struct ShardRequestServiceTable<Request: 'static, Reply: 'static, Event: 'static = Infallible> {
+    inner: OrderedShardTable<tina::ServiceRequestAddress<Event, Request, Reply>>,
+}
+
+impl<Request: 'static, Reply: 'static, Event: 'static>
+    ShardRequestServiceTable<Request, Reply, Event>
+{
+    /// Creates a request-service table whose ordered shard ids exactly match
+    /// `placement.shards()` and whose capabilities carry those same shards.
+    pub fn new(
+        placement: ShardPlacement,
+        entries: Vec<(ShardId, tina::ServiceRequestAddress<Event, Request, Reply>)>,
+    ) -> Result<Self, ShardServiceTableError> {
+        OrderedShardTable::new(placement, entries, |address| {
+            address.address().address().shard()
+        })
+        .map(|inner| Self { inner })
+    }
+
+    /// Builds a table by registering one request capability per shard.
+    /// Structural failure returns every registered capability.
+    pub fn from_placement<F>(
+        placement: ShardPlacement,
+        register: F,
+    ) -> Result<
+        Self,
+        ServiceTableBuildError<Infallible, tina::ServiceRequestAddress<Event, Request, Reply>>,
+    >
+    where
+        F: FnMut(ShardId) -> tina::ServiceRequestAddress<Event, Request, Reply>,
+    {
+        OrderedShardTable::from_placement(placement, register, |address| {
+            address.address().address().shard()
+        })
+        .map(|inner| Self { inner })
+    }
+
+    /// Builds a table with a fallible per-shard registration closure.
+    /// Either failure variant returns the successfully registered prefix.
+    pub fn try_from_placement<F, E>(
+        placement: ShardPlacement,
+        register: F,
+    ) -> Result<Self, ServiceTableBuildError<E, tina::ServiceRequestAddress<Event, Request, Reply>>>
+    where
+        F: FnMut(ShardId) -> Result<tina::ServiceRequestAddress<Event, Request, Reply>, E>,
+    {
+        OrderedShardTable::try_from_placement(placement, register, |address| {
+            address.address().address().shard()
+        })
+        .map(|inner| Self { inner })
+    }
+
+    /// Returns the placement that defines this table's shard order.
+    pub fn placement(&self) -> &ShardPlacement {
+        &self.inner.placement
+    }
+
+    /// Returns request capabilities parallel to `placement().shards()`.
+    pub fn addresses(&self) -> &[tina::ServiceRequestAddress<Event, Request, Reply>] {
+        &self.inner.addresses
+    }
+
+    /// Looks up a request capability by shard.
+    pub fn address_for(
+        &self,
+        shard: ShardId,
+    ) -> Result<tina::ServiceRequestAddress<Event, Request, Reply>, MissingShard> {
+        self.inner.address_for(shard).copied()
+    }
+
+    /// Returns the request capability that owns `key`.
+    pub fn address_for_bytes(
+        &self,
+        key: &[u8],
+    ) -> tina::ServiceRequestAddress<Event, Request, Reply> {
+        *self.inner.address_for_bytes(key)
+    }
+
+    /// Returns the request capability that owns the string key.
+    pub fn address_for_str(&self, key: &str) -> tina::ServiceRequestAddress<Event, Request, Reply> {
         self.address_for_bytes(key.as_bytes())
     }
 }
@@ -1179,6 +1402,49 @@ mod tests {
                 assert_eq!(placement, shards(&[3, 17]));
                 assert_eq!(entries, shards(&[17, 3]));
             }
+            other => panic!("expected shard-list mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_tables_reject_a_capability_for_the_wrong_shard() {
+        let placement = ShardPlacement::new("p", shards(&[3])).unwrap();
+        let raw = ShardServiceTable::new(
+            placement.clone(),
+            vec![(ShardId::new(3), addr::<u32>(17, 1))],
+        )
+        .unwrap_err();
+        assert_eq!(
+            raw,
+            ShardServiceTableError::AddressShardMismatch {
+                entry: ShardId::new(3),
+                address: ShardId::new(17),
+            }
+        );
+
+        let request = ShardRequestServiceTable::<u32, u64>::new(
+            placement,
+            vec![(ShardId::new(3), request_addr(17, 1))],
+        )
+        .unwrap_err();
+        assert_eq!(request, raw);
+
+        let placement = ShardPlacement::new("built", shards(&[3])).unwrap();
+        let built = ShardRequestServiceTable::<u32, u64>::from_placement(placement, |_| {
+            request_addr(17, 2)
+        })
+        .unwrap_err();
+        match built {
+            ServiceTableBuildError::Table { source, registered } => {
+                assert_eq!(source, raw);
+                assert_eq!(registered.len(), 1);
+                assert_eq!(registered[0].0, ShardId::new(3));
+                assert_eq!(
+                    registered[0].1.address().address().shard(),
+                    ShardId::new(17)
+                );
+            }
+            other => panic!("expected Table, got {other:?}"),
         }
     }
 
@@ -1194,6 +1460,126 @@ mod tests {
             table.address_for(ShardId::new(99)).unwrap_err(),
             MissingShard(ShardId::new(99))
         );
+    }
+
+    #[test]
+    fn request_service_table_preserves_capability_and_placement_order() {
+        let placement = ShardPlacement::new("requests", shards(&[3, 17, 91])).unwrap();
+        let table =
+            ShardRequestServiceTable::<u32, u64>::from_placement(placement.clone(), |shard| {
+                request_addr(shard.get(), u64::from(shard.get()) + 100)
+            })
+            .unwrap();
+
+        assert_eq!(table.placement().shards(), placement.shards());
+        let _: tina::ServiceRequestAddress<Infallible, u32, u64> =
+            table.address_for(ShardId::new(17)).unwrap();
+        assert_eq!(
+            table
+                .address_for(ShardId::new(17))
+                .unwrap()
+                .address()
+                .address()
+                .isolate(),
+            tina::IsolateId::new(117)
+        );
+        assert_eq!(
+            table.address_for(ShardId::new(99)).unwrap_err(),
+            MissingShard(ShardId::new(99))
+        );
+        for key in ["alpha", "beta", "gamma"] {
+            assert_eq!(
+                table.address_for_str(key).address().address().shard(),
+                placement.owner_for_str(key)
+            );
+        }
+    }
+
+    #[test]
+    fn request_service_table_also_preserves_a_split_service_request_lane() {
+        enum Event {}
+
+        let placement = ShardPlacement::new("split", shards(&[3])).unwrap();
+        let table =
+            ShardRequestServiceTable::<u32, u64, Event>::from_placement(placement, |shard| {
+                split_request_addr(shard.get(), 41)
+            })
+            .unwrap();
+        let _: tina::ServiceRequestAddress<Event, u32, u64> =
+            table.address_for(ShardId::new(3)).unwrap();
+    }
+
+    #[test]
+    fn request_service_table_captures_generation_until_rebuilt() {
+        let placement = ShardPlacement::new("restart", shards(&[3])).unwrap();
+        let original = ShardRequestServiceTable::<u32, u64>::new(
+            placement.clone(),
+            vec![(ShardId::new(3), request_addr_generation(3, 41, 7))],
+        )
+        .unwrap();
+        let rebuilt = ShardRequestServiceTable::<u32, u64>::new(
+            placement,
+            vec![(ShardId::new(3), request_addr_generation(3, 41, 8))],
+        )
+        .unwrap();
+
+        assert_eq!(
+            original
+                .address_for(ShardId::new(3))
+                .unwrap()
+                .address()
+                .generation(),
+            tina::AddressGeneration::new(7)
+        );
+        assert_eq!(
+            rebuilt
+                .address_for(ShardId::new(3))
+                .unwrap()
+                .address()
+                .generation(),
+            tina::AddressGeneration::new(8)
+        );
+    }
+
+    #[test]
+    fn request_service_table_rejects_mismatch_and_propagates_registration_error() {
+        let placement = ShardPlacement::new("requests", shards(&[3, 17])).unwrap();
+        let mismatch = ShardRequestServiceTable::<u32, u64>::new(
+            placement.clone(),
+            vec![
+                (ShardId::new(17), request_addr(17, 1)),
+                (ShardId::new(3), request_addr(3, 2)),
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            mismatch,
+            ShardServiceTableError::ShardListMismatch { .. }
+        ));
+
+        let registration =
+            ShardRequestServiceTable::<u32, u64>::try_from_placement(placement, |shard| {
+                if shard == ShardId::new(17) {
+                    Err("worker stopped")
+                } else {
+                    Ok(request_addr(shard.get(), 1))
+                }
+            })
+            .unwrap_err();
+        match registration {
+            ServiceTableBuildError::Register {
+                shard,
+                source,
+                registered,
+            } => {
+                assert_eq!(shard, ShardId::new(17));
+                assert_eq!(source, "worker stopped");
+                assert_eq!(registered.len(), 1);
+                assert_eq!(registered[0].0, ShardId::new(3));
+                assert_eq!(registered[0].1.address().address().shard(), ShardId::new(3));
+            }
+            other => panic!("expected Register, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1235,7 +1621,15 @@ mod tests {
         })
         .unwrap_err();
         match err {
-            ServiceTableBuildError::Register(e) => assert_eq!(e, "dead worker"),
+            ServiceTableBuildError::Register {
+                shard,
+                source,
+                registered,
+            } => {
+                assert_eq!(shard, ShardId::new(17));
+                assert_eq!(source, "dead worker");
+                assert_eq!(registered, vec![(ShardId::new(3), addr::<u32>(3, 1))]);
+            }
             other => panic!("expected Register, got {other:?}"),
         }
     }
@@ -1421,6 +1815,41 @@ mod tests {
 
     fn addr<M: 'static>(shard: u32, isolate: u64) -> Address<M> {
         Address::new(ShardId::new(shard), tina::IsolateId::new(isolate))
+    }
+
+    fn request_addr<Request: 'static, Reply: 'static>(
+        shard: u32,
+        isolate: u64,
+    ) -> tina::ServiceRequestAddress<Infallible, Request, Reply> {
+        request_addr_generation(shard, isolate, 0)
+    }
+
+    fn request_addr_generation<Request: 'static, Reply: 'static>(
+        shard: u32,
+        isolate: u64,
+        generation: u64,
+    ) -> tina::ServiceRequestAddress<Infallible, Request, Reply> {
+        split_request_addr_generation(shard, isolate, generation)
+    }
+
+    fn split_request_addr<Event: 'static, Request: 'static, Reply: 'static>(
+        shard: u32,
+        isolate: u64,
+    ) -> tina::ServiceRequestAddress<Event, Request, Reply> {
+        split_request_addr_generation(shard, isolate, 0)
+    }
+
+    fn split_request_addr_generation<Event: 'static, Request: 'static, Reply: 'static>(
+        shard: u32,
+        isolate: u64,
+        generation: u64,
+    ) -> tina::ServiceRequestAddress<Event, Request, Reply> {
+        let address = Address::<tina::ServiceMessage<Event, Request>, Reply>::new_with_generation(
+            ShardId::new(shard),
+            tina::IsolateId::new(isolate),
+            tina::AddressGeneration::new(generation),
+        );
+        tina::ServiceRequestAddress::from_call_address(address.callable())
     }
 
     // ---- Proptest: placement properties over random shard lists + keys ----
