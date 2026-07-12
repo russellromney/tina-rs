@@ -18,11 +18,14 @@ holder is still installed, the lock hands off to the next FIFO waiter
 
 Caps in this specimen:
 
-- `pending_capacity` — total parked acquire-callers across every key
-  (one bounded `PendingReplies`).
-- `max_waiters_per_key` — per-key wait queue length.
+- `waiter_capacity` — total parked acquire-callers across every key.
+- `max_waiters_per_key` — per-key FIFO capacity. `SharedWork` owns both
+  limits and returns typed `GlobalFull` / `KeyFull` replies.
 - `max_keys` — number of active keys with a holder or waiters.
 - `mailbox` — lock manager mailbox capacity.
+
+Zero-valued bounded-shape fields are rejected through the fallible run path
+before the service is registered.
 
 ## Run
 
@@ -31,7 +34,7 @@ cargo run  --manifest-path examples/systems/system_lock_manager/Cargo.toml
 cargo test --manifest-path examples/systems/system_lock_manager/Cargo.toml
 ```
 
-The smoke suite exercises five behaviours:
+The smoke suite exercises nine behaviours:
 
 1. **FIFO fairness** — four contenders queue behind a host-held key;
    admission order matches grant order.
@@ -43,8 +46,19 @@ The smoke suite exercises five behaviours:
 4. **Stale release rejected** — releasing the same handle twice is
    rejected on the second call.
 5. **Per-key overflow** — bursting more contenders than
-   `max_waiters_per_key` drains the surplus to `Busy` without
-   consuming pending slots.
+   `max_waiters_per_key` returns `Busy(KeyFull)` without consuming the
+   remaining global capacity.
+6. **Global overflow** — two independently held keys prove
+   `Busy(GlobalFull)` is distinct from per-key pressure.
+7. **Caller-gone refill** — a timed-out FIFO head is reclaimed and a new
+   caller reuses the exact capacity-one slot before hand-off.
+8. **Keyspace overflow** — a new key is rejected at `max_keys` while the
+   existing holder remains valid.
+9. **Fallible bounded shape** — zero capacity is returned as configuration
+   failure instead of reaching a constructor panic.
+
+A focused unit probe injects `CallError::TimerFull` and proves the lease state
+is unchanged while the exact typed error is retained in statistics.
 
 ## Findings
 
@@ -54,9 +68,9 @@ What felt good:
   handle, and expiry processing is one equality check. In a Tokio
   build this would be `JoinHandle::abort` plus a oneshot cancel
   channel; here the wake just gets ignored.
-- `PendingReplies::try_insert` with a manual waiter id worked well for
-  parking acquire-callers behind one global cap. The same table
-  protects every key.
+- `SharedWork::with_key_limit` is the complete lock-waiter vocabulary:
+  `wait` consumes `RequestCall` authority, `take_next` selects the oldest
+  live caller, and one table owns FIFO order, both caps, and reclamation.
 - The `(key, holder_id)` pair is enough for stale-handle detection;
   `holder_id` is monotonic and never reused.
 - Hand-off as a single helper used by both release and expiry paths
@@ -64,33 +78,27 @@ What felt good:
 - The split-service shape made the public surface much cleaner:
   `LockRequest` is callable, private `LockEvent::LeaseExpired` is an
   internal continuation, and host code uses `call_blocking_request`.
-  Stale-handle detection stays trivial: the slot is either in the
-  pending box or it isn't.
+  Stale-handle detection stays trivial: the holder generation either
+  matches or it does not.
+- `LocalSystem` supplies every host operation this specimen needs:
+  fallible startup, split registration, typed blocking request calls,
+  shared shutdown control, and a clean terminal report.
+- Carrying `SleepReply` into `LeaseExpired` makes timer admission failure
+  visible and typed instead of treating every continuation as a wake.
 - The compiler caught mistakes fast. `Effect<I>` typing meant pasting
   the wrong reply variant failed loudly; `RequestEffect<I>` now means
   forgetting to consume `RequestCall` fails before runtime.
 
 What felt rough:
-- Per-key wait queue length is a hand-rolled `VecDeque<u64>` next to a
-  global `PendingReplies`, including the "skip waiters whose slot was
-  reclaimed" loop. Same shape as `system_cache_with_fill`. Promoted to
-  `examples/FINDINGS.md` as a `SharedWork` helper candidate.
 - Lease bookkeeping is two unrelated `u64`s (`holder_id`,
   `expiry_token`) that have to be bumped in lockstep at the right
   times (new acquire, renew, hand-off). Easy to mis-pair if a future
   change forgets to bump one. A typed `Lease` newtype with one
   `bump()` would make this a compile-time invariant instead of a
   discipline thing. Local to this specimen for now.
-- Parking a waiter now goes through `RequestCall::capture(...)`, which
-  is safer than raw `CallContext::into_request_context()`, but still
-  makes the `PendingReplies` insertion ceremony visible.
-- Whether a single global `PendingReplies` cap is the right shape for
-  a lock manager is genuinely unclear. One noisy key can starve
-  waiters on every other key. A real lock manager probably wants the
-  per-key cap as primary admission control and a global cap only as
-  a backstop. Followed the prompt's "every wait queue and per-isolate
-  map needs a cap" but flagging the sharing pattern as worth more
-  thought for non-toy versions.
+- The global cap remains a deliberate backstop shared by all keys. One
+  hot key can consume it up to its per-key limit; production tuning must
+  choose the per-key cap with that fairness policy in mind.
 
 What felt rough in the smoke harness, not the framework:
 - The contended-FIFO test needed a sequential admission gate
@@ -106,13 +114,13 @@ What felt rough in the smoke harness, not the framework:
   sharp edge for test design.
 
 Tina capability pulled:
-- Bounded deferred replies (`PendingReplies`).
-- Explicit caller authority (`CallContext`).
-- Runtime-owned time (`sleep().then(...)`).
+- Bounded keyed FIFO hand-off (`SharedWork`).
+- Linear caller authority (`RequestCall`).
+- Runtime-owned time with typed completion (`sleep().then_service_event(...)`).
 - Generation-stamped messages for stale-event dedup.
+- Fallible `LocalSystem` ownership and truthful bounded shutdown.
 
 Suggested follow-up:
-- See `examples/FINDINGS.md` items for the cross-system patterns.
 - Local: try a `Lease` newtype if a future change to this specimen
   forces a third bump-site for `expiry_token`.
 

@@ -11,6 +11,26 @@ valid; the long-form history lives in
 
 ## Active
 
+### 2026-07-12 Lock-manager keyed FIFO canonicalization
+
+Migrated `system_lock_manager` from the historical
+`PendingReplies<u64, LockReply>` + monotonic waiter ids + per-lock
+`VecDeque<u64>` sidecar onto `SharedWork<String, LockReply>`. The specimen now
+uses `with_key_limit`, `wait`, and `take_next`; the helper owns FIFO order,
+global and per-key admission, caller-gone reclamation, and exact occupancy.
+`SharedWorkError::Full` and `KeyFull` remain distinct as
+`Busy(GlobalFull)` and `Busy(KeyFull)` rather than collapsing terminal
+pressure. The host is now a fallible `LocalSystem`, and lease continuations
+carry and exhaustively handle `SleepReply`.
+
+Direct live coverage proves FIFO hand-off, capacity-one caller-timeout
+reclamation and refill, distinct global/per-key Full rails, keyspace Full,
+release and expiry hand-off, renew plus stale timer suppression, stale
+release/renew rejection, zero final waiter/key occupancy, and clean bounded
+shutdown. A focused unit probe proves typed timer failure does not mutate
+lease ownership. This fully applies closed finding 21 to its remaining
+motivating specimen; no new framework gap surfaced.
+
 ### 2026-07-11 Bounded shutdown truth across the example corpus
 
 Migrated production examples away from exclusive-`Arc` teardown and
