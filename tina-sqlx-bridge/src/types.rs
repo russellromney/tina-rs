@@ -1172,8 +1172,9 @@ impl PgPoolConfig {
 pub struct PgConfig {
     /// SQLx pool settings. `None` means the worker must be installed
     /// with a caller-supplied `sqlx::PgPool` via
-    /// [`crate::PgWorker::install_with_pool`]; passing it to the
-    /// config-built [`crate::PgWorker::install`] path returns
+    /// [`crate::PgWorker::install_with_pool`] or
+    /// [`crate::PgWorker::install_local_with_pool`]; passing it to either
+    /// config-built install path returns
     /// [`crate::InstallError::MissingPoolConfig`].
     pub pool: Option<PgPoolConfig>,
     /// Worker mailbox capacity (Tina ingress). Past this, callers see
@@ -1205,8 +1206,9 @@ pub struct PgConfig {
     /// `None`; `Some` validates but is not honored until a quarantine-based
     /// cancel path exists.
     ///
-    /// **Only honored on [`crate::PgWorker::install`].** The
-    /// supplied-pool path ([`crate::PgWorker::install_with_pool`])
+    /// **Only validated on the config-built install paths.** The supplied-pool
+    /// paths ([`crate::PgWorker::install_with_pool`] and
+    /// [`crate::PgWorker::install_local_with_pool`])
     /// silently ignores this field — the bridge cannot construct a
     /// sidecar pool without an owned URL, and the caller already
     /// owns connection lifetimes.
@@ -1219,7 +1221,8 @@ pub struct PgConfig {
 impl PgConfig {
     /// Conservative defaults targeting "small, visible, bounded."
     /// `pool` is `None`; either set it via [`Self::with_pool`] or use
-    /// [`crate::PgWorker::install_with_pool`].
+    /// [`crate::PgWorker::install_with_pool`] or
+    /// [`crate::PgWorker::install_local_with_pool`].
     pub fn new() -> Self {
         Self {
             pool: None,
@@ -1245,7 +1248,7 @@ impl PgConfig {
         Self::new()
     }
 
-    /// Sets `pool` so [`crate::PgWorker::install`] can build a pool.
+    /// Sets `pool` so a config-built install can build a pool.
     pub fn with_pool(mut self, pool: PgPoolConfig) -> Self {
         self.pool = Some(pool);
         self
@@ -1288,9 +1291,10 @@ impl PgConfig {
     }
 
     /// Records a future DB-side cancellation preference. This is a
-    /// compatibility no-op: the bridge validates the config but does not fire
-    /// `pg_cancel_backend(pid)` because the old sidecar path could cancel a
-    /// later query on a reused backend PID.
+    /// compatibility no-op: config-built installs validate the config but the
+    /// bridge does not fire `pg_cancel_backend(pid)` because the old sidecar
+    /// path could cancel a later query on a reused backend PID. Supplied-pool
+    /// installs ignore this pool-specific setting entirely.
     ///
     /// Tina-side timeout still settles the caller promptly, while
     /// the SQLx slot remains occupied until physical terminal.
@@ -1308,8 +1312,8 @@ impl PgConfig {
     }
 
     /// Validates the full config — Tina-side fields plus the
-    /// embedded `pool` config when it is `Some`. Used by
-    /// [`crate::PgWorker::install`] (config-built pool path).
+    /// embedded `pool` and cancel configs when present. Used by the
+    /// config-built pool paths.
     pub fn validate(&self) -> Result<(), PgConfigError> {
         self.validate_tina()?;
         if let Some(pool) = &self.pool {
@@ -1320,14 +1324,19 @@ impl PgConfig {
                 return Err(PgConfigError::ZeroPoolAcquireTimeout);
             }
         }
+        if let Some(cancel) = &self.cancel {
+            if cancel.pool_size == 0 {
+                return Err(PgConfigError::ZeroCancelPoolSize);
+            }
+            if cancel.acquire_timeout.is_zero() {
+                return Err(PgConfigError::ZeroCancelAcquireTimeout);
+            }
+        }
         Ok(())
     }
 
-    /// Validates only the Tina-side fields, ignoring `pool`. Used by
-    /// [`crate::PgWorker::install_with_pool`] where the supplied
-    /// `sqlx::PgPool` owns its SQLx settings — rejecting on
-    /// `PgConfig::pool` here would punish a caller for fields the
-    /// bridge promised not to apply.
+    /// Validates only the Tina-side fields, ignoring `pool` and `cancel`.
+    /// Used by supplied-pool installs where those settings are not applied.
     pub fn validate_tina(&self) -> Result<(), PgConfigError> {
         if self.mailbox_capacity == 0 {
             return Err(PgConfigError::ZeroMailboxCapacity);
@@ -1353,14 +1362,6 @@ impl PgConfig {
         if self.max_response_rows == 0 {
             return Err(PgConfigError::ZeroMaxResponseRows);
         }
-        if let Some(cancel) = &self.cancel {
-            if cancel.pool_size == 0 {
-                return Err(PgConfigError::ZeroCancelPoolSize);
-            }
-            if cancel.acquire_timeout.is_zero() {
-                return Err(PgConfigError::ZeroCancelAcquireTimeout);
-            }
-        }
         Ok(())
     }
 }
@@ -1376,10 +1377,8 @@ impl Default for PgConfig {
 pub enum InstallError {
     /// Config rejected by [`PgConfig::validate`].
     Config(PgConfigError),
-    /// [`crate::PgWorker::install`] was called without
-    /// `config.pool`. Either set the pool config or use
-    /// [`crate::PgWorker::install_with_pool`] with a supplied
-    /// `sqlx::PgPool`.
+    /// A config-built install was called without `config.pool`. Either set the
+    /// pool config or use a supplied-pool install with a `sqlx::PgPool`.
     MissingPoolConfig,
     /// Building the SQLx `PgPool` failed (URL parse, TLS setup,
     /// initial connect failure depending on pool options).
@@ -1395,7 +1394,7 @@ impl std::fmt::Display for InstallError {
         match self {
             Self::Config(e) => write!(f, "pg bridge install: {e}"),
             Self::MissingPoolConfig => f.write_str(
-                "pg bridge install: PgConfig.pool is None; use install_with_pool or set with_pool",
+                "pg bridge install: PgConfig.pool is None; use a supplied-pool install or set with_pool",
             ),
             Self::Pool(source) => write!(f, "pg bridge install: pool: {source}"),
             Self::Runtime(source) => write!(f, "pg bridge install: tokio runtime: {source}"),

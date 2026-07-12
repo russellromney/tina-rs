@@ -13,8 +13,8 @@ use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig,
 };
 use tina_sqlx_bridge::{
-    InstallError, InstalledPgBridge, PgAddress, PgCallOutcome, PgConfig, PgError, PgRequest,
-    PgStep, PgWorker, send_request,
+    InstallError, InstalledPgBridge, PgAddress, PgCallOutcome, PgConfig, PgError, PgPoolConfig,
+    PgRequest, PgStep, PgWorker, send_request,
 };
 
 #[derive(Default)]
@@ -211,6 +211,19 @@ fn install_with_pool_silently_ignores_cancel_config() {
     let cfg = config_for_admission_tests().with_cancel_on_timeout(1);
     let (bridge, _tokio_rt) = install_lazy(&runtime, cfg);
     // The bridge is alive; closing exercises drop ordering.
+    bridge.closer.close();
+    assert_eq!(bridge.metrics.snapshot().db_cancels_sent, 0);
+    shutdown(runtime);
+}
+
+#[test]
+fn install_with_pool_ignores_invalid_pool_and_cancel_only_config() {
+    let runtime = make_runtime();
+    let mut cfg = config_for_admission_tests()
+        .with_pool(PgPoolConfig::new("ignored").with_max_connections(0))
+        .with_cancel_on_timeout(0);
+    cfg.cancel.as_mut().expect("cancel config").acquire_timeout = Duration::ZERO;
+    let (bridge, _tokio_rt) = install_lazy(&runtime, cfg);
     bridge.closer.close();
     assert_eq!(bridge.metrics.snapshot().db_cancels_sent, 0);
     shutdown(runtime);

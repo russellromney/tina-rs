@@ -55,7 +55,10 @@ This file records completed work.
 - The reqwest, SQLite, and SQLx Postgres workers now install directly through
   `LocalSystem` without exposing its lower threaded runtime. The new local
   entry points preserve the existing callable address, closer, metrics, pool
-  ownership, and typed install-error phases.
+  ownership, and typed install-error phases. Saturated registration returns
+  `CommandFull` without leaking a built worker; stopped-worker registration
+  cleans up before returning `WorkerStopped`. SQLx supplied-pool installs
+  ignore pool/cancel construction fields and never close caller pool ownership.
 
 ### Authoritative child-restart observation
 

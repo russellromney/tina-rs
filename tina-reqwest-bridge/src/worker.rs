@@ -138,6 +138,12 @@ pub struct ReqwestWorker<S: Shard + 'static> {
     _shard: PhantomData<S>,
 }
 
+impl<S: Shard + 'static> Drop for ReqwestWorker<S> {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+    }
+}
+
 /// Wraps an owned `tokio::runtime::Runtime` so that drop on the Tina
 /// shard thread returns immediately instead of blocking on pending
 /// tasks.
@@ -910,7 +916,8 @@ impl ReqwestCloser {
         self.closed.store(true, Ordering::Release);
     }
 
-    /// Whether the worker has been closed.
+    /// Whether the worker has been closed or dropped. A failed registration
+    /// drops the fully built worker and therefore also closes retained handles.
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
@@ -1032,6 +1039,38 @@ mod tests {
     use tina::SingleShard;
 
     use super::*;
+
+    #[test]
+    fn rejected_install_drops_built_worker_and_closes_retained_handle() {
+        for expected in [
+            ThreadedRuntimeError::CommandFull,
+            ThreadedRuntimeError::WorkerStopped,
+        ] {
+            let retained = Arc::new(std::sync::Mutex::new(None));
+            let retained_for_register = Arc::clone(&retained);
+            let result = ReqwestWorker::<SingleShard>::install_via(
+                ReqwestConfig::default(),
+                move |worker, _| {
+                    *retained_for_register.lock().expect("retained closer") = Some(worker.closer());
+                    Err(expected)
+                },
+            );
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("registration rejection must fail install"),
+            };
+            assert!(matches!(error, InstallError::Register(error) if error == expected));
+            assert!(
+                retained
+                    .lock()
+                    .expect("retained closer")
+                    .take()
+                    .expect("closer captured before registration")
+                    .is_closed(),
+                "failed registration must drop the fully built worker"
+            );
+        }
+    }
 
     #[test]
     fn closed_result_channel_is_internal_and_never_retried() {

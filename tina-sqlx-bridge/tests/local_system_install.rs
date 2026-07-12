@@ -1,15 +1,43 @@
+use std::convert::Infallible;
 use std::error::Error as _;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use sqlx::postgres::PgPoolOptions;
 use tina::prelude::*;
 use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, ThreadedRuntimeError};
-use tina_sqlx_bridge::{InstallError, PgConfig, PgError, PgMsg, PgRequest, PgWorker};
+use tina_sqlx_bridge::{InstallError, PgConfig, PgError, PgMsg, PgPoolConfig, PgRequest, PgWorker};
 
 fn system() -> LocalSystem<SingleShard, DefaultThreadedMailboxFactory> {
     LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
         .try_build()
         .expect("start local system")
+}
+
+#[derive(Debug)]
+enum GateMsg {
+    Hold,
+}
+
+struct Gate {
+    entered: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+}
+
+#[tina_runtime::isolate(message = GateMsg)]
+impl Gate {
+    fn handle(
+        &mut self,
+        _message: GateMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        self.entered.store(true, Ordering::Release);
+        while !self.release.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        noop()
+    }
 }
 
 fn lazy_pool() -> (sqlx::PgPool, tokio::runtime::Runtime) {
@@ -34,9 +62,18 @@ fn lazy_pool() -> (sqlx::PgPool, tokio::runtime::Runtime) {
 fn install_local_with_pool_returns_callable_address_closer_metrics_and_clean_shutdown() {
     let app = system();
     let (pool, tokio_runtime) = lazy_pool();
+    let mut config = PgConfig::bridge_only()
+        .with_poll_interval(Duration::from_millis(1))
+        .with_pool(PgPoolConfig::new("ignored").with_max_connections(0))
+        .with_cancel_on_timeout(0);
+    config
+        .cancel
+        .as_mut()
+        .expect("cancel config")
+        .acquire_timeout = Duration::ZERO;
     let bridge = PgWorker::<SingleShard>::install_local_with_pool(
         &app,
-        PgConfig::bridge_only().with_poll_interval(Duration::from_millis(1)),
+        config,
         pool,
         tokio_runtime.handle().clone(),
     )
@@ -55,6 +92,7 @@ fn install_local_with_pool_returns_callable_address_closer_metrics_and_clean_shu
         CallOutcome::Replied(Err(PgError::Closed))
     ));
     assert_eq!(bridge.metrics.snapshot().closed, 1);
+    assert_eq!(bridge.metrics.snapshot().db_cancels_sent, 0);
     assert!(bridge.closer.is_closed());
 
     app.shutdown()
@@ -125,4 +163,75 @@ fn install_local_preserves_config_pool_and_register_error_sources() {
             .is_some()
     );
     drop(tokio_runtime);
+}
+
+#[test]
+fn install_local_with_pool_reports_command_full_preserves_pool_and_refills() {
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+        .ingress_capacity(1)
+        .try_build()
+        .expect("start bounded local system");
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let gate = app
+        .register_root::<Gate, Infallible>(
+            Gate {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+            2,
+        )
+        .expect("register gate");
+    app.try_send(gate, GateMsg::Hold).expect("occupy worker");
+    while !entered.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+    app.try_send(gate, GateMsg::Hold)
+        .expect("fill host-control queue");
+
+    let (pool, tokio_runtime) = lazy_pool();
+    let error = match PgWorker::<SingleShard>::install_local_with_pool(
+        &app,
+        PgConfig::bridge_only(),
+        pool.clone(),
+        tokio_runtime.handle().clone(),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("saturated registration must fail"),
+    };
+    assert!(matches!(
+        error,
+        InstallError::Register(ThreadedRuntimeError::CommandFull)
+    ));
+    assert!(
+        !pool.is_closed(),
+        "failed supplied-pool registration must preserve caller ownership"
+    );
+
+    release.store(true, Ordering::Release);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let bridge = loop {
+        match PgWorker::<SingleShard>::install_local_with_pool(
+            &app,
+            PgConfig::bridge_only(),
+            pool.clone(),
+            tokio_runtime.handle().clone(),
+        ) {
+            Ok(bridge) => break bridge,
+            Err(InstallError::Register(ThreadedRuntimeError::CommandFull))
+                if std::time::Instant::now() < deadline =>
+            {
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("registration after refill failed: {error}"),
+        }
+    };
+    bridge.closer.close();
+    app.shutdown()
+        .drain()
+        .join_report()
+        .ensure_clean()
+        .expect("clean shutdown after rejected and successful installs");
+    assert!(!pool.is_closed());
+    tokio_runtime.block_on(pool.close());
 }

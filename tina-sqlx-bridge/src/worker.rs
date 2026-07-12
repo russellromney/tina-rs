@@ -128,7 +128,8 @@ impl PgCloser {
         self.closed.store(true, Ordering::Release);
     }
 
-    /// Whether the bridge has been closed.
+    /// Whether the bridge has been closed or dropped. Failed registration
+    /// closes this bridge handle without closing a caller-supplied pool.
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
@@ -193,6 +194,12 @@ pub struct PgWorker<S: Shard + 'static> {
     metrics: Arc<MetricsInner>,
     _owned_runtime: Option<OwnedRuntime>,
     _shard: PhantomData<S>,
+}
+
+impl<S: Shard + 'static> Drop for PgWorker<S> {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+    }
 }
 
 impl<S: Shard + 'static> PgWorker<S> {
@@ -1164,5 +1171,68 @@ fn map_sqlx_error(err: sqlx::Error) -> PgError {
         sqlx::Error::PoolTimedOut => PgError::PoolAcquireTimeout,
         sqlx::Error::PoolClosed => PgError::PoolClosed,
         other => PgError::Sqlx(format!("{other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tina::SingleShard;
+
+    use super::*;
+
+    #[test]
+    fn rejected_supplied_pool_install_drops_worker_but_not_caller_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let pool = {
+            let _entered = runtime.handle().enter();
+            PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(Duration::from_millis(100))
+                .connect_lazy("postgres://test:test@127.0.0.1:1/test")
+                .expect("lazy pool")
+        };
+
+        for expected in [
+            ThreadedRuntimeError::CommandFull,
+            ThreadedRuntimeError::WorkerStopped,
+        ] {
+            let (worker, metrics, cap) = PgWorker::<SingleShard>::build_with_pool(
+                PgConfig::bridge_only(),
+                pool.clone(),
+                runtime.handle().clone(),
+            )
+            .expect("build supplied-pool worker");
+            let retained = Arc::new(std::sync::Mutex::new(None));
+            let retained_for_register = Arc::clone(&retained);
+            let result =
+                PgWorker::<SingleShard>::finish_install(worker, metrics, cap, move |worker, _| {
+                    *retained_for_register.lock().expect("retained closer") = Some(worker.closer());
+                    Err(expected)
+                });
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("registration rejection must fail install"),
+            };
+            assert!(matches!(error, InstallError::Register(error) if error == expected));
+            assert!(
+                retained
+                    .lock()
+                    .expect("retained closer")
+                    .take()
+                    .expect("closer captured before registration")
+                    .is_closed()
+            );
+            assert!(
+                !pool.is_closed(),
+                "dropping a rejected supplied-pool worker must not close caller ownership"
+            );
+        }
+
+        runtime.block_on(pool.close());
     }
 }

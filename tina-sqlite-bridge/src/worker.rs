@@ -190,6 +190,12 @@ pub struct SqliteWorker<S: Shard + 'static> {
     _shard: PhantomData<S>,
 }
 
+impl<S: Shard + 'static> Drop for SqliteWorker<S> {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+    }
+}
+
 /// Result of [`SqliteWorker::install`] or [`SqliteWorker::install_local`].
 pub struct InstalledSqliteBridge<S: Shard + 'static> {
     /// Tina address callers use with `call(...)`.
@@ -231,7 +237,9 @@ impl SqliteCloser {
         self.closed.store(true, Ordering::Release);
     }
 
-    /// Whether the worker has been closed.
+    /// Whether the worker has been closed or dropped. A failed registration
+    /// drops the fully built worker and joins its blocking thread before the
+    /// install error returns.
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
@@ -772,5 +780,44 @@ fn map_rusqlite_error(err: rusqlite::Error) -> SqliteError {
             }
         }
         _ => SqliteError::Sqlite(format!("{err}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tina::SingleShard;
+
+    use super::*;
+
+    #[test]
+    fn rejected_install_drops_worker_joins_thread_and_closes_retained_handle() {
+        for expected in [
+            ThreadedRuntimeError::CommandFull,
+            ThreadedRuntimeError::WorkerStopped,
+        ] {
+            let retained = Arc::new(std::sync::Mutex::new(None));
+            let retained_for_register = Arc::clone(&retained);
+            let result = SqliteWorker::<SingleShard>::install_via(
+                SqliteConfig::memory(),
+                move |worker, _| {
+                    *retained_for_register.lock().expect("retained closer") = Some(worker.closer());
+                    Err(expected)
+                },
+            );
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("registration rejection must fail install"),
+            };
+            assert!(matches!(error, InstallError::Register(error) if error == expected));
+            assert!(
+                retained
+                    .lock()
+                    .expect("retained closer")
+                    .take()
+                    .expect("closer captured before registration")
+                    .is_closed(),
+                "return proves the blocking worker thread joined during drop"
+            );
+        }
     }
 }
