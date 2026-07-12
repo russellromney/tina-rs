@@ -250,9 +250,13 @@ where
     ///
     /// This mirrors
     /// [`tina_runtime::MultiShardRuntime::register_with_capacity_and_bootstrap_on`].
-    /// Unknown shards retain this simulator's existing registration panic
-    /// convention; mailbox refusal returns the bootstrap message and publishes
-    /// no isolate entry or address.
+    /// Mailbox refusal returns the bootstrap message and publishes no isolate
+    /// entry or address.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `shard` is not owned by this simulator, matching the other
+    /// simulator registration APIs.
     #[allow(private_bounds, clippy::type_complexity)]
     pub fn register_with_capacity_and_bootstrap_on<I, Msg, Outbound>(
         &mut self,

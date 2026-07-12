@@ -2,6 +2,7 @@
 
 use std::cell::Cell;
 use std::convert::Infallible;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use tina::prelude::*;
@@ -184,4 +185,30 @@ fn multi_shard_simulator_has_the_same_bootstrap_shape() {
     simulator.run_until_quiescent();
     assert_eq!(delivered.get(), 1);
     assert_eq!(message_drops.get(), 1);
+}
+
+#[test]
+fn multi_shard_unknown_shard_panics_and_drops_inputs_without_publication() {
+    let mut simulator =
+        MultiShardSimulator::new([TestShard(10), TestShard(20)], SimulatorConfig::default());
+    let (service, delivered, service_drops) = fresh_service();
+    let message_drops = Rc::new(Cell::new(0));
+
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        let _ = simulator.register_with_capacity_and_bootstrap_on::<Service, Msg, Infallible>(
+            ShardId::new(99),
+            service,
+            1,
+            Msg::Bootstrap(DropProbe(Rc::clone(&message_drops))),
+        );
+    }));
+
+    assert!(panic.is_err());
+    assert_eq!(service_drops.get(), 1);
+    assert_eq!(message_drops.get(), 1);
+    assert_eq!(delivered.get(), 0);
+    assert!(simulator.trace().is_empty());
+    simulator.run_until_quiescent();
+    assert_eq!(delivered.get(), 0);
+    assert!(simulator.trace().is_empty());
 }
