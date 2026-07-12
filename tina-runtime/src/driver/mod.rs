@@ -2009,6 +2009,17 @@ mod tests {
     }
 
     #[test]
+    fn empty_shared_io_shutdown_does_not_call_backend_cancellation() {
+        let (io_loop, backend, metrics) = tracked_cancel_loop(false);
+        let mut driver = BetelgeuseDriver::with_io_loop_and_capacities(io_loop, 1, 1, 1, 1, 1, 1);
+
+        assert_eq!(driver.cancel_pending(Instant::now()), Ok(()));
+        assert_eq!(metrics.cancel_calls.get(), 0);
+        drop(driver);
+        assert!(backend.upgrade().is_none());
+    }
+
+    #[test]
     fn ordinary_drop_quarantines_when_backend_retains_a_completion() {
         let (io_loop, backend, metrics) = tracked_cancel_loop(true);
         let mut driver = BetelgeuseDriver::with_io_loop_and_capacities(io_loop, 1, 1, 1, 1, 1, 1);

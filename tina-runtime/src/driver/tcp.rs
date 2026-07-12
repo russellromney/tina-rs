@@ -645,10 +645,15 @@ impl BetelgeuseTcp {
         for op in &mut self.pending {
             op.shutdown_marked = true;
         }
-        let cancel_result = self
-            .io_loop
-            .cancel_pending_completions()
-            .map_err(|_| DriverShutdownError::BackendStillOwnsCompletions);
+        let has_backend_work =
+            !self.pending.is_empty() || self.io_loop.pending_completion_count() != 0;
+        let cancel_result = if has_backend_work {
+            self.io_loop
+                .cancel_pending_completions()
+                .map_err(|_| DriverShutdownError::BackendStillOwnsCompletions)
+        } else {
+            Ok(())
+        };
         self.close_all_resources();
         self.drain_cancelled_pending_for_shutdown(deadline);
         if cancel_result.is_err()
