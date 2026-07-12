@@ -241,7 +241,8 @@ fn accept_next(listener: ListenerId) -> Effect<EchoListener> {
 /// Starts a one-shot echo server, sends `payload` from a std client,
 /// and returns the bytes echoed back.
 pub fn echo_round_trip(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)
+        .map_err(|e| anyhow::anyhow!("runtime startup: {e:?}"))?;
     let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
 
     let listener = runtime
@@ -358,7 +359,8 @@ impl LoadShedReport {
 /// The worker drains one record per gated sleep, so a burst larger than
 /// its capacity outruns it and the surplus comes back as typed `Full`.
 pub fn run_load_shed(burst: u32, capacity: usize) -> anyhow::Result<LoadShedReport> {
-    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)
+        .map_err(|e| anyhow::anyhow!("runtime startup: {e:?}"))?;
     let worker = runtime
         .register_with_capacity::<Meter, Infallible>(
             Meter {
