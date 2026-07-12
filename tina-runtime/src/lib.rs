@@ -134,8 +134,8 @@ pub use local_system::{
     LocalMultiShardSystem, LocalMultiShardSystemShutdown, LocalSystem, LocalSystemConfig,
     LocalSystemConfigError, LocalSystemMultiShardBuilder, LocalSystemShutdown,
     LocalSystemShutdownReport, LocalSystemSingleShardBuilder, LocalSystemState,
-    LocalSystemTerminalReport, LocalSystemTerminalSummary, ShutdownUncleanReason, TraceSnapshot,
-    UncleanShutdownError,
+    LocalSystemTerminalReport, LocalSystemTerminalSummary, RunToShutdownError,
+    ShutdownUncleanReason, TerminalShutdownError, TraceSnapshot, UncleanShutdownError,
 };
 pub use multi_shard::{MultiShardRuntime, MultiShardRuntimeConfig};
 

@@ -19,7 +19,8 @@ use crate::call::IntoErasedCall;
 use crate::capabilities::RuntimeCapabilities;
 use crate::driver;
 use crate::errors::{
-    StartupError, ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError,
+    ShutdownAndWaitError, StartupError, ThreadedRuntimeError, ThreadedSendObservedError,
+    ThreadedTrySendError,
 };
 use crate::live_report::{LiveShardReport, LiveShardState, LiveTopologyReport};
 use crate::mailbox::MailboxFactory;
@@ -367,6 +368,133 @@ impl std::error::Error for UncleanShutdownError {
         match self.report.unclean_reasons().first() {
             Some(ShutdownUncleanReason::RuntimeError(error)) => Some(error),
             _ => None,
+        }
+    }
+}
+
+/// Failure while consuming a local system through bounded terminal observation.
+///
+/// The bound applies to shutdown admission and terminal-report observation.
+/// On timeout, the consumed owner does not start a second blocking shutdown
+/// attempt; an admitted background joiner or escaped shutdown handle may still
+/// observe terminal truth later. After an admission timeout, an escaped handle
+/// retains shutdown control and must retry or be dropped. Without one, owner
+/// consumption disconnects the remaining control senders; it does not claim
+/// terminal truth was observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalShutdownError {
+    /// Shutdown admission or terminal-report observation exceeded its budget,
+    /// or the shutdown joiner stopped before producing terminal truth.
+    Observation(ShutdownAndWaitError),
+    /// Terminal truth was observed, but it proved shutdown was not clean.
+    Unclean(UncleanShutdownError),
+}
+
+impl fmt::Display for TerminalShutdownError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Observation(error) => write!(f, "failed to observe terminal shutdown: {error}"),
+            Self::Unclean(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for TerminalShutdownError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Observation(error) => Some(error),
+            Self::Unclean(error) => Some(error),
+        }
+    }
+}
+
+/// Typed result of a fallible workload followed by guaranteed local-system shutdown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunToShutdownError<E> {
+    /// The workload failed, while shutdown completed cleanly.
+    Workload(E),
+    /// The workload succeeded, but shutdown failed.
+    Shutdown(TerminalShutdownError),
+    /// Both the workload and shutdown failed. Neither failure is erased.
+    WorkloadAndShutdown {
+        /// Original workload failure.
+        workload: E,
+        /// Independent terminal shutdown failure.
+        shutdown: TerminalShutdownError,
+    },
+}
+
+impl<E> RunToShutdownError<E> {
+    /// Returns the workload failure when one occurred.
+    pub const fn workload(&self) -> Option<&E> {
+        match self {
+            Self::Workload(error)
+            | Self::WorkloadAndShutdown {
+                workload: error, ..
+            } => Some(error),
+            Self::Shutdown(_) => None,
+        }
+    }
+
+    /// Returns the terminal shutdown failure when one occurred.
+    pub const fn shutdown(&self) -> Option<&TerminalShutdownError> {
+        match self {
+            Self::Shutdown(error)
+            | Self::WorkloadAndShutdown {
+                shutdown: error, ..
+            } => Some(error),
+            Self::Workload(_) => None,
+        }
+    }
+}
+
+impl<E: fmt::Display> fmt::Display for RunToShutdownError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Workload(error) => write!(f, "workload failed: {error}"),
+            Self::Shutdown(error) => write!(f, "shutdown failed: {error}"),
+            Self::WorkloadAndShutdown { workload, shutdown } => {
+                write!(
+                    f,
+                    "workload failed: {workload}; shutdown also failed: {shutdown}"
+                )
+            }
+        }
+    }
+}
+
+impl<E> std::error::Error for RunToShutdownError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Workload(error)
+            | Self::WorkloadAndShutdown {
+                workload: error, ..
+            } => Some(error),
+            Self::Shutdown(error) => Some(error),
+        }
+    }
+}
+
+fn finish_run_to_shutdown<T, E>(
+    workload: Result<T, E>,
+    terminal: Result<LocalSystemTerminalReport, ShutdownAndWaitError>,
+) -> Result<T, RunToShutdownError<E>> {
+    let shutdown = terminal
+        .map_err(TerminalShutdownError::Observation)
+        .and_then(|report| {
+            report
+                .ensure_clean()
+                .map_err(TerminalShutdownError::Unclean)
+        });
+    match (workload, shutdown) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(RunToShutdownError::Workload(error)),
+        (Ok(_), Err(error)) => Err(RunToShutdownError::Shutdown(error)),
+        (Err(workload), Err(shutdown)) => {
+            Err(RunToShutdownError::WorkloadAndShutdown { workload, shutdown })
         }
     }
 }
@@ -1225,6 +1353,41 @@ where
         self.runtime().shutdown_handle()
     }
 
+    /// Runs a fallible workload, then always consumes this owner through
+    /// bounded shutdown and terminal-report observation.
+    ///
+    /// The closure borrows the live system so `?` can be used for registration,
+    /// host calls, sends, waits, and application validation without bypassing
+    /// shutdown. `timeout` is one total budget for shutdown admission and
+    /// terminal observation; it does not include workload execution. An
+    /// observed report is also required to prove clean shutdown. After this
+    /// bounded attempt, consuming the owner does not perform a second blocking
+    /// shutdown attempt. A timed-out worker may therefore finish later, and an
+    /// escaped shutdown handle retains control so it can retry admission or
+    /// observe its cached report; the handle must eventually retry or be
+    /// dropped. Without an escaped handle, consuming the owner disconnects the
+    /// remaining control senders rather than claiming terminal truth.
+    ///
+    /// Workload and shutdown failures remain independent in
+    /// [`RunToShutdownError`]. If the closure panics, the panic is not converted
+    /// into an error. The bounded shutdown attempt and destructor disarm happen
+    /// only after the closure returns, so panic unwinding uses the owner's
+    /// existing blocking teardown contract.
+    pub fn run_to_shutdown<T, E>(
+        mut self,
+        timeout: Duration,
+        workload: impl FnOnce(&Self) -> Result<T, E>,
+    ) -> Result<T, RunToShutdownError<E>> {
+        let result = workload(&self);
+        let shutdown = self.shutdown_handle().request_and_wait_report(timeout);
+        self.runtime
+            .as_mut()
+            .expect("local system runtime is available")
+            .disarm_owner_drop();
+        drop(self);
+        finish_run_to_shutdown(result, shutdown)
+    }
+
     /// Begins graceful shutdown.
     pub fn shutdown(self) -> LocalSystemShutdown<S, F> {
         LocalSystemShutdown {
@@ -2011,6 +2174,32 @@ where
     /// [`ThreadedMultiShardRuntime::shutdown_handle`].
     pub fn shutdown_handle(&self) -> crate::ThreadedShutdownHandle {
         self.runtime().shutdown_handle()
+    }
+
+    /// Runs a fallible workload, then always consumes every owned shard through
+    /// bounded shutdown and terminal-report observation.
+    ///
+    /// This is the multi-shard parity form of [`LocalSystem::run_to_shutdown`].
+    /// Shutdown admission progress remains shard-aware and both workload and
+    /// terminal failures are preserved in [`RunToShutdownError`]. As in the
+    /// single-shard form, `timeout` covers admission and observation, not the
+    /// workload. Consuming the owner does not extend that deadline with its
+    /// ordinary blocking `Drop` shutdown path. The single-shard timeout and
+    /// escaped-handle ownership rules apply identically to partial multi-shard
+    /// admission.
+    pub fn run_to_shutdown<T, E>(
+        mut self,
+        timeout: Duration,
+        workload: impl FnOnce(&Self) -> Result<T, E>,
+    ) -> Result<T, RunToShutdownError<E>> {
+        let result = workload(&self);
+        let shutdown = self.shutdown_handle().request_and_wait_report(timeout);
+        self.runtime
+            .as_mut()
+            .expect("local multi-shard runtime is available")
+            .disarm_owner_drop();
+        drop(self);
+        finish_run_to_shutdown(result, shutdown)
     }
 
     /// Begins graceful shutdown.

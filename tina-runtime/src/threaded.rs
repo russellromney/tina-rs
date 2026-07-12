@@ -713,6 +713,7 @@ where
     /// Upper bound on a host-control `call` awaiting the worker's reply.
     control_call_timeout: Duration,
     system_incarnation: SystemIncarnation,
+    owner_drop_armed: bool,
 }
 
 impl<S, F> ThreadedRuntime<S, F>
@@ -976,7 +977,14 @@ where
             shutdown,
             control_call_timeout: config.control_call_timeout,
             system_incarnation,
+            owner_drop_armed: true,
         })
+    }
+
+    /// Prevents the owner destructor from starting a second, blocking shutdown
+    /// attempt after a caller has already performed bounded shutdown control.
+    pub(crate) fn disarm_owner_drop(&mut self) {
+        self.owner_drop_armed = false;
     }
 
     /// Registers one root isolate and lets the worker allocate its mailbox.
@@ -2329,6 +2337,9 @@ where
     F: MailboxFactory + Send + 'static,
 {
     fn drop(&mut self) {
+        if !self.owner_drop_armed {
+            return;
+        }
         self.shutdown.shutdown_blocking();
         let _ = self
             .shutdown
