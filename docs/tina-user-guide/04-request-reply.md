@@ -412,6 +412,21 @@ capabilities instead of passing raw envelope addresses around. A send has no
 caller to reject, so the compiler rail is the safety feature. The runtime trace
 still records that the raw wrong-lane path returned `Reject`.
 
+An isolate that uses both lanes should declare the matching outbound
+capability without naming that envelope:
+
+```rust
+#[tina::isolate(
+    message = CacheClientMessage,
+    send = tina::ServiceOutbound<CacheEvent, CacheRequest>,
+)]
+impl CacheClient { /* ... */ }
+```
+
+`ServiceOutbound<Event, Request>` is the canonical associated type for a
+mixed service client. It works with `send_event` and `call_request`; the two
+typed handles still prevent events and requests from crossing lanes.
+
 ## Request-Scoped Children
 
 A multi-turn request that fans out to several child rails (DB call,

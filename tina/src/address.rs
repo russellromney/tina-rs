@@ -290,6 +290,40 @@ pub enum ServiceMessage<Event, Request> {
     Request(Request),
 }
 
+/// Outbound effect capability for a split event/request service.
+///
+/// Use this as an isolate's `send` type when it calls [`crate::send_event`]
+/// and `tina_runtime::call_request` against split-service handles. The alias
+/// keeps the routing envelope out of application-facing associated types while
+/// preserving the exact event and request capabilities.
+///
+/// ```
+/// # use tina::prelude::*;
+/// # use tina::{ServiceEventAddress, ServiceOutbound};
+/// # enum Event { Refresh }
+/// # enum Request { Read }
+/// # enum ClientMessage { Refresh }
+/// # struct Client {
+/// #     events: ServiceEventAddress<Event, Request>,
+/// # }
+/// #[tina::isolate(
+///     message = ClientMessage,
+///     send = ServiceOutbound<Event, Request>,
+/// )]
+/// impl Client {
+///     fn handle(
+///         &mut self,
+///         message: ClientMessage,
+///         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+///     ) -> Effect<Self> {
+///         match message {
+///             ClientMessage::Refresh => tina::send_event(self.events, Event::Refresh),
+///         }
+///     }
+/// }
+/// ```
+pub type ServiceOutbound<Event, Request> = Outbound<ServiceMessage<Event, Request>>;
+
 /// Send capability for split-service events.
 #[derive(Debug)]
 #[repr(transparent)]
