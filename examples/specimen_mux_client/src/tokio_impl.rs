@@ -65,9 +65,13 @@ pub fn run() -> anyhow::Result<Report> {
         }
 
         drop(write_half);
-        let _ = reader.await;
+        reader.await.expect("response reader task");
         server.abort();
-        let _ = server.await;
+        match server.await {
+            Err(error) if error.is_cancelled() => {}
+            Ok(()) => {}
+            Err(error) => panic!("responder task failed: {error}"),
+        }
 
         let arrival_order = arrivals.lock().expect("arrivals lock").clone();
         Ok(Report { arrival_order })

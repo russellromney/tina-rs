@@ -26,9 +26,10 @@ snapshot when close settlement misses its bound.
 The perf corpus now records leak cleanliness only after Tina terminal truth or
 Tokio stop-and-join truth succeeds, preserving any earlier failed surface
 observation. `scripts/examples_shutdown_truth_guard.sh`, wired into
-`verify-guards`, prevents exclusive-owner shutdown, unreported
-`runtime.shutdown()`, and ignored stop/join results from returning to production
-examples.
+`verify-guards`, rejects exclusive-owner and transport-only runtime shutdown,
+discarded synchronous or Tokio task joins, ignored service stop sends, and
+ignored bridge drain reports. The guard strips literals and comments before
+matching so documentation cannot masquerade as lifecycle code.
 
 **Still open:** broader `LocalSystem` host-facade migration remains a separate
 ergonomics cohort; this slice establishes truthful shutdown behavior for the

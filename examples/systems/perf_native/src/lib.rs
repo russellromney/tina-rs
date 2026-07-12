@@ -612,12 +612,14 @@ fn tokio_observed_admission_row() -> anyhow::Result<PerfReport> {
         },
         None::<fn() -> LoadObservation>,
     );
-    stop_tx
-        .send(())
-        .map_err(|_| anyhow::anyhow!("tokio observed stop receiver dropped"))?;
-    handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("tokio observed worker panicked"))?;
+    finish_teardown([
+        stop_tx
+            .send(())
+            .map_err(|_| "tokio observed stop receiver dropped".to_owned()),
+        handle
+            .join()
+            .map_err(|_| "tokio observed worker panicked".to_owned()),
+    ])?;
     record_clean_lifecycle(&mut load);
     Ok(PerfReport::from_load_with_allocations(
         "tokio_observed_admission",
@@ -676,12 +678,14 @@ fn tokio_host_call_row() -> anyhow::Result<PerfReport> {
         move |_| tokio_call_op(&tx),
         None::<fn() -> LoadObservation>,
     );
-    stop_tx
-        .send(())
-        .map_err(|_| anyhow::anyhow!("tokio call stop receiver dropped"))?;
-    handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("tokio call worker panicked"))?;
+    finish_teardown([
+        stop_tx
+            .send(())
+            .map_err(|_| "tokio call stop receiver dropped".to_owned()),
+        handle
+            .join()
+            .map_err(|_| "tokio call worker panicked".to_owned()),
+    ])?;
     record_clean_lifecycle(&mut load);
     Ok(PerfReport::from_load_with_allocations(
         "tokio_host_call",
@@ -754,18 +758,20 @@ fn tokio_service_call_chain_row() -> anyhow::Result<PerfReport> {
         move |_| tokio_call_op(&service_tx),
         None::<fn() -> LoadObservation>,
     );
-    service_stop
-        .send(())
-        .map_err(|_| anyhow::anyhow!("tokio chain service stop receiver dropped"))?;
-    ping_stop
-        .send(())
-        .map_err(|_| anyhow::anyhow!("tokio chain ping stop receiver dropped"))?;
-    service_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("tokio chain service panicked"))?;
-    ping_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("tokio chain ping panicked"))?;
+    finish_teardown([
+        service_stop
+            .send(())
+            .map_err(|_| "tokio chain service stop receiver dropped".to_owned()),
+        ping_stop
+            .send(())
+            .map_err(|_| "tokio chain ping stop receiver dropped".to_owned()),
+        service_handle
+            .join()
+            .map_err(|_| "tokio chain service panicked".to_owned()),
+        ping_handle
+            .join()
+            .map_err(|_| "tokio chain ping panicked".to_owned()),
+    ])?;
     record_clean_lifecycle(&mut load);
     Ok(PerfReport::from_load_with_allocations(
         "tokio_service_call_chain",
@@ -1009,13 +1015,17 @@ fn tokio_http_row(
     let (allocs_delta, allocated_bytes_delta, rss_delta) =
         ProcessSnapshot::now().delta_from(process_before);
     print_process_metrics(label, allocs_delta, allocated_bytes_delta, rss_delta);
-    stop_tx
-        .send(())
-        .map_err(|_| anyhow::anyhow!("tokio HTTP stop receiver dropped"))?;
-    done_rx.recv_timeout(Duration::from_secs(2))?;
-    handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("tokio http worker panicked"))?;
+    finish_teardown([
+        stop_tx
+            .send(())
+            .map_err(|_| "tokio HTTP stop receiver dropped".to_owned()),
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|error| format!("tokio HTTP completion: {error}")),
+        handle
+            .join()
+            .map_err(|_| "tokio http worker panicked".to_owned()),
+    ])?;
     record_clean_lifecycle(&mut load);
     Ok(PerfReport::from_load_with_allocations(
         label,
@@ -1061,13 +1071,17 @@ fn tokio_http_steady_state_row(
     });
     let addr = addr_rx.recv_timeout(Duration::from_secs(2))?;
     let mut report = http_steady_state_load(label, kind, addr, expected_len)?;
-    stop_tx
-        .send(())
-        .map_err(|_| anyhow::anyhow!("tokio steady HTTP stop receiver dropped"))?;
-    done_rx.recv_timeout(Duration::from_secs(2))?;
-    handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("tokio steady http worker panicked"))?;
+    finish_teardown([
+        stop_tx
+            .send(())
+            .map_err(|_| "tokio steady HTTP stop receiver dropped".to_owned()),
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|error| format!("tokio steady HTTP completion: {error}")),
+        handle
+            .join()
+            .map_err(|_| "tokio steady http worker panicked".to_owned()),
+    ])?;
     record_clean_lifecycle(&mut report.load);
     Ok(report)
 }
@@ -1123,12 +1137,14 @@ fn stop_tokio_counter(
     stop_tx: oneshot::Sender<()>,
     handle: thread::JoinHandle<()>,
 ) -> anyhow::Result<()> {
-    stop_tx
-        .send(())
-        .map_err(|_| anyhow::anyhow!("tokio counter stop receiver dropped"))?;
-    handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("tokio counter worker panicked"))
+    finish_teardown([
+        stop_tx
+            .send(())
+            .map_err(|_| "tokio counter stop receiver dropped".to_owned()),
+        handle
+            .join()
+            .map_err(|_| "tokio counter worker panicked".to_owned()),
+    ])
 }
 
 type TokioPingHandle = (
@@ -1612,6 +1628,18 @@ fn record_clean_lifecycle(load: &mut LoadReport) {
     let prior_observation_clean = !load.leak_checked || load.leak_clean;
     load.leak_checked = true;
     load.leak_clean = prior_observation_clean;
+}
+
+fn finish_teardown<const N: usize>(steps: [Result<(), String>; N]) -> anyhow::Result<()> {
+    let errors = steps
+        .into_iter()
+        .filter_map(Result::err)
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("teardown failed: {}", errors.join("; "))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3239,8 +3267,26 @@ fn ws_overfill_op(addr: SocketAddr) -> anyhow::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::net::TcpListener;
     use std::sync::mpsc;
+
+    #[test]
+    fn teardown_attempts_join_after_stop_failure() {
+        let join_attempted = Cell::new(false);
+        let error = finish_teardown([
+            Err("stop receiver dropped".to_owned()),
+            {
+                join_attempted.set(true);
+                Err("worker panicked".to_owned())
+            },
+        ])
+        .expect_err("stop failure remains visible");
+
+        assert!(join_attempted.get(), "join step must still be attempted");
+        assert!(error.to_string().contains("stop receiver dropped"));
+        assert!(error.to_string().contains("worker panicked"));
+    }
 
     #[test]
     fn websocket_close_drain_does_not_treat_timeout_as_clean_close() {

@@ -83,7 +83,7 @@ async fn serve(stream: TcpStream, burst: usize) -> anyhow::Result<()> {
         }
     }
     drop(tx);
-    let _ = writer_task.await;
+    writer_task.await?;
     Ok(())
 }
 

@@ -1285,6 +1285,27 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_timeout_is_typed_and_carries_the_last_snapshot() {
+        let _guard = test_guard();
+        let server = crate::RoomServer::start_with(crate::RoomServerConfig {
+            member_capacity: 0,
+            ..Default::default()
+        })
+        .expect("start empty room server");
+
+        let error = server
+            .shutdown_room()
+            .expect_err("an empty room cannot request a member close");
+        let timeout = error
+            .downcast_ref::<crate::RoomShutdownTimeout>()
+            .expect("shutdown timeout remains typed");
+        assert!(timeout.report.shutdown_started);
+        assert_eq!(timeout.report.shutdown_close_requested, 0);
+        assert_eq!(timeout.report, server.report());
+        server.stop().expect("stop empty room server");
+    }
+
+    #[test]
     fn real_tungstenite_clients_use_the_room_and_report_endpoint() {
         let _guard = test_guard();
         let server = crate::RoomServer::start().expect("start room server");

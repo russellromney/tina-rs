@@ -47,16 +47,19 @@ pub fn run() -> Report {
             .route("/counter/increment", post(increment_counter))
             .with_state(state);
 
-        let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
 
         let report = tokio::task::spawn_blocking(move || scripted_client(addr))
             .await
             .expect("client task");
 
         server.abort();
-        let _ = server.await;
+        match server.await {
+            Err(error) if error.is_cancelled() => {}
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("axum server failed: {error}"),
+            Err(error) => panic!("axum server task failed: {error}"),
+        }
         report
     })
 }
