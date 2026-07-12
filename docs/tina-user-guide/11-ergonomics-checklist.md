@@ -216,13 +216,21 @@ using retry mode. Every retry delay is a visible Tina `sleep`.
 ### Register and bootstrap
 
 When a service always needs its first bootstrap message delivered before
-any other work, use `runtime.register_with_capacity_and_bootstrap(...)`
-(and shard-aware mirrors). The helper:
+any other work, use the registration-and-bootstrap form for the owner:
+
+| Owner | Form |
+| --- | --- |
+| explicit/live runtime | `register_with_capacity_and_bootstrap(...)` |
+| canonical live facade | `register_root_with_bootstrap(...)` |
+| simulator | `register_with_capacity_and_bootstrap(...)` |
+
+Multi-shard owners add `_on(shard, ...)`. The helper:
 
 1. allocates the mailbox;
 2. prefills it with the bootstrap message via the mailbox's own
    `try_send`;
-3. only then inserts the isolate entry into the registry.
+3. publishes the isolate entry and typed address only after successful
+   prefill.
 
 If the prefill fails, no address is returned and no isolate is
 registered. There is no cleanup-after-registration path.

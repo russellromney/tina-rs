@@ -1,0 +1,148 @@
+//! Live/simulator vocabulary parity for atomic root bootstrap registration.
+
+use std::cell::Cell;
+use std::convert::Infallible;
+use std::rc::Rc;
+
+use tina::prelude::*;
+use tina_runtime::RegisterBootstrapError;
+use tina_sim::{MultiShardSimulator, Simulator, SimulatorConfig};
+
+#[derive(Debug, Clone, Copy)]
+struct TestShard(u32);
+
+impl Shard for TestShard {
+    fn id(&self) -> ShardId {
+        ShardId::new(self.0)
+    }
+}
+
+#[derive(Debug)]
+struct DropProbe(Rc<Cell<u32>>);
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+    }
+}
+
+#[derive(Debug)]
+enum Msg {
+    Bootstrap(DropProbe),
+}
+
+struct Service {
+    delivered: Rc<Cell<u32>>,
+    service_drops: Rc<Cell<u32>>,
+}
+
+impl Drop for Service {
+    fn drop(&mut self) {
+        self.service_drops.set(self.service_drops.get() + 1);
+    }
+}
+
+#[tina_runtime::isolate(message = Msg, shard = TestShard)]
+impl Service {
+    fn handle(
+        &mut self,
+        message: Msg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match message {
+            Msg::Bootstrap(_authority) => {
+                self.delivered.set(self.delivered.get() + 1);
+                noop()
+            }
+        }
+    }
+}
+
+fn fresh_service() -> (Service, Rc<Cell<u32>>, Rc<Cell<u32>>) {
+    let delivered = Rc::new(Cell::new(0));
+    let service_drops = Rc::new(Cell::new(0));
+    (
+        Service {
+            delivered: Rc::clone(&delivered),
+            service_drops: Rc::clone(&service_drops),
+        },
+        delivered,
+        service_drops,
+    )
+}
+
+#[test]
+fn simulator_bootstrap_is_admitted_before_address_publication() {
+    let mut simulator = Simulator::new(TestShard(1), SimulatorConfig::default());
+    let (service, delivered, service_drops) = fresh_service();
+    let message_drops = Rc::new(Cell::new(0));
+    let _address = simulator
+        .register_with_capacity_and_bootstrap::<Service, Msg, Infallible>(
+            service,
+            1,
+            Msg::Bootstrap(DropProbe(Rc::clone(&message_drops))),
+        )
+        .expect("bootstrap admitted");
+
+    assert!(simulator.trace().is_empty());
+    simulator.run_until_quiescent();
+    assert_eq!(delivered.get(), 1);
+    assert_eq!(message_drops.get(), 1);
+    drop(simulator);
+    assert_eq!(service_drops.get(), 1);
+}
+
+#[test]
+fn simulator_full_prefill_returns_authority_and_publishes_nothing() {
+    let mut simulator = Simulator::new(TestShard(2), SimulatorConfig::default());
+    let (service, delivered, service_drops) = fresh_service();
+    let message_drops = Rc::new(Cell::new(0));
+    let error = simulator
+        .register_with_capacity_and_bootstrap::<Service, Msg, Infallible>(
+            service,
+            0,
+            Msg::Bootstrap(DropProbe(Rc::clone(&message_drops))),
+        )
+        .expect_err("zero-capacity prefill");
+    assert!(matches!(error, RegisterBootstrapError::Full(_)));
+    assert_eq!(simulator.trace().len(), 0);
+    assert_eq!(delivered.get(), 0);
+    assert_eq!(service_drops.get(), 1);
+    assert_eq!(message_drops.get(), 0);
+    drop(error);
+    assert_eq!(message_drops.get(), 1);
+
+    let (retry_service, _, _) = fresh_service();
+    let retry = simulator
+        .register_with_capacity_and_bootstrap::<Service, Msg, Infallible>(
+            retry_service,
+            1,
+            Msg::Bootstrap(DropProbe(Rc::new(Cell::new(0)))),
+        )
+        .expect("refill after refused prefill");
+    assert_eq!(
+        retry.isolate(),
+        IsolateId::new(2),
+        "simulator identity progression must match live rollback"
+    );
+}
+
+#[test]
+fn multi_shard_simulator_has_the_same_bootstrap_shape() {
+    let mut simulator =
+        MultiShardSimulator::new([TestShard(10), TestShard(20)], SimulatorConfig::default());
+    let (service, delivered, _) = fresh_service();
+    let message_drops = Rc::new(Cell::new(0));
+    let address = simulator
+        .register_with_capacity_and_bootstrap_on::<Service, Msg, Infallible>(
+            ShardId::new(20),
+            service,
+            1,
+            Msg::Bootstrap(DropProbe(Rc::clone(&message_drops))),
+        )
+        .expect("bootstrap admitted on owned shard");
+    assert_eq!(address.shard(), ShardId::new(20));
+    simulator.run_until_quiescent();
+    assert_eq!(delivered.get(), 1);
+    assert_eq!(message_drops.get(), 1);
+}
