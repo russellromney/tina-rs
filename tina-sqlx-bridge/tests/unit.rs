@@ -464,19 +464,21 @@ fn bridge_only_config_has_no_pool() {
 }
 
 #[test]
-fn validate_tina_ignores_pool_settings() {
+fn validate_tina_ignores_pool_and_cancel_settings() {
     // A caller who builds a config from a URL but then plans to pass
     // a supplied pool should not be rejected for `pool` fields the
     // bridge promises not to apply on the supplied-pool path.
-    let cfg = good_config().with_pool(
-        PgPoolConfig::new("postgres://invalid/")
-            .with_max_connections(0)
-            .with_acquire_timeout(Duration::ZERO),
-    );
+    let cfg = good_config()
+        .with_pool(
+            PgPoolConfig::new("postgres://invalid/")
+                .with_max_connections(0)
+                .with_acquire_timeout(Duration::ZERO),
+        )
+        .with_cancel(PgCancelConfig::new().with_pool_size(0));
     assert!(cfg.validate().is_err(), "full validate should reject");
     assert!(
         cfg.validate_tina().is_ok(),
-        "tina-only validate must ignore pool fields",
+        "tina-only validate must ignore pool and cancel fields",
     );
 }
 

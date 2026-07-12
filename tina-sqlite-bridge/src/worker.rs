@@ -16,7 +16,9 @@ use std::time::Instant;
 
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
 use tina::prelude::*;
-use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, sleep};
+use tina_runtime::{
+    LocalSystem, MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeError, sleep,
+};
 #[cfg(feature = "tracing")]
 use tracing::{Level, event};
 
@@ -188,7 +190,13 @@ pub struct SqliteWorker<S: Shard + 'static> {
     _shard: PhantomData<S>,
 }
 
-/// Result of [`SqliteWorker::install`].
+impl<S: Shard + 'static> Drop for SqliteWorker<S> {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+    }
+}
+
+/// Result of [`SqliteWorker::install`] or [`SqliteWorker::install_local`].
 pub struct InstalledSqliteBridge<S: Shard + 'static> {
     /// Tina address callers use with `call(...)`.
     pub address: tina::CallAddress<SqliteMsg, SqliteResult>,
@@ -229,7 +237,9 @@ impl SqliteCloser {
         self.closed.store(true, Ordering::Release);
     }
 
-    /// Whether the worker has been closed.
+    /// Whether the worker has been closed or dropped. A failed registration
+    /// drops the fully built worker and joins its blocking thread before the
+    /// install error returns.
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
@@ -479,6 +489,26 @@ impl<S: Shard + 'static> SqliteWorker<S> {
 }
 
 impl<S: Shard + Send + 'static> SqliteWorker<S> {
+    fn install_via(
+        config: SqliteConfig,
+        register: impl FnOnce(
+            Self,
+            usize,
+        )
+            -> Result<tina::Address<SqliteMsg, SqliteResult>, ThreadedRuntimeError>,
+    ) -> Result<InstalledSqliteBridge<S>, InstallError> {
+        let cap = config.mailbox_capacity;
+        let (worker, metrics) = Self::new(config)?;
+        let closer = worker.closer();
+        let address = register(worker, cap).map_err(InstallError::Register)?;
+        Ok(InstalledSqliteBridge {
+            address: address.callable(),
+            closer,
+            metrics,
+            _shard: PhantomData,
+        })
+    }
+
     /// Validate, build, register. Returns address + closer + metrics.
     pub fn install<F>(
         runtime: &ThreadedRuntime<S, F>,
@@ -487,17 +517,24 @@ impl<S: Shard + Send + 'static> SqliteWorker<S> {
     where
         F: MailboxFactory + Send + 'static,
     {
-        let cap = config.mailbox_capacity;
-        let (worker, metrics) = Self::new(config)?;
-        let closer = worker.closer();
-        let address = runtime
-            .register_with_capacity::<_, Infallible>(worker, cap)
-            .map_err(InstallError::Register)?;
-        Ok(InstalledSqliteBridge {
-            address: address.callable(),
-            closer,
-            metrics,
-            _shard: PhantomData,
+        Self::install_via(config, |worker, cap| {
+            runtime.register_with_capacity::<_, Infallible>(worker, cap)
+        })
+    }
+
+    /// Local-system first form of [`Self::install`].
+    ///
+    /// Worker setup and registration retain the existing typed
+    /// [`InstallError`] phases while callers stay on the application facade.
+    pub fn install_local<F>(
+        system: &LocalSystem<S, F>,
+        config: SqliteConfig,
+    ) -> Result<InstalledSqliteBridge<S>, InstallError>
+    where
+        F: MailboxFactory + Send + 'static,
+    {
+        Self::install_via(config, |worker, cap| {
+            system.register_root::<_, Infallible>(worker, cap)
         })
     }
 }
@@ -743,5 +780,44 @@ fn map_rusqlite_error(err: rusqlite::Error) -> SqliteError {
             }
         }
         _ => SqliteError::Sqlite(format!("{err}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tina::SingleShard;
+
+    use super::*;
+
+    #[test]
+    fn rejected_install_drops_worker_joins_thread_and_closes_retained_handle() {
+        for expected in [
+            ThreadedRuntimeError::CommandFull,
+            ThreadedRuntimeError::WorkerStopped,
+        ] {
+            let retained = Arc::new(std::sync::Mutex::new(None));
+            let retained_for_register = Arc::clone(&retained);
+            let result = SqliteWorker::<SingleShard>::install_via(
+                SqliteConfig::memory(),
+                move |worker, _| {
+                    *retained_for_register.lock().expect("retained closer") = Some(worker.closer());
+                    Err(expected)
+                },
+            );
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("registration rejection must fail install"),
+            };
+            assert!(matches!(error, InstallError::Register(error) if error == expected));
+            assert!(
+                retained
+                    .lock()
+                    .expect("retained closer")
+                    .take()
+                    .expect("closer captured before registration")
+                    .is_closed(),
+                "return proves the blocking worker thread joined during drop"
+            );
+        }
     }
 }

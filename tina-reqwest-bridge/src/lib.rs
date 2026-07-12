@@ -151,7 +151,8 @@
 //!
 //! Forced cancellation depends on which install path you used:
 //!
-//! - **Owned runtime** ([`ReqwestWorker::install`]): the bridge holds
+//! - **Owned runtime** ([`ReqwestWorker::install`] or
+//!   [`ReqwestWorker::install_local`]): the bridge holds
 //!   the `tokio::runtime::Runtime`. Dropping the worker isolate
 //!   drops that runtime and calls
 //!   [`tokio::runtime::Runtime::shutdown_background`], which aborts

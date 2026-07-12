@@ -141,10 +141,15 @@
 //! - [`PgWorker::install`] builds a `PgPool` (and a small Tokio
 //!   runtime) from [`PgConfig`]'s pool settings. Use this when the
 //!   bridge is the only consumer of the pool.
-//! - [`PgWorker::install_with_pool`] wraps a caller-supplied `PgPool`
+//! - [`PgWorker::install_with_pool`] borrows and internally clones a
+//!   caller-supplied `PgPool`
 //!   and Tokio runtime handle. Use this when other code in the
-//!   application already holds a pool. The supplied pool owns its
+//!   application already holds a pool. The caller retains its pool handle and
+//!   the supplied pool owns its
 //!   own SQLx settings; the bridge does not re-apply them.
+//! - [`PgWorker::install_local`] and [`PgWorker::install_local_with_pool`]
+//!   preserve those two ownership modes while registering through
+//!   `LocalSystem`.
 //!
 //! # Tina caps vs SQLx pool caps
 //!
