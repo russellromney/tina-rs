@@ -19,6 +19,8 @@ use crate::tcp_loops::LoopStep;
 pub struct UnixWriteAll {
     stream: UnixStreamId,
     buffer: Option<Vec<u8>>,
+    allocation: usize,
+    in_flight: bool,
     written: usize,
     total: usize,
 }
@@ -27,27 +29,58 @@ impl UnixWriteAll {
     /// Builds a write-all helper.
     pub fn new(stream: UnixStreamId, bytes: Vec<u8>) -> Self {
         let total = bytes.len();
+        let allocation = bytes.as_ptr() as usize;
         Self {
             stream,
             buffer: Some(bytes),
+            allocation,
+            in_flight: false,
             written: 0,
             total,
         }
     }
 
     /// Returns the effect that issues the next `unix_write`. Returns `None` if
-    /// the loop has nothing left to send.
+    /// the loop is complete or already has a write in flight.
     pub fn next_effect<I, M, F>(&mut self, on_progress: F) -> Option<tina::Effect<I>>
     where
         I: Isolate<Message = M, Io = RuntimeCall<M>>,
         F: FnOnce(UnixWriteOwnedReply) -> M + Send + 'static,
         M: 'static,
     {
-        if self.written >= self.total {
+        if self.written >= self.total || self.in_flight {
             return None;
         }
         let bytes = self.buffer.take()?;
+        if bytes.as_ptr() as usize != self.allocation {
+            self.buffer = Some(bytes);
+            return None;
+        }
+        self.in_flight = true;
         Some(unix_write_owned_from(self.stream, bytes, self.written).then(on_progress))
+    }
+
+    /// Issues the next write and delivers its full owned-buffer reply as a
+    /// split service event.
+    ///
+    /// This is the service-envelope sibling of [`Self::next_effect`]. It
+    /// hides only [`tina::ServiceMessage::Event`]; buffer ownership and the
+    /// raw [`UnixWriteOwnedReply`] remain unchanged.
+    /// Returns `None` when the loop is complete or already armed.
+    pub fn next_service_event<I, Event, Request, F>(
+        &mut self,
+        on_progress: F,
+    ) -> Option<tina::Effect<I>>
+    where
+        I: Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        F: FnOnce(UnixWriteOwnedReply) -> Event + Send + 'static,
+        Event: 'static,
+        Request: 'static,
+    {
+        self.next_effect(move |reply| tina::ServiceMessage::Event(on_progress(reply)))
     }
 
     /// Records progress from a `unix_write` reply.
@@ -64,6 +97,15 @@ impl UnixWriteAll {
         F: FnOnce(UnixWriteOwnedReply) -> M + Send + 'static,
         M: 'static,
     {
+        let returned_allocation = match &reply {
+            Ok(reply) => reply.bytes.as_ptr() as usize,
+            Err(error) => error.bytes.as_ptr() as usize,
+        };
+        if !self.in_flight || returned_allocation != self.allocation {
+            return LoopStep::Failed(CallError::InvariantViolation);
+        }
+        self.in_flight = false;
+
         match reply {
             Ok(reply) => {
                 if reply.bytes.len() != self.total {
@@ -84,6 +126,7 @@ impl UnixWriteAll {
                     self.buffer = Some(reply.bytes);
                     LoopStep::Done(self.written)
                 } else {
+                    self.in_flight = true;
                     LoopStep::Pending(
                         unix_write_owned_from(self.stream, reply.bytes, self.written)
                             .then(on_progress),
@@ -97,6 +140,31 @@ impl UnixWriteAll {
         }
     }
 
+    /// Records progress and routes any next partial write as a split service
+    /// event.
+    ///
+    /// Validation, buffer recovery, and [`LoopStep`] terminal outcomes are
+    /// identical to [`Self::advance`]. Only the continuation envelope is
+    /// supplied here.
+    pub fn advance_service_event<I, Event, Request, F>(
+        &mut self,
+        reply: UnixWriteOwnedReply,
+        on_progress: F,
+    ) -> LoopStep<I, usize>
+    where
+        I: Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        F: FnOnce(UnixWriteOwnedReply) -> Event + Send + 'static,
+        Event: 'static,
+        Request: 'static,
+    {
+        self.advance(reply, move |reply| {
+            tina::ServiceMessage::Event(on_progress(reply))
+        })
+    }
+
     /// Bytes successfully written so far.
     pub const fn written(&self) -> usize {
         self.written
@@ -105,6 +173,11 @@ impl UnixWriteAll {
     /// Bytes still pending.
     pub fn remaining(&self) -> usize {
         self.total.saturating_sub(self.written)
+    }
+
+    /// Returns whether one owned write currently holds the buffer.
+    pub const fn is_in_flight(&self) -> bool {
+        self.in_flight
     }
 }
 
@@ -218,26 +291,53 @@ mod tests {
         Wrote(UnixWriteOwnedReply),
     }
 
+    #[derive(Debug)]
+    struct DummyEventService;
+
+    impl Isolate for DummyEventService {
+        type Message = tina::ServiceMessage<ServiceEvent, std::convert::Infallible>;
+        type Reply = ();
+        type Send = ();
+        type Spawn = std::convert::Infallible;
+        type SpawnObserved = std::convert::Infallible;
+        type Io = RuntimeCall<Self::Message>;
+        type Fact = std::convert::Infallible;
+        type Shard = tina::SingleShard;
+
+        fn handle(
+            &mut self,
+            _: Self::Message,
+            _: &mut tina::Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            tina::noop()
+        }
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    enum ServiceEvent {
+        Wrote(UnixWriteOwnedReply),
+    }
+
     fn stream(id: u64) -> UnixStreamId {
         UnixStreamId::new(id)
     }
 
-    fn wrote(bytes: &[u8], written: usize) -> UnixWriteOwnedReply {
-        Ok(crate::call::WriteOwnedReply {
-            bytes: bytes.to_vec(),
-            written,
-        })
+    fn arm_write(helper: &mut UnixWriteAll, written: usize) -> UnixWriteOwnedReply {
+        let bytes = helper.buffer.take().expect("buffer stored");
+        helper.in_flight = true;
+        Ok(crate::call::WriteOwnedReply { bytes, written })
     }
 
     #[test]
     fn write_all_handles_partial_writes() {
         let mut helper = UnixWriteAll::new(stream(1), b"abcdef".to_vec());
-        let step: LoopStep<DummyIsolate, usize> = helper.advance(wrote(b"abcdef", 2), Msg::Wrote);
+        let reply = arm_write(&mut helper, 2);
+        let step: LoopStep<DummyIsolate, usize> = helper.advance(reply, Msg::Wrote);
         assert!(matches!(step, LoopStep::Pending(_)));
         assert_eq!(helper.written(), 2);
         assert_eq!(helper.remaining(), 4);
-        let step: LoopStep<DummyIsolate, usize> = helper.advance(wrote(b"abcdef", 4), Msg::Wrote);
-        assert!(matches!(step, LoopStep::Done(6)));
+        assert!(helper.is_in_flight());
     }
 
     #[test]
@@ -245,6 +345,7 @@ mod tests {
         let mut helper = UnixWriteAll::new(stream(1), b"abcdef".to_vec());
         let bytes = helper.buffer.take().expect("buffer stored");
         let allocation = bytes.as_ptr();
+        helper.in_flight = true;
         let step: LoopStep<DummyIsolate, usize> = helper.advance(
             Ok(crate::call::WriteOwnedReply { bytes, written: 6 }),
             Msg::Wrote,
@@ -257,16 +358,42 @@ mod tests {
     }
 
     #[test]
+    fn write_all_service_event_shape_keeps_owned_allocation() {
+        let mut shape = UnixWriteAll::new(stream(1), b"abcdef".to_vec());
+        assert!(
+            shape
+                .next_service_event::<DummyEventService, _, _, _>(ServiceEvent::Wrote)
+                .is_some()
+        );
+
+        let mut helper = UnixWriteAll::new(stream(1), b"abcdef".to_vec());
+        let bytes = helper.buffer.take().expect("buffer stored");
+        let allocation = bytes.as_ptr();
+        helper.in_flight = true;
+        let step: LoopStep<DummyEventService, usize> = helper.advance_service_event(
+            Ok(crate::call::WriteOwnedReply { bytes, written: 6 }),
+            ServiceEvent::Wrote,
+        );
+        assert!(matches!(step, LoopStep::Done(6)));
+        assert_eq!(
+            helper.buffer.as_ref().expect("buffer returned").as_ptr(),
+            allocation
+        );
+    }
+
+    #[test]
     fn write_all_rejects_zero_progress() {
         let mut helper = UnixWriteAll::new(stream(1), b"abc".to_vec());
-        let step: LoopStep<DummyIsolate, usize> = helper.advance(wrote(b"abc", 0), Msg::Wrote);
+        let reply = arm_write(&mut helper, 0);
+        let step: LoopStep<DummyIsolate, usize> = helper.advance(reply, Msg::Wrote);
         assert!(matches!(step, LoopStep::Failed(CallError::Io)));
     }
 
     #[test]
     fn write_all_rejects_impossible_completion_count() {
         let mut helper = UnixWriteAll::new(stream(1), b"abc".to_vec());
-        let step: LoopStep<DummyIsolate, usize> = helper.advance(wrote(b"abc", 4), Msg::Wrote);
+        let reply = arm_write(&mut helper, 4);
+        let step: LoopStep<DummyIsolate, usize> = helper.advance(reply, Msg::Wrote);
         assert!(matches!(
             step,
             LoopStep::Failed(CallError::InvariantViolation)
@@ -276,12 +403,62 @@ mod tests {
     #[test]
     fn write_all_rejects_a_changed_owned_buffer_length() {
         let mut helper = UnixWriteAll::new(stream(1), b"abcdef".to_vec());
-        let step: LoopStep<DummyIsolate, usize> = helper.advance(wrote(b"abc", 3), Msg::Wrote);
+        let _ = helper.buffer.take();
+        let bytes = b"abc".to_vec();
+        helper.allocation = bytes.as_ptr() as usize;
+        helper.in_flight = true;
+        let step: LoopStep<DummyIsolate, usize> = helper.advance(
+            Ok(crate::call::WriteOwnedReply { bytes, written: 3 }),
+            Msg::Wrote,
+        );
         assert!(matches!(
             step,
             LoopStep::Failed(CallError::InvariantViolation)
         ));
         assert_eq!(helper.remaining(), 6);
+    }
+
+    #[test]
+    fn write_all_rejects_unarmed_and_stale_owned_replies() {
+        let mut unarmed = UnixWriteAll::new(stream(1), b"abcdef".to_vec());
+        let step: LoopStep<DummyIsolate, usize> = unarmed.advance(
+            Ok(crate::call::WriteOwnedReply {
+                bytes: b"abcdef".to_vec(),
+                written: 6,
+            }),
+            Msg::Wrote,
+        );
+        assert!(matches!(
+            step,
+            LoopStep::Failed(CallError::InvariantViolation)
+        ));
+
+        let mut pending = UnixWriteAll::new(stream(1), b"abcdef".to_vec());
+        let live_effect = pending
+            .next_effect::<DummyIsolate, _, _>(Msg::Wrote)
+            .expect("write arms");
+        assert!(pending.is_in_flight());
+        assert!(
+            pending
+                .next_effect::<DummyIsolate, _, _>(Msg::Wrote)
+                .is_none()
+        );
+        let step: LoopStep<DummyIsolate, usize> = pending.advance(
+            Ok(crate::call::WriteOwnedReply {
+                bytes: b"abcdef".to_vec(),
+                written: 1,
+            }),
+            Msg::Wrote,
+        );
+        assert!(matches!(
+            step,
+            LoopStep::Failed(CallError::InvariantViolation)
+        ));
+        assert!(
+            pending.is_in_flight(),
+            "stale reply cannot disarm live work"
+        );
+        drop(live_effect);
     }
 
     #[test]

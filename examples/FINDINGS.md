@@ -36,6 +36,37 @@ reply trace without minting fresh caller authority. Live/simulator proofs now
 also preserve an exact raw `CallError::InvalidResource` from typed file I/O and
 cover caller-gone and owner-stop capture settlement on both backends.
 
+### 2026-07-12 Unix write-all split-service continuation prerequisite
+
+`UnixWriteAll` now has `next_service_event` and `advance_service_event`, the
+domain-event siblings of `next_effect` and `advance`. They delegate to the same
+partial-progress state machine, hide only `ServiceMessage::Event`, and preserve
+the complete `UnixWriteOwnedReply` plus original `Vec` allocation on success or
+failure. Adjacent one-shot Unix operations already inherit
+`TypedCall::then_service_event`; no broader loop abstraction was added because
+the motivating custom-codec migration only needs write-all.
+
+One event-only writer service runs unchanged on explicit `Runtime` and
+`Simulator`. Simulator coverage forces two-byte partial writes through bounded
+peer pressure, proves exact completion count and allocation identity, preserves
+peer close as `CallError::Io`, and proves owner stop cancels a genuinely parked
+write with no report or in-flight authority left. Unix peer-buffer Full is a
+parking condition rather than a user-facing `Full` terminal outcome; the test
+therefore proves bounded park-and-resume instead of inventing a false variant.
+The refill proof also saturates a one-slot service-event mailbox when the
+parked write resumes and proves the continuation is retained through overflow.
+
+Adversarial review found that both Unix and adjacent TCP write-all helpers
+accepted a plausible fabricated or stale owned reply without proving that a
+write was armed or that the reply carried the original allocation. Both now
+track one in-flight write, validate allocation identity, reject unarmed/stale
+advance calls with `InvariantViolation`, and leave genuine in-flight work armed
+when a stale reply is rejected.
+
+This closes the framework prerequisite found by
+`tina-extension-custom-codec`. Migrating that extension to event-only service
+registration and exhaustive Unix outcomes remains a separate example commit.
+
 ### 2026-07-12 Lock-manager keyed FIFO canonicalization
 
 Migrated `system_lock_manager` from the historical
