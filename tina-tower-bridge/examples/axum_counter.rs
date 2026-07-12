@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ingress_capacity(16)
         .idle_wait(Duration::from_millis(1))
         .try_build()?;
-    let host = BridgeHost::from_app(tina_app);
+    let mut host = BridgeHost::from_app(tina_app);
     let bridge = host
         .register_bridge::<Counter, BrushRequest, BrushReply, Infallible>(
             Counter::default(),
@@ -80,6 +80,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
     println!("listening on http://{}", listener.local_addr()?);
-    axum::serve(listener, app).await?;
+    let serve_result = axum::serve(listener, app).await;
+    let shutdown_result = host.drain_and_shutdown(Duration::from_secs(2));
+    serve_result?;
+    let shutdown = shutdown_result.map_err(|error| format!("shutdown bridge host: {error:?}"))?;
+    if !shutdown.drained_within_timeout {
+        return Err(format!(
+            "bridge host still had {} handles after drain timeout",
+            shutdown.outstanding_handles_at_shutdown
+        )
+        .into());
+    }
     Ok(())
 }

@@ -150,14 +150,21 @@ pub fn run() -> anyhow::Result<Report> {
                 Outcome::GatewayTimeout => report.gateway_timeout_count += 1,
             }
         }
-        report.exit_clean = true;
-
         // Bridge lifecycle: the helper waits for in-flight clones to
         // drop, then shuts the runtime down. With JoinSet drained, the
         // only remaining handle is the one inside `stack`; dropping
         // `stack` releases it.
         drop(stack);
-        let _ = host.drain_and_shutdown(Duration::from_secs(2));
+        let shutdown = host
+            .drain_and_shutdown(Duration::from_secs(2))
+            .map_err(|error| anyhow::anyhow!("shut down bridge host: {error:?}"))?;
+        if !shutdown.drained_within_timeout {
+            anyhow::bail!(
+                "bridge host still had {} handles after drain timeout",
+                shutdown.outstanding_handles_at_shutdown
+            );
+        }
+        report.exit_clean = true;
 
         Ok(report)
     })

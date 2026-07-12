@@ -14,8 +14,9 @@ use axum::routing::get;
 use tina::prelude::*;
 use tina::{Mailbox, TrySendError};
 use tina_runtime::{
-    FileId, LocalSystem, MailboxFactory, RuntimeEventKind, ThreadedRuntime, ThreadedRuntimeConfig,
-    file_close, file_create, file_fsync, file_read, file_size, file_write, sleep,
+    FileId, LocalSystem, LocalSystemConfigError, MailboxFactory, RuntimeEventKind, StartupError,
+    ThreadedRuntime, ThreadedRuntimeConfig, file_close, file_create, file_fsync, file_read,
+    file_size, file_write, sleep,
 };
 use tina_tokio_bridge::{
     BRIDGE_CAPABILITIES, BridgeBackpressure, BridgeError, BridgeHandle, BridgeHealth, BridgeHost,
@@ -155,6 +156,22 @@ fn make_bridge_host(command_capacity: usize) -> BridgeHost<BridgeShard, BridgeMa
         .try_build()
         .expect("start local bridge app");
     BridgeHost::from_app(app)
+}
+
+#[test]
+fn bridge_host_setup_preserves_typed_local_system_startup_errors() {
+    let error = match LocalSystem::single_shard(BridgeShard, BridgeMailboxFactory)
+        .ingress_capacity(0)
+        .try_build()
+    {
+        Ok(_) => panic!("zero ingress capacity must fail before bridge-host construction"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        StartupError::InvalidLocalSystemConfig(LocalSystemConfigError::ZeroIngressCapacity)
+    ));
 }
 
 async fn brush(State(bridge): State<LlamaBridge>) -> (StatusCode, String) {
