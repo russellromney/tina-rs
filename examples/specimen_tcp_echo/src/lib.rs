@@ -252,8 +252,12 @@ pub fn echo_round_trip(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
         )
         .map_err(|e| anyhow::anyhow!("register listener: {e:?}"))?;
 
-    let bound = runtime.observe_next_bound();
-    let listener_stopped = runtime.observe_isolate_complete(listener);
+    let bound = runtime
+        .observe_next_bound()
+        .map_err(|e| anyhow::anyhow!("register bind observer: {e}"))?;
+    let listener_stopped = runtime
+        .observe_isolate_complete(listener)
+        .map_err(|e| anyhow::anyhow!("register listener observer: {e}"))?;
     runtime
         .try_send(listener, EchoListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start listener: {e:?}"))?;
