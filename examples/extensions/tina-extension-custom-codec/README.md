@@ -33,14 +33,15 @@ is reproducible.
 
 ## Authoring status
 
-The codec hook itself is canonical. The sample server and client are still
-generic message isolates because `UnixWriteAll` does not yet have
-`next_service_event` / `advance_service_event` siblings. Converting them to
-event-only services today would require application code to construct the
-private `ServiceMessage::Event` routing envelope. The extension sweep records
-that narrow runtime prerequisite in `examples/FINDINGS.md`; after it lands,
-this crate must move to event-only registration and exhaustive typed Unix
-terminal outcomes.
+The codec hook and both actors use the canonical public surface. Server and
+client are event-only services registered through `register_event_service` and
+started through `try_send_event`. One-shot Unix calls use
+`then_service_event`; `UnixWriteAll` uses `next_service_event` and
+`advance_service_event`. Application code never constructs a service envelope.
+
+Bind, accept, connect, read, write, and close failures retain the exact
+`CallError` and endpoint/stage in `CodecIoFailure`. Codec policy rejection
+(`Full` or `Malformed`) remains distinct from transport failure.
 
 ## Run the smoke test
 

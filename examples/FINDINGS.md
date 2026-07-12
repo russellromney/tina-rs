@@ -64,8 +64,7 @@ advance calls with `InvariantViolation`, and leave genuine in-flight work armed
 when a stale reply is rejected.
 
 This closes the framework prerequisite found by
-`tina-extension-custom-codec`. Migrating that extension to event-only service
-registration and exhaustive Unix outcomes remains a separate example commit.
+`tina-extension-custom-codec`; the extension migration is recorded below.
 
 ### 2026-07-12 Typed sharded request-service table prerequisite
 
@@ -124,15 +123,17 @@ surface and need no migration:
 | `tina-extension-compile-fail` | None; public/private ownership boundaries are compile-fail doctests. | Current public constructors with unforgeable private state. | yes | none | `agent/extensions-canonical` | 4 doctests + count guard | canonical |
 | `tina-extension-fake-bridge` | None; bounded worker lifecycle is intentionally outside isolate authoring. | Current typed bridge setup, pressure, timeout warning, late terminal, close, and drain vocabulary. | yes | none | `agent/extensions-canonical` | 2 unit tests | canonical; docs migrated to event handle vocabulary |
 | `tina-extension-service-policy` | None; policy returns exhaustive typed decisions from caller-supplied time. | Current `ServicePolicy` and fixed-capacity key table. | yes | none | `agent/extensions-canonical` | 1 unit test | canonical |
-| `tina-extension-custom-codec` | Server/client are event-only in behavior but use `message = ...`; `UnixWriteAll` continuation translators require the full isolate message, so event-only conversion would manually construct `ServiceMessage::Event`. Unix errors are also collapsed into generic stop paths. | `#[isolate(event = ..., shard = CodecShard)]`, `register_event_service`, `try_send_event`, domain-event continuation helpers, and exhaustive bind/accept/read/write/close outcomes. | no | `UnixWriteAll::next_service_event` and `advance_service_event`, mirroring typed-call `then_service_event` without exposing the service envelope. | pending after framework prerequisite | 5 unit/simulator tests currently green | blocked on framework prerequisite; not retained as legacy |
+| `tina-extension-custom-codec` | Closed: both actors were event-only but used generic message authoring and collapsed Unix errors. | Event-only isolates/registration/sends, envelope-free typed continuations, and exact staged Unix failures. | yes | `UnixWriteAll::next_service_event` and `advance_service_event` (PR #331). | `agent/extensions-canonical` | 5 unit/simulator tests | canonical |
 
 The custom codec README and extension user guide now show the correct public
 `SyncCodec::feed` signature (`-> usize`). Fake-bridge documentation now teaches
 typed event-only registration and `try_send_event` rather than a generic
 message address. No example-local envelope adapter or duplicate write loop was
-added. Once the two narrow `UnixWriteAll` siblings land in a separate framework
-PR, this cohort must resume and complete the event-only migration; the extension
-sweep is not complete until then.
+added. After PR #331, the custom codec resumed and now uses event-only service
+handles throughout. `CodecIoFailure` preserves endpoint, bind/accept/connect/
+read/write/close stage, and exact `CallError`; codec Full/Malformed policy
+outcomes remain separate from transport failure. The extension sweep is now
+complete.
 
 ### 2026-07-12 Lock-manager keyed FIFO canonicalization
 

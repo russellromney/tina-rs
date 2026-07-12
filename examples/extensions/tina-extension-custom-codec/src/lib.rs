@@ -24,12 +24,12 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use tina::{Address, Effect, Shard, ShardId};
+use tina::{Effect, Shard, ShardId};
 use tina_codec::{DecodeStatus, FrameDecision, SyncCodec, decode_chunk};
 use tina_runtime::{
-    LoopStep, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerId, UnixReadReply,
-    UnixStreamId, UnixWriteAll, UnixWriteOwnedReply, unix_accept, unix_bind, unix_close_stream,
-    unix_connect, unix_read,
+    CallError, LoopStep, UnixAcceptReply, UnixBindReply, UnixConnectReply, UnixListenerId,
+    UnixReadReply, UnixStreamCloseReply, UnixStreamId, UnixWriteAll, UnixWriteOwnedReply,
+    unix_accept, unix_bind, unix_close_stream, unix_connect, unix_read,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -127,7 +127,7 @@ enum ServerMsg {
     Accepted(UnixAcceptReply),
     Read(UnixReadReply),
     Wrote(UnixWriteOwnedReply),
-    Done,
+    Closed(UnixStreamCloseReply),
 }
 
 struct CodecServer {
@@ -141,27 +141,28 @@ struct CodecServer {
     closing: bool,
     seen: Arc<Mutex<Vec<Vec<u8>>>>,
     rejected: Arc<Mutex<bool>>,
+    failures: Arc<Mutex<Vec<CodecIoFailure>>>,
 }
 
-#[tina_runtime::isolate(message = ServerMsg, shard = CodecShard)]
+#[tina_runtime::isolate(event = ServerMsg, shard = CodecShard)]
 impl CodecServer {
-    fn handle(
+    fn handle_event(
         &mut self,
         msg: ServerMsg,
         _ctx: &mut Context<'_, CodecShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            ServerMsg::Start => unix_bind(self.path.clone()).then(ServerMsg::Bound),
+            ServerMsg::Start => unix_bind(self.path.clone()).then_service_event(ServerMsg::Bound),
             ServerMsg::Bound(Ok((listener, _))) => {
                 self.listener = Some(listener);
-                unix_accept(listener).then(ServerMsg::Accepted)
+                unix_accept(listener).then_service_event(ServerMsg::Accepted)
             }
-            ServerMsg::Bound(Err(_)) => Effect::Stop,
+            ServerMsg::Bound(Err(error)) => self.fail(CodecIoStage::Bind, error),
             ServerMsg::Accepted(Ok(stream)) => {
                 self.stream = Some(stream);
-                unix_read(stream, 64).then(ServerMsg::Read)
+                unix_read(stream, 64).then_service_event(ServerMsg::Read)
             }
-            ServerMsg::Accepted(Err(_)) => Effect::Stop,
+            ServerMsg::Accepted(Err(error)) => self.fail(CodecIoStage::Accept, error),
             ServerMsg::Read(Ok(bytes)) => {
                 if bytes.is_empty() {
                     return self.close();
@@ -197,39 +198,54 @@ impl CodecServer {
                     if self.closing {
                         return self.close();
                     }
-                    unix_read(self.stream.expect("stream"), 64).then(ServerMsg::Read)
+                    unix_read(self.stream.expect("stream"), 64).then_service_event(ServerMsg::Read)
                 } else {
                     let mut write_all = UnixWriteAll::new(self.stream.expect("stream"), reply);
                     let effect = write_all
-                        .next_effect(ServerMsg::Wrote)
+                        .next_service_event(ServerMsg::Wrote)
                         .expect("reply buffer is non-empty");
                     self.write_all = Some(write_all);
                     effect
                 }
             }
-            ServerMsg::Read(Err(_)) => Effect::Stop,
+            ServerMsg::Read(Err(error)) => self.fail(CodecIoStage::Read, error),
             ServerMsg::Wrote(reply) => {
                 let write_all = self.write_all.as_mut().expect("write helper armed");
-                match write_all.advance::<Self, _, _>(reply, ServerMsg::Wrote) {
+                match write_all.advance_service_event(reply, ServerMsg::Wrote) {
                     LoopStep::Pending(effect) => effect,
                     LoopStep::Done(_) => {
                         self.write_all = None;
                         if self.closing {
                             self.close()
                         } else {
-                            unix_read(self.stream.expect("stream"), 64).then(ServerMsg::Read)
+                            unix_read(self.stream.expect("stream"), 64)
+                                .then_service_event(ServerMsg::Read)
                         }
                     }
-                    LoopStep::Failed(_) => self.close(),
+                    LoopStep::Failed(error) => self.fail(CodecIoStage::Write, error),
                 }
             }
-            ServerMsg::Done => Effect::Stop,
+            ServerMsg::Closed(Ok(())) => Effect::Stop,
+            ServerMsg::Closed(Err(error)) => self.fail(CodecIoStage::Close, error),
         }
     }
 
     fn close(&mut self) -> Effect<Self> {
         if let Some(stream) = self.stream.take() {
-            unix_close_stream(stream).then(|_| ServerMsg::Done)
+            unix_close_stream(stream).then_service_event(ServerMsg::Closed)
+        } else {
+            Effect::Stop
+        }
+    }
+
+    fn fail(&mut self, stage: CodecIoStage, error: CallError) -> Effect<Self> {
+        self.failures.lock().unwrap().push(CodecIoFailure {
+            endpoint: CodecEndpoint::Server,
+            stage,
+            error,
+        });
+        if matches!(stage, CodecIoStage::Read | CodecIoStage::Write) {
+            self.close()
         } else {
             Effect::Stop
         }
@@ -242,7 +258,7 @@ enum ClientMsg {
     Connected(UnixConnectReply),
     Wrote(UnixWriteOwnedReply),
     Read(UnixReadReply),
-    Done,
+    Closed(UnixStreamCloseReply),
 }
 
 struct CodecClient {
@@ -251,57 +267,102 @@ struct CodecClient {
     outbound: Vec<u8>,
     write_all: Option<UnixWriteAll>,
     received: Arc<Mutex<Vec<u8>>>,
+    failures: Arc<Mutex<Vec<CodecIoFailure>>>,
 }
 
-#[tina_runtime::isolate(message = ClientMsg, shard = CodecShard)]
+#[tina_runtime::isolate(event = ClientMsg, shard = CodecShard)]
 impl CodecClient {
-    fn handle(
+    fn handle_event(
         &mut self,
         msg: ClientMsg,
         _ctx: &mut Context<'_, CodecShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            ClientMsg::Start => unix_connect(self.path.clone()).then(ClientMsg::Connected),
+            ClientMsg::Start => {
+                unix_connect(self.path.clone()).then_service_event(ClientMsg::Connected)
+            }
             ClientMsg::Connected(Ok(stream)) => {
                 self.stream = Some(stream);
                 let bytes = std::mem::take(&mut self.outbound);
                 if bytes.is_empty() {
                     self.stream = None;
-                    return unix_close_stream(stream).then(|_| ClientMsg::Done);
+                    return unix_close_stream(stream).then_service_event(ClientMsg::Closed);
                 }
                 let mut write_all = UnixWriteAll::new(stream, bytes);
                 let effect = write_all
-                    .next_effect(ClientMsg::Wrote)
+                    .next_service_event(ClientMsg::Wrote)
                     .expect("non-empty client payload has a write step");
                 self.write_all = Some(write_all);
                 effect
             }
-            ClientMsg::Connected(Err(_)) => Effect::Stop,
+            ClientMsg::Connected(Err(error)) => self.fail(CodecIoStage::Connect, error),
             ClientMsg::Wrote(reply) => {
                 let write_all = self.write_all.as_mut().expect("write helper armed");
-                match write_all.advance::<Self, _, _>(reply, ClientMsg::Wrote) {
+                match write_all.advance_service_event(reply, ClientMsg::Wrote) {
                     LoopStep::Pending(effect) => effect,
                     LoopStep::Done(_) => {
                         self.write_all = None;
-                        unix_read(self.stream.expect("stream"), 64).then(ClientMsg::Read)
+                        unix_read(self.stream.expect("stream"), 64)
+                            .then_service_event(ClientMsg::Read)
                     }
-                    LoopStep::Failed(_) => Effect::Stop,
+                    LoopStep::Failed(error) => self.fail(CodecIoStage::Write, error),
                 }
             }
             ClientMsg::Read(Ok(bytes)) => {
                 if bytes.is_empty() {
                     if let Some(stream) = self.stream.take() {
-                        return unix_close_stream(stream).then(|_| ClientMsg::Done);
+                        return unix_close_stream(stream).then_service_event(ClientMsg::Closed);
                     }
                     return Effect::Stop;
                 }
                 self.received.lock().unwrap().extend_from_slice(&bytes);
-                unix_read(self.stream.expect("stream"), 64).then(ClientMsg::Read)
+                unix_read(self.stream.expect("stream"), 64).then_service_event(ClientMsg::Read)
             }
-            ClientMsg::Read(Err(_)) => Effect::Stop,
-            ClientMsg::Done => Effect::Stop,
+            ClientMsg::Read(Err(error)) => self.fail(CodecIoStage::Read, error),
+            ClientMsg::Closed(Ok(())) => Effect::Stop,
+            ClientMsg::Closed(Err(error)) => self.fail(CodecIoStage::Close, error),
         }
     }
+
+    fn fail(&mut self, stage: CodecIoStage, error: CallError) -> Effect<Self> {
+        self.failures.lock().unwrap().push(CodecIoFailure {
+            endpoint: CodecEndpoint::Client,
+            stage,
+            error,
+        });
+        if matches!(stage, CodecIoStage::Read | CodecIoStage::Write) {
+            if let Some(stream) = self.stream.take() {
+                return unix_close_stream(stream).then_service_event(ClientMsg::Closed);
+            }
+        }
+        Effect::Stop
+    }
+}
+
+/// Endpoint that observed a terminal Unix rail failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecEndpoint {
+    Server,
+    Client,
+}
+
+/// Exact stage that produced a terminal Unix rail failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodecIoStage {
+    Bind,
+    Accept,
+    Connect,
+    Read,
+    Write,
+    Close,
+}
+
+/// Typed terminal Unix failure retained by the example.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodecIoFailure {
+    pub endpoint: CodecEndpoint,
+    pub stage: CodecIoStage,
+    pub error: CallError,
 }
 
 /// One exchange's observations.
@@ -313,6 +374,8 @@ pub struct CodecRun {
     pub client_received: Vec<u8>,
     /// True if the codec rejected the stream (`Malformed` or `Full`).
     pub rejected: bool,
+    /// Exhaustive terminal Unix rail failures, if any.
+    pub io_failures: Vec<CodecIoFailure>,
 }
 
 /// Run one client/server exchange over the simulator Unix rails.
@@ -321,6 +384,7 @@ pub fn run_codec_service(path: PathBuf, payload: Vec<u8>, max_frame: usize) -> C
     let seen = Arc::new(Mutex::new(Vec::new()));
     let rejected = Arc::new(Mutex::new(false));
     let received = Arc::new(Mutex::new(Vec::new()));
+    let failures = Arc::new(Mutex::new(Vec::new()));
 
     let server = CodecServer {
         path: path.clone(),
@@ -331,8 +395,9 @@ pub fn run_codec_service(path: PathBuf, payload: Vec<u8>, max_frame: usize) -> C
         closing: false,
         seen: Arc::clone(&seen),
         rejected: Arc::clone(&rejected),
+        failures: Arc::clone(&failures),
     };
-    let server_addr: Address<ServerMsg, ()> = sim.register(server);
+    let server_addr = sim.register_event_service(server, 8);
 
     let client = CodecClient {
         path,
@@ -340,17 +405,19 @@ pub fn run_codec_service(path: PathBuf, payload: Vec<u8>, max_frame: usize) -> C
         outbound: payload,
         write_all: None,
         received: Arc::clone(&received),
+        failures: Arc::clone(&failures),
     };
-    let client_addr: Address<ClientMsg, ()> = sim.register(client);
+    let client_addr = sim.register_event_service(client, 8);
 
-    sim.try_send(server_addr, ServerMsg::Start).unwrap();
-    sim.try_send(client_addr, ClientMsg::Start).unwrap();
+    sim.try_send_event(server_addr, ServerMsg::Start).unwrap();
+    sim.try_send_event(client_addr, ClientMsg::Start).unwrap();
     sim.run_until_quiescent();
 
     CodecRun {
         server_saw: seen.lock().unwrap().clone(),
         client_received: received.lock().unwrap().clone(),
         rejected: *rejected.lock().unwrap(),
+        io_failures: failures.lock().unwrap().clone(),
     }
 }
 
@@ -365,6 +432,8 @@ pub struct Report {
     pub oversize_rejected: bool,
     /// An embedded-NUL frame surfaced `Malformed`.
     pub malformed_rejected: bool,
+    /// Typed Unix rail failures across the three exchanges.
+    pub io_failures: Vec<CodecIoFailure>,
 }
 
 /// Drive the happy path plus the two bounded/malformed rejections.
@@ -392,6 +461,12 @@ pub fn run() -> Report {
         echoed_bytes: happy.client_received.len() as u64,
         oversize_rejected: big.rejected,
         malformed_rejected: bad.rejected,
+        io_failures: happy
+            .io_failures
+            .into_iter()
+            .chain(big.io_failures)
+            .chain(bad.io_failures)
+            .collect(),
     }
 }
 
@@ -411,6 +486,11 @@ mod tests {
             report.malformed_rejected,
             "embedded NUL must surface Malformed"
         );
+        assert!(
+            report.io_failures.is_empty(),
+            "normal and policy-close paths have no Unix rail failures: {:?}",
+            report.io_failures
+        );
     }
 
     #[test]
@@ -429,6 +509,7 @@ mod tests {
         );
         assert_eq!(a.server_saw, b.server_saw);
         assert_eq!(a.client_received, b.client_received);
+        assert_eq!(a.io_failures, b.io_failures);
     }
 
     #[test]
@@ -440,6 +521,7 @@ mod tests {
         );
         assert!(result.server_saw.is_empty());
         assert!(result.client_received.is_empty());
+        assert!(result.io_failures.is_empty());
     }
 
     #[test]
