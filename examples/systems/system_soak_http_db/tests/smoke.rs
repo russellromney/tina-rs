@@ -118,6 +118,104 @@ fn caller_timeout_releases_parked_http_authority_on_shutdown() {
 
     assert_eq!(report.call_timeout, 1);
     assert_eq!(report.ok + report.http_full + report.db_full, 0);
+    assert_eq!(report.slow_events_accepted, 0);
+}
+
+#[test]
+fn caller_gone_before_handler_does_not_arm_http_timer() {
+    let report = run(RunConfig {
+        workers: 32,
+        requests_per_worker: 1,
+        http_in_flight_cap: 32,
+        db_in_flight_cap: 32,
+        fake_http_ms: 100,
+        timer_capacity: 1,
+        call_timeout_ms: 0,
+        ..RunConfig::default()
+    })
+    .expect("already-timed-out callers settle without parked timers");
+
+    assert_eq!(report.call_timeout, report.total_requests);
+    assert_eq!(report.timer_failed, 0, "closed callers must not arm timers");
+    assert_eq!(report.slow_events_accepted, 0);
+}
+
+#[test]
+fn caller_timeout_releases_parked_db_authority_on_shutdown() {
+    let report = run(RunConfig {
+        workers: 1,
+        requests_per_worker: 1,
+        http_in_flight_cap: 1,
+        db_in_flight_cap: 1,
+        fake_http_ms: 1,
+        fake_db_ms: 100,
+        call_timeout_ms: 20,
+        ..RunConfig::default()
+    })
+    .expect("DB-stage timeout shuts down cleanly");
+
+    assert_eq!(report.call_timeout, 1);
+    assert_eq!(report.slow_events_accepted, 0);
+    let db = report
+        .discovery_lines
+        .iter()
+        .find(|line| line.starts_with("scope ") && line.contains("name=soak.db.in_flight"))
+        .expect("DB scope discovery line");
+    assert!(db.contains("high=1"), "DB lease was never admitted: {db}");
+}
+
+#[test]
+fn full_timer_lane_replies_with_timer_failed_and_settles_every_lease() {
+    let report = run(RunConfig {
+        workers: 8,
+        requests_per_worker: 1,
+        http_in_flight_cap: 8,
+        db_in_flight_cap: 8,
+        fake_http_ms: 100,
+        fake_db_ms: 1,
+        timer_capacity: 1,
+        call_timeout_ms: 1_000,
+        ..RunConfig::default()
+    })
+    .expect("timer pressure remains typed and shuts down cleanly");
+
+    assert!(report.timer_failed > 0, "expected TimerFull: {report:?}");
+    assert_eq!(report.call_timeout, 0, "timer Full must not become timeout");
+    assert_eq!(
+        report.ok
+            + report.timer_failed
+            + report.http_full
+            + report.db_full
+            + report.call_full
+            + report.call_closed
+            + report.call_timeout
+            + report.call_rejected,
+        report.total_requests
+    );
+}
+
+#[test]
+fn full_gateway_mailbox_remains_a_distinct_call_outcome() {
+    let report = run(RunConfig {
+        workers: 64,
+        requests_per_worker: 1,
+        http_in_flight_cap: 64,
+        db_in_flight_cap: 64,
+        fake_http_ms: 50,
+        fake_db_ms: 1,
+        gateway_mailbox: 1,
+        timer_capacity: 64,
+        call_timeout_ms: 1_000,
+        ..RunConfig::default()
+    })
+    .expect("mailbox pressure remains typed and shuts down cleanly");
+
+    assert!(report.call_full > 0, "expected call Full: {report:?}");
+    assert_eq!(report.call_timeout, 0, "mailbox Full must not become timeout");
+    assert_eq!(
+        report.slow_events_accepted, report.ok as u64,
+        "only completed slow requests should emit events"
+    );
 }
 
 #[test]

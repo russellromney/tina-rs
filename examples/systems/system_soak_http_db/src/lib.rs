@@ -26,9 +26,9 @@ use tina::capacity::CapacityMode;
 use tina::prelude::*;
 use tina_runtime::{
     BoundedEventSink, CallOutcome, CapacitySummary, DefaultThreadedMailboxFactory, DropPolicy,
-    ServicePressureReport, ServicePressureSurface, SharedCapacityScope, SharedLease,
-    SharedScopeFull, SleepReply, SplitServiceHandle, ThreadedRuntime, format_assertion_failure,
-    sleep,
+    LocalSystem, LocalSystemConfig, ServicePressureReport, ServicePressureSurface,
+    SharedCapacityScope, SharedLease, SharedScopeFull, SleepReply, SplitServiceHandle,
+    ThreadedRuntimeError, format_assertion_failure, sleep,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -42,6 +42,7 @@ pub struct RunConfig {
     pub slow_threshold_ms: u64,
     pub event_sink_cap: usize,
     pub gateway_mailbox: usize,
+    pub timer_capacity: usize,
     pub call_timeout_ms: u64,
 }
 
@@ -57,6 +58,7 @@ impl Default for RunConfig {
             slow_threshold_ms: 12,
             event_sink_cap: 8,
             gateway_mailbox: 64,
+            timer_capacity: LocalSystemConfig::default().timer_capacity,
             call_timeout_ms: 5_000,
         }
     }
@@ -198,6 +200,10 @@ impl Soak {
             }
         };
         call.capture(|request| {
+            if !request.is_open() {
+                drop(http_lease);
+                return noop();
+            }
             let started_ms = self.now_ms();
             let fake = self.fake_http;
             sleep(fake).then_service_event_with_request(request, move |request, outcome| {
@@ -269,22 +275,72 @@ impl Soak {
     }
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct OutcomeCounts {
+    ok: usize,
+    http_full: usize,
+    db_full: usize,
+    timer_failed: usize,
+    call_full: usize,
+    call_closed: usize,
+    call_timeout: usize,
+    call_rejected: usize,
+}
+
+fn classify_outcomes(
+    outcomes: &[Result<CallOutcome<SoakReply>, ThreadedRuntimeError>],
+) -> anyhow::Result<OutcomeCounts> {
+    let mut counts = OutcomeCounts::default();
+    for outcome in outcomes {
+        match outcome {
+            Ok(CallOutcome::Replied(SoakReply::Ok)) => counts.ok += 1,
+            Ok(CallOutcome::Replied(SoakReply::HttpFull { .. })) => counts.http_full += 1,
+            Ok(CallOutcome::Replied(SoakReply::DbFull { .. })) => counts.db_full += 1,
+            Ok(CallOutcome::Replied(SoakReply::TimerFailed(_))) => counts.timer_failed += 1,
+            Ok(CallOutcome::Full) => counts.call_full += 1,
+            Ok(CallOutcome::Closed) => counts.call_closed += 1,
+            Ok(CallOutcome::Timeout) => counts.call_timeout += 1,
+            Ok(CallOutcome::Rejected(_)) => counts.call_rejected += 1,
+            Err(error) => anyhow::bail!("host call failed: {error}"),
+        }
+    }
+    Ok(counts)
+}
+
+type SoakSystem = LocalSystem<SingleShard, DefaultThreadedMailboxFactory>;
+
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
+    let local_config = LocalSystemConfig {
+        timer_capacity: config.timer_capacity,
+        ..LocalSystemConfig::default()
+    };
+    let runtime = Arc::new(
+        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+            .config(local_config)
+            .try_build()?,
+    );
     let shutdown = runtime.shutdown_handle();
     let soak = Soak::new(&config);
     let http_scope = soak.http_scope.clone();
     let db_scope = soak.db_scope.clone();
     let events = soak.events.clone();
-    let svc: SplitServiceHandle<SoakEvent, SoakRequest, SoakReply> = runtime
+    let svc_result: Result<SplitServiceHandle<SoakEvent, SoakRequest, SoakReply>, _> = runtime
         .register_split_service::<Soak, SoakEvent, SoakRequest, Infallible>(
             soak,
             config.gateway_mailbox,
-        )
-        .map_err(|e| anyhow::anyhow!("register soak gateway: {e:?}"))?;
+        );
+    let svc = match svc_result {
+        Ok(service) => service,
+        Err(error) => {
+            let shutdown_result = shutdown_runtime(shutdown, runtime);
+            return match shutdown_result {
+                Ok(()) => Err(anyhow::anyhow!("register soak gateway: {error:?}")),
+                Err(shutdown_error) => Err(anyhow::anyhow!(
+                    "register soak gateway: {error:?}; shutdown also failed: {shutdown_error}"
+                )),
+            };
+        }
+    };
 
     let timeout = Duration::from_millis(config.call_timeout_ms);
     let total = config.workers * config.requests_per_worker;
@@ -314,39 +370,25 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         }));
     }
     barrier.wait();
-    for t in threads {
-        t.join().expect("worker thread panicked");
+    let mut worker_panicked = false;
+    for worker in threads {
+        worker_panicked |= worker.join().is_err();
     }
 
-    let mut ok = 0usize;
-    let mut http_full = 0usize;
-    let mut db_full = 0usize;
-    let mut timer_failed = 0usize;
-    let mut call_full = 0usize;
-    let mut call_closed = 0usize;
-    let mut call_timeout = 0usize;
-    let mut call_rejected = 0usize;
-    for outcome in outcomes.lock().expect("outcomes").iter() {
-        match outcome {
-            Ok(CallOutcome::Replied(SoakReply::Ok)) => ok += 1,
-            Ok(CallOutcome::Replied(SoakReply::HttpFull { .. })) => http_full += 1,
-            Ok(CallOutcome::Replied(SoakReply::DbFull { .. })) => db_full += 1,
-            Ok(CallOutcome::Replied(SoakReply::TimerFailed(_))) => timer_failed += 1,
-            Ok(CallOutcome::Full) => call_full += 1,
-            Ok(CallOutcome::Closed) => call_closed += 1,
-            Ok(CallOutcome::Timeout) => call_timeout += 1,
-            Ok(CallOutcome::Rejected(_)) => call_rejected += 1,
-            Err(error) => anyhow::bail!("host call failed: {error}"),
+    let report_result = (|| -> anyhow::Result<RunReport> {
+        if worker_panicked {
+            anyhow::bail!("one or more soak worker threads panicked");
         }
-    }
+        let outcomes = outcomes.lock().expect("outcomes");
+        let counts = classify_outcomes(&outcomes)?;
 
     // Aggregate everything into a ServicePressureReport .
-    let mut summary = ServicePressureReport::new("soak_http_db");
-    summary.add_surface(ServicePressureSurface::measured(
-        "soak.http.in_flight",
-        "scope",
-        http_scope.surface_report(CapacityMode::Fixed),
-    ));
+        let mut summary = ServicePressureReport::new("soak_http_db");
+        summary.add_surface(ServicePressureSurface::measured(
+            "soak.http.in_flight",
+            "scope",
+            http_scope.surface_report(CapacityMode::Fixed),
+        ));
     summary.add_surface(ServicePressureSurface::measured(
         "soak.db.in_flight",
         "scope",
@@ -363,54 +405,61 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         "no outbound pool installed in this soak",
     );
 
-    let mut discovery_lines: Vec<String> = Vec::new();
-    discovery_lines.push(http_scope.discovery_line());
+        let mut discovery_lines: Vec<String> = Vec::new();
+        discovery_lines.push(http_scope.discovery_line());
     discovery_lines.push(db_scope.discovery_line());
     discovery_lines.push(events.discovery_line());
     for surface in &summary.surfaces {
         discovery_lines.push(surface.discovery_line());
     }
 
-    let mut copyable_assertion_failures = Vec::new();
-    let capacity_summary: CapacitySummary = summary
-        .capacity_summary()
-        .map_err(|e| anyhow::anyhow!("capacity summary: {e:?}"))?;
+        let mut copyable_assertion_failures = Vec::new();
+        let capacity_summary: CapacitySummary = summary
+            .capacity_summary()
+            .map_err(|e| anyhow::anyhow!("capacity summary: {e:?}"))?;
     if let Err(errors) = capacity_summary.assert_no_full() {
         for err in &errors {
             copyable_assertion_failures.push(format_assertion_failure(err));
         }
     }
 
-    let event_snap = events.snapshot();
-    let service_summary_line = summary.summary_line();
+        let event_snap = events.snapshot();
+        let service_summary_line = summary.summary_line();
 
-    shutdown_runtime(shutdown, runtime)?;
+        Ok(RunReport {
+            total_requests: total,
+            ok: counts.ok,
+            http_full: counts.http_full,
+            db_full: counts.db_full,
+            timer_failed: counts.timer_failed,
+            call_full: counts.call_full,
+            call_closed: counts.call_closed,
+            call_timeout: counts.call_timeout,
+            call_rejected: counts.call_rejected,
+            slow_events_accepted: event_snap.accepted,
+            slow_events_dropped: event_snap.dropped,
+            discovery_lines,
+            service_summary_line,
+            copyable_assertion_failures,
+        })
+    })();
+
+    let shutdown_result = shutdown_runtime(shutdown, runtime);
     let http_after_shutdown = http_scope.snapshot();
     let db_after_shutdown = db_scope.snapshot();
-    if http_after_shutdown.current != 0 || db_after_shutdown.current != 0 {
-        anyhow::bail!(
+    let settlement_result = if http_after_shutdown.current != 0 || db_after_shutdown.current != 0 {
+        Err(anyhow::anyhow!(
             "shutdown leaked scope authority: http={} db={}",
             http_after_shutdown.current,
             db_after_shutdown.current
-        );
-    }
-
-    let report = RunReport {
-        total_requests: total,
-        ok,
-        http_full,
-        db_full,
-        timer_failed,
-        call_full,
-        call_closed,
-        call_timeout,
-        call_rejected,
-        slow_events_accepted: event_snap.accepted,
-        slow_events_dropped: event_snap.dropped,
-        discovery_lines,
-        service_summary_line,
-        copyable_assertion_failures,
+        ))
+    } else {
+        Ok(())
     };
+
+    shutdown_result?;
+    settlement_result?;
+    let report = report_result?;
 
     // Echo lines to stdout so CI consumers see them.
     for line in &report.discovery_lines {
@@ -423,10 +472,71 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
 
 fn shutdown_runtime(
     shutdown: tina_runtime::ThreadedShutdownHandle,
-    runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
+    runtime: Arc<SoakSystem>,
 ) -> anyhow::Result<()> {
     let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
     drop(runtime);
     terminal.ensure_clean()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outcome_accounting_keeps_every_terminal_variant_distinct() {
+        let outcomes = vec![
+            Ok(CallOutcome::Replied(SoakReply::Ok)),
+            Ok(CallOutcome::Replied(SoakReply::HttpFull {
+                current: 1,
+                max: 1,
+            })),
+            Ok(CallOutcome::Replied(SoakReply::DbFull {
+                current: 1,
+                max: 1,
+            })),
+            Ok(CallOutcome::Replied(SoakReply::TimerFailed(
+                tina_runtime::CallError::TimerFull,
+            ))),
+            Ok(CallOutcome::Full),
+            Ok(CallOutcome::Closed),
+            Ok(CallOutcome::Timeout),
+            Ok(CallOutcome::Rejected(
+                tina::CallRejectedReason::UnsupportedMessage,
+            )),
+        ];
+
+        assert_eq!(
+            classify_outcomes(&outcomes).unwrap(),
+            OutcomeCounts {
+                ok: 1,
+                http_full: 1,
+                db_full: 1,
+                timer_failed: 1,
+                call_full: 1,
+                call_closed: 1,
+                call_timeout: 1,
+                call_rejected: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn outer_host_errors_remain_errors() {
+        let errors = [
+            ThreadedRuntimeError::WorkerStopped,
+            ThreadedRuntimeError::UnknownShard(ShardId::new(99)),
+            ThreadedRuntimeError::DriverShutdownFailed,
+            ThreadedRuntimeError::DriverParkFailed,
+            ThreadedRuntimeError::CommandFull,
+            ThreadedRuntimeError::HostWaitTimeout,
+            ThreadedRuntimeError::WorkerUnresponsive,
+        ];
+        for error in errors {
+            let message = classify_outcomes(&[Err(error)]).unwrap_err().to_string();
+            assert!(message.starts_with("host call failed:"), "{message}");
+            assert!(message.contains(&error.to_string()), "{message}");
+        }
+    }
 }

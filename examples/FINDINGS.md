@@ -104,6 +104,15 @@ a focused caller-timeout smoke proves a parked HTTP lease is cancelled and
 released. This closes the motivating example for the request-aware flow
 prerequisite.
 
+Adversarial review moved the live host to fallible `LocalSystem`, releases an
+HTTP lease immediately when the caller was already gone before its handler
+turn, and guarantees registration, worker, classification, and capacity-report
+failures still pass through bounded terminal shutdown. Live proofs cover caller
+timeout in both the HTTP and DB stages, timer-lane Full as an exact
+`TimerFailed(TimerFull)`, gateway mailbox Full, completion-only slow events,
+concurrent workers, and zero HTTP/DB authority after shutdown. Unit accounting
+keeps every call terminal and every outer threaded-host error distinct.
+
 ### 2026-07-12 Lock-manager keyed FIFO canonicalization
 
 Migrated `system_lock_manager` from the historical
