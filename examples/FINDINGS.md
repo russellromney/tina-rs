@@ -57,7 +57,9 @@ app.run_to_shutdown(Duration::from_secs(5), |app| {
 failure. `TerminalShutdownError` keeps bounded admission/observation failure
 distinct from an observed `UncleanShutdownError`. No failure is flattened and
 the dual variant owns both values. The closure's panic continues unwinding;
-the owner's existing bounded drop contract remains its panic teardown path.
+the owner's existing drop contract remains its panic teardown path. The
+explicit timeout is one budget for shutdown admission and terminal
+observation, not for workload execution or the subsequent owner drop.
 
 Framework tests cover clean authority settlement, workload-only,
 shutdown-only, dual failure, bounded terminal timeout, real registration and

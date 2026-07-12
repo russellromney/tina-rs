@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,7 +10,7 @@ use tina::{CallRejectedReason, Mailbox};
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, MailboxFactory, RunToShutdownError,
     ShutdownAndWaitError, ShutdownUncleanReason, ShutdownWaitError, TerminalShutdownError,
-    ThreadedRuntimeError,
+    ThreadedRuntimeError, UncleanShutdownError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -178,6 +179,20 @@ fn dual_failure_keeps_workload_and_shutdown_values_separate() {
         error.shutdown(),
         Some(TerminalShutdownError::Unclean(_))
     ));
+    assert!(matches!(
+        error.source().and_then(Error::source),
+        Some(source) if source.downcast_ref::<ThreadedRuntimeError>()
+            == Some(&ThreadedRuntimeError::WorkerStopped)
+    ));
+    assert!(matches!(
+        error.shutdown().and_then(Error::source),
+        Some(source) if source.downcast_ref::<UncleanShutdownError>().is_some()
+    ));
+    assert!(matches!(
+        error.shutdown().and_then(Error::source).and_then(Error::source),
+        Some(source) if source.downcast_ref::<ThreadedRuntimeError>()
+            == Some(&ThreadedRuntimeError::WorkerStopped)
+    ));
 }
 
 #[test]
@@ -191,14 +206,52 @@ fn bounded_terminal_timeout_remains_distinct_from_unclean_truth() {
         Ok::<_, WorkError>(())
     });
 
-    assert_eq!(
-        result,
-        Err(RunToShutdownError::Shutdown(
-            TerminalShutdownError::Observation(ShutdownAndWaitError::Wait(
-                ShutdownWaitError::Timeout
-            ))
-        ))
-    );
+    let Err(
+        error @ RunToShutdownError::Shutdown(TerminalShutdownError::Observation(
+            ShutdownAndWaitError::Wait(ShutdownWaitError::Timeout),
+        )),
+    ) = result
+    else {
+        panic!("expected typed terminal-observation timeout");
+    };
+    assert!(matches!(
+        error.source().and_then(Error::source),
+        Some(source) if source.downcast_ref::<ShutdownAndWaitError>()
+            == Some(&ShutdownAndWaitError::Wait(ShutdownWaitError::Timeout))
+    ));
+    assert!(matches!(
+        error.source()
+            .and_then(Error::source)
+            .and_then(Error::source),
+        Some(source) if source.downcast_ref::<ShutdownWaitError>()
+            == Some(&ShutdownWaitError::Timeout)
+    ));
+}
+
+#[test]
+fn escaped_shutdown_handle_cannot_keep_the_consumed_owner_live() {
+    let handle = app()
+        .run_to_shutdown(Duration::from_secs(2), |app| {
+            Ok::<_, WorkError>(app.shutdown_handle())
+        })
+        .expect("runner must complete cleanly");
+
+    let report = handle
+        .wait_report(Duration::ZERO)
+        .expect("escaped control sees the cached terminal report");
+    report.ensure_clean().expect("terminal report stays clean");
+}
+
+#[test]
+fn workload_requested_shutdown_does_not_bypass_terminal_validation() {
+    let result = app().run_to_shutdown(Duration::from_secs(2), |app| {
+        app.shutdown_handle()
+            .request_shutdown()
+            .map_err(|_| WorkError::Expected("early shutdown request failed"))?;
+        Ok::<_, WorkError>(17)
+    });
+
+    assert_eq!(result, Ok(17));
 }
 
 #[test]
@@ -283,7 +336,7 @@ fn closed_host_call_early_return_still_reaches_clean_shutdown() {
 }
 
 #[test]
-fn workload_panic_propagates_after_existing_bounded_drop_teardown() {
+fn workload_panic_propagates_after_existing_owner_drop_teardown() {
     let dropped = Arc::new(AtomicBool::new(false));
     let probe = Arc::clone(&dropped);
     let panic = std::panic::catch_unwind(|| {

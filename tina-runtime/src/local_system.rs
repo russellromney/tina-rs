@@ -373,6 +373,10 @@ impl std::error::Error for UncleanShutdownError {
 }
 
 /// Failure while consuming a local system through bounded terminal observation.
+///
+/// The bound applies to shutdown admission and terminal-report observation.
+/// Consuming the owner still runs its ordinary `Drop` cleanup after that
+/// observation attempt, including when the attempt times out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalShutdownError {
     /// Shutdown admission or terminal-report observation exceeded its budget,
@@ -1351,13 +1355,14 @@ where
     /// The closure borrows the live system so `?` can be used for registration,
     /// host calls, sends, waits, and application validation without bypassing
     /// shutdown. `timeout` is one total budget for shutdown admission and
-    /// terminal observation. An observed report is also required to prove
-    /// clean shutdown.
+    /// terminal observation; it does not include workload execution or the
+    /// owner's subsequent `Drop` cleanup. An observed report is also required
+    /// to prove clean shutdown.
     ///
     /// Workload and shutdown failures remain independent in
     /// [`RunToShutdownError`]. If the closure panics, the panic is not converted
     /// into an error; normal unwinding drops the owner through its existing
-    /// bounded teardown contract.
+    /// teardown contract.
     pub fn run_to_shutdown<T, E>(
         self,
         timeout: Duration,
@@ -2162,7 +2167,9 @@ where
     ///
     /// This is the multi-shard parity form of [`LocalSystem::run_to_shutdown`].
     /// Shutdown admission progress remains shard-aware and both workload and
-    /// terminal failures are preserved in [`RunToShutdownError`].
+    /// terminal failures are preserved in [`RunToShutdownError`]. As in the
+    /// single-shard form, `timeout` covers admission and observation, not the
+    /// workload or subsequent owner `Drop` cleanup.
     pub fn run_to_shutdown<T, E>(
         self,
         timeout: Duration,
