@@ -951,6 +951,20 @@ What felt rough — each is a `Build`:
 Findings shipped by recent phases. Numbers are kept stable so
 existing README references stay valid.
 
+### 2026-07-12 Worker-pool caller authority canonicalization
+
+`specimen_worker_pool` no longer invents a `qid` or parks each caller in a
+`PendingReplies` sidecar for a workflow with exactly one child call per
+request. The frontend now uses
+`RequestCall::defer(call_request(...)).reply_service_event(...)`, which moves
+the typed `RequestContext` directly into the worker completion event. This
+deletes the synthetic pending-full and duplicate-key outcomes while preserving
+distinct worker `Full`, `Closed`, `Timeout`, and `Rejected` outcomes. The live
+host also preserves the timer continuation's typed `CallError` instead of
+collapsing every timer failure into one flag, and uses `LocalSystem` for
+startup, registration, result observation, typed ingress, and terminal
+shutdown. No framework prerequisite was needed.
+
 ### 13. Tina-owned database client (`tina-sqlx-bridge`) — closed
 
 **Surfaced by:** `specimen_sqlite_counter`.

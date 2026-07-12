@@ -1,16 +1,16 @@
-//! Worker pool with deferred replies.
+//! Worker pool with typed deferred calls.
 //!
-//! Frontend captures one [`tina::DeferredReply`] per client request,
-//! dispatches to the next worker round-robin, and replies through
-//! the matching slot when the worker finishes. Workers have varied
-//! work times so replies arrive out of order.
+//! The frontend moves each request's [`tina::RequestContext`] directly into
+//! the matching worker-call continuation. Workers have varied work times, so
+//! replies arrive out of order without any application-level request IDs or
+//! correlation table.
 
 pub mod tina_impl;
 pub mod tokio_impl;
 
 pub const WORKERS: usize = 3;
 pub const CLIENTS: usize = 8;
-pub const MAX_PENDING: usize = 8;
+pub const DRIVER_BURST_CAP: usize = 8;
 
 /// Each request carries a payload; the worker returns
 /// `payload + worker_id`. Used by the smoke test to confirm the
