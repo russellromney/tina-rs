@@ -14,6 +14,13 @@ This file records completed work.
   waiters release their bounded observation slots and cannot consume a later
   fact intended for a live waiter.
 
+### LocalSystem observation parity
+
+- `LocalSystem` now forwards TCP-bind, isolate-completion, child-restart, and
+  pressure-summary observation plus fallible supervisor registration.
+  `LocalMultiShardSystem` forwards address-routed child-restart observation.
+  Each facade preserves the lower threaded owner's waiter and error contracts.
+
 ### LocalSystem host-control parity
 
 - `LocalSystem` and `LocalMultiShardSystem` now forward typed terminal-result

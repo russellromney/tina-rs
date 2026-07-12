@@ -936,6 +936,19 @@ where
         self.runtime().supervise(parent, config)
     }
 
+    /// Configures a registered root as a supervisor without panicking when
+    /// `parent` is unknown or stale.
+    ///
+    /// The nested result preserves the lower owner's distinction between a
+    /// domain registration failure and a worker/control-plane failure.
+    pub fn try_supervise<M: 'static, R: 'static>(
+        &self,
+        parent: Address<M, R>,
+        config: SupervisorConfig,
+    ) -> Result<Result<(), crate::SuperviseError>, ThreadedRuntimeError> {
+        self.runtime().try_supervise(parent, config)
+    }
+
     /// Attempts one bounded ingress handoff.
     pub fn try_send<M: Send + 'static, R: 'static>(
         &self,
@@ -1020,6 +1033,32 @@ where
         self.runtime().observe_result::<T, M, R>(address)
     }
 
+    /// Registers a waiter for the next successful runtime TCP bind.
+    ///
+    /// Register before triggering the bind. FIFO registration, bounded
+    /// observation, call failure, and runtime-stopped outcomes match
+    /// [`ThreadedRuntime::observe_next_bound`] exactly.
+    pub fn observe_next_bound(&self) -> crate::BoundAddressWaiter {
+        self.runtime().observe_next_bound()
+    }
+
+    /// Registers a waiter for the targeted isolate's terminal stop event.
+    pub fn observe_isolate_complete<M: 'static, R: 'static>(
+        &self,
+        address: Address<M, R>,
+    ) -> crate::IsolateCompleteWaiter {
+        self.runtime().observe_isolate_complete(address)
+    }
+
+    /// Registers a waiter for the next supervised restart of a direct child
+    /// owned by `parent`.
+    pub fn observe_child_restarted<M: 'static, R: 'static>(
+        &self,
+        parent: Address<M, R>,
+    ) -> crate::ChildRestartedWaiter {
+        self.runtime().observe_child_restarted(parent)
+    }
+
     /// Returns retained trace without failing the observability path.
     pub fn trace(&self) -> TraceSnapshot {
         self.runtime().trace()
@@ -1028,6 +1067,11 @@ where
     /// Returns complete trace, failing if the worker can no longer report.
     pub fn complete_trace(&self) -> Result<Vec<RuntimeEvent>, ThreadedRuntimeError> {
         self.runtime().complete_trace()
+    }
+
+    /// Returns counted pressure facts from the retained runtime trace.
+    pub fn pressure_summary(&self) -> Result<crate::PressureSummary, ThreadedRuntimeError> {
+        self.runtime().pressure_summary()
     }
 
     /// Returns cloneable runtime-level shutdown control without consuming the
@@ -1555,6 +1599,18 @@ where
         config: SupervisorConfig,
     ) -> Result<(), ThreadedRuntimeError> {
         self.runtime().supervise(parent, config)
+    }
+
+    /// Registers a waiter for the next direct-child restart reported on the
+    /// parent address's owning shard.
+    ///
+    /// The outer error preserves worker and unknown-shard routing failures
+    /// from [`ThreadedMultiShardRuntime::observe_child_restarted`].
+    pub fn observe_child_restarted<M: 'static, R: 'static>(
+        &self,
+        parent: Address<M, R>,
+    ) -> Result<crate::ChildRestartedWaiter, ThreadedRuntimeError> {
+        self.runtime().observe_child_restarted(parent)
     }
 
     /// Attempts one bounded ingress handoff to the owning worker shard.
