@@ -169,6 +169,12 @@ the continuation, the runtime trace still shows every rail call, and
 the helper owns the boring offset/progress math. See
 [`../tcp-loops.md`](../tcp-loops.md).
 
+For an event-only split service, `UnixWriteAll::next_service_event` and
+`advance_service_event` accept a domain-event translator and supply the private
+`ServiceMessage::Event` envelope. They preserve the full
+`UnixWriteOwnedReply`, including the caller-owned buffer on failure. Generic
+message isolates continue to use `next_effect` and `advance`.
+
 ## Native gRPC
 
 `tina-http::GrpcRouter` is the native gRPC server layer. It sits on

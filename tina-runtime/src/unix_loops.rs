@@ -50,6 +50,28 @@ impl UnixWriteAll {
         Some(unix_write_owned_from(self.stream, bytes, self.written).then(on_progress))
     }
 
+    /// Issues the next write and delivers its full owned-buffer reply as a
+    /// split service event.
+    ///
+    /// This is the service-envelope sibling of [`Self::next_effect`]. It
+    /// hides only [`tina::ServiceMessage::Event`]; buffer ownership and the
+    /// raw [`UnixWriteOwnedReply`] remain unchanged.
+    pub fn next_service_event<I, Event, Request, F>(
+        &mut self,
+        on_progress: F,
+    ) -> Option<tina::Effect<I>>
+    where
+        I: Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        F: FnOnce(UnixWriteOwnedReply) -> Event + Send + 'static,
+        Event: 'static,
+        Request: 'static,
+    {
+        self.next_effect(move |reply| tina::ServiceMessage::Event(on_progress(reply)))
+    }
+
     /// Records progress from a `unix_write` reply.
     ///
     /// `Ok(0)` with non-empty pending data is a stuck stream. Surface it as
@@ -95,6 +117,31 @@ impl UnixWriteAll {
                 LoopStep::Failed(error.error)
             }
         }
+    }
+
+    /// Records progress and routes any next partial write as a split service
+    /// event.
+    ///
+    /// Validation, buffer recovery, and [`LoopStep`] terminal outcomes are
+    /// identical to [`Self::advance`]. Only the continuation envelope is
+    /// supplied here.
+    pub fn advance_service_event<I, Event, Request, F>(
+        &mut self,
+        reply: UnixWriteOwnedReply,
+        on_progress: F,
+    ) -> LoopStep<I, usize>
+    where
+        I: Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        F: FnOnce(UnixWriteOwnedReply) -> Event + Send + 'static,
+        Event: 'static,
+        Request: 'static,
+    {
+        self.advance(reply, move |reply| {
+            tina::ServiceMessage::Event(on_progress(reply))
+        })
     }
 
     /// Bytes successfully written so far.
@@ -218,6 +265,34 @@ mod tests {
         Wrote(UnixWriteOwnedReply),
     }
 
+    #[derive(Debug)]
+    struct DummyEventService;
+
+    impl Isolate for DummyEventService {
+        type Message = tina::ServiceMessage<ServiceEvent, std::convert::Infallible>;
+        type Reply = ();
+        type Send = ();
+        type Spawn = std::convert::Infallible;
+        type SpawnObserved = std::convert::Infallible;
+        type Io = RuntimeCall<Self::Message>;
+        type Fact = std::convert::Infallible;
+        type Shard = tina::SingleShard;
+
+        fn handle(
+            &mut self,
+            _: Self::Message,
+            _: &mut tina::Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            tina::noop()
+        }
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    enum ServiceEvent {
+        Wrote(UnixWriteOwnedReply),
+    }
+
     fn stream(id: u64) -> UnixStreamId {
         UnixStreamId::new(id)
     }
@@ -248,6 +323,29 @@ mod tests {
         let step: LoopStep<DummyIsolate, usize> = helper.advance(
             Ok(crate::call::WriteOwnedReply { bytes, written: 6 }),
             Msg::Wrote,
+        );
+        assert!(matches!(step, LoopStep::Done(6)));
+        assert_eq!(
+            helper.buffer.as_ref().expect("buffer returned").as_ptr(),
+            allocation
+        );
+    }
+
+    #[test]
+    fn write_all_service_event_shape_keeps_owned_allocation() {
+        let mut shape = UnixWriteAll::new(stream(1), b"abcdef".to_vec());
+        assert!(
+            shape
+                .next_service_event::<DummyEventService, _, _, _>(ServiceEvent::Wrote)
+                .is_some()
+        );
+
+        let mut helper = UnixWriteAll::new(stream(1), b"abcdef".to_vec());
+        let bytes = helper.buffer.take().expect("buffer stored");
+        let allocation = bytes.as_ptr();
+        let step: LoopStep<DummyEventService, usize> = helper.advance_service_event(
+            Ok(crate::call::WriteOwnedReply { bytes, written: 6 }),
+            ServiceEvent::Wrote,
         );
         assert!(matches!(step, LoopStep::Done(6)));
         assert_eq!(
