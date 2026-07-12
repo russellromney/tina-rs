@@ -602,6 +602,18 @@ match shared.wait(key.clone(), call) {
 - What not to use: hand-rolled `HashMap<key, VecDeque<id>>` next to
   `PendingReplies`. That is exactly what `SharedWork` exists to replace.
 
+When one completion belongs to only the oldest caller, use FIFO handoff:
+
+```rust
+if let Some(caller) = shared.take_next(&key) {
+    return reply_to::<LockManager>(caller, LockReply::Granted { lease });
+}
+```
+
+`take_next` skips callers that cancelled or timed out and reclaims their
+capacity. It returns one-shot reply authority so lease construction and any
+accompanying timer remain explicit in the service.
+
 For split services, continuation builders keep the domain event visible and
 wrap the routing envelope themselves. Use `then_service_event` for ordinary
 timer, I/O, isolate-call, cancelable-call, and cancel-acknowledgement

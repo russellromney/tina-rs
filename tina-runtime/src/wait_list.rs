@@ -506,6 +506,37 @@ where
         Ok(reply_to::<I>(entry.reply, reply))
     }
 
+    /// Remove and return the oldest live waiter under `key`.
+    ///
+    /// Closed callers ahead of the next live waiter are reclaimed before
+    /// returning. Any ticket for a removed entry becomes stale.
+    pub(crate) fn take_next(&mut self, key: &K) -> Option<DeferredReply<R>> {
+        loop {
+            let oldest = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, slot)| {
+                    slot.as_ref()
+                        .filter(|entry| &entry.key == key)
+                        .map(|entry| (idx, entry.seq))
+                })
+                .min_by_key(|(_, seq)| *seq)
+                .map(|(idx, _)| idx)?;
+
+            let entry = self
+                .remove_slot(oldest)
+                .expect("selected waiter slot must remain occupied");
+            match entry.reply.state() {
+                DeferredSlotState::Open => return Some(entry.reply),
+                DeferredSlotState::Closed => {
+                    self.reclaimed += 1;
+                }
+                DeferredSlotState::Replied => {}
+            }
+        }
+    }
+
     /// Reply every waiter under `key` with the same value (FIFO order).
     /// Requires `R: Clone` because the value is shared across waiters.
     pub fn reply_all_clone<I>(&mut self, key: &K, reply: R) -> Vec<Effect<I>>
@@ -739,6 +770,40 @@ mod tests {
             other => panic!("expected ReplyTo, got {other:?}"),
         }
         assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn take_next_returns_oldest_live_waiter_for_key() {
+        let mut list = WaitList::<u32, u32>::with_capacity(4);
+        list.admit_request(1, fake_request(10)).unwrap();
+        list.admit_request(2, fake_request(20)).unwrap();
+        list.admit_request(1, fake_request(11)).unwrap();
+
+        assert_eq!(list.take_next(&1).unwrap().slot_id(), 10);
+        assert_eq!(list.take_next(&1).unwrap().slot_id(), 11);
+        assert!(list.take_next(&1).is_none());
+        assert_eq!(list.take_next(&2).unwrap().slot_id(), 20);
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn take_next_skips_closed_callers_and_reclaims_capacity() {
+        let mut list = WaitList::<u32, u32>::with_key_limit(3, 2);
+        list.store_entry(1, fake_slot_closed(10));
+        list.store_entry(1, fake_slot(11));
+        list.store_entry(2, fake_slot(20));
+
+        assert_eq!(list.take_next(&1).unwrap().slot_id(), 11);
+        assert_eq!(list.reclaimed(), 1);
+        assert_eq!(list.len(), 1);
+
+        list.admit_request(1, fake_request(12))
+            .expect("handoff must refill global and per-key capacity");
+        list.admit_request(1, fake_request(13))
+            .expect("second per-key slot must refill");
+        assert_eq!(list.len(), 3);
+        assert_eq!(list.take_next(&1).unwrap().slot_id(), 12);
+        assert_eq!(list.take_next(&1).unwrap().slot_id(), 13);
     }
 
     #[test]
