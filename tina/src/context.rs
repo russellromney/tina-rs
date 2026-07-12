@@ -1240,6 +1240,7 @@ pub struct MessageCaller {
     /// supplies this when constructing the caller; the captured slot
     /// inherits it.
     expected_reply_type_id: TypeId,
+    open: bool,
 }
 
 impl MessageCaller {
@@ -1258,6 +1259,30 @@ impl MessageCaller {
             capturing_isolate,
             routing,
             expected_reply_type_id,
+            open: true,
+        }
+    }
+
+    /// Constructs authority for a request whose caller is already terminal.
+    ///
+    /// The handler may still run so its late reply is observable, but any
+    /// captured [`RequestContext`] starts closed and cannot mint fresh caller
+    /// authority.
+    #[doc(hidden)]
+    pub fn new_closed(
+        registry: Rc<DeferredSlotRegistry>,
+        call_id: u64,
+        capturing_isolate: IsolateId,
+        routing: CallRouting,
+        expected_reply_type_id: TypeId,
+    ) -> Self {
+        Self {
+            registry,
+            call_id,
+            capturing_isolate,
+            routing,
+            expected_reply_type_id,
+            open: false,
         }
     }
 
@@ -1275,6 +1300,9 @@ impl MessageCaller {
             slot_id,
             self.expected_reply_type_id,
         ));
+        if !self.open {
+            shared.set_state(DeferredSlotState::Closed);
+        }
         self.registry.register_pending(PendingCapture {
             slot_id,
             call_id: self.call_id,

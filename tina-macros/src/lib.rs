@@ -181,6 +181,11 @@ pub fn runtime_isolate(args: TokenStream, input: TokenStream) -> TokenStream {
 ///   `RequestContext` slot); use this when the step's caller authority, if
 ///   any, is parked elsewhere and resumed by an explicit key rather than
 ///   carried in the message.
+/// - `step Name(captures) -> raw request T { .. }` — a request-aware
+///   ordinary continuation. The variant carries `RequestContext<Reply>`, the
+///   captures, and `T` verbatim. This is the timer/I/O sibling of a call step:
+///   it threads caller authority without pretending `Result<T, CallError>` is
+///   a `CallOutcome<T>`.
 #[proc_macro]
 pub fn flow(input: TokenStream) -> TokenStream {
     let flow = parse_macro_input!(input as FlowInput);
@@ -193,6 +198,7 @@ pub fn flow(input: TokenStream) -> TokenStream {
 mod flow_kw {
     syn::custom_keyword!(flow);
     syn::custom_keyword!(raw);
+    syn::custom_keyword!(request);
     syn::custom_keyword!(reply);
     syn::custom_keyword!(runtime_crate);
     syn::custom_keyword!(step);
@@ -226,9 +232,12 @@ struct FlowStep {
 /// no `RequestContext` slot and no requirement that the body mention
 /// `req`. Use `Raw` when the step's caller authority (if any) is parked
 /// elsewhere and resumed by an explicit key, not carried in the message.
+/// `RawRequest(T)` keeps that verbatim outcome and also carries caller
+/// authority for typed timer/I/O continuations.
 enum StepOutcome {
     Call(Type),
     Raw(Type),
+    RawRequest(Type),
 }
 
 struct FlowCapture {
@@ -312,7 +321,21 @@ impl Parse for FlowInput {
             content.parse::<Token![->]>()?;
             let outcome = if content.peek(flow_kw::raw) {
                 content.parse::<flow_kw::raw>()?;
-                StepOutcome::Raw(content.parse()?)
+                // `request` is contextual here. Keep existing raw outcome
+                // paths such as `request::Outcome` and `request<T>` valid.
+                let request_qualifier = if content.peek(flow_kw::request) {
+                    let lookahead = content.fork();
+                    lookahead.parse::<flow_kw::request>()?;
+                    !lookahead.peek(Token![::]) && !lookahead.peek(Token![<])
+                } else {
+                    false
+                };
+                if request_qualifier {
+                    content.parse::<flow_kw::request>()?;
+                    StepOutcome::RawRequest(content.parse()?)
+                } else {
+                    StepOutcome::Raw(content.parse()?)
+                }
             } else {
                 StepOutcome::Call(content.parse()?)
             };
@@ -360,11 +383,13 @@ fn build_flow(flow: FlowInput) -> Result<proc_macro2::TokenStream> {
     let handler = format_ident!("handle_{}", ident_to_snake(&flow.name));
 
     for step in &flow.steps {
-        // Raw steps carry no `RequestContext` slot (their caller authority,
-        // if any, is parked elsewhere and resumed by an explicit key), so
-        // there is nothing for `req` to name and no policy to enforce here.
-        if matches!(step.outcome, StepOutcome::Call(_))
-            && !block_mentions_unshadowed_ident(&step.body, "req")
+        // Plain raw steps carry no `RequestContext` slot (their caller
+        // authority, if any, is parked elsewhere and resumed by an explicit
+        // key), so there is nothing for `req` to name or enforce there.
+        if matches!(
+            step.outcome,
+            StepOutcome::Call(_) | StepOutcome::RawRequest(_)
+        ) && !block_mentions_unshadowed_ident(&step.body, "req")
         {
             return Err(Error::new_spanned(
                 &step.name,
@@ -390,6 +415,13 @@ fn build_flow(flow: FlowInput) -> Result<proc_macro2::TokenStream> {
                     #outcome,
                 )
             },
+            StepOutcome::RawRequest(outcome) => quote! {
+                #step_name(
+                    #tina_crate::RequestContext<#reply>,
+                    #(#capture_types,)*
+                    #outcome,
+                )
+            },
         }
     });
 
@@ -403,6 +435,9 @@ fn build_flow(flow: FlowInput) -> Result<proc_macro2::TokenStream> {
             },
             StepOutcome::Raw(_) => quote! {
                 #flow_name::#step_name(#(#capture_names,)* outcome) => #body
+            },
+            StepOutcome::RawRequest(_) => quote! {
+                #flow_name::#step_name(req, #(#capture_names,)* outcome) => #body
             },
         }
     });

@@ -149,6 +149,32 @@ impl<T, E> TypedCall<T, E> {
             translator(req, decode(output))
         }))
     }
+
+    /// Carries caller authority into a split service's typed-call event.
+    ///
+    /// The typed result remains visible; this helper only supplies the
+    /// private [`tina::ServiceMessage::Event`] envelope.
+    pub fn then_service_event_with_request<I, F, Event, Request, Q>(
+        self,
+        req: tina::RequestContext<Q>,
+        translator: F,
+    ) -> tina::Effect<I>
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        F: FnOnce(tina::RequestContext<Q>, Result<T, E>) -> Event + 'static,
+        T: 'static,
+        E: 'static,
+        Event: 'static,
+        Request: 'static,
+        Q: 'static,
+    {
+        self.then_with_request(req, move |req, result| {
+            tina::ServiceMessage::Event(translator(req, result))
+        })
+    }
 }
 
 impl<T, Q, E> DeferredTypedCall<T, Q, E>
@@ -320,6 +346,28 @@ impl SleepCall {
         Q: 'static,
     {
         self.inner.then_with_request(req, translator)
+    }
+
+    /// Carries caller authority into a split service's timer event.
+    ///
+    /// The typed timer result remains visible; this helper only supplies the
+    /// private [`tina::ServiceMessage::Event`] envelope.
+    pub fn then_service_event_with_request<I, F, Event, Request, Q>(
+        self,
+        req: tina::RequestContext<Q>,
+        translator: F,
+    ) -> tina::Effect<I>
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        F: FnOnce(tina::RequestContext<Q>, Result<(), CallError>) -> Event + 'static,
+        Event: 'static,
+        Request: 'static,
+        Q: 'static,
+    {
+        self.inner.then_service_event_with_request(req, translator)
     }
 
     /// Timer-only sugar: produce the next event without reading the timer
