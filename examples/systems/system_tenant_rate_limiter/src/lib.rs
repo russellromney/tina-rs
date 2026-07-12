@@ -9,8 +9,8 @@
 //! Two truths the specimen proves:
 //!
 //! 1. `retry_after` is a deterministic function of `(rate, burst, now,
-//!    key history)`. The gateway owns `now` through `call.now()`; simulator
-//!    tests provide virtual time through the same policy method.
+//!    key history)`. Two runs with the same script produce byte-identical
+//!    `retry_after` values.
 //! 2. Cold tenants make progress while a hot tenant is rate-limited.
 //!
 //! The service itself is plain Tina: bounded mailbox, request/reply with
@@ -19,12 +19,13 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use tina::CallRejectedReason;
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, CapacitySummary, DefaultThreadedMailboxFactory, LocalSystem, RateLimit,
-    RateLimitConfig, RateLimitDecision, format_discovery_line,
+    AdmissionDecision, CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, RateLimit,
+    format_discovery_line,
 };
 
 /// Tenant identifier. Static strings keep the specimen allocation-free
@@ -34,11 +35,14 @@ pub type TenantId = &'static str;
 /// One request from a caller to the gateway.
 #[derive(Debug)]
 pub enum GatewayMsg {
-    /// Attempt one admission for `tenant`. The gateway owner supplies the
-    /// logical timestamp from `call.now()`.
+    /// `now` is the caller-supplied admission timestamp. In production
+    /// services this is `ctx.now()` on the caller side; the specimen
+    /// drives it explicitly so the replay determinism is visible.
     Request {
         /// Tenant to charge against.
         tenant: TenantId,
+        /// Admission timestamp.
+        now: Instant,
     },
     /// Read the limiter's current capacity surface. Equivalent to a
     /// `GET /debug/capacity` probe in a real edge service.
@@ -61,13 +65,8 @@ pub enum GatewayReply {
         /// Earliest moment the caller could retry.
         retry_after: Duration,
     },
-    /// No tracked-key capacity remained for a fresh tenant.
-    TenantCapacityFull {
-        /// Tenant that could not be admitted.
-        tenant: TenantId,
-    },
-    /// The limiter has been explicitly closed.
-    Closed {
+    /// Key table full — no slot for a fresh tenant.
+    TenantTableFull {
         /// Tenant that could not be admitted.
         tenant: TenantId,
     },
@@ -82,7 +81,7 @@ pub struct SnapshotReport {
     pub live_tenants: usize,
     /// Cumulative `RateLimited` decisions.
     pub rate_limited_count: u64,
-    /// Cumulative tracked-key-capacity decisions.
+    /// Cumulative `Full` (table full) decisions.
     pub full_count: u64,
     /// One-line discovery summary for the capacity surface.
     pub discovery_line: String,
@@ -112,26 +111,28 @@ impl Gateway {
 
     fn handle_call(&mut self, msg: GatewayMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
         match msg {
-            GatewayMsg::Request { tenant } => match self.rate.try_admit_at(&tenant, call.now()) {
-                RateLimitDecision::Admitted => call.reply(GatewayReply::Ok { tenant }),
-                RateLimitDecision::RateLimited { retry_after, .. } => {
+            GatewayMsg::Request { tenant, now } => match self.rate.try_admit(&tenant, now) {
+                AdmissionDecision::Admitted(_grant) => call.reply(GatewayReply::Ok { tenant }),
+                AdmissionDecision::RateLimited { retry_after, .. } => {
                     call.reply(GatewayReply::Limited {
                         tenant,
                         retry_after,
                     })
                 }
-                RateLimitDecision::KeyCapacityFull(_) => {
-                    call.reply(GatewayReply::TenantCapacityFull { tenant })
+                AdmissionDecision::Full(_) => call.reply(GatewayReply::TenantTableFull { tenant }),
+                AdmissionDecision::Closed(_)
+                | AdmissionDecision::Wait { .. }
+                | AdmissionDecision::Degrade { .. }
+                | AdmissionDecision::TimedOut(_) => {
+                    // The policy is configured as Shed; these arms are
+                    // unreachable in the default first form. Reject loudly
+                    // if a future change rewires the policy.
+                    call.reject(CallRejectedReason::UnsupportedMessage)
                 }
-                RateLimitDecision::Closed(_) => call.reply(GatewayReply::Closed { tenant }),
             },
             GatewayMsg::Snapshot => {
                 let report = self.rate.report();
-                let mut summary = CapacitySummary::new();
-                summary
-                    .push(self.rate.capacity_surface())
-                    .expect("push surface");
-                let line = format_discovery_line(summary.surface("tenant.rate").report().unwrap());
+                let line = format_discovery_line(&self.rate.capacity_surface());
                 call.reply(GatewayReply::Snapshot(SnapshotReport {
                     live_tenants: report.current,
                     rate_limited_count: report.rate_limited_count,
@@ -203,92 +204,113 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
     );
     let shutdown = runtime.shutdown_handle();
+    let result = (|| {
+        let rate = RateLimit::<TenantId>::new(
+            "tenant.rate",
+            config.max_tenants,
+            config.rate_per_sec,
+            config.burst,
+        );
 
-    let rate = RateLimit::<TenantId>::new(
-        "tenant.rate",
-        RateLimitConfig {
-            max_keys: config.max_tenants,
-            rate_per_sec: config.rate_per_sec,
-            burst: config.burst,
-        },
-    );
+        let gateway = runtime
+            .register_root::<_, Infallible>(Gateway::new(rate), config.mailbox)
+            .map_err(|e| anyhow::anyhow!("register gateway: {e:?}"))?;
 
-    let gateway = runtime
-        .register_root::<_, Infallible>(Gateway::new(rate), config.mailbox)
-        .map_err(|e| anyhow::anyhow!("register gateway: {e:?}"))?;
+        let timeout = Duration::from_millis(config.call_timeout_ms);
+        let base = Instant::now();
 
-    let timeout = Duration::from_millis(config.call_timeout_ms);
-    let mut hot_admitted = 0usize;
-    let mut hot_limited = 0usize;
-    let mut hot_retry_afters_ms: Vec<u128> = Vec::with_capacity(config.hot_requests);
-    for _ in 0..config.hot_requests {
-        let outcome = runtime
-            .call_blocking(
-                gateway,
-                GatewayMsg::Request {
-                    tenant: "tenant.hot",
-                },
-                timeout,
-            )
-            .map_err(|e| anyhow::anyhow!("hot call: {e:?}"))?;
-        match outcome {
-            CallOutcome::Replied(GatewayReply::Ok { .. }) => hot_admitted += 1,
-            CallOutcome::Replied(GatewayReply::Limited { retry_after, .. }) => {
-                hot_limited += 1;
-                hot_retry_afters_ms.push(retry_after.as_millis());
+        let mut hot_admitted = 0usize;
+        let mut hot_limited = 0usize;
+        let mut hot_retry_afters_ms: Vec<u128> = Vec::with_capacity(config.hot_requests);
+        for _ in 0..config.hot_requests {
+            let outcome = runtime
+                .call_blocking(
+                    gateway,
+                    GatewayMsg::Request {
+                        tenant: "tenant.hot",
+                        now: base,
+                    },
+                    timeout,
+                )
+                .map_err(|e| anyhow::anyhow!("hot call: {e:?}"))?;
+            match outcome {
+                CallOutcome::Replied(GatewayReply::Ok { .. }) => hot_admitted += 1,
+                CallOutcome::Replied(GatewayReply::Limited { retry_after, .. }) => {
+                    hot_limited += 1;
+                    hot_retry_afters_ms.push(retry_after.as_millis());
+                }
+                CallOutcome::Replied(other) => anyhow::bail!("hot reply: {other:?}"),
+                other => anyhow::bail!("hot outcome: {other:?}"),
             }
-            CallOutcome::Replied(other) => anyhow::bail!("hot reply: {other:?}"),
-            other => anyhow::bail!("hot outcome: {other:?}"),
         }
-    }
 
-    let mut cold_admitted = 0usize;
-    let mut cold_limited = 0usize;
-    for _ in 0..config.cold_requests {
-        let outcome = runtime
-            .call_blocking(
-                gateway,
-                GatewayMsg::Request {
-                    tenant: "tenant.cold",
-                },
-                timeout,
-            )
-            .map_err(|e| anyhow::anyhow!("cold call: {e:?}"))?;
-        match outcome {
-            CallOutcome::Replied(GatewayReply::Ok { .. }) => cold_admitted += 1,
-            CallOutcome::Replied(GatewayReply::Limited { .. }) => cold_limited += 1,
-            CallOutcome::Replied(other) => anyhow::bail!("cold reply: {other:?}"),
-            other => anyhow::bail!("cold outcome: {other:?}"),
+        let mut cold_admitted = 0usize;
+        let mut cold_limited = 0usize;
+        for _ in 0..config.cold_requests {
+            let outcome = runtime
+                .call_blocking(
+                    gateway,
+                    GatewayMsg::Request {
+                        tenant: "tenant.cold",
+                        now: base,
+                    },
+                    timeout,
+                )
+                .map_err(|e| anyhow::anyhow!("cold call: {e:?}"))?;
+            match outcome {
+                CallOutcome::Replied(GatewayReply::Ok { .. }) => cold_admitted += 1,
+                CallOutcome::Replied(GatewayReply::Limited { .. }) => cold_limited += 1,
+                CallOutcome::Replied(other) => anyhow::bail!("cold reply: {other:?}"),
+                other => anyhow::bail!("cold outcome: {other:?}"),
+            }
         }
-    }
 
-    let snap_outcome = runtime
-        .call_blocking(gateway, GatewayMsg::Snapshot, timeout)
-        .map_err(|e| anyhow::anyhow!("snapshot call: {e:?}"))?;
-    let snapshot = match snap_outcome {
-        CallOutcome::Replied(GatewayReply::Snapshot(s)) => s,
-        other => anyhow::bail!("snapshot outcome: {other:?}"),
-    };
+        let snap_outcome = runtime
+            .call_blocking(gateway, GatewayMsg::Snapshot, timeout)
+            .map_err(|e| anyhow::anyhow!("snapshot call: {e:?}"))?;
+        let snapshot = match snap_outcome {
+            CallOutcome::Replied(GatewayReply::Snapshot(s)) => s,
+            other => anyhow::bail!("snapshot outcome: {other:?}"),
+        };
 
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+        let summary_line = format!(
+            "system=system_tenant_rate_limiter hot_admitted={hot_admitted} hot_limited={hot_limited} \
+             cold_admitted={cold_admitted} cold_limited={cold_limited} \
+             live_tenants={live} rate_limited_count={rl}",
+            live = snapshot.live_tenants,
+            rl = snapshot.rate_limited_count,
+        );
+
+        Ok(RunReport {
+            hot_admitted,
+            hot_limited,
+            cold_admitted,
+            cold_limited,
+            hot_retry_afters_ms,
+            snapshot,
+            summary_line,
+        })
+    })();
+
+    finish_after_shutdown(result, shutdown, runtime)
+}
+
+fn finish_after_shutdown<T>(
+    result: anyhow::Result<T>,
+    shutdown: tina_runtime::ThreadedShutdownHandle,
+    runtime: Arc<LocalSystem<SingleShard, DefaultThreadedMailboxFactory>>,
+) -> anyhow::Result<T> {
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5));
     drop(runtime);
-    terminal.ensure_clean()?;
+    let shutdown_result: anyhow::Result<()> = terminal
+        .map_err(Into::into)
+        .and_then(|report| report.ensure_clean().map_err(Into::into));
 
-    let summary_line = format!(
-        "system=system_tenant_rate_limiter hot_admitted={hot_admitted} hot_limited={hot_limited} \
-         cold_admitted={cold_admitted} cold_limited={cold_limited} \
-         live_tenants={live} rate_limited_count={rl}",
-        live = snapshot.live_tenants,
-        rl = snapshot.rate_limited_count,
-    );
-
-    Ok(RunReport {
-        hot_admitted,
-        hot_limited,
-        cold_admitted,
-        cold_limited,
-        hot_retry_afters_ms,
-        snapshot,
-        summary_line,
-    })
+    match (result, shutdown_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(shutdown_error)) => Err(anyhow::anyhow!(
+            "{error:#}; shutdown also failed: {shutdown_error}"
+        )),
+    }
 }

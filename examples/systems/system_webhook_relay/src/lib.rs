@@ -73,16 +73,10 @@ impl OutboundError {
             Self::Full => BridgeOutcomeClass::Retryable(BridgeRetryable::BridgeFull),
             Self::Closed => BridgeOutcomeClass::Unavailable(BridgeUnavailable::BridgeClosed),
             Self::Timeout => BridgeOutcomeClass::Retryable(BridgeRetryable::BridgeTimeout),
-            Self::Throttled => {
-                BridgeOutcomeClass::Retryable(BridgeRetryable::ServiceThrottled)
-            }
-            Self::SdkTransient => {
-                BridgeOutcomeClass::Retryable(BridgeRetryable::SdkRetryable)
-            }
+            Self::Throttled => BridgeOutcomeClass::Retryable(BridgeRetryable::ServiceThrottled),
+            Self::SdkTransient => BridgeOutcomeClass::Retryable(BridgeRetryable::SdkRetryable),
             Self::NotFound => BridgeOutcomeClass::Fatal(BridgeFatal::NotFound),
-            Self::InvalidParameter => {
-                BridgeOutcomeClass::Fatal(BridgeFatal::InvalidParameter)
-            }
+            Self::InvalidParameter => BridgeOutcomeClass::Fatal(BridgeFatal::InvalidParameter),
             Self::AccessDenied => BridgeOutcomeClass::Fatal(BridgeFatal::AccessDenied),
             Self::InvalidRequest => BridgeOutcomeClass::Fatal(BridgeFatal::InvalidRequest),
             Self::Internal => BridgeOutcomeClass::Fatal(BridgeFatal::Internal),
@@ -278,15 +272,16 @@ impl Relay {
     fn issue(&mut self, event: Event, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
         let timeout = self.timeout;
         match &self.outbound {
-            OutboundPort::Fake(addr) => call
-                .defer(tina_runtime::call(
+            OutboundPort::Fake(addr) => {
+                call.defer(tina_runtime::call(
                     *addr,
                     FakeOutboundMsg::Send(event),
                     timeout,
                 ))
                 .reply_service_event(|request, outcome| {
                     RelayEvent::FakeFinished { request, outcome }
-                }),
+                })
+            }
             OutboundPort::Sqs(sqs) => {
                 let address = sqs.address;
                 let queue_url = sqs.queue_url.clone();
@@ -301,9 +296,11 @@ impl Relay {
                     }),
                     bridge_timeout,
                 );
-                call.defer(issued).reply_service_event(|request, outcome| {
-                    RelayEvent::SqsFinished { request, outcome }
-                })
+                call.defer(issued)
+                    .reply_service_event(|request, outcome| RelayEvent::SqsFinished {
+                        request,
+                        outcome,
+                    })
             }
         }
     }
@@ -319,7 +316,12 @@ impl Relay {
                 }
             }
             CallOutcome::Replied(Err(err)) => match err.classify() {
-                BridgeOutcomeClass::Succeeded => unreachable!(),
+                BridgeOutcomeClass::Succeeded => {
+                    self.stats.dead_letter += 1;
+                    RelayReply::DeadLetter {
+                        reason: DeadLetterReason::Fatal(BridgeFatal::Internal),
+                    }
+                }
                 BridgeOutcomeClass::Retryable(reason) => {
                     self.stats.transient += 1;
                     RelayReply::Retry { reason }
@@ -485,7 +487,12 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
             )
             .map_err(|e| anyhow::anyhow!("register relay: {e:?}"))?;
 
-        drive_relay(&runtime, relay.requests, config.events, config.call_timeout_ms)
+        drive_relay(
+            &runtime,
+            relay.requests,
+            config.events,
+            config.call_timeout_ms,
+        )
     })();
     finish_after_shutdown(result, shutdown, runtime)
 }

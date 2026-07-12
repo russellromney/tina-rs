@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
@@ -305,73 +305,78 @@ pub fn run_single_flight(config: RunConfig) -> anyhow::Result<SingleFlightReport
         LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
     );
     let shutdown = runtime.shutdown_handle();
-    let cache = register_cache(&runtime, config)?;
+    let result = (|| {
+        let cache = register_cache(&runtime, config)?;
 
-    let barrier = Arc::new(Barrier::new(config.callers + 1));
-    let outcomes = Arc::new(Mutex::new(Vec::with_capacity(config.callers)));
-    let timeout = Duration::from_millis(config.call_timeout_ms);
-    let mut threads = Vec::with_capacity(config.callers);
+        let barrier = Arc::new(Barrier::new(config.callers + 1));
+        let timeout = Duration::from_millis(config.call_timeout_ms);
+        let mut threads = Vec::with_capacity(config.callers);
 
-    for _ in 0..config.callers {
-        let rt = Arc::clone(&runtime);
-        let gate = Arc::clone(&barrier);
-        let out = Arc::clone(&outcomes);
-        threads.push(thread::spawn(move || {
-            gate.wait();
-            let outcome = rt.call_blocking_request(
+        for _ in 0..config.callers {
+            let rt = Arc::clone(&runtime);
+            let gate = Arc::clone(&barrier);
+            threads.push(thread::spawn(move || {
+                gate.wait();
+                rt.call_blocking_request(
+                    cache.requests,
+                    CacheRequest::Get {
+                        key: "shared".into(),
+                    },
+                    timeout,
+                )
+            }));
+        }
+
+        barrier.wait();
+        let outcomes = threads
+            .into_iter()
+            .map(|thread| {
+                thread
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("cache caller thread panicked"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let mut filled = 0;
+        let mut busy = 0;
+        let mut failed = 0;
+        for outcome in &outcomes {
+            match outcome {
+                Ok(CallOutcome::Replied(CacheReply::Value {
+                    source: ValueSource::Fill,
+                    ..
+                })) => filled += 1,
+                Ok(CallOutcome::Replied(CacheReply::Busy)) => busy += 1,
+                _ => failed += 1,
+            }
+        }
+
+        let hit_after_fill = matches!(
+            runtime.call_blocking_request(
                 cache.requests,
                 CacheRequest::Get {
-                    key: "shared".into(),
+                    key: "shared".into()
                 },
-                timeout,
-            );
-            out.lock().expect("outcomes lock").push(outcome);
-        }));
-    }
-
-    barrier.wait();
-    for thread in threads {
-        thread.join().expect("caller thread panicked");
-    }
-
-    let mut filled = 0;
-    let mut busy = 0;
-    let mut failed = 0;
-    for outcome in outcomes.lock().expect("outcomes lock").iter() {
-        match outcome {
-            Ok(CallOutcome::Replied(CacheReply::Value {
-                source: ValueSource::Fill,
+                timeout
+            )?,
+            CallOutcome::Replied(CacheReply::Value {
+                source: ValueSource::Hit,
                 ..
-            })) => filled += 1,
-            Ok(CallOutcome::Replied(CacheReply::Busy)) => busy += 1,
-            _ => failed += 1,
-        }
-    }
+            })
+        );
+        let stats = stats(&runtime, cache.requests)?;
 
-    let hit_after_fill = matches!(
-        runtime.call_blocking_request(
-            cache.requests,
-            CacheRequest::Get {
-                key: "shared".into()
-            },
-            timeout
-        )?,
-        CallOutcome::Replied(CacheReply::Value {
-            source: ValueSource::Hit,
-            ..
+        Ok(SingleFlightReport {
+            callers: config.callers,
+            filled,
+            busy,
+            failed,
+            hit_after_fill,
+            stats,
         })
-    );
-    let stats = stats(&runtime, cache.requests)?;
-    shutdown_runtime(shutdown, runtime)?;
+    })();
 
-    Ok(SingleFlightReport {
-        callers: config.callers,
-        filled,
-        busy,
-        failed,
-        hit_after_fill,
-        stats,
-    })
+    finish_after_shutdown(result, shutdown, runtime)
 }
 
 pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalidationReport> {
@@ -379,57 +384,62 @@ pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalida
         LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
     );
     let shutdown = runtime.shutdown_handle();
-    let cache = register_cache(&runtime, config)?;
-    let timeout = Duration::from_millis(config.call_timeout_ms);
+    let result = (|| {
+        let cache = register_cache(&runtime, config)?;
+        let timeout = Duration::from_millis(config.call_timeout_ms);
 
-    let rt = Arc::clone(&runtime);
-    let cache_call = cache.requests;
-    let first = thread::spawn(move || {
-        rt.call_blocking_request(
-            cache_call,
-            CacheRequest::Get {
+        let rt = Arc::clone(&runtime);
+        let cache_call = cache.requests;
+        let first = thread::spawn(move || {
+            rt.call_blocking_request(
+                cache_call,
+                CacheRequest::Get {
+                    key: "invalidate-me".into(),
+                },
+                timeout,
+            )
+        });
+
+        thread::sleep(Duration::from_millis((config.fill_ms / 4).max(1)));
+        let _ = runtime.call_blocking_request(
+            cache.requests,
+            CacheRequest::Invalidate {
                 key: "invalidate-me".into(),
             },
             timeout,
-        )
-    });
+        )?;
 
-    thread::sleep(Duration::from_millis((config.fill_ms / 4).max(1)));
-    let _ = runtime.call_blocking_request(
-        cache.requests,
-        CacheRequest::Invalidate {
-            key: "invalidate-me".into(),
-        },
-        timeout,
-    )?;
+        let first_get_stale = matches!(
+            first
+                .join()
+                .map_err(|_| anyhow::anyhow!("cache get thread panicked"))??,
+            CallOutcome::Replied(CacheReply::Stale)
+        );
 
-    let first_get_stale = matches!(
-        first.join().expect("get thread panicked")?,
-        CallOutcome::Replied(CacheReply::Stale)
-    );
+        thread::sleep(Duration::from_millis(config.fill_ms + 20));
+        let replacement_filled = matches!(
+            runtime.call_blocking_request(
+                cache.requests,
+                CacheRequest::Get {
+                    key: "invalidate-me".into()
+                },
+                timeout
+            )?,
+            CallOutcome::Replied(CacheReply::Value {
+                source: ValueSource::Fill,
+                ..
+            })
+        );
+        let stats = stats(&runtime, cache.requests)?;
 
-    thread::sleep(Duration::from_millis(config.fill_ms + 20));
-    let replacement_filled = matches!(
-        runtime.call_blocking_request(
-            cache.requests,
-            CacheRequest::Get {
-                key: "invalidate-me".into()
-            },
-            timeout
-        )?,
-        CallOutcome::Replied(CacheReply::Value {
-            source: ValueSource::Fill,
-            ..
+        Ok(StaleInvalidationReport {
+            first_get_stale,
+            replacement_filled,
+            stats,
         })
-    );
-    let stats = stats(&runtime, cache.requests)?;
-    shutdown_runtime(shutdown, runtime)?;
+    })();
 
-    Ok(StaleInvalidationReport {
-        first_get_stale,
-        replacement_filled,
-        stats,
-    })
+    finish_after_shutdown(result, shutdown, runtime)
 }
 
 fn register_cache(
@@ -457,12 +467,22 @@ fn stats(
     }
 }
 
-fn shutdown_runtime(
+fn finish_after_shutdown<T>(
+    result: anyhow::Result<T>,
     shutdown: tina_runtime::ThreadedShutdownHandle,
     runtime: Arc<LocalSystem<SingleShard, DefaultThreadedMailboxFactory>>,
-) -> anyhow::Result<()> {
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+) -> anyhow::Result<T> {
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5));
     drop(runtime);
-    terminal.ensure_clean()?;
-    Ok(())
+    let shutdown_result: anyhow::Result<()> = terminal
+        .map_err(Into::into)
+        .and_then(|report| report.ensure_clean().map_err(Into::into));
+
+    match (result, shutdown_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(shutdown_error)) => Err(anyhow::anyhow!(
+            "{error:#}; shutdown also failed: {shutdown_error}"
+        )),
+    }
 }

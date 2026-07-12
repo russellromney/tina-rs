@@ -109,3 +109,18 @@ fn invalid_parameter_and_access_denied_are_dead_letter() {
     assert_eq!(report.stats.dead_letter, 2);
     assert_eq!(report.stats.transient, 0);
 }
+
+#[test]
+fn caller_timeout_settles_before_bounded_shutdown() {
+    let report = run(RunConfig {
+        events: 1,
+        call_timeout_ms: 0,
+        program: vec![FakeOutboundProgram::Deliver("too-late".into())],
+    })
+    .expect("caller-gone completion and shutdown must settle");
+
+    assert_eq!(report.replies, vec![DriverReply::OuterTimeout]);
+    assert_eq!(report.stats.delivered, 0);
+    assert_eq!(report.stats.transient, 1);
+    assert_eq!(report.stats.dead_letter, 0);
+}

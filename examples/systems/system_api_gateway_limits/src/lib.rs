@@ -10,7 +10,7 @@
 //! so the smoke test can be copied into CI without modification.
 
 use std::convert::Infallible;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
@@ -298,121 +298,158 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     let shutdown = runtime.shutdown_handle();
     let scope = SharedCapacityScope::new("gateway.in_flight", "weight", config.shared_cap);
     let body_scope = SharedCapacityScope::new("gateway.body_bytes", "bytes", config.body_cap);
-    let gateway: SplitServiceHandle<GatewayEvent, GatewayRequest, GatewayReply> = runtime
-        .register_split_service::<Gateway, GatewayEvent, GatewayRequest, Infallible>(
-            Gateway::new(
-                scope.clone(),
-                body_scope.clone(),
-                config.upload_weight,
-                config.list_weight,
-                config.upload_body,
-                config.list_body,
-                config.pending_capacity,
-            ),
-            config.gateway_mailbox,
-        )
-        .map_err(|e| anyhow::anyhow!("register gateway: {e:?}"))?;
+    let result = (|| {
+        let gateway: SplitServiceHandle<GatewayEvent, GatewayRequest, GatewayReply> = runtime
+            .register_split_service::<Gateway, GatewayEvent, GatewayRequest, Infallible>(
+                Gateway::new(
+                    scope.clone(),
+                    body_scope.clone(),
+                    config.upload_weight,
+                    config.list_weight,
+                    config.upload_body,
+                    config.list_body,
+                    config.pending_capacity,
+                ),
+                config.gateway_mailbox,
+            )
+            .map_err(|e| anyhow::anyhow!("register gateway: {e:?}"))?;
 
-    let timeout = Duration::from_millis(config.call_timeout_ms);
-    let outcomes = Arc::new(Mutex::new(Vec::with_capacity(
-        config.upload_callers + config.list_callers,
-    )));
-    let barrier = Arc::new(Barrier::new(
-        config.upload_callers + config.list_callers + 1,
-    ));
-    let mut threads = Vec::new();
+        let timeout = Duration::from_millis(config.call_timeout_ms);
+        let barrier = Arc::new(Barrier::new(
+            config.upload_callers + config.list_callers + 1,
+        ));
+        let mut threads = Vec::new();
 
-    for _ in 0..config.upload_callers {
-        let rt = Arc::clone(&runtime);
-        let gate = Arc::clone(&barrier);
-        let out = Arc::clone(&outcomes);
-        let hold = Duration::from_millis(config.upload_hold_ms);
-        let addr = gateway.requests;
-        threads.push(thread::spawn(move || {
-            gate.wait();
-            let r = rt.call_blocking_request(
-                addr,
-                GatewayRequest::Request {
-                    route: Route::Upload,
-                    hold,
-                },
-                timeout,
-            );
-            out.lock().expect("outcomes").push(("upload", r));
-        }));
-    }
-    for _ in 0..config.list_callers {
-        let rt = Arc::clone(&runtime);
-        let gate = Arc::clone(&barrier);
-        let out = Arc::clone(&outcomes);
-        let hold = Duration::from_millis(config.list_hold_ms);
-        let addr = gateway.requests;
-        threads.push(thread::spawn(move || {
-            gate.wait();
-            let r = rt.call_blocking_request(
-                addr,
-                GatewayRequest::Request {
-                    route: Route::List,
-                    hold,
-                },
-                timeout,
-            );
-            out.lock().expect("outcomes").push(("list", r));
-        }));
-    }
-    barrier.wait();
-    for t in threads {
-        t.join().expect("caller thread panicked");
-    }
-
-    let mut upload_admitted = 0usize;
-    let mut upload_full = 0usize;
-    let mut upload_timeout = 0usize;
-    let mut list_admitted = 0usize;
-    let mut list_full = 0usize;
-    let mut list_timeout = 0usize;
-    for (route, outcome) in outcomes.lock().expect("outcomes").iter() {
-        match (route, outcome) {
-            (&"upload", Ok(CallOutcome::Replied(GatewayReply::Ok { .. }))) => upload_admitted += 1,
-            (&"upload", Ok(CallOutcome::Replied(GatewayReply::Full { .. }))) => upload_full += 1,
-            (&"upload", Ok(CallOutcome::Timeout)) => upload_timeout += 1,
-            (&"list", Ok(CallOutcome::Replied(GatewayReply::Ok { .. }))) => list_admitted += 1,
-            (&"list", Ok(CallOutcome::Replied(GatewayReply::Full { .. }))) => list_full += 1,
-            (&"list", Ok(CallOutcome::Timeout)) => list_timeout += 1,
-            other => anyhow::bail!("unexpected outcome: {other:?}"),
+        for _ in 0..config.upload_callers {
+            let rt = Arc::clone(&runtime);
+            let gate = Arc::clone(&barrier);
+            let hold = Duration::from_millis(config.upload_hold_ms);
+            let addr = gateway.requests;
+            threads.push(thread::spawn(move || {
+                gate.wait();
+                (
+                    "upload",
+                    rt.call_blocking_request(
+                        addr,
+                        GatewayRequest::Request {
+                            route: Route::Upload,
+                            hold,
+                        },
+                        timeout,
+                    ),
+                )
+            }));
         }
-    }
-
-    // Pre-shutdown snapshot for discovery output / capacity summary.
-    let snap_pre = scope.snapshot();
-    let body_pre = body_scope.snapshot();
-    let scope_line = scope.discovery_line();
-    let body_line = body_scope.discovery_line();
-    let surface_line =
-        format_discovery_line(&scope.surface_report(tina::capacity::CapacityMode::Fixed));
-    let mut capacity_summary = CapacitySummary::new();
-    capacity_summary
-        .push(scope.surface_report(tina::capacity::CapacityMode::Fixed))
-        .map_err(|e| anyhow::anyhow!("push surface: {e:?}"))?;
-    capacity_summary
-        .push(body_scope.surface_report(tina::capacity::CapacityMode::Fixed))
-        .map_err(|e| anyhow::anyhow!("push body surface: {e:?}"))?;
-    if let Err(errors) = capacity_summary.assert_no_full() {
-        // Failing is expected for this specimen; surface the
-        // copyable FAIL line for CI consumers but do not error.
-        for err in &errors {
-            eprintln!("{}", format_assertion_failure(err));
+        for _ in 0..config.list_callers {
+            let rt = Arc::clone(&runtime);
+            let gate = Arc::clone(&barrier);
+            let hold = Duration::from_millis(config.list_hold_ms);
+            let addr = gateway.requests;
+            threads.push(thread::spawn(move || {
+                gate.wait();
+                (
+                    "list",
+                    rt.call_blocking_request(
+                        addr,
+                        GatewayRequest::Request {
+                            route: Route::List,
+                            hold,
+                        },
+                        timeout,
+                    ),
+                )
+            }));
         }
-    }
+        barrier.wait();
+        let outcomes = threads
+            .into_iter()
+            .map(|thread| {
+                thread
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("gateway caller thread panicked"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let mut upload_admitted = 0usize;
+        let mut upload_full = 0usize;
+        let mut upload_timeout = 0usize;
+        let mut list_admitted = 0usize;
+        let mut list_full = 0usize;
+        let mut list_timeout = 0usize;
+        for (route, outcome) in &outcomes {
+            match (route, outcome) {
+                (&"upload", Ok(CallOutcome::Replied(GatewayReply::Ok { .. }))) => {
+                    upload_admitted += 1
+                }
+                (&"upload", Ok(CallOutcome::Replied(GatewayReply::Full { .. }))) => {
+                    upload_full += 1
+                }
+                (&"upload", Ok(CallOutcome::Timeout)) => upload_timeout += 1,
+                (&"list", Ok(CallOutcome::Replied(GatewayReply::Ok { .. }))) => list_admitted += 1,
+                (&"list", Ok(CallOutcome::Replied(GatewayReply::Full { .. }))) => list_full += 1,
+                (&"list", Ok(CallOutcome::Timeout)) => list_timeout += 1,
+                other => anyhow::bail!("unexpected outcome: {other:?}"),
+            }
+        }
+
+        // Pre-shutdown snapshot for discovery output / capacity summary.
+        let snap_pre = scope.snapshot();
+        let body_pre = body_scope.snapshot();
+        let scope_line = scope.discovery_line();
+        let body_line = body_scope.discovery_line();
+        let surface_line =
+            format_discovery_line(&scope.surface_report(tina::capacity::CapacityMode::Fixed));
+        let mut capacity_summary = CapacitySummary::new();
+        capacity_summary
+            .push(scope.surface_report(tina::capacity::CapacityMode::Fixed))
+            .map_err(|e| anyhow::anyhow!("push surface: {e:?}"))?;
+        capacity_summary
+            .push(body_scope.surface_report(tina::capacity::CapacityMode::Fixed))
+            .map_err(|e| anyhow::anyhow!("push body surface: {e:?}"))?;
+        if let Err(errors) = capacity_summary.assert_no_full() {
+            // Failing is expected for this specimen; surface the
+            // copyable FAIL line for CI consumers but do not error.
+            for err in &errors {
+                eprintln!("{}", format_assertion_failure(err));
+            }
+        }
+
+        Ok((
+            upload_admitted,
+            upload_full,
+            upload_timeout,
+            list_admitted,
+            list_full,
+            list_timeout,
+            snap_pre,
+            body_pre,
+            scope_line,
+            body_line,
+            surface_line,
+        ))
+    })();
 
     // Owner stop must release every held charge. Shutdown drops the
     // gateway isolate, which drops every parked capacity reservation.
     // The post-shutdown snapshot is the load-bearing
     // proof: `current` must be 0 even if callers were still timing
     // out at shutdown time.
-    shutdown_runtime(shutdown, runtime)?;
+    let result = finish_after_shutdown(result, shutdown, runtime);
     let snap = scope.snapshot();
     let body_snap = body_scope.snapshot();
+    let (
+        upload_admitted,
+        upload_full,
+        upload_timeout,
+        list_admitted,
+        list_full,
+        list_timeout,
+        snap_pre,
+        body_pre,
+        scope_line,
+        body_line,
+        surface_line,
+    ) = result?;
 
     let summary_line = format!(
         "system=system_api_gateway_limits upload_admitted={} upload_full={} upload_timeout={} list_admitted={} list_full={} list_timeout={} scope_high_water={} scope_full_count={} scope_current_at_drain={} body_high_water={} body_full_count={} body_current_at_drain={}",
@@ -453,12 +490,22 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     })
 }
 
-fn shutdown_runtime(
+fn finish_after_shutdown<T>(
+    result: anyhow::Result<T>,
     shutdown: tina_runtime::ThreadedShutdownHandle,
     runtime: Arc<LocalSystem<SingleShard, DefaultThreadedMailboxFactory>>,
-) -> anyhow::Result<()> {
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+) -> anyhow::Result<T> {
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5));
     drop(runtime);
-    terminal.ensure_clean()?;
-    Ok(())
+    let shutdown_result: anyhow::Result<()> = terminal
+        .map_err(Into::into)
+        .and_then(|report| report.ensure_clean().map_err(Into::into));
+
+    match (result, shutdown_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(shutdown_error)) => Err(anyhow::anyhow!(
+            "{error:#}; shutdown also failed: {shutdown_error}"
+        )),
+    }
 }

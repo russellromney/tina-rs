@@ -1,4 +1,4 @@
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
@@ -128,10 +128,12 @@ impl ObjectLane {
                 permit,
                 result,
             } => {
-                let _ = self
-                    .gate
-                    .release(permit)
-                    .expect("permit released exactly once by PutFinished");
+                if let Err(error) = self.gate.release(permit) {
+                    return reply_to(
+                        request,
+                        LaneReply::Failed(format!("permit release failed: {error:?}")),
+                    );
+                }
                 match result {
                     Ok(()) => {
                         self.completed += 1;
@@ -237,32 +239,29 @@ pub fn run_against_s3(
         LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
     );
     let shutdown = runtime.shutdown_handle();
-    let lane = runtime
-        .register_split_service::<ObjectLane, LaneEvent, LaneRequest, std::convert::Infallible>(
-            ObjectLane {
-                gate: LocalPermitGate::with_capacity(config.lane_in_flight)
-                    .named(LocalPermitName("object_lane")),
-                backend: WorkBackend::AwsS3 {
-                    address: s3_address,
-                    bucket,
-                    key_prefix,
-                    timeout: bridge_timeout,
+    let result = (|| {
+        let lane = runtime
+            .register_split_service::<ObjectLane, LaneEvent, LaneRequest, std::convert::Infallible>(
+                ObjectLane {
+                    gate: LocalPermitGate::with_capacity(config.lane_in_flight)
+                        .named(LocalPermitName("object_lane")),
+                    backend: WorkBackend::AwsS3 {
+                        address: s3_address,
+                        bucket,
+                        key_prefix,
+                        timeout: bridge_timeout,
+                    },
+                    accepted: 0,
+                    busy: 0,
+                    completed: 0,
                 },
-                accepted: 0,
-                busy: 0,
-                completed: 0,
-            },
-            config.lane_mailbox,
-        )
-        .map_err(|e| anyhow::anyhow!("register lane: {e:?}"))?;
+                config.lane_mailbox,
+            )
+            .map_err(|e| anyhow::anyhow!("register lane: {e:?}"))?;
 
-    let report = drive_callers(&runtime, lane.requests, config)?;
-
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
-
-    Ok(report)
+        drive_callers(&runtime, lane.requests, config)
+    })();
+    finish_after_shutdown(result, shutdown, runtime)
 }
 
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
@@ -270,29 +269,26 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
     );
     let shutdown = runtime.shutdown_handle();
-    let lane = runtime
-        .register_split_service::<ObjectLane, LaneEvent, LaneRequest, std::convert::Infallible>(
-            ObjectLane {
-                gate: LocalPermitGate::with_capacity(config.lane_in_flight)
-                    .named(LocalPermitName("object_lane")),
-                backend: WorkBackend::FakeSleep {
-                    work: Duration::from_millis(config.work_ms),
+    let result = (|| {
+        let lane = runtime
+            .register_split_service::<ObjectLane, LaneEvent, LaneRequest, std::convert::Infallible>(
+                ObjectLane {
+                    gate: LocalPermitGate::with_capacity(config.lane_in_flight)
+                        .named(LocalPermitName("object_lane")),
+                    backend: WorkBackend::FakeSleep {
+                        work: Duration::from_millis(config.work_ms),
+                    },
+                    accepted: 0,
+                    busy: 0,
+                    completed: 0,
                 },
-                accepted: 0,
-                busy: 0,
-                completed: 0,
-            },
-            config.lane_mailbox,
-        )
-        .map_err(|e| anyhow::anyhow!("register lane: {e:?}"))?;
+                config.lane_mailbox,
+            )
+            .map_err(|e| anyhow::anyhow!("register lane: {e:?}"))?;
 
-    let report = drive_callers(&runtime, lane.requests, config)?;
-
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
-
-    Ok(report)
+        drive_callers(&runtime, lane.requests, config)
+    })();
+    finish_after_shutdown(result, shutdown, runtime)
 }
 
 fn drive_callers(
@@ -301,36 +297,38 @@ fn drive_callers(
     config: RunConfig,
 ) -> anyhow::Result<RunReport> {
     let barrier = Arc::new(Barrier::new(config.callers + 1));
-    let outcomes = Arc::new(Mutex::new(Vec::with_capacity(config.callers)));
     let mut threads = Vec::with_capacity(config.callers);
     let call_timeout = Duration::from_millis(config.call_timeout_ms);
 
     for n in 0..config.callers {
         let rt = Arc::clone(runtime);
         let gate = Arc::clone(&barrier);
-        let out = Arc::clone(&outcomes);
         threads.push(thread::spawn(move || {
             gate.wait();
-            let outcome = rt.call_blocking_request(
+            rt.call_blocking_request(
                 lane,
                 LaneRequest::Put {
                     key: format!("object-{n}"),
                 },
                 call_timeout,
-            );
-            out.lock().expect("outcomes lock").push(outcome);
+            )
         }));
     }
 
     barrier.wait();
-    for thread in threads {
-        thread.join().expect("caller thread panicked");
-    }
+    let outcomes = threads
+        .into_iter()
+        .map(|thread| {
+            thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("object-lane caller thread panicked"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     let mut stored = 0;
     let mut busy = 0;
     let mut failed = 0;
-    for outcome in outcomes.lock().expect("outcomes lock").iter() {
+    for outcome in &outcomes {
         match outcome {
             Ok(CallOutcome::Replied(LaneReply::Stored(_))) => stored += 1,
             Ok(CallOutcome::Replied(LaneReply::Busy { .. })) => busy += 1,
@@ -351,6 +349,26 @@ fn drive_callers(
         failed,
         stats,
     })
+}
+
+fn finish_after_shutdown<T>(
+    result: anyhow::Result<T>,
+    shutdown: tina_runtime::ThreadedShutdownHandle,
+    runtime: Arc<LocalSystem<SingleShard, DefaultThreadedMailboxFactory>>,
+) -> anyhow::Result<T> {
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5));
+    drop(runtime);
+    let shutdown_result: anyhow::Result<()> = terminal
+        .map_err(Into::into)
+        .and_then(|report| report.ensure_clean().map_err(Into::into));
+
+    match (result, shutdown_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(shutdown_error)) => Err(anyhow::anyhow!(
+            "{error:#}; shutdown also failed: {shutdown_error}"
+        )),
+    }
 }
 
 #[allow(dead_code)]

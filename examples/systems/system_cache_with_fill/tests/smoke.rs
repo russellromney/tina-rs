@@ -29,3 +29,17 @@ fn cache_fill_is_single_flight_and_stale_results_do_not_cache() {
     assert_eq!(report.stale_invalidation.stats.fills_started, 2);
     assert_eq!(report.stale_invalidation.stats.fills_completed, 1);
 }
+
+#[test]
+fn report_failure_returns_after_bounded_shutdown() {
+    let error = run(RunConfig {
+        cache_mailbox: 0,
+        ..RunConfig::default()
+    })
+    .expect_err("zero-capacity mailbox must refuse the stats call");
+
+    assert!(
+        format!("{error:#}").contains("stats failed: Full"),
+        "unexpected error: {error:#}"
+    );
+}

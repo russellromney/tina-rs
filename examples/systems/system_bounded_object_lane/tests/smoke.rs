@@ -20,3 +20,17 @@ fn overload_is_visible_as_busy_not_hidden_queueing() {
     assert_eq!(report.stats.busy, 8);
     assert_eq!(report.stats.in_flight, 0);
 }
+
+#[test]
+fn report_failure_returns_after_bounded_shutdown() {
+    let error = run(RunConfig {
+        lane_mailbox: 0,
+        ..RunConfig::default()
+    })
+    .expect_err("zero-capacity mailbox must refuse the stats call");
+
+    assert!(
+        format!("{error:#}").contains("stats call failed: Full"),
+        "unexpected error: {error:#}"
+    );
+}

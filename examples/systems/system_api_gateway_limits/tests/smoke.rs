@@ -195,3 +195,17 @@ fn pure_upload_burst_fills_only_upload_lane_then_drains() {
     );
     assert_eq!(report.scope_current_at_drain, 0);
 }
+
+#[test]
+fn host_call_failure_returns_after_bounded_shutdown() {
+    let error = run(RunConfig {
+        gateway_mailbox: 0,
+        ..RunConfig::default()
+    })
+    .expect_err("zero-capacity mailbox must refuse host calls");
+
+    assert!(
+        format!("{error:#}").contains("unexpected outcome"),
+        "unexpected error: {error:#}"
+    );
+}
