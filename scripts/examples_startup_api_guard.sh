@@ -4,14 +4,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-readonly runtime_pattern='(Threaded(MultiShard)?Runtime::(new|with_config[[:alnum:]_]*)|BridgeHost::new)\b'
-
 scan_runtime() {
-    rg -n "$runtime_pattern" "$@" \
-        --glob '*.rs' \
-        --glob '!**/target/**' \
-        --glob '!**/tests/**' \
-        --glob '!**/benches/**' || true
+    find "$@" -type f -name '*.rs' \
+        ! -path '*/target/*' ! -path '*/tests/*' ! -path '*/benches/*' \
+        -exec perl -ne '
+            while (/\b(?:Threaded(?:MultiShard)?Runtime::(?:new|with_config[[:alnum:]_]*)|BridgeHost::new)\b/g) {
+                print "$ARGV:$.: $&\n";
+            }
+            close ARGV if eof;
+        ' {} + || true
 }
 
 scan_local_system() {
