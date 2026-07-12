@@ -167,8 +167,48 @@ coordinators now need one event variant, one bounded field, one inferred
 `start_service` call, and one inferred `advance_service` call; they no longer
 spell reply/cancel/timer variants, qids, token lookup, or find/remove logic.
 
-This is the framework prerequisite for migrating `specimen_scatter_gather` and
-`specimen_sharded_fanout_read`; those example changes remain a separate cohort.
+`specimen_scatter_gather` now applies this prerequisite directly. Its
+coordinator contains only the worker list plus `ScatterGatherOperations`; one
+`Scatter` event replaces qids, `PendingReplies`, partial rows, manual batches,
+and terminal folding. The completed typed report reaches the driver without
+collapsing target outcomes. A capacity-one live probe proves one admitted
+operation, typed `Full` for every excess caller, exact caller settlement, and
+clean shutdown.
+
+`specimen_sharded_fanout_read` exposed one narrower prerequisite before it can
+apply the same coordinator unchanged. Canonical request-only registration
+returns `ServiceRequestAddress<Infallible, ShardCounterRequest,
+ShardCounterReply>`, but `ShardServiceTable` is fixed to raw `Address<M, R>`.
+Today the example would have to downgrade each handle through
+`.address().address()`, expose `ServiceMessage` in its table type, replace the
+table with an example-local lookup vector, or retain the legacy message plus
+`handle_call` form. None is an acceptable public example.
+
+The smallest motivating API is a request-service table whose construction and
+lookup preserve the typed capability:
+
+```rust
+let counters = ShardRequestServiceTable::try_from_placement(placement, |shard| {
+    runtime.register_request_service_on(shard, ShardCounter { value }, 8)
+})?;
+
+let targets = BoundedItems::try_from_iter(config.max_targets,
+    placement.shards().iter().copied().map(|shard| {
+        (shard, counters.address_for(shard).ok())
+    }))?;
+
+operations.start_service(request, config, targets, |counter, timeout| {
+    call_cancelable_request(counter, ShardCounterRequest::Get, timeout)
+}, ScatterCoordEvent::Scatter)?;
+```
+
+A dedicated `ShardRequestServiceTable<Event, Request, Reply>` is preferable to
+making the existing table capability-generic for this prerequisite: it matches
+the concrete request-only use, keeps `ServiceMessage` private, and avoids a new
+public address-capability trait before a second motivating capability exists.
+After that lands, the sharded specimen can delete `ReplyAdapter`, `Bind`,
+`Start`, `pending_targets`, manual outcome sorting, and raw outbound sends, then
+use the same `ScatterGatherEvent`/`ScatterGatherOperations` coordinator shape.
 
 ### 2026-07-11 Bounded shutdown truth across the example corpus
 

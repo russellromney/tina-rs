@@ -100,7 +100,14 @@ async fn driver() -> Report {
         let payload = c.wrapping_mul(7).wrapping_add(11);
         tasks.push(tokio::spawn(async move {
             let (rtx, rrx) = oneshot::channel();
-            if coord.send(CoordReq { payload, reply: rtx }).await.is_err() {
+            if coord
+                .send(CoordReq {
+                    payload,
+                    reply: rtx,
+                })
+                .await
+                .is_err()
+            {
                 return (payload, None);
             }
             let answer = tokio::time::timeout(Duration::from_secs(2), rrx).await;
