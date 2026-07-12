@@ -270,13 +270,10 @@ impl LockManager {
         expiry_token: u64,
         result: SleepReply,
     ) -> Effect<Self> {
-        match result {
-            Ok(()) => {}
-            Err(error) => {
-                self.stats.timer_errors += 1;
-                self.stats.last_timer_error = Some(error);
-                return noop();
-            }
+        let timer_error = result.err();
+        if let Some(error) = timer_error {
+            self.stats.timer_errors += 1;
+            self.stats.last_timer_error = Some(error);
         }
         let Some(entry) = self.locks.get(&key) else {
             self.stats.stale_expiries_ignored += 1;
@@ -286,7 +283,9 @@ impl LockManager {
             self.stats.stale_expiries_ignored += 1;
             return noop();
         }
-        self.stats.expiries += 1;
+        if timer_error.is_none() {
+            self.stats.expiries += 1;
+        }
         let effects = self.hand_off(key);
         if effects.is_empty() {
             noop()
@@ -303,6 +302,14 @@ impl LockManager {
             self.locks.remove(&key);
             return Vec::new();
         };
+        self.install_handoff(key, slot)
+    }
+
+    fn install_handoff(
+        &mut self,
+        key: String,
+        slot: DeferredReply<LockReply>,
+    ) -> Vec<Effect<Self>> {
         let entry = self.locks.get_mut(&key).expect("held key remains present");
         self.next_holder_id += 1;
         let new_holder_id = self.next_holder_id;
@@ -440,6 +447,7 @@ pub struct KeyspaceOverflowReport {
 }
 
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
+    validate_config(config)?;
     Ok(RunReport {
         fifo: run_fifo(config)?,
         expiry_handoff: run_expiry_handoff(config)?,
@@ -456,12 +464,13 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
 /// remaining three park in FIFO order. Each holder releases as soon as
 /// it sees `Granted`, so the queue should drain in admission order.
 pub fn run_fifo(config: RunConfig) -> anyhow::Result<FifoReport> {
+    validate_config(config)?;
     // Use a long lease so expiry never fires during the test.
     let cfg = RunConfig {
         lease_ms: 5_000,
         ..config
     };
-    let runtime = start()?;
+    let runtime = start(cfg)?;
     let shutdown = runtime.shutdown_handle();
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
@@ -547,11 +556,12 @@ pub fn run_fifo(config: RunConfig) -> anyhow::Result<FifoReport> {
 /// the lease elapses, the parked caller is granted automatically and the
 /// original release is rejected as stale.
 pub fn run_expiry_handoff(config: RunConfig) -> anyhow::Result<ExpiryHandoffReport> {
+    validate_config(config)?;
     let cfg = RunConfig {
         lease_ms: 100,
         ..config
     };
-    let runtime = start()?;
+    let runtime = start(cfg)?;
     let shutdown = runtime.shutdown_handle();
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
@@ -613,11 +623,12 @@ pub fn run_expiry_handoff(config: RunConfig) -> anyhow::Result<ExpiryHandoffRepo
 /// Acquire, queue a waiter, renew before the lease expires, then verify
 /// the waiter is still parked once the original lease window is past.
 pub fn run_renewal(config: RunConfig) -> anyhow::Result<RenewalReport> {
+    validate_config(config)?;
     let cfg = RunConfig {
         lease_ms: 120,
         ..config
     };
-    let runtime = start()?;
+    let runtime = start(cfg)?;
     let shutdown = runtime.shutdown_handle();
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
@@ -706,11 +717,12 @@ pub fn run_renewal(config: RunConfig) -> anyhow::Result<RenewalReport> {
 /// Acquire, release, then release the same handle again. The second
 /// release must be rejected as stale.
 pub fn run_stale_release(config: RunConfig) -> anyhow::Result<StaleReleaseReport> {
+    validate_config(config)?;
     let cfg = RunConfig {
         lease_ms: 5_000,
         ..config
     };
-    let runtime = start()?;
+    let runtime = start(cfg)?;
     let shutdown = runtime.shutdown_handle();
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
@@ -740,12 +752,13 @@ pub fn run_stale_release(config: RunConfig) -> anyhow::Result<StaleReleaseReport
 /// Hold one key, then burst more contenders than the per-key cap allows.
 /// Overflow callers must see `Busy`, not park silently.
 pub fn run_per_key_overflow(config: RunConfig) -> anyhow::Result<PerKeyOverflowReport> {
+    validate_config(config)?;
     let cfg = RunConfig {
         lease_ms: 5_000,
         max_waiters_per_key: 2,
         ..config
     };
-    let runtime = start()?;
+    let runtime = start(cfg)?;
     let shutdown = runtime.shutdown_handle();
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
@@ -835,13 +848,14 @@ pub fn run_per_key_overflow(config: RunConfig) -> anyhow::Result<PerKeyOverflowR
 /// Saturate the global waiter table across two held keys. The second key is
 /// below its per-key limit, so rejection must remain specifically global.
 pub fn run_global_overflow(config: RunConfig) -> anyhow::Result<GlobalOverflowReport> {
+    validate_config(config)?;
     let cfg = RunConfig {
         lease_ms: 5_000,
         waiter_capacity: 1,
         max_waiters_per_key: 2,
         ..config
     };
-    let runtime = start()?;
+    let runtime = start(cfg)?;
     let shutdown = runtime.shutdown_handle();
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
@@ -898,13 +912,14 @@ pub fn run_global_overflow(config: RunConfig) -> anyhow::Result<GlobalOverflowRe
 /// A timed-out FIFO head is reclaimed on refill. With capacity one, admitting
 /// the replacement proves the closed caller released its exact table slot.
 pub fn run_caller_gone_refill(config: RunConfig) -> anyhow::Result<CallerGoneRefillReport> {
+    validate_config(config)?;
     let cfg = RunConfig {
         lease_ms: 5_000,
         waiter_capacity: 1,
         max_waiters_per_key: 1,
         ..config
     };
-    let runtime = start()?;
+    let runtime = start(cfg)?;
     let shutdown = runtime.shutdown_handle();
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
@@ -969,12 +984,13 @@ pub fn run_caller_gone_refill(config: RunConfig) -> anyhow::Result<CallerGoneRef
 }
 
 pub fn run_keyspace_overflow(config: RunConfig) -> anyhow::Result<KeyspaceOverflowReport> {
+    validate_config(config)?;
     let cfg = RunConfig {
         lease_ms: 5_000,
         max_keys: 1,
         ..config
     };
-    let runtime = start()?;
+    let runtime = start(cfg)?;
     let shutdown = runtime.shutdown_handle();
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
@@ -1172,7 +1188,8 @@ fn shutdown_runtime(
     Ok(())
 }
 
-fn start() -> anyhow::Result<Arc<App>> {
+fn start(config: RunConfig) -> anyhow::Result<Arc<App>> {
+    validate_config(config)?;
     Ok(Arc::new(
         LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
     ))
@@ -1181,20 +1198,117 @@ fn start() -> anyhow::Result<Arc<App>> {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use std::any::TypeId;
+
+    fn fake_reply(slot_id: u64) -> (DeferredReply<LockReply>, Arc<tina::DeferredSlotShared>) {
+        let shared = Arc::new(tina::DeferredSlotShared::new(
+            slot_id,
+            TypeId::of::<LockReply>(),
+        ));
+        let reply = tina::runtime_internal::deferred_from_handle(
+            tina::runtime_internal::handle_from_shared(Arc::clone(&shared)),
+        );
+        (reply, shared)
+    }
 
     #[test]
-    fn timer_failure_is_typed_and_does_not_mutate_lease_state() {
+    fn current_timer_failure_retires_the_unenforceable_lease() {
         let mut manager = LockManager::new(RunConfig::default());
-        let effect = manager.lease_expired(
-            "missing".into(),
-            1,
-            1,
-            Err(tina_runtime::CallError::TimerFull),
+        manager.locks.insert(
+            "held".into(),
+            LockState {
+                holder_id: 1,
+                expiry_token: 1,
+            },
         );
+        let effect =
+            manager.lease_expired("held".into(), 1, 1, Err(tina_runtime::CallError::TimerFull));
         assert!(matches!(effect, Effect::Noop));
         assert_eq!(manager.stats.timer_errors, 1);
         assert_eq!(manager.stats.last_timer_error, Some(CallError::TimerFull));
         assert_eq!(manager.stats.expiries, 0);
         assert_eq!(manager.stats.stale_expiries_ignored, 0);
+        assert!(manager.locks.is_empty());
+    }
+
+    #[test]
+    fn stale_timer_failure_is_typed_without_revoking_the_current_holder() {
+        let mut manager = LockManager::new(RunConfig::default());
+        manager.locks.insert(
+            "held".into(),
+            LockState {
+                holder_id: 2,
+                expiry_token: 3,
+            },
+        );
+        let effect =
+            manager.lease_expired("held".into(), 1, 1, Err(tina_runtime::CallError::TimerFull));
+        assert!(matches!(effect, Effect::Noop));
+        assert_eq!(manager.stats.timer_errors, 1);
+        assert_eq!(manager.stats.stale_expiries_ignored, 1);
+        assert_eq!(manager.locks["held"].holder_id, 2);
+    }
+
+    #[test]
+    fn selected_waiter_late_close_keeps_exclusivity_until_lease_expiry_rolls_back() {
+        let mut manager = LockManager::new(RunConfig::default());
+        manager.locks.insert(
+            "held".into(),
+            LockState {
+                holder_id: 1,
+                expiry_token: 1,
+            },
+        );
+        manager.next_holder_id = 1;
+        let (slot, shared) = fake_reply(7);
+        shared.set_state(tina::DeferredSlotState::Closed);
+
+        let effects = manager.install_handoff("held".into(), slot);
+        assert_eq!(effects.len(), 2, "reply and expiry must remain paired");
+        let holder = manager.locks["held"].holder_id;
+        let token = manager.locks["held"].expiry_token;
+        assert_ne!(holder, 1, "the old holder loses authority at handoff");
+
+        let expiry = manager.lease_expired("held".into(), holder, token, Ok(()));
+        assert!(matches!(expiry, Effect::Noop));
+        assert!(
+            manager.locks.is_empty(),
+            "ghost holder retires at lease expiry"
+        );
+    }
+
+    #[test]
+    fn shutdown_closes_a_parked_caller_and_reports_clean() {
+        let cfg = RunConfig {
+            lease_ms: 5_000,
+            ..RunConfig::default()
+        };
+        let runtime = start(cfg).expect("start");
+        let shutdown = runtime.shutdown_handle();
+        let lockmgr = register(&runtime, cfg).expect("register");
+        let timeout = Duration::from_secs(2);
+        let _holder = acquire_handle(&runtime, lockmgr, "shutdown", timeout).expect("holder");
+        let caller_runtime = Arc::clone(&runtime);
+        let caller = thread::spawn(move || {
+            caller_runtime.call_blocking_request(
+                lockmgr,
+                LockRequest::Acquire {
+                    key: "shutdown".into(),
+                },
+                timeout,
+            )
+        });
+        wait_for_waiters(&runtime, lockmgr, 1, timeout).expect("waiter parked");
+
+        let terminal = shutdown
+            .request_and_wait_report(Duration::from_secs(5))
+            .expect("shutdown report");
+        let outcome = caller.join().expect("caller thread");
+        assert!(matches!(
+            outcome,
+            Err(tina_runtime::ThreadedRuntimeError::WorkerStopped)
+        ));
+        drop(runtime);
+        terminal.ensure_clean().expect("clean terminal report");
     }
 }

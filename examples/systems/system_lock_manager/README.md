@@ -57,8 +57,11 @@ The smoke suite exercises nine behaviours:
 9. **Fallible bounded shape** — zero capacity is returned as configuration
    failure instead of reaching a constructor panic.
 
-A focused unit probe injects `CallError::TimerFull` and proves the lease state
-is unchanged while the exact typed error is retained in statistics.
+Focused unit probes inject `CallError::TimerFull` and prove a current lease is
+retired rather than becoming immortal, while a stale timer failure cannot
+revoke the current holder. Another probe closes a selected FIFO caller before
+delivery and proves the generation-stamped lease timer rolls the ghost holder
+back without overlapping a second owner.
 
 ## Findings
 
@@ -84,7 +87,9 @@ What felt good:
   fallible startup, split registration, typed blocking request calls,
   shared shutdown control, and a clean terminal report.
 - Carrying `SleepReply` into `LeaseExpired` makes timer admission failure
-  visible and typed instead of treating every continuation as a wake.
+  visible and typed instead of treating every continuation as a wake. A
+  current timer failure retires or hands off the lease immediately because an
+  unscheduled expiry cannot enforce lease ownership.
 - The compiler caught mistakes fast. `Effect<I>` typing meant pasting
   the wrong reply variant failed loudly; `RequestEffect<I>` now means
   forgetting to consume `RequestCall` fails before runtime.

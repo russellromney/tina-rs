@@ -27,9 +27,11 @@ Direct live coverage proves FIFO hand-off, capacity-one caller-timeout
 reclamation and refill, distinct global/per-key Full rails, keyspace Full,
 release and expiry hand-off, renew plus stale timer suppression, stale
 release/renew rejection, zero final waiter/key occupancy, and clean bounded
-shutdown. A focused unit probe proves typed timer failure does not mutate
-lease ownership. This fully applies closed finding 21 to its remaining
-motivating specimen; no new framework gap surfaced.
+shutdown. Focused unit probes prove a current-generation timer failure retires
+an unenforceable lease, a stale failure cannot revoke the current holder, and a
+caller that closes after FIFO selection leaves at most a lease-bounded ghost
+holder before expiry rollback. This fully applies closed finding 21 to its
+remaining motivating specimen; no new framework gap surfaced.
 
 ### 2026-07-11 Bounded shutdown truth across the example corpus
 

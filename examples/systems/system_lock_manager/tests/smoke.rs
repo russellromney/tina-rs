@@ -108,10 +108,56 @@ fn active_keyspace_cap_rejects_only_new_keys() {
 
 #[test]
 fn invalid_bounded_shape_is_fallible() {
-    let error = run_fifo(RunConfig {
-        waiter_capacity: 0,
-        ..cfg()
-    })
-    .expect_err("zero waiter capacity must not panic or start the service");
-    assert!(error.to_string().contains("waiter_capacity"));
+    let invalid = [
+        (
+            "waiter_capacity",
+            RunConfig {
+                waiter_capacity: 0,
+                ..cfg()
+            },
+        ),
+        (
+            "max_waiters_per_key",
+            RunConfig {
+                max_waiters_per_key: 0,
+                ..cfg()
+            },
+        ),
+        (
+            "max_keys",
+            RunConfig {
+                max_keys: 0,
+                ..cfg()
+            },
+        ),
+        (
+            "mailbox",
+            RunConfig {
+                mailbox: 0,
+                ..cfg()
+            },
+        ),
+        (
+            "lease_ms",
+            RunConfig {
+                lease_ms: 0,
+                ..cfg()
+            },
+        ),
+        (
+            "call_timeout_ms",
+            RunConfig {
+                call_timeout_ms: 0,
+                ..cfg()
+            },
+        ),
+    ];
+
+    for (field, config) in invalid {
+        let error = run_fifo(config).expect_err("invalid config must fail before runtime startup");
+        assert!(
+            error.to_string().contains(field),
+            "wrong error for {field}: {error:#}"
+        );
+    }
 }
