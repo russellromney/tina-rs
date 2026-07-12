@@ -26,9 +26,9 @@ use tina::capacity::CapacityMode;
 use tina::prelude::*;
 use tina_runtime::{
     BoundedEventSink, CallOutcome, CapacitySummary, DefaultThreadedMailboxFactory, DropPolicy,
-    GuardedPendingReplies, ServicePressureReport, ServicePressureSurface, SharedCapacityScope,
-    SharedLease, SharedScopeFull, SleepReply, SplitServiceHandle, ThreadedRuntime,
-    format_assertion_failure, sleep,
+    LocalSystem, LocalSystemConfig, ServicePressureReport, ServicePressureSurface,
+    SharedCapacityScope, SharedLease, SharedScopeFull, SleepReply, SplitServiceHandle,
+    ThreadedRuntimeError, format_assertion_failure, sleep,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -42,7 +42,7 @@ pub struct RunConfig {
     pub slow_threshold_ms: u64,
     pub event_sink_cap: usize,
     pub gateway_mailbox: usize,
-    pub pending_capacity: usize,
+    pub timer_capacity: usize,
     pub call_timeout_ms: u64,
 }
 
@@ -58,7 +58,7 @@ impl Default for RunConfig {
             slow_threshold_ms: 12,
             event_sink_cap: 8,
             gateway_mailbox: 64,
-            pending_capacity: 64,
+            timer_capacity: LocalSystemConfig::default().timer_capacity,
             call_timeout_ms: 5_000,
         }
     }
@@ -70,7 +70,11 @@ pub struct RunReport {
     pub ok: usize,
     pub http_full: usize,
     pub db_full: usize,
-    pub pending_full: usize,
+    pub timer_failed: usize,
+    pub call_full: usize,
+    pub call_closed: usize,
+    pub call_timeout: usize,
+    pub call_rejected: usize,
     pub slow_events_accepted: u64,
     pub slow_events_dropped: u64,
     pub discovery_lines: Vec<String>,
@@ -96,67 +100,34 @@ pub enum SoakEvent {
     Flow(SoakFlow),
 }
 
-/// Split-service envelope for `Soak`.
-pub type SoakMsg = tina::ServiceMessage<SoakEvent, SoakRequest>;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SoakReply {
     Ok,
-    HttpFull {
-        current: usize,
-        max: usize,
-    },
-    DbFull {
-        current: usize,
-        max: usize,
-    },
-    /// `PendingReplies` rejected the slot; the request never reached
-    /// the DB stage. Distinct from `HttpFull` so a debug operator
-    /// reading replies can find the right surface.
-    PendingFull {
-        current: usize,
-        max: usize,
-    },
-    /// `PendingReplies` rejected the slot for a duplicate qid. Should
-    /// not happen with monotone qids; reserved so the variant cannot
-    /// be silently swallowed.
-    PendingDuplicate,
+    HttpFull { current: usize, max: usize },
+    DbFull { current: usize, max: usize },
+    TimerFailed(tina_runtime::CallError),
 }
 
 struct Soak {
     http_scope: SharedCapacityScope,
     db_scope: SharedCapacityScope,
     events: BoundedEventSink<SlowEvent>,
-    pending: GuardedPendingReplies<u64, SoakReply, SharedLease>,
     fake_http: Duration,
     fake_db: Duration,
     slow_threshold: Duration,
     started_at: Instant,
-    next_qid: u64,
 }
 
-// Both steps are timer wake-ups, not runtime calls: the caller's authority
-// stays parked in `self.pending` keyed by `qid` (see `dispatch`/
-// `http_released`), swapped from the http lease to the db lease between
-// steps. Neither step carries a `RequestContext` in the message, so each
-// uses `-> raw SleepReply` instead of the call-shaped `-> T` arrow: the
-// field is `SleepReply` verbatim (no `CallOutcome` wrap), and the body has
-// no `req` to thread. Continuations land as domain events via
-// `then_service_event` so the split-service form never names the envelope.
 tina::flow! {
     pub flow SoakFlow for Soak {
         reply SoakReply;
 
-        step HttpReleased(qid: u64, worker_id: usize, request_id: usize, started_ms: u64) -> raw SleepReply {
-            // The timer payload carries no information (sleep cannot fail
-            // short of runtime shutdown); the pre-flow code ignored it too.
-            let _ = outcome;
-            self.http_released(qid, worker_id, request_id, started_ms)
+        step HttpReleased(http_lease: SharedLease, worker_id: usize, request_id: usize, started_ms: u64) -> raw request SleepReply {
+            self.http_released(req, http_lease, worker_id, request_id, started_ms, outcome)
         }
 
-        step DbReleased(qid: u64, worker_id: usize, request_id: usize, started_ms: u64) -> raw SleepReply {
-            let _ = outcome;
-            self.db_released(qid, worker_id, request_id, started_ms)
+        step DbReleased(db_lease: SharedLease, worker_id: usize, request_id: usize, started_ms: u64) -> raw request SleepReply {
+            self.db_released(req, db_lease, worker_id, request_id, started_ms, outcome)
         }
     }
 }
@@ -205,13 +176,10 @@ impl Soak {
                 config.event_sink_cap,
                 DropPolicy::DropOldest,
             ),
-            pending: GuardedPendingReplies::with_capacity(config.pending_capacity)
-                .named("system_soak_http_db.pending"),
             fake_http: Duration::from_millis(config.fake_http_ms),
             fake_db: Duration::from_millis(config.fake_db_ms),
             slow_threshold: Duration::from_millis(config.slow_threshold_ms),
             started_at: Instant::now(),
-            next_qid: 1,
         }
     }
 
@@ -231,80 +199,70 @@ impl Soak {
                 return call.reply(SoakReply::HttpFull { current, max });
             }
         };
-        let qid = self.next_qid;
         call.capture(|request| {
-            match self
-                .pending
-                .insert_deferred_guarded(qid, request.into_deferred(), http_lease)
-            {
-                Ok(_ticket) => {
-                    self.next_qid = qid + 1;
-                    let started_ms = self.now_ms();
-                    let fake = self.fake_http;
-                    sleep(fake).then_service_event(move |result| {
-                        SoakEvent::Flow(SoakFlow::HttpReleased(
-                            qid, worker_id, request_id, started_ms, result,
-                        ))
-                    })
-                }
-                Err(tina_runtime::GuardedInsertError::Full { reply, .. }) => {
-                    let cap = self.pending.capacity();
-                    reply_to::<Self>(
-                        reply,
-                        SoakReply::PendingFull {
-                            current: cap,
-                            max: cap,
-                        },
-                    )
-                }
-                Err(tina_runtime::GuardedInsertError::DuplicateKey { reply, .. }) => {
-                    reply_to::<Self>(reply, SoakReply::PendingDuplicate)
-                }
+            if !request.is_open() {
+                drop(http_lease);
+                return noop();
             }
+            let started_ms = self.now_ms();
+            let fake = self.fake_http;
+            sleep(fake).then_service_event_with_request(request, move |request, outcome| {
+                SoakEvent::Flow(SoakFlow::HttpReleased(
+                    request, http_lease, worker_id, request_id, started_ms, outcome,
+                ))
+            })
         })
     }
 
     fn http_released(
         &mut self,
-        qid: u64,
+        request: RequestContext<SoakReply>,
+        http_lease: SharedLease,
         worker_id: usize,
         request_id: usize,
         started_ms: u64,
+        outcome: SleepReply,
     ) -> Effect<Self> {
-        // Take the slot+http_lease out so we can swap the guard.
-        let Some((slot, http_lease)) = self.pending.take_by_key(&qid) else {
+        if let Err(error) = outcome {
+            drop(http_lease);
+            return reply_to(request, SoakReply::TimerFailed(error));
+        }
+        if !request.is_open() {
+            drop(http_lease);
             return noop();
-        };
+        }
         let db_lease = match self.db_scope.try_admit(1) {
             Ok(lease) => lease,
             Err(SharedScopeFull { current, max, .. }) => {
                 drop(http_lease);
-                return reply_to(slot, SoakReply::DbFull { current, max });
+                return reply_to(request, SoakReply::DbFull { current, max });
             }
         };
         drop(http_lease);
-        // Re-admit the same caller under the same key, this time with
-        // the DB lease as the guard. Admission cannot fail: we just
-        // freed slot qid.
-        self.pending
-            .insert_deferred_guarded(qid, slot, db_lease)
-            .map_err(|_| ())
-            .expect("re-admission after take cannot fail");
         let fake = self.fake_db;
-        sleep(fake).then_service_event(move |result| {
+        sleep(fake).then_service_event_with_request(request, move |request, outcome| {
             SoakEvent::Flow(SoakFlow::DbReleased(
-                qid, worker_id, request_id, started_ms, result,
+                request, db_lease, worker_id, request_id, started_ms, outcome,
             ))
         })
     }
 
     fn db_released(
         &mut self,
-        qid: u64,
+        request: RequestContext<SoakReply>,
+        db_lease: SharedLease,
         worker_id: usize,
         request_id: usize,
         started_ms: u64,
+        outcome: SleepReply,
     ) -> Effect<Self> {
+        drop(db_lease);
+        if !request.is_open() {
+            return noop();
+        }
+        if let Err(error) = outcome {
+            return reply_to(request, SoakReply::TimerFailed(error));
+        }
         let took = self.now_ms().saturating_sub(started_ms);
         if Duration::from_millis(took) >= self.slow_threshold {
             self.events.push(SlowEvent {
@@ -313,31 +271,76 @@ impl Soak {
                 took_ms: took,
             });
         }
-        let Some((slot, db_lease)) = self.pending.take_by_key(&qid) else {
-            return noop();
-        };
-        let effect = reply_to(slot, SoakReply::Ok);
-        drop(db_lease);
-        effect
+        reply_to(request, SoakReply::Ok)
     }
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct OutcomeCounts {
+    ok: usize,
+    http_full: usize,
+    db_full: usize,
+    timer_failed: usize,
+    call_full: usize,
+    call_closed: usize,
+    call_timeout: usize,
+    call_rejected: usize,
+}
+
+fn classify_outcomes(
+    outcomes: &[Result<CallOutcome<SoakReply>, ThreadedRuntimeError>],
+) -> anyhow::Result<OutcomeCounts> {
+    let mut counts = OutcomeCounts::default();
+    for outcome in outcomes {
+        match outcome {
+            Ok(CallOutcome::Replied(SoakReply::Ok)) => counts.ok += 1,
+            Ok(CallOutcome::Replied(SoakReply::HttpFull { .. })) => counts.http_full += 1,
+            Ok(CallOutcome::Replied(SoakReply::DbFull { .. })) => counts.db_full += 1,
+            Ok(CallOutcome::Replied(SoakReply::TimerFailed(_))) => counts.timer_failed += 1,
+            Ok(CallOutcome::Full) => counts.call_full += 1,
+            Ok(CallOutcome::Closed) => counts.call_closed += 1,
+            Ok(CallOutcome::Timeout) => counts.call_timeout += 1,
+            Ok(CallOutcome::Rejected(_)) => counts.call_rejected += 1,
+            Err(error) => anyhow::bail!("host call failed: {error}"),
+        }
+    }
+    Ok(counts)
+}
+
+type SoakSystem = LocalSystem<SingleShard, DefaultThreadedMailboxFactory>;
+
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
+    let local_config = LocalSystemConfig {
+        timer_capacity: config.timer_capacity,
+        ..LocalSystemConfig::default()
+    };
+    let runtime = Arc::new(
+        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+            .config(local_config)
+            .try_build()?,
+    );
     let shutdown = runtime.shutdown_handle();
     let soak = Soak::new(&config);
     let http_scope = soak.http_scope.clone();
     let db_scope = soak.db_scope.clone();
     let events = soak.events.clone();
-    let svc: SplitServiceHandle<SoakEvent, SoakRequest, SoakReply> = runtime
+    let svc_result: Result<SplitServiceHandle<SoakEvent, SoakRequest, SoakReply>, _> = runtime
         .register_split_service::<Soak, SoakEvent, SoakRequest, Infallible>(
             soak,
             config.gateway_mailbox,
-        )
-        .map_err(|e| anyhow::anyhow!("register soak gateway: {e:?}"))?;
+        );
+    let svc = match svc_result {
+        Ok(service) => service,
+        Err(error) => {
+            let shutdown_result = shutdown_runtime(shutdown, runtime);
+            return match shutdown_result {
+                Ok(()) => Err(anyhow::anyhow!("register soak gateway: {error:?}")),
+                Err(shutdown_error) => Err(anyhow::anyhow!(
+                    "register soak gateway: {error:?}; shutdown also failed: {shutdown_error}"
+                )),
+            };
+        }
+    };
 
     let timeout = Duration::from_millis(config.call_timeout_ms);
     let total = config.workers * config.requests_per_worker;
@@ -349,17 +352,17 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         let rt = Arc::clone(&runtime);
         let gate = Arc::clone(&barrier);
         let out = Arc::clone(&outcomes);
-        let addr = svc.requests.address();
+        let requests = svc.requests;
         let per = config.requests_per_worker;
         threads.push(thread::spawn(move || {
             gate.wait();
             for request_id in 0..per {
-                let r = rt.call_blocking_typed(
-                    addr,
-                    SoakMsg::Request(SoakRequest::Request {
+                let r = rt.call_blocking_request(
+                    requests,
+                    SoakRequest::Request {
                         worker_id,
                         request_id,
-                    }),
+                    },
                     timeout,
                 );
                 out.lock().expect("outcomes").push(r);
@@ -367,34 +370,25 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         }));
     }
     barrier.wait();
-    for t in threads {
-        t.join().expect("worker thread panicked");
+    let mut worker_panicked = false;
+    for worker in threads {
+        worker_panicked |= worker.join().is_err();
     }
 
-    let mut ok = 0usize;
-    let mut http_full = 0usize;
-    let mut db_full = 0usize;
-    let mut pending_full = 0usize;
-    for outcome in outcomes.lock().expect("outcomes").iter() {
-        match outcome {
-            Ok(CallOutcome::Replied(SoakReply::Ok)) => ok += 1,
-            Ok(CallOutcome::Replied(SoakReply::HttpFull { .. })) => http_full += 1,
-            Ok(CallOutcome::Replied(SoakReply::DbFull { .. })) => db_full += 1,
-            Ok(CallOutcome::Replied(SoakReply::PendingFull { .. })) => pending_full += 1,
-            Ok(CallOutcome::Replied(SoakReply::PendingDuplicate)) => {
-                anyhow::bail!("pending duplicate qid — qid generator is broken");
-            }
-            other => anyhow::bail!("unexpected outcome: {other:?}"),
+    let report_result = (|| -> anyhow::Result<RunReport> {
+        if worker_panicked {
+            anyhow::bail!("one or more soak worker threads panicked");
         }
-    }
+        let outcomes = outcomes.lock().expect("outcomes");
+        let counts = classify_outcomes(&outcomes)?;
 
     // Aggregate everything into a ServicePressureReport .
-    let mut summary = ServicePressureReport::new("soak_http_db");
-    summary.add_surface(ServicePressureSurface::measured(
-        "soak.http.in_flight",
-        "scope",
-        http_scope.surface_report(CapacityMode::Fixed),
-    ));
+        let mut summary = ServicePressureReport::new("soak_http_db");
+        summary.add_surface(ServicePressureSurface::measured(
+            "soak.http.in_flight",
+            "scope",
+            http_scope.surface_report(CapacityMode::Fixed),
+        ));
     summary.add_surface(ServicePressureSurface::measured(
         "soak.db.in_flight",
         "scope",
@@ -411,41 +405,61 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         "no outbound pool installed in this soak",
     );
 
-    let mut discovery_lines: Vec<String> = Vec::new();
-    discovery_lines.push(http_scope.discovery_line());
+        let mut discovery_lines: Vec<String> = Vec::new();
+        discovery_lines.push(http_scope.discovery_line());
     discovery_lines.push(db_scope.discovery_line());
     discovery_lines.push(events.discovery_line());
     for surface in &summary.surfaces {
         discovery_lines.push(surface.discovery_line());
     }
 
-    let mut copyable_assertion_failures = Vec::new();
-    let capacity_summary: CapacitySummary = summary
-        .capacity_summary()
-        .map_err(|e| anyhow::anyhow!("capacity summary: {e:?}"))?;
+        let mut copyable_assertion_failures = Vec::new();
+        let capacity_summary: CapacitySummary = summary
+            .capacity_summary()
+            .map_err(|e| anyhow::anyhow!("capacity summary: {e:?}"))?;
     if let Err(errors) = capacity_summary.assert_no_full() {
         for err in &errors {
             copyable_assertion_failures.push(format_assertion_failure(err));
         }
     }
 
-    let event_snap = events.snapshot();
-    let service_summary_line = summary.summary_line();
+        let event_snap = events.snapshot();
+        let service_summary_line = summary.summary_line();
 
-    shutdown_runtime(shutdown, runtime)?;
+        Ok(RunReport {
+            total_requests: total,
+            ok: counts.ok,
+            http_full: counts.http_full,
+            db_full: counts.db_full,
+            timer_failed: counts.timer_failed,
+            call_full: counts.call_full,
+            call_closed: counts.call_closed,
+            call_timeout: counts.call_timeout,
+            call_rejected: counts.call_rejected,
+            slow_events_accepted: event_snap.accepted,
+            slow_events_dropped: event_snap.dropped,
+            discovery_lines,
+            service_summary_line,
+            copyable_assertion_failures,
+        })
+    })();
 
-    let report = RunReport {
-        total_requests: total,
-        ok,
-        http_full,
-        db_full,
-        pending_full,
-        slow_events_accepted: event_snap.accepted,
-        slow_events_dropped: event_snap.dropped,
-        discovery_lines,
-        service_summary_line,
-        copyable_assertion_failures,
+    let shutdown_result = shutdown_runtime(shutdown, runtime);
+    let http_after_shutdown = http_scope.snapshot();
+    let db_after_shutdown = db_scope.snapshot();
+    let settlement_result = if http_after_shutdown.current != 0 || db_after_shutdown.current != 0 {
+        Err(anyhow::anyhow!(
+            "shutdown leaked scope authority: http={} db={}",
+            http_after_shutdown.current,
+            db_after_shutdown.current
+        ))
+    } else {
+        Ok(())
     };
+
+    shutdown_result?;
+    settlement_result?;
+    let report = report_result?;
 
     // Echo lines to stdout so CI consumers see them.
     for line in &report.discovery_lines {
@@ -458,10 +472,71 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
 
 fn shutdown_runtime(
     shutdown: tina_runtime::ThreadedShutdownHandle,
-    runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
+    runtime: Arc<SoakSystem>,
 ) -> anyhow::Result<()> {
     let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
     drop(runtime);
     terminal.ensure_clean()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outcome_accounting_keeps_every_terminal_variant_distinct() {
+        let outcomes = vec![
+            Ok(CallOutcome::Replied(SoakReply::Ok)),
+            Ok(CallOutcome::Replied(SoakReply::HttpFull {
+                current: 1,
+                max: 1,
+            })),
+            Ok(CallOutcome::Replied(SoakReply::DbFull {
+                current: 1,
+                max: 1,
+            })),
+            Ok(CallOutcome::Replied(SoakReply::TimerFailed(
+                tina_runtime::CallError::TimerFull,
+            ))),
+            Ok(CallOutcome::Full),
+            Ok(CallOutcome::Closed),
+            Ok(CallOutcome::Timeout),
+            Ok(CallOutcome::Rejected(
+                tina::CallRejectedReason::UnsupportedMessage,
+            )),
+        ];
+
+        assert_eq!(
+            classify_outcomes(&outcomes).unwrap(),
+            OutcomeCounts {
+                ok: 1,
+                http_full: 1,
+                db_full: 1,
+                timer_failed: 1,
+                call_full: 1,
+                call_closed: 1,
+                call_timeout: 1,
+                call_rejected: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn outer_host_errors_remain_errors() {
+        let errors = [
+            ThreadedRuntimeError::WorkerStopped,
+            ThreadedRuntimeError::UnknownShard(ShardId::new(99)),
+            ThreadedRuntimeError::DriverShutdownFailed,
+            ThreadedRuntimeError::DriverParkFailed,
+            ThreadedRuntimeError::CommandFull,
+            ThreadedRuntimeError::HostWaitTimeout,
+            ThreadedRuntimeError::WorkerUnresponsive,
+        ];
+        for error in errors {
+            let message = classify_outcomes(&[Err(error)]).unwrap_err().to_string();
+            assert!(message.starts_with("host call failed:"), "{message}");
+            assert!(message.contains(&error.to_string()), "{message}");
+        }
+    }
 }

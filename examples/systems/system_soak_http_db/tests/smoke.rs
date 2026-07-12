@@ -10,7 +10,14 @@ fn soak_emits_grep_friendly_discovery_lines() {
     let report = run(config).expect("soak ran");
 
     assert_eq!(
-        report.ok + report.http_full + report.db_full + report.pending_full,
+        report.ok
+            + report.http_full
+            + report.db_full
+            + report.timer_failed
+            + report.call_full
+            + report.call_closed
+            + report.call_timeout
+            + report.call_rejected,
         report.total_requests,
         "every request must produce one outcome (report={report:?})",
     );
@@ -18,6 +25,7 @@ fn soak_emits_grep_friendly_discovery_lines() {
         report.ok > 0,
         "at least some requests should succeed (report={report:?})",
     );
+    assert_eq!(report.timer_failed, 0, "timers should settle cleanly");
     // With http cap=4 and db cap=2 against 8 workers x 16 reqs, the
     // scopes must fill at least sometimes.
     assert!(
@@ -95,6 +103,122 @@ fn soak_emits_grep_friendly_discovery_lines() {
 }
 
 #[test]
+fn caller_timeout_releases_parked_http_authority_on_shutdown() {
+    let report = run(RunConfig {
+        workers: 1,
+        requests_per_worker: 1,
+        http_in_flight_cap: 1,
+        db_in_flight_cap: 1,
+        fake_http_ms: 100,
+        fake_db_ms: 100,
+        call_timeout_ms: 1,
+        ..RunConfig::default()
+    })
+    .expect("timed-out soak shuts down cleanly");
+
+    assert_eq!(report.call_timeout, 1);
+    assert_eq!(report.ok + report.http_full + report.db_full, 0);
+    assert_eq!(report.slow_events_accepted, 0);
+}
+
+#[test]
+fn caller_gone_before_handler_does_not_arm_http_timer() {
+    let report = run(RunConfig {
+        workers: 32,
+        requests_per_worker: 1,
+        http_in_flight_cap: 32,
+        db_in_flight_cap: 32,
+        fake_http_ms: 100,
+        timer_capacity: 1,
+        call_timeout_ms: 0,
+        ..RunConfig::default()
+    })
+    .expect("already-timed-out callers settle without parked timers");
+
+    assert_eq!(report.call_timeout, report.total_requests);
+    assert_eq!(report.timer_failed, 0, "closed callers must not arm timers");
+    assert_eq!(report.slow_events_accepted, 0);
+}
+
+#[test]
+fn caller_timeout_releases_parked_db_authority_on_shutdown() {
+    let report = run(RunConfig {
+        workers: 1,
+        requests_per_worker: 1,
+        http_in_flight_cap: 1,
+        db_in_flight_cap: 1,
+        fake_http_ms: 1,
+        fake_db_ms: 100,
+        call_timeout_ms: 20,
+        ..RunConfig::default()
+    })
+    .expect("DB-stage timeout shuts down cleanly");
+
+    assert_eq!(report.call_timeout, 1);
+    assert_eq!(report.slow_events_accepted, 0);
+    let db = report
+        .discovery_lines
+        .iter()
+        .find(|line| line.starts_with("scope ") && line.contains("name=soak.db.in_flight"))
+        .expect("DB scope discovery line");
+    assert!(db.contains("high=1"), "DB lease was never admitted: {db}");
+}
+
+#[test]
+fn full_timer_lane_replies_with_timer_failed_and_settles_every_lease() {
+    let report = run(RunConfig {
+        workers: 8,
+        requests_per_worker: 1,
+        http_in_flight_cap: 8,
+        db_in_flight_cap: 8,
+        fake_http_ms: 100,
+        fake_db_ms: 1,
+        timer_capacity: 1,
+        call_timeout_ms: 1_000,
+        ..RunConfig::default()
+    })
+    .expect("timer pressure remains typed and shuts down cleanly");
+
+    assert!(report.timer_failed > 0, "expected TimerFull: {report:?}");
+    assert_eq!(report.call_timeout, 0, "timer Full must not become timeout");
+    assert_eq!(
+        report.ok
+            + report.timer_failed
+            + report.http_full
+            + report.db_full
+            + report.call_full
+            + report.call_closed
+            + report.call_timeout
+            + report.call_rejected,
+        report.total_requests
+    );
+}
+
+#[test]
+fn full_gateway_mailbox_remains_a_distinct_call_outcome() {
+    let report = run(RunConfig {
+        workers: 64,
+        requests_per_worker: 1,
+        http_in_flight_cap: 64,
+        db_in_flight_cap: 64,
+        fake_http_ms: 50,
+        fake_db_ms: 1,
+        gateway_mailbox: 1,
+        timer_capacity: 64,
+        call_timeout_ms: 1_000,
+        ..RunConfig::default()
+    })
+    .expect("mailbox pressure remains typed and shuts down cleanly");
+
+    assert!(report.call_full > 0, "expected call Full: {report:?}");
+    assert_eq!(report.call_timeout, 0, "mailbox Full must not become timeout");
+    assert_eq!(
+        report.slow_events_accepted, report.ok as u64,
+        "only completed slow requests should emit events"
+    );
+}
+
+#[test]
 fn event_sink_drops_visibly_under_load() {
     // Force the slow-event sink to overflow by setting its cap small
     // and the slow threshold low enough that most requests exceed it.
@@ -145,7 +269,6 @@ fn soak_with_no_pressure_passes_assert_no_full() {
         requests_per_worker: 4,
         http_in_flight_cap: 32,
         db_in_flight_cap: 32,
-        pending_capacity: 64,
         slow_threshold_ms: 1_000,
         event_sink_cap: 32,
         ..RunConfig::default()
