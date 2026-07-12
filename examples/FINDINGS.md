@@ -39,6 +39,10 @@ drain/quarantine contract. A tracked-backend regression proves zero cancel
 calls for empty shared I/O; retained-completion quarantine tests and 200
 consecutive copied-path owner-stop runs prove both sides of the boundary.
 
+This driver hotfix is independent of address provenance; the provenance work
+only stamps and validates routing identity and does not alter backend
+cancellation or completion draining.
+
 ### 2026-07-12 Split-service outbound facade prerequisite
 
 **Surfaced by:** `ergonomics_playground`'s debounced batch client.
@@ -206,6 +210,7 @@ one-shot server now closes both its stream and listener instead of relying on
 simulator teardown to hide the listener. The fake bridge now reserves its
 installed in-flight cap before dispatch, and the custom policy rejects
 self-contradictory zero configurations. The extension sweep is now complete.
+
 ### 2026-07-12 Runtime address provenance prerequisite
 
 Address identity now includes an opaque `SystemIncarnation` ahead of shard,

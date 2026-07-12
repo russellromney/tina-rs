@@ -303,7 +303,8 @@ fn main() {
 
     // Refresh the registry with the replacement address. The host learned the
     // new incarnation from the typed restart waiter, not from the trace.
-    let replacement = Address::<WorkerEvent>::new_with_generation(
+    let replacement = Address::<WorkerEvent>::new_with_generation_in(
+        dispatcher.system(),
         restarted.new_shard,
         restarted.new_isolate,
         restarted.new_generation,
