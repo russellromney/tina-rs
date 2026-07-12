@@ -535,6 +535,7 @@ mod tests {
                 expected: tina::SystemIncarnation::new(1),
                 actual: tina::SystemIncarnation::new(2),
             },
+            ThreadedRuntimeError::ParentStopped,
             ThreadedRuntimeError::WorkerStopped,
             ThreadedRuntimeError::UnknownShard(ShardId::new(99)),
             ThreadedRuntimeError::DriverShutdownFailed,

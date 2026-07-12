@@ -241,6 +241,9 @@ example workspaces outside the root workspace that had exhaustive terminal
 classifiers predating `ForeignSystem`. Copied-path, bounded-batcher, bridge,
 worker-pool, and soak probes now classify or directly assert that terminal
 instead of adding wildcard arms or collapsing it into an unrelated outcome.
+The final lifecycle-parity review also made a stopped or stale parent distinct
+from a stopped worker. Copied-path, bounded-batcher, and soak now preserve and
+prove the `ParentStopped` host terminal explicitly.
 
 ### 2026-07-12 Lock-manager keyed FIFO canonicalization
 

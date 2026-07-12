@@ -482,6 +482,7 @@ fn rejected_kind(reason: CallRejectedReason) -> &'static str {
 fn host_error_kind(error: ThreadedRuntimeError) -> &'static str {
     match error {
         ThreadedRuntimeError::ForeignSystem { .. } => "host_foreign_system",
+        ThreadedRuntimeError::ParentStopped => "host_parent_stopped",
         ThreadedRuntimeError::WorkerStopped => "host_worker_stopped",
         ThreadedRuntimeError::UnknownShard(_) => "host_unknown_shard",
         ThreadedRuntimeError::DriverShutdownFailed => "host_driver_shutdown_failed",
@@ -553,6 +554,10 @@ mod adversarial_tests {
         assert_eq!(
             host_error_kind(ThreadedRuntimeError::ForeignSystem { expected, actual }),
             "host_foreign_system"
+        );
+        assert_eq!(
+            host_error_kind(ThreadedRuntimeError::ParentStopped),
+            "host_parent_stopped"
         );
     }
 

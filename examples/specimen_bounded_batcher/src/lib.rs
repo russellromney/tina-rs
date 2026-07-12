@@ -31,6 +31,7 @@ pub struct Report {
     pub rejected: usize,
     pub timer_failures: usize,
     pub host_foreign_system: usize,
+    pub host_parent_stopped: usize,
     pub host_command_full: usize,
     pub host_worker_stopped: usize,
     pub host_wait_timeout: usize,
