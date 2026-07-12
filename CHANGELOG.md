@@ -4,6 +4,13 @@ This file records completed work.
 
 ## Unreleased
 
+### Bounded shared-runtime shutdown
+
+- Added `ThreadedShutdownHandle::request_and_wait_report`, which retries
+  bounded shutdown admission and waits for terminal truth under one total
+  timeout. Partial multi-shard progress and the final request failure remain
+  visible through typed `ShutdownAndWaitError` outcomes.
+
 ### Fallible threaded runtime startup (#296)
 
 - Added typed `StartupError` and `ThreadedRuntimeConfigError`. Startup failures

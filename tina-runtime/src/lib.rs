@@ -109,9 +109,10 @@ pub use concurrency_pending::{
 };
 pub use drain_state::{AdmitDecision, DrainReport, DrainStage, DrainState};
 pub use errors::{
-    RegisterBootstrapError, SendObservedUntilError, ShutdownRequestError, ShutdownWaitError,
-    StartupError, SuperviseError, ThreadedRegisterBootstrapError, ThreadedRuntimeConfigError,
-    ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError,
+    RegisterBootstrapError, SendObservedUntilError, ShutdownAndWaitError, ShutdownRequestError,
+    ShutdownWaitError, StartupError, SuperviseError, ThreadedRegisterBootstrapError,
+    ThreadedRuntimeConfigError, ThreadedRuntimeError, ThreadedSendObservedError,
+    ThreadedTrySendError,
 };
 pub use full_handling::{
     FullDecision, FullExhaustionReason, FullHandling, FullHandlingReport, FullHandlingToken,
