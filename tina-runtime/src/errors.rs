@@ -457,6 +457,8 @@ impl Error for ThreadedSendObservedError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendObservedUntilError {
     /// Deadline elapsed while still racing the mailbox/ingress for a slot.
+    /// The timed-out attempt no longer owns delivery authority and cannot
+    /// deliver later.
     Timeout,
     /// Target isolate mailbox reported closed/stale.
     Closed,

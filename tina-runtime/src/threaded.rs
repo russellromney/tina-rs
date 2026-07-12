@@ -388,6 +388,178 @@ where
     report_worker_stopped_on_drop: bool,
 }
 
+pub(crate) fn observed_send_command<S, F, M, R, P, O>(
+    address: Address<M, R>,
+    message: M,
+    preflight: P,
+    observer: O,
+) -> ThreadedCommand<S, F>
+where
+    S: Shard + 'static,
+    F: MailboxFactory + 'static,
+    M: Send + 'static,
+    R: 'static,
+    P: FnOnce(&M) -> Option<ThreadedSendObservedError> + Send + 'static,
+    O: FnOnce(Result<(), ThreadedSendObservedError>) + Send + 'static,
+{
+    ThreadedCommand::RunObserved(Box::new(SendObservedCommand {
+        address,
+        message: Some(message),
+        preflight: Some(preflight),
+        observer: Some(observer),
+        report_worker_stopped_on_drop: true,
+    }))
+}
+
+#[derive(Clone, Copy)]
+enum DeadlineObservedState {
+    Pending,
+    Cancelled,
+    Completed(Result<(), ThreadedSendObservedError>),
+}
+
+struct DeadlineObservedCommand<M, R> {
+    address: Address<M, R>,
+    message: Option<M>,
+    reply: Option<std::sync::mpsc::Sender<Result<(), ThreadedSendObservedError>>>,
+    state: Arc<std::sync::Mutex<DeadlineObservedState>>,
+    report_worker_stopped_on_drop: bool,
+}
+
+impl<S, F, M, R> ThreadedObservedCommandTask<S, F> for DeadlineObservedCommand<M, R>
+where
+    S: Shard + 'static,
+    F: MailboxFactory + 'static,
+    M: Send + 'static,
+    R: 'static,
+{
+    fn run(mut self: Box<Self>, runtime: &mut Runtime<S, F>) {
+        self.report_worker_stopped_on_drop = false;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(*state, DeadlineObservedState::Cancelled) {
+            return;
+        }
+        debug_assert!(matches!(*state, DeadlineObservedState::Pending));
+        let outcome = runtime
+            .try_send(
+                self.address,
+                self.message
+                    .take()
+                    .expect("deadline-observed command runs once"),
+            )
+            .map_err(|error| match error {
+                TrySendError::Full(_) => ThreadedSendObservedError::MailboxFull,
+                TrySendError::Closed(_) => ThreadedSendObservedError::MailboxClosed,
+            });
+        *state = DeadlineObservedState::Completed(outcome);
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(outcome);
+        }
+    }
+
+    fn disarm(mut self: Box<Self>) {
+        self.report_worker_stopped_on_drop = false;
+    }
+}
+
+impl<M, R> Drop for DeadlineObservedCommand<M, R> {
+    fn drop(&mut self) {
+        if !self.report_worker_stopped_on_drop {
+            return;
+        }
+        drop(self.message.take());
+        let outcome = Err(ThreadedSendObservedError::WorkerStopped);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !matches!(*state, DeadlineObservedState::Pending) {
+            return;
+        }
+        *state = DeadlineObservedState::Completed(outcome);
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(outcome);
+        }
+    }
+}
+
+pub(crate) struct DeadlineObservedAttempt<S, F>
+where
+    S: Shard + 'static,
+    F: MailboxFactory,
+{
+    command: Option<ThreadedCommand<S, F>>,
+    state: Arc<std::sync::Mutex<DeadlineObservedState>>,
+    reply: std::sync::mpsc::Receiver<Result<(), ThreadedSendObservedError>>,
+}
+
+impl<S, F> DeadlineObservedAttempt<S, F>
+where
+    S: Shard + 'static,
+    F: MailboxFactory,
+{
+    pub(crate) fn take_command(&mut self) -> ThreadedCommand<S, F> {
+        self.command
+            .take()
+            .expect("deadline-observed attempt enqueues once")
+    }
+
+    pub(crate) fn wait_until(
+        self,
+        remaining: Duration,
+    ) -> Result<Result<(), ThreadedSendObservedError>, SendObservedUntilError> {
+        match self.reply.recv_timeout(remaining) {
+            Ok(outcome) => Ok(outcome),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(SendObservedUntilError::WorkerStopped)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match *state {
+                    DeadlineObservedState::Pending => {
+                        *state = DeadlineObservedState::Cancelled;
+                        Err(SendObservedUntilError::Timeout)
+                    }
+                    DeadlineObservedState::Completed(outcome) => Ok(outcome),
+                    DeadlineObservedState::Cancelled => Err(SendObservedUntilError::Timeout),
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn deadline_observed_attempt<S, F, M, R>(
+    address: Address<M, R>,
+    message: M,
+) -> DeadlineObservedAttempt<S, F>
+where
+    S: Shard + 'static,
+    F: MailboxFactory + 'static,
+    M: Send + 'static,
+    R: 'static,
+{
+    let state = Arc::new(std::sync::Mutex::new(DeadlineObservedState::Pending));
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    let command = ThreadedCommand::RunObserved(Box::new(DeadlineObservedCommand {
+        address,
+        message: Some(message),
+        reply: Some(reply_tx),
+        state: Arc::clone(&state),
+        report_worker_stopped_on_drop: true,
+    }));
+    DeadlineObservedAttempt {
+        command: Some(command),
+        state,
+        reply: reply_rx,
+    }
+}
+
 impl<S, F, M, R, P, O> ThreadedObservedCommandTask<S, F> for SendObservedCommand<M, R, P, O>
 where
     S: Shard + 'static,
@@ -398,28 +570,37 @@ where
     O: FnOnce(Result<(), ThreadedSendObservedError>) + Send + 'static,
 {
     fn run(mut self: Box<Self>, runtime: &mut Runtime<S, F>) {
-        self.report_worker_stopped_on_drop = false;
         let message = self.message.take().expect("observed command runs once");
         let preflight = self
             .preflight
             .take()
             .expect("observed command preflight runs once");
+        if let Some(error) = preflight(&message) {
+            drop(message);
+            let observer = self
+                .observer
+                .take()
+                .expect("observed command observer runs once");
+            self.report_worker_stopped_on_drop = false;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer(Err(error));
+            }));
+            return;
+        }
+        let outcome = runtime
+            .try_send(self.address, message)
+            .map_err(|error| match error {
+                TrySendError::Full(_) => ThreadedSendObservedError::MailboxFull,
+                TrySendError::Closed(_) => ThreadedSendObservedError::MailboxClosed,
+            });
         let observer = self
             .observer
             .take()
             .expect("observed command observer runs once");
-        if let Some(error) = preflight(&message) {
-            observer(Err(error));
-            return;
-        }
-        observer(
-            runtime
-                .try_send(self.address, message)
-                .map_err(|error| match error {
-                    TrySendError::Full(_) => ThreadedSendObservedError::MailboxFull,
-                    TrySendError::Closed(_) => ThreadedSendObservedError::MailboxClosed,
-                }),
-        );
+        self.report_worker_stopped_on_drop = false;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            observer(outcome);
+        }));
     }
 
     fn disarm(mut self: Box<Self>) {
@@ -435,6 +616,7 @@ where
         if !self.report_worker_stopped_on_drop {
             return;
         }
+        drop(self.message.take());
         let Some(observer) = self.observer.take() else {
             return;
         };
@@ -1319,7 +1501,8 @@ where
     /// mailbox admission, the observer receives
     /// [`ThreadedSendObservedError::WorkerStopped`]. A host-side
     /// `Err(IngressFull | WorkerStopped)` means the observer will not run.
-    /// The observer must stay nonblocking.
+    /// The observer must stay nonblocking. A panic from the observer is
+    /// contained after settlement and does not stop the worker.
     pub fn try_send_and_observe_with<M, R, O>(
         &self,
         address: Address<M, R>,
@@ -1367,19 +1550,22 @@ where
     /// queue capacity that other ingress could use. Pick a backoff that
     /// reflects how fast the data mailbox actually drains.
     ///
-    /// **Worker-observation latency is bounded by the deadline.** Each
-    /// attempt waits for the worker to admit the command using
-    /// `recv_timeout(remaining)`, so a stuck or slow worker cannot
-    /// extend the call past `deadline`. A worker that accepts the
-    /// command but does not observe the mailbox outcome before the
-    /// deadline elapses surfaces as
-    /// [`SendObservedUntilError::Timeout`].
+    /// **Timeout is unambiguous.** Each attempt uses a shared delivery claim.
+    /// If the deadline wins while the command is still queued, it cancels the
+    /// attempt and the worker retires the message without mailbox delivery. If
+    /// the worker has already claimed the attempt, its nonblocking mailbox
+    /// admission decides the exact `Ok` / `Full` / `Closed` outcome before the
+    /// host returns. Therefore `Timeout` guarantees that the message cannot be
+    /// delivered later.
     ///
     /// **Past deadline.** If `deadline <= Instant::now()` at entry, the
     /// helper returns `Timeout` immediately without enqueueing a
     /// command. That avoids the race where a "must finish by" deadline
     /// causes the helper to deliver the message *and* report `Timeout`,
     /// leaving the caller unsure whether the side effect happened.
+    /// The deadline is checked again after `make_message` returns; time spent
+    /// constructing a message consumes the same budget, and a message completed
+    /// after the deadline is retired without enqueueing.
     pub fn send_observed_until<M, R, MakeMsg>(
         &self,
         address: Address<M, R>,
@@ -1400,8 +1586,6 @@ where
             if now >= deadline {
                 return Err(SendObservedUntilError::Timeout);
             }
-            let remaining = deadline.saturating_duration_since(now);
-
             // Worker rejects ingress to a quarantined shard immediately,
             // matching `try_send` / `send_and_observe`.
             if self.metrics.state() == LiveShardState::Failed {
@@ -1409,39 +1593,39 @@ where
                 return Err(SendObservedUntilError::WorkerStopped);
             }
 
-            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
             let message = make_message();
-            let command = ThreadedCommand::Run(Box::new(move |runtime| {
-                let result = runtime
-                    .try_send(address, message)
-                    .map_err(|error| match error {
-                        TrySendError::Full(_) => ThreadedSendObservedError::MailboxFull,
-                        TrySendError::Closed(_) => ThreadedSendObservedError::MailboxClosed,
-                    });
-                let _ = reply_tx.send(result);
-            }));
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(SendObservedUntilError::Timeout);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let mut attempt = deadline_observed_attempt(address, message);
 
-            let outcome = match self.commands.try_send(command) {
+            let outcome = match self.commands.try_send(attempt.take_command()) {
                 Ok(()) => {
                     self.metrics.ingress.accepted();
-                    match reply_rx.recv_timeout(remaining) {
+                    match attempt.wait_until(remaining) {
                         Ok(result) => result,
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            // Worker accepted the command but didn't
-                            // observe the mailbox outcome in time.
-                            return Err(SendObservedUntilError::Timeout);
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        Err(SendObservedUntilError::WorkerStopped) => {
                             self.metrics.set_state(LiveShardState::Failed);
                             return Err(SendObservedUntilError::WorkerStopped);
                         }
+                        Err(error) => return Err(error),
                     }
                 }
-                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                Err(std::sync::mpsc::TrySendError::Full(command)) => {
+                    let ThreadedCommand::RunObserved(command) = command else {
+                        unreachable!("deadline admission enqueues an observed command")
+                    };
+                    command.disarm();
                     self.metrics.ingress.rejected_full();
                     Err(ThreadedSendObservedError::IngressFull)
                 }
-                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                Err(std::sync::mpsc::TrySendError::Disconnected(command)) => {
+                    let ThreadedCommand::RunObserved(command) = command else {
+                        unreachable!("deadline admission enqueues an observed command")
+                    };
+                    command.disarm();
                     self.metrics.ingress.rejected_closed();
                     self.metrics.set_state(LiveShardState::Failed);
                     return Err(SendObservedUntilError::WorkerStopped);
@@ -1540,6 +1724,8 @@ where
     /// before the worker could observe them; it must stay nonblocking. Its
     /// observer has the same exact-once contract as
     /// [`Self::try_send_and_observe_with`].
+    /// If preflight or mailbox admission panics, the worker stops and the
+    /// retained observer settles once with `WorkerStopped` during unwind.
     pub fn try_send_and_observe_with_preflight<M, R, P, O>(
         &self,
         address: Address<M, R>,
@@ -1561,13 +1747,7 @@ where
             return Err(ThreadedTrySendError::WorkerStopped);
         }
 
-        let command = ThreadedCommand::RunObserved(Box::new(SendObservedCommand {
-            address,
-            message: Some(message),
-            preflight: Some(preflight),
-            observer: Some(observer),
-            report_worker_stopped_on_drop: true,
-        }));
+        let command = observed_send_command(address, message, preflight, observer);
 
         match self.commands.try_send(command) {
             Ok(()) => {
