@@ -26,9 +26,10 @@ use crate::capabilities::RuntimeCapabilities;
 use crate::clock::MonotonicClock;
 use crate::driver::BetelgeuseDriver;
 use crate::errors::{
-    ShutdownWaitError, StartupError, ThreadedRegisterBootstrapError, ThreadedRuntimeError,
-    ThreadedTrySendError,
+    SendObservedUntilError, ShutdownWaitError, StartupError, ThreadedRegisterBootstrapError,
+    ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError,
 };
+use crate::host_burst::HostBurstOutcomes;
 use crate::live_report::{
     LiveQueueMetrics, LiveRemoteQueueReport, LiveShardMetrics, LiveShardState, LiveTopologyReport,
 };
@@ -41,7 +42,8 @@ use crate::shutdown::{SharedShutdownState, ShutdownWorker, ThreadedShutdownHandl
 use crate::threaded::{
     CommandSender, DEFAULT_STARTUP_HANDSHAKE_TIMEOUT, RecoverableControlCallError,
     STARTUP_CLEANUP_JOIN_TIMEOUT, ThreadedCommand, ThreadedRuntimeConfig,
-    deliver_shutdown_signal_and_drain_with_remote, panic_payload_message, run_host_call,
+    deadline_observed_attempt, deliver_shutdown_signal_and_drain_with_remote,
+    observed_send_command, panic_payload_message, run_host_call,
 };
 use crate::trace::{RuntimeEvent, SendRejectedReason};
 use crate::{
@@ -808,6 +810,278 @@ where
             address.address().address(),
             tina::ServiceMessage::Event(event),
         )
+    }
+
+    /// Attempts one ingress send and waits for the owning worker to report the
+    /// exact mailbox outcome.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the address targets a shard not owned by this runtime.
+    pub fn send_and_observe<M: Send + 'static, R: 'static>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+    ) -> Result<(), ThreadedSendObservedError> {
+        let Some(sender) = self.commands.get(&address.shard()) else {
+            panic!(
+                "ThreadedMultiShardRuntime::send_and_observe targeted unknown shard {}",
+                address.shard().get()
+            );
+        };
+        let metrics = self
+            .shard_metrics
+            .get(&address.shard())
+            .expect("owned shard has metrics");
+        if metrics.state() == LiveShardState::Failed {
+            metrics.ingress.rejected_closed();
+            return Err(ThreadedSendObservedError::WorkerStopped);
+        }
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let command = ThreadedCommand::Run(Box::new(move |runtime| {
+            let outcome = runtime
+                .try_send(address, message)
+                .map_err(|error| match error {
+                    TinaTrySendError::Full(_) => ThreadedSendObservedError::MailboxFull,
+                    TinaTrySendError::Closed(_) => ThreadedSendObservedError::MailboxClosed,
+                });
+            let _ = reply_tx.send(outcome);
+        }));
+        match sender.try_send(command) {
+            Ok(()) => {
+                metrics.ingress.accepted();
+                reply_rx
+                    .recv()
+                    .unwrap_or(Err(ThreadedSendObservedError::WorkerStopped))
+            }
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                metrics.ingress.rejected_full();
+                Err(ThreadedSendObservedError::IngressFull)
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                metrics.ingress.rejected_closed();
+                metrics.set_state(LiveShardState::Failed);
+                Err(ThreadedSendObservedError::WorkerStopped)
+            }
+        }
+    }
+
+    /// Sends one split-service event and reports the exact target-mailbox
+    /// outcome from the event address's owning shard.
+    pub fn send_event_and_observe<Event, Request>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        event: Event,
+    ) -> Result<(), ThreadedSendObservedError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+    {
+        self.send_and_observe(
+            address.address().address(),
+            tina::ServiceMessage::Event(event),
+        )
+    }
+
+    /// Attempts one bounded observed send on the address's owning shard.
+    /// Accepted observers settle exactly once, including worker-failure races.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the address targets a shard not owned by this runtime.
+    pub fn try_send_and_observe_with<M, R, O>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        observer: O,
+    ) -> Result<(), ThreadedTrySendError>
+    where
+        M: Send + 'static,
+        R: 'static,
+        O: FnOnce(Result<(), ThreadedSendObservedError>) + Send + 'static,
+    {
+        let Some(sender) = self.commands.get(&address.shard()) else {
+            panic!(
+                "ThreadedMultiShardRuntime::try_send_and_observe_with targeted unknown shard {}",
+                address.shard().get()
+            );
+        };
+        let metrics = self
+            .shard_metrics
+            .get(&address.shard())
+            .expect("owned shard has metrics");
+        if metrics.state() == LiveShardState::Failed {
+            metrics.ingress.rejected_closed();
+            return Err(ThreadedTrySendError::WorkerStopped);
+        }
+        let command = observed_send_command(address, message, |_| None, observer);
+        match sender.try_send(command) {
+            Ok(()) => {
+                metrics.ingress.accepted();
+                Ok(())
+            }
+            Err(std::sync::mpsc::TrySendError::Full(command)) => {
+                let ThreadedCommand::RunObserved(command) = command else {
+                    unreachable!("observed send enqueues an observed command")
+                };
+                command.disarm();
+                metrics.ingress.rejected_full();
+                Err(ThreadedTrySendError::IngressFull)
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(command)) => {
+                let ThreadedCommand::RunObserved(command) = command else {
+                    unreachable!("observed send enqueues an observed command")
+                };
+                command.disarm();
+                metrics.ingress.rejected_closed();
+                metrics.set_state(LiveShardState::Failed);
+                Err(ThreadedTrySendError::WorkerStopped)
+            }
+        }
+    }
+
+    /// Attempts one bounded observed send and records its eventual outcome.
+    pub fn try_send_outcome<M, R>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        outcomes: &HostBurstOutcomes,
+    ) -> Result<(), ThreadedTrySendError>
+    where
+        M: Send + 'static,
+        R: 'static,
+    {
+        if !self.commands.contains_key(&address.shard()) {
+            panic!(
+                "ThreadedMultiShardRuntime::try_send_outcome targeted unknown shard {}",
+                address.shard().get()
+            );
+        }
+        outcomes.note_submitted();
+        let observer = outcomes.observer();
+        match self.try_send_and_observe_with(address, message, observer) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                outcomes.note_host_side_error(error);
+                Err(error)
+            }
+        }
+    }
+
+    /// Retries observed admission on the owning shard until it succeeds or the
+    /// deadline expires. `Timeout` guarantees that no accepted attempt can
+    /// deliver after this method returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the address targets a shard not owned by this runtime.
+    pub fn send_observed_until<M, R, MakeMessage>(
+        &self,
+        address: Address<M, R>,
+        deadline: Instant,
+        backoff: Duration,
+        mut make_message: MakeMessage,
+    ) -> Result<(), SendObservedUntilError>
+    where
+        M: Send + 'static,
+        R: 'static,
+        MakeMessage: FnMut() -> M,
+    {
+        let Some(sender) = self.commands.get(&address.shard()) else {
+            panic!(
+                "ThreadedMultiShardRuntime::send_observed_until targeted unknown shard {}",
+                address.shard().get()
+            );
+        };
+        let metrics = self
+            .shard_metrics
+            .get(&address.shard())
+            .expect("owned shard has metrics");
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(SendObservedUntilError::Timeout);
+            }
+            if metrics.state() == LiveShardState::Failed {
+                metrics.ingress.rejected_closed();
+                return Err(SendObservedUntilError::WorkerStopped);
+            }
+
+            let message = make_message();
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(SendObservedUntilError::Timeout);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let mut attempt = deadline_observed_attempt(address, message);
+            let outcome = match sender.try_send(attempt.take_command()) {
+                Ok(()) => {
+                    metrics.ingress.accepted();
+                    match attempt.wait_until(remaining) {
+                        Ok(outcome) => outcome,
+                        Err(SendObservedUntilError::WorkerStopped) => {
+                            metrics.set_state(LiveShardState::Failed);
+                            return Err(SendObservedUntilError::WorkerStopped);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(std::sync::mpsc::TrySendError::Full(command)) => {
+                    let ThreadedCommand::RunObserved(command) = command else {
+                        unreachable!("deadline admission enqueues an observed command")
+                    };
+                    command.disarm();
+                    metrics.ingress.rejected_full();
+                    Err(ThreadedSendObservedError::IngressFull)
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(command)) => {
+                    let ThreadedCommand::RunObserved(command) = command else {
+                        unreachable!("deadline admission enqueues an observed command")
+                    };
+                    command.disarm();
+                    metrics.ingress.rejected_closed();
+                    metrics.set_state(LiveShardState::Failed);
+                    return Err(SendObservedUntilError::WorkerStopped);
+                }
+            };
+
+            match outcome {
+                Ok(()) => return Ok(()),
+                Err(ThreadedSendObservedError::MailboxFull)
+                | Err(ThreadedSendObservedError::IngressFull) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(SendObservedUntilError::Timeout);
+                    }
+                    thread::sleep(backoff.min(deadline.saturating_duration_since(now)));
+                }
+                Err(ThreadedSendObservedError::MailboxClosed) => {
+                    return Err(SendObservedUntilError::Closed);
+                }
+                Err(ThreadedSendObservedError::WorkerStopped) => {
+                    return Err(SendObservedUntilError::WorkerStopped);
+                }
+            }
+        }
+    }
+
+    /// Retries split-service event admission on the owning shard until the
+    /// event lands or the deadline expires.
+    pub fn send_event_observed_until<Event, Request, MakeEvent>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        deadline: Instant,
+        backoff: Duration,
+        mut make_event: MakeEvent,
+    ) -> Result<(), SendObservedUntilError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+        MakeEvent: FnMut() -> Event,
+    {
+        self.send_observed_until(address.address().address(), deadline, backoff, move || {
+            tina::ServiceMessage::Event(make_event())
+        })
     }
 
     /// Registers a typed result waiter for the isolate at `address` on the

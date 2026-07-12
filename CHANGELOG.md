@@ -93,6 +93,14 @@ This file records completed work.
   retain `Arc` owners, observe exact `stop_with` values, and obtain cached
   terminal truth without exposing or unwrapping the lower threaded runtime.
 
+### Deadline-observed admission truth
+
+- `send_observed_until` now cancels an accepted but still-queued attempt when
+  its deadline expires, so `Timeout` guarantees no later mailbox delivery.
+  The raw observed-admission, outcome-accounting, and split-service event
+  helpers are also available on `ThreadedMultiShardRuntime` with owning-shard
+  routing and the same exact terminal vocabulary as the single-shard owner.
+
 ### Typed clean-shutdown check
 
 - Added `LocalSystemTerminalReport::ensure_clean` and

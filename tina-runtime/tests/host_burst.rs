@@ -140,6 +140,7 @@ impl Shard for TestShard {
 enum SlowMsg {
     Job(u32),
     Owned(DropProbe),
+    Hold(Arc<FailureGate>),
     /// Stop the isolate cleanly so its mailbox closes.
     Stop,
 }
@@ -167,6 +168,10 @@ impl Slow {
             }
             SlowMsg::Owned(_probe) => {
                 self.processed.fetch_add(1, Ordering::Release);
+                noop()
+            }
+            SlowMsg::Hold(gate) => {
+                gate.enter_and_wait();
                 noop()
             }
             SlowMsg::Stop => stop(),
@@ -615,6 +620,101 @@ fn send_observed_until_past_deadline_returns_timeout_without_attempting() {
     // Give the worker a moment in case any command leaked through;
     // none should have, so `processed` must stay at 0.
     std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(processed.load(Ordering::Acquire), 0);
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn message_factory_that_crosses_deadline_cannot_enqueue() {
+    let runtime = make_runtime();
+    let processed = Arc::new(AtomicU32::new(0));
+    let worker = runtime
+        .register_with_capacity::<Slow, Infallible>(
+            Slow {
+                processed: Arc::clone(&processed),
+            },
+            8,
+        )
+        .expect("register slow");
+    let drops = Arc::new(AtomicU32::new(0));
+
+    assert_eq!(
+        runtime.send_observed_until(
+            worker,
+            Instant::now() + Duration::from_millis(10),
+            Duration::from_millis(1),
+            || {
+                std::thread::sleep(Duration::from_millis(30));
+                SlowMsg::Owned(DropProbe(Arc::clone(&drops)))
+            },
+        ),
+        Err(SendObservedUntilError::Timeout)
+    );
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(processed.load(Ordering::Acquire), 0);
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn accepted_deadline_attempt_cannot_deliver_after_timeout() {
+    let runtime = ThreadedRuntime::with_config(
+        TestShard,
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            command_capacity: 2,
+            idle_wait: Duration::from_millis(1),
+            ..Default::default()
+        },
+    );
+    let processed = Arc::new(AtomicU32::new(0));
+    let worker = runtime
+        .register_with_capacity::<Slow, Infallible>(
+            Slow {
+                processed: Arc::clone(&processed),
+            },
+            8,
+        )
+        .expect("register slow");
+    let gate = Arc::new(FailureGate::default());
+    runtime
+        .try_send(worker, SlowMsg::Hold(Arc::clone(&gate)))
+        .expect("admit blocking handler");
+    gate.wait_until_entered();
+
+    let drops = Arc::new(AtomicU32::new(0));
+    let calls = Arc::new(AtomicU32::new(0));
+    let started = Instant::now();
+    assert_eq!(
+        runtime.send_observed_until(
+            worker,
+            started + Duration::from_millis(50),
+            Duration::from_millis(1),
+            || {
+                calls.fetch_add(1, Ordering::Release);
+                SlowMsg::Owned(DropProbe(Arc::clone(&drops)))
+            },
+        ),
+        Err(SendObservedUntilError::Timeout)
+    );
+    assert!(started.elapsed() < Duration::from_millis(250));
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    assert_eq!(processed.load(Ordering::Acquire), 0);
+
+    gate.release();
+    let drop_deadline = Instant::now() + Duration::from_secs(1);
+    while drops.load(Ordering::Acquire) != 1 {
+        assert!(
+            Instant::now() < drop_deadline,
+            "cancelled message was not retired"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(drops.load(Ordering::Acquire), 1);
     assert_eq!(processed.load(Ordering::Acquire), 0);
 
     let _ = runtime.shutdown();
