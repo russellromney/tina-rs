@@ -246,6 +246,11 @@ impl OperationDoneWaiter {
 /// Typed, bounded handle that resolves on the next supervised restart of a
 /// direct child of the chosen parent isolate.
 ///
+/// Registration is authoritative over the parent's complete address identity:
+/// shard, isolate id, and generation must all match the restart producer.
+/// A stale generation or same-id address on another shard cannot claim the
+/// replacement fact.
+///
 /// Replaces the `Arc<Mutex<Option<Address<...>>>>` + `AtomicU64` generation
 /// pair in `specimen_supervised_worker`-style code.
 #[derive(Debug)]
@@ -419,7 +424,9 @@ struct OperationDoneSlot {
 
 #[derive(Debug)]
 struct ChildRestartedSlot {
-    parent: IsolateId,
+    parent_shard: ShardId,
+    parent_isolate: IsolateId,
+    parent_generation: AddressGeneration,
     sender: SyncSender<ChildRestarted>,
 }
 
@@ -548,13 +555,22 @@ impl ObservationRegistry {
         waiter
     }
 
-    pub(crate) fn register_child_restarted(&mut self, parent: IsolateId) -> ChildRestartedWaiter {
+    pub(crate) fn register_child_restarted(
+        &mut self,
+        parent_shard: ShardId,
+        parent_isolate: IsolateId,
+        parent_generation: AddressGeneration,
+    ) -> ChildRestartedWaiter {
         if self.is_full() {
             return ChildRestartedWaiter::with_error(WaitError::ObservationFull);
         }
         let (waiter, sender) = ChildRestartedWaiter::from_pair();
-        self.pending_child_restarted
-            .push(ChildRestartedSlot { parent, sender });
+        self.pending_child_restarted.push(ChildRestartedSlot {
+            parent_shard,
+            parent_isolate,
+            parent_generation,
+            sender,
+        });
         waiter
     }
 
@@ -749,12 +765,18 @@ impl ObservationRegistry {
         }
     }
 
-    pub(crate) fn notify_child_restarted(&mut self, parent: IsolateId, restarted: ChildRestarted) {
-        if let Some(index) = self
-            .pending_child_restarted
-            .iter()
-            .position(|slot| slot.parent == parent)
-        {
+    pub(crate) fn notify_child_restarted(
+        &mut self,
+        parent_shard: ShardId,
+        parent_isolate: IsolateId,
+        parent_generation: AddressGeneration,
+        restarted: ChildRestarted,
+    ) {
+        if let Some(index) = self.pending_child_restarted.iter().position(|slot| {
+            slot.parent_shard == parent_shard
+                && slot.parent_isolate == parent_isolate
+                && slot.parent_generation == parent_generation
+        }) {
             let slot = self.pending_child_restarted.remove(index);
             let _ = slot.sender.try_send(restarted);
         }

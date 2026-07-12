@@ -561,7 +561,9 @@ where
                     },
                 );
                 self.observation.notify_child_restarted(
+                    restarted.owner.shard,
                     restarted.owner.isolate,
+                    restarted.owner.generation,
                     crate::observation::ChildRestarted {
                         child_ordinal: restarted.child_ordinal,
                         new_shard: new_child.shard,

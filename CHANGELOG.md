@@ -4,6 +4,14 @@ This file records completed work.
 
 ## Unreleased
 
+### Authoritative child-restart observation
+
+- Child-restart waiters now match the complete parent address identity
+  (shard, isolate id, and generation). Stale-generation and same-id
+  foreign-shard addresses can no longer claim a live parent's replacement
+  event; threaded and deterministic multi-shard owners retain the same typed
+  waiter API and replacement-address result.
+
 ### LocalSystem host-control parity
 
 - `LocalSystem` and `LocalMultiShardSystem` now forward typed terminal-result
