@@ -64,6 +64,59 @@ pub struct ScatterGatherCompleted<K, R, Q> {
     pub report: ScatterGatherReport<R, K>,
 }
 
+/// Unified continuation vocabulary for a bounded scatter/gather owner.
+#[derive(Debug)]
+pub enum ScatterGatherEvent<K, R> {
+    /// One child call reached a terminal outcome.
+    Reply(ScatterGatherToken, K, CallGroupToken, CallOutcome<R>),
+    /// The aggregate deadline fired.
+    AggregateTimeout(ScatterGatherToken),
+    /// One aggregate-timeout cancellation settled.
+    Cancelled(ScatterGatherToken, K, CallGroupToken, CancelOutcome),
+}
+
+impl<K, R> ScatterGatherEvent<K, R> {
+    /// Operation identity carried by this continuation.
+    pub const fn operation(&self) -> ScatterGatherToken {
+        match self {
+            Self::Reply(operation, ..)
+            | Self::AggregateTimeout(operation)
+            | Self::Cancelled(operation, ..) => *operation,
+        }
+    }
+}
+
+/// Fixed-capacity owner for concurrent scatter/gather operations.
+#[derive(Debug)]
+pub struct ScatterGatherOperations<K, R, Q> {
+    capacity: usize,
+    operations: Vec<ScatterGather<K, R, Q>>,
+}
+
+/// Start result after [`ScatterGatherOperations`] has retained running state.
+pub enum ScatterGatherOperationsStart<I, K, R, Q>
+where
+    I: Isolate,
+{
+    /// The operation completed without child effects.
+    Ready(ScatterGatherCompleted<K, R, Q>),
+    /// Running state was installed and these bounded effects may execute.
+    Running(Effect<I>),
+}
+
+/// Typed continuation-routing failure that returns the unconsumed event.
+#[derive(Debug)]
+pub enum ScatterGatherOperationsError<K, R> {
+    /// A reply or cancel continuation named no live operation.
+    UnknownOperation(ScatterGatherEvent<K, R>),
+    /// The operation rejected a duplicate, stale, or mismatched branch token.
+    Record(ScatterGatherRecordError<K, R>),
+}
+
+/// Result of routing one unified event through a bounded operation owner.
+pub type ScatterGatherOperationsAdvanceResult<I, K, R, Q> =
+    Result<Option<ScatterGatherAdvance<I, K, R, Q>>, ScatterGatherOperationsError<K, R>>;
+
 /// Result of starting one scatter/gather operation.
 pub enum ScatterGatherStart<I, K, R, Q>
 where
@@ -94,6 +147,11 @@ where
 /// Why [`ScatterGather::start`] rejected before producing effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScatterGatherStartError<K> {
+    /// The bounded concurrent-operation owner is full.
+    OperationsFull {
+        /// Configured maximum simultaneous operations.
+        max: usize,
+    },
     /// Invalid scatter/gather configuration.
     Config(ScatterGatherConfigError),
     /// The bounded target input still exceeds this operation's configured cap.
@@ -121,6 +179,9 @@ pub struct ScatterGatherStartFailure<K, Q> {
 impl<K: fmt::Debug> fmt::Display for ScatterGatherStartError<K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::OperationsFull { max } => {
+                write!(f, "scatter operation capacity {max} is full")
+            }
             Self::Config(error) => write!(f, "invalid scatter/gather config: {error}"),
             Self::TooManyTargets { max, observed } => {
                 write!(
@@ -131,6 +192,149 @@ impl<K: fmt::Debug> fmt::Display for ScatterGatherStartError<K> {
             Self::DuplicateTarget(key) => write!(f, "duplicate scatter target {key:?}"),
             Self::EffectCapacityOverflow => f.write_str("scatter effect capacity overflow"),
         }
+    }
+}
+
+impl<K, R, Q> ScatterGatherOperations<K, R, Q>
+where
+    K: Clone + PartialEq + 'static,
+    R: 'static,
+    Q: 'static,
+{
+    /// Creates an empty fixed-capacity concurrent operation owner.
+    pub fn with_capacity(capacity: usize) -> Self {
+        assert!(capacity > 0, "ScatterGatherOperations capacity must be > 0");
+        Self {
+            capacity,
+            operations: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Number of live operations.
+    pub fn len(&self) -> usize {
+        self.operations.len()
+    }
+
+    /// Whether no operation is live.
+    pub fn is_empty(&self) -> bool {
+        self.operations.is_empty()
+    }
+
+    /// Whether a new operation would be rejected before effect construction.
+    pub fn is_full(&self) -> bool {
+        self.operations.len() == self.capacity
+    }
+
+    /// Starts and atomically retains one split-service scatter operation.
+    pub fn start_service<I, Target, Payload, Event, Request, Build, Wrap>(
+        &mut self,
+        request: RequestContext<Q>,
+        config: ScatterGatherConfig,
+        targets: BoundedItems<(K, Option<Target>)>,
+        build_call: Build,
+        wrap: Wrap,
+    ) -> Result<ScatterGatherOperationsStart<I, K, R, Q>, ScatterGatherStartFailure<K, Q>>
+    where
+        I: Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        Payload: Send + 'static,
+        Event: 'static,
+        Request: 'static,
+        Build: FnMut(Target, std::time::Duration) -> CancelableCall<Payload, R>,
+        Wrap: Fn(ScatterGatherEvent<K, R>) -> Event + Clone + 'static,
+    {
+        if self.is_full() {
+            return Err(ScatterGatherStartFailure {
+                request,
+                error: ScatterGatherStartError::OperationsFull { max: self.capacity },
+            });
+        }
+        let reply_wrap = wrap.clone();
+        let timeout_wrap = wrap;
+        match ScatterGather::start_service(
+            request,
+            config,
+            targets,
+            build_call,
+            move |operation, key, branch, outcome| {
+                reply_wrap(ScatterGatherEvent::Reply(operation, key, branch, outcome))
+            },
+            move |operation| timeout_wrap(ScatterGatherEvent::AggregateTimeout(operation)),
+        )? {
+            ScatterGatherStart::Ready(completed) => {
+                Ok(ScatterGatherOperationsStart::Ready(completed))
+            }
+            ScatterGatherStart::Running { operation, effect } => {
+                self.operations.push(operation);
+                Ok(ScatterGatherOperationsStart::Running(effect))
+            }
+        }
+    }
+
+    /// Advances one unified split-service continuation.
+    pub fn advance_service<I, Event, Request, Wrap>(
+        &mut self,
+        event: ScatterGatherEvent<K, R>,
+        wrap: Wrap,
+    ) -> ScatterGatherOperationsAdvanceResult<I, K, R, Q>
+    where
+        I: Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        Event: 'static,
+        Request: 'static,
+        Wrap: Fn(ScatterGatherEvent<K, R>) -> Event + Clone + 'static,
+    {
+        let operation_token = event.operation();
+        let Some(index) = self
+            .operations
+            .iter()
+            .position(|operation| operation.token() == operation_token)
+        else {
+            return match event {
+                ScatterGatherEvent::AggregateTimeout(_) => Ok(None),
+                other => Err(ScatterGatherOperationsError::UnknownOperation(other)),
+            };
+        };
+
+        let (effect, completed) = match event {
+            ScatterGatherEvent::Reply(_, key, branch, outcome) => (
+                tina::noop(),
+                self.operations[index]
+                    .record_reply(key, branch, outcome)
+                    .map_err(ScatterGatherOperationsError::Record)?,
+            ),
+            ScatterGatherEvent::AggregateTimeout(operation) => {
+                let cancel_wrap = wrap;
+                let Some(advance) = self.operations[index]
+                    .aggregate_timeout_service::<I, Event, Request, _>(
+                        operation,
+                        move |operation, key, branch, outcome| {
+                            cancel_wrap(ScatterGatherEvent::Cancelled(
+                                operation, key, branch, outcome,
+                            ))
+                        },
+                    )
+                    .map_err(ScatterGatherOperationsError::Record)?
+                else {
+                    return Ok(None);
+                };
+                (advance.effect, advance.completed)
+            }
+            ScatterGatherEvent::Cancelled(_, key, branch, outcome) => (
+                tina::noop(),
+                self.operations[index]
+                    .record_cancel(key, branch, outcome)
+                    .map_err(ScatterGatherOperationsError::Record)?,
+            ),
+        };
+        if completed.is_some() {
+            self.operations.swap_remove(index);
+        }
+        Ok(Some(ScatterGatherAdvance { effect, completed }))
     }
 }
 
@@ -539,6 +743,39 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    enum TestServiceEvent {
+        Scatter(ScatterGatherEvent<u8, u32>),
+    }
+
+    struct TestService;
+
+    #[tina_macros::isolate(
+        event = TestServiceEvent,
+        request = (),
+        reply = (),
+        io = crate::RuntimeCall<tina::ServiceMessage<TestServiceEvent, ()>>
+    )]
+    impl TestService {
+        fn handle_event(
+            &mut self,
+            event: TestServiceEvent,
+            _ctx: &mut tina::Context<'_, SingleShard, Self::Reply>,
+        ) -> Effect<Self> {
+            let TestServiceEvent::Scatter(event) = event;
+            let _ = event;
+            tina::noop()
+        }
+
+        fn handle_request(
+            &mut self,
+            _request: (),
+            call: tina::RequestCall<'_, Self>,
+        ) -> tina::RequestEffect<Self> {
+            call.reply(())
+        }
+    }
+
     fn request() -> RequestContext<()> {
         let shared = Arc::new(DeferredSlotShared::new(1, TypeId::of::<()>()));
         runtime_internal::request_context_from_deferred(runtime_internal::deferred_from_handle(
@@ -819,5 +1056,125 @@ mod tests {
             overflow.error,
             ScatterGatherStartError::EffectCapacityOverflow
         ));
+
+        let (operation, _) = operation(&[1]);
+        let mut operations = ScatterGatherOperations::with_capacity(1);
+        operations.operations.push(operation);
+        let empty = BoundedItems::try_from_iter(1, std::iter::empty::<(u8, Option<Address<()>>)>())
+            .unwrap();
+        let full = match operations.start_service::<TestService, _, (), _, _, _, _>(
+            request(),
+            config(1),
+            empty,
+            |_address, _timeout| unreachable!("full owner cannot build calls"),
+            TestServiceEvent::Scatter,
+        ) {
+            Err(failure) => failure,
+            Ok(_) => panic!("full operation owner unexpectedly started"),
+        };
+        assert!(full.request.is_open());
+        assert!(matches!(
+            full.error,
+            ScatterGatherStartError::OperationsFull { max: 1 }
+        ));
+    }
+
+    #[test]
+    fn bounded_owner_returns_late_events_and_ignores_only_stale_timer() {
+        let (operation, tokens) = operation(&[1]);
+        let operation_token = operation.token();
+        let branch_token = tokens[0].1;
+        let mut operations = ScatterGatherOperations::with_capacity(1);
+        operations.operations.push(operation);
+
+        let completed = operations
+            .advance_service::<TestService, _, _, _>(
+                ScatterGatherEvent::Reply(
+                    operation_token,
+                    1,
+                    branch_token,
+                    CallOutcome::Replied(7),
+                ),
+                TestServiceEvent::Scatter,
+            )
+            .unwrap()
+            .expect("known operation advances")
+            .completed
+            .expect("only branch completed");
+        assert_eq!(
+            completed.report.outcomes,
+            vec![(1, ScatterGatherTargetOutcome::Replied(7))]
+        );
+        assert!(operations.is_empty());
+
+        let late = operations.advance_service::<TestService, _, _, _>(
+            ScatterGatherEvent::Reply(operation_token, 1, branch_token, CallOutcome::Replied(9)),
+            TestServiceEvent::Scatter,
+        );
+        assert!(matches!(
+            late,
+            Err(ScatterGatherOperationsError::UnknownOperation(
+                ScatterGatherEvent::Reply(_, 1, _, CallOutcome::Replied(9))
+            ))
+        ));
+        assert!(
+            operations
+                .advance_service::<TestService, _, _, _>(
+                    ScatterGatherEvent::AggregateTimeout(operation_token),
+                    TestServiceEvent::Scatter,
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn bounded_owner_withholds_caller_until_every_cancel_ack() {
+        let (operation, tokens) = operation(&[1, 2]);
+        let operation_token = operation.token();
+        let mut operations = ScatterGatherOperations::with_capacity(1);
+        operations.operations.push(operation);
+
+        let advance = operations
+            .advance_service::<TestService, _, _, _>(
+                ScatterGatherEvent::AggregateTimeout(operation_token),
+                TestServiceEvent::Scatter,
+            )
+            .unwrap()
+            .expect("current timer advances");
+        assert!(advance.completed.is_none());
+        assert!(matches!(advance.effect, Effect::Batch(ref effects) if effects.len() == 2));
+
+        let first = operations
+            .advance_service::<TestService, _, _, _>(
+                ScatterGatherEvent::Cancelled(
+                    operation_token,
+                    1,
+                    tokens[0].1,
+                    CancelOutcome::Cancelled,
+                ),
+                TestServiceEvent::Scatter,
+            )
+            .unwrap()
+            .expect("first ack advances");
+        assert!(first.completed.is_none());
+        assert_eq!(operations.len(), 1);
+
+        let completed = operations
+            .advance_service::<TestService, _, _, _>(
+                ScatterGatherEvent::Cancelled(
+                    operation_token,
+                    2,
+                    tokens[1].1,
+                    CancelOutcome::Cancelled,
+                ),
+                TestServiceEvent::Scatter,
+            )
+            .unwrap()
+            .expect("second ack advances")
+            .completed
+            .expect("all cancel truth returns caller");
+        assert!(completed.request.is_open());
+        assert!(operations.is_empty());
     }
 }

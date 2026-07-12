@@ -295,8 +295,10 @@ pub use observer::{
 pub use pressure::{MailboxBudget, PressureReport, PressureSummary, format_pressure_line};
 pub use scatter_gather::{
     ScatterGather, ScatterGatherAdvance, ScatterGatherAdvanceResult, ScatterGatherCompleted,
-    ScatterGatherRecordError, ScatterGatherRecordResult, ScatterGatherStart,
-    ScatterGatherStartError, ScatterGatherStartFailure, ScatterGatherToken,
+    ScatterGatherEvent, ScatterGatherOperations, ScatterGatherOperationsAdvanceResult,
+    ScatterGatherOperationsError, ScatterGatherOperationsStart, ScatterGatherRecordError,
+    ScatterGatherRecordResult, ScatterGatherStart, ScatterGatherStartError,
+    ScatterGatherStartFailure, ScatterGatherToken,
 };
 pub use scope::{
     CallContextScopeExt, DeferScopedThrough, DeferredScopedCall, RequestScope, RequestScopeId,

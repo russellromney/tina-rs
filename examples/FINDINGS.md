@@ -54,8 +54,16 @@ a completed request cannot expire a newer request in the same coordinator.
 Start failures return the untouched `RequestContext`, and over-cap or duplicate
 input is rejected before the call factory or effect batch exists. One
 coordinator implementation is exercised unchanged on `Runtime`,
-`ThreadedRuntime`, and `Simulator`; owner stop with child authority pending
-closes the original caller.
+`ThreadedRuntime`, `Simulator`, `MultiShardRuntime`, and
+`ThreadedMultiShardRuntime`; owner stop with child authority pending closes the
+original caller.
+
+`ScatterGatherOperations<K, R, Q>` closes the concurrent coordinator gap. It
+owns a fixed-capacity operation collection, rejects `Full` before building a
+call, and routes the unified `ScatterGatherEvent<K, R>` vocabulary. Application
+coordinators now need one event variant, one bounded field, one inferred
+`start_service` call, and one inferred `advance_service` call; they no longer
+spell reply/cancel/timer variants, qids, token lookup, or find/remove logic.
 
 This is the framework prerequisite for migrating `specimen_scatter_gather` and
 `specimen_sharded_fanout_read`; those example changes remain a separate cohort.

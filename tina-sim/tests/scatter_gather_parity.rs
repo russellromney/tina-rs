@@ -8,11 +8,21 @@ use std::time::Duration;
 use tina::prelude::*;
 use tina_runtime::sharded::{ScatterGatherConfig, ScatterGatherReport, ScatterGatherTargetOutcome};
 use tina_runtime::{
-    BoundedItems, CallGroupToken, CallOutcome, DefaultMailboxFactory, Runtime, ScatterGather,
-    ScatterGatherCompleted, ScatterGatherStart, ScatterGatherToken, ThreadedRuntime,
-    call_cancelable_request, call_request,
+    BoundedItems, CallOutcome, DefaultMailboxFactory, DefaultThreadedMailboxFactory,
+    MultiShardRuntime, Runtime, ScatterGatherCompleted, ScatterGatherEvent,
+    ScatterGatherOperations, ScatterGatherOperationsStart, ThreadedMultiShardRuntime,
+    ThreadedRuntime, call_cancelable_request, call_request,
 };
 use tina_sim::{Simulator, SimulatorConfig};
+
+#[derive(Debug, Clone, Copy)]
+struct AppShard(u32);
+
+impl Shard for AppShard {
+    fn id(&self) -> ShardId {
+        ShardId::new(self.0)
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 enum WorkerRequest {
@@ -24,7 +34,7 @@ struct Worker {
     held: Vec<RequestContext<u32>>,
 }
 
-#[tina_runtime::isolate(request = WorkerRequest, reply = u32)]
+#[tina_runtime::isolate(request = WorkerRequest, reply = u32, shard = AppShard)]
 impl Worker {
     fn handle_request(
         &mut self,
@@ -56,76 +66,46 @@ enum CoordRequest {
 
 #[derive(Debug)]
 enum CoordEvent {
-    Target(ScatterGatherToken, usize, CallGroupToken, CallOutcome<u32>),
-    AggregateTimeout(ScatterGatherToken),
-    Cancelled(ScatterGatherToken, usize, CallGroupToken, CancelOutcome),
+    Scatter(ScatterGatherEvent<usize, u32>),
     Stop,
 }
 
 struct Coordinator {
     workers: Vec<tina_runtime::RequestServiceHandle<WorkerRequest, u32>>,
-    operations: Vec<ScatterGather<usize, u32, CoordReply>>,
+    operations: ScatterGatherOperations<usize, u32, CoordReply>,
     started: Arc<AtomicBool>,
     max_live: Arc<AtomicUsize>,
 }
 
 const MAX_IN_FLIGHT: usize = 8;
 
-#[tina_runtime::isolate(event = CoordEvent, request = CoordRequest, reply = CoordReply)]
+#[tina_runtime::isolate(
+    event = CoordEvent,
+    request = CoordRequest,
+    reply = CoordReply,
+    shard = AppShard
+)]
 impl Coordinator {
     fn handle_event(
         &mut self,
         event: CoordEvent,
-        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
     ) -> Effect<Self> {
-        if matches!(event, CoordEvent::Stop) {
-            return stop();
-        }
-        let operation_token = match &event {
-            CoordEvent::Target(operation, ..)
-            | CoordEvent::AggregateTimeout(operation)
-            | CoordEvent::Cancelled(operation, ..) => *operation,
-            CoordEvent::Stop => unreachable!("stop handled before operation lookup"),
-        };
-        let Some(index) = self
-            .operations
-            .iter()
-            .position(|operation| operation.token() == operation_token)
-        else {
-            return noop();
-        };
         match event {
-            CoordEvent::Target(_, key, token, outcome) => {
-                match self.operations[index]
-                    .record_reply(key, token, outcome)
-                    .expect("continuation token came from ScatterGather::start")
-                {
-                    Some(completed) => self.complete(index, completed, noop()),
-                    None => noop(),
-                }
-            }
-            CoordEvent::AggregateTimeout(token) => {
-                let Some(advance) = self.operations[index]
-                    .aggregate_timeout_service::<Self, _, _, _>(token, CoordEvent::Cancelled)
-                    .expect("a current aggregate timer fires once")
+            CoordEvent::Scatter(event) => {
+                let Some(advance) = self
+                    .operations
+                    .advance_service(event, CoordEvent::Scatter)
+                    .expect("operation owner issued the continuation")
                 else {
                     return noop();
                 };
                 match advance.completed {
-                    Some(completed) => self.complete(index, completed, advance.effect),
+                    Some(completed) => self.complete(completed, advance.effect),
                     None => advance.effect,
                 }
             }
-            CoordEvent::Cancelled(_, key, token, outcome) => {
-                match self.operations[index]
-                    .record_cancel(key, token, outcome)
-                    .expect("cancel token came from aggregate expiry")
-                {
-                    Some(completed) => self.complete(index, completed, noop()),
-                    None => noop(),
-                }
-            }
-            CoordEvent::Stop => unreachable!("stop handled before operation lookup"),
+            CoordEvent::Stop => stop(),
         }
     }
 
@@ -134,11 +114,6 @@ impl Coordinator {
         _request: CoordRequest,
         call: RequestCall<'_, Self>,
     ) -> RequestEffect<Self> {
-        if self.operations.len() == MAX_IN_FLIGHT {
-            return call.reply(CoordReply::StartRejected(
-                "scatter operation capacity is full".to_owned(),
-            ));
-        }
         let config = ScatterGatherConfig {
             max_targets: self.workers.len() + 1,
             collector_capacity: self.workers.len() + 1,
@@ -157,20 +132,18 @@ impl Coordinator {
         .expect("service-owned target cap covers workers plus missing probe");
 
         call.capture(|request| {
-            match ScatterGather::start_service(
+            match self.operations.start_service(
                 request,
                 config,
                 targets,
                 |worker, timeout| call_cancelable_request(worker, WorkerRequest::Read, timeout),
-                CoordEvent::Target,
-                CoordEvent::AggregateTimeout,
+                CoordEvent::Scatter,
             ) {
-                Ok(ScatterGatherStart::Ready(completed)) => {
+                Ok(ScatterGatherOperationsStart::Ready(completed)) => {
                     reply_to(completed.request, CoordReply::Report(completed.report))
                 }
-                Ok(ScatterGatherStart::Running { operation, effect }) => {
+                Ok(ScatterGatherOperationsStart::Running(effect)) => {
                     self.started.store(true, Ordering::Release);
-                    self.operations.push(operation);
                     self.max_live
                         .fetch_max(self.operations.len(), Ordering::AcqRel);
                     effect
@@ -187,11 +160,9 @@ impl Coordinator {
 impl Coordinator {
     fn complete(
         &mut self,
-        index: usize,
         completed: ScatterGatherCompleted<usize, u32, CoordReply>,
         effect: Effect<Self>,
     ) -> Effect<Self> {
-        self.operations.swap_remove(index);
         batch([
             reply_to(completed.request, CoordReply::Report(completed.report)),
             effect,
@@ -209,12 +180,12 @@ struct Client {
     outcome: Arc<Mutex<Option<CallOutcome<CoordReply>>>>,
 }
 
-#[tina_runtime::isolate(message = ClientMessage)]
+#[tina_runtime::isolate(message = ClientMessage, shard = AppShard)]
 impl Client {
     fn handle(
         &mut self,
         message: ClientMessage,
-        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+        _ctx: &mut Context<'_, AppShard, Self::Reply>,
     ) -> Effect<Self> {
         match message {
             ClientMessage::Start(coordinator) => {
@@ -251,7 +222,7 @@ fn assert_report(outcome: CallOutcome<CoordReply>) {
 #[test]
 fn explicit_runtime_and_simulator_use_identical_scatter_authoring() {
     let runtime_outcome = Arc::new(Mutex::new(None));
-    let mut runtime = Runtime::new(SingleShard, DefaultMailboxFactory);
+    let mut runtime = Runtime::new(AppShard(0), DefaultMailboxFactory);
     let workers = vec![
         runtime.register_request_service::<_, _, Infallible>(
             Worker {
@@ -272,7 +243,7 @@ fn explicit_runtime_and_simulator_use_identical_scatter_authoring() {
         .register_split_service::<Coordinator, CoordEvent, CoordRequest, Infallible>(
             Coordinator {
                 workers,
-                operations: Vec::with_capacity(MAX_IN_FLIGHT),
+                operations: ScatterGatherOperations::with_capacity(MAX_IN_FLIGHT),
                 started: Arc::new(AtomicBool::new(false)),
                 max_live: Arc::new(AtomicUsize::new(0)),
             },
@@ -298,7 +269,7 @@ fn explicit_runtime_and_simulator_use_identical_scatter_authoring() {
     );
 
     let sim_outcome = Arc::new(Mutex::new(None));
-    let mut sim = Simulator::new(SingleShard, SimulatorConfig::default());
+    let mut sim = Simulator::new(AppShard(0), SimulatorConfig::default());
     let workers = vec![
         sim.register_request_service::<_, _, Infallible>(
             Worker {
@@ -319,7 +290,7 @@ fn explicit_runtime_and_simulator_use_identical_scatter_authoring() {
         .register_split_service::<Coordinator, CoordEvent, CoordRequest, Infallible>(
             Coordinator {
                 workers,
-                operations: Vec::with_capacity(MAX_IN_FLIGHT),
+                operations: ScatterGatherOperations::with_capacity(MAX_IN_FLIGHT),
                 started: Arc::new(AtomicBool::new(false)),
                 max_live: Arc::new(AtomicUsize::new(0)),
             },
@@ -337,7 +308,7 @@ fn explicit_runtime_and_simulator_use_identical_scatter_authoring() {
 
 #[test]
 fn public_operation_tokens_route_a_bounded_concurrent_scatter_set() {
-    let mut runtime = Runtime::new(SingleShard, DefaultMailboxFactory);
+    let mut runtime = Runtime::new(AppShard(0), DefaultMailboxFactory);
     let workers = vec![
         runtime.register_request_service::<_, _, Infallible>(
             Worker {
@@ -359,7 +330,7 @@ fn public_operation_tokens_route_a_bounded_concurrent_scatter_set() {
         .register_split_service::<Coordinator, CoordEvent, CoordRequest, Infallible>(
             Coordinator {
                 workers,
-                operations: Vec::with_capacity(MAX_IN_FLIGHT),
+                operations: ScatterGatherOperations::with_capacity(MAX_IN_FLIGHT),
                 started: Arc::new(AtomicBool::new(false)),
                 max_live: Arc::clone(&max_live),
             },
@@ -367,7 +338,7 @@ fn public_operation_tokens_route_a_bounded_concurrent_scatter_set() {
         )
         .requests;
 
-    let outcomes: Vec<_> = (0..MAX_IN_FLIGHT)
+    let outcomes: Vec<_> = (0..=MAX_IN_FLIGHT)
         .map(|_| Arc::new(Mutex::new(None)))
         .collect();
     for outcome in &outcomes {
@@ -388,16 +359,33 @@ fn public_operation_tokens_route_a_bounded_concurrent_scatter_set() {
         MAX_IN_FLIGHT,
         "all bounded operations must coexist without private qid correlation"
     );
-    for outcome in outcomes {
+    for outcome in &outcomes[..MAX_IN_FLIGHT] {
         assert_report(outcome.lock().unwrap().take().expect("concurrent report"));
     }
+    assert!(matches!(
+        outcomes[MAX_IN_FLIGHT].lock().unwrap().take(),
+        Some(CallOutcome::Replied(CoordReply::StartRejected(_)))
+    ));
+
+    let refill = Arc::new(Mutex::new(None));
+    let client = runtime.register_with_capacity::<_, Infallible>(
+        Client {
+            outcome: Arc::clone(&refill),
+        },
+        4,
+    );
+    runtime
+        .try_send(client, ClientMessage::Start(coordinator))
+        .unwrap();
+    while runtime.step() > 0 {}
+    assert_report(refill.lock().unwrap().take().expect("refill report"));
 }
 
 #[test]
 fn owner_stop_closes_original_caller_with_child_authority_pending() {
     let outcome = Arc::new(Mutex::new(None));
     let started = Arc::new(AtomicBool::new(false));
-    let mut runtime = Runtime::new(SingleShard, DefaultMailboxFactory);
+    let mut runtime = Runtime::new(AppShard(0), DefaultMailboxFactory);
     let worker = runtime.register_request_service::<_, _, Infallible>(
         Worker {
             value: None,
@@ -409,7 +397,7 @@ fn owner_stop_closes_original_caller_with_child_authority_pending() {
         .register_split_service::<Coordinator, CoordEvent, CoordRequest, Infallible>(
             Coordinator {
                 workers: vec![worker],
-                operations: Vec::with_capacity(MAX_IN_FLIGHT),
+                operations: ScatterGatherOperations::with_capacity(MAX_IN_FLIGHT),
                 started: Arc::clone(&started),
                 max_live: Arc::new(AtomicUsize::new(0)),
             },
@@ -440,7 +428,7 @@ fn owner_stop_closes_original_caller_with_child_authority_pending() {
 #[test]
 fn threaded_runtime_uses_the_same_scatter_coordinator() {
     let outcome = Arc::new(Mutex::new(None));
-    let runtime = ThreadedRuntime::new(SingleShard, tina_runtime::DefaultThreadedMailboxFactory);
+    let runtime = ThreadedRuntime::new(AppShard(0), DefaultThreadedMailboxFactory);
     let workers = vec![
         runtime
             .register_request_service::<_, _, Infallible>(
@@ -465,7 +453,7 @@ fn threaded_runtime_uses_the_same_scatter_coordinator() {
         .register_split_service::<Coordinator, CoordEvent, CoordRequest, Infallible>(
             Coordinator {
                 workers,
-                operations: Vec::with_capacity(MAX_IN_FLIGHT),
+                operations: ScatterGatherOperations::with_capacity(MAX_IN_FLIGHT),
                 started: Arc::new(AtomicBool::new(false)),
                 max_live: Arc::new(AtomicUsize::new(0)),
             },
@@ -489,5 +477,97 @@ fn threaded_runtime_uses_the_same_scatter_coordinator() {
         std::thread::sleep(Duration::from_millis(2));
     }
     assert_report(outcome.lock().unwrap().take().expect("threaded report"));
+    runtime.shutdown_report().ensure_clean().unwrap();
+}
+
+#[test]
+fn explicit_multishard_uses_same_coordinator_for_cross_shard_calls() {
+    let outcome = Arc::new(Mutex::new(None));
+    let mut runtime = MultiShardRuntime::new([AppShard(11), AppShard(22)], DefaultMailboxFactory);
+    let worker = runtime.register_request_service_on(
+        ShardId::new(22),
+        Worker {
+            value: Some(10),
+            held: Vec::new(),
+        },
+        8,
+    );
+    let coordinator = runtime
+        .register_split_service_on(
+            ShardId::new(11),
+            Coordinator {
+                workers: vec![worker],
+                operations: ScatterGatherOperations::with_capacity(MAX_IN_FLIGHT),
+                started: Arc::new(AtomicBool::new(false)),
+                max_live: Arc::new(AtomicUsize::new(0)),
+            },
+            16,
+        )
+        .requests;
+    let client = runtime.register_with_capacity_on::<_, Infallible>(
+        ShardId::new(11),
+        Client {
+            outcome: Arc::clone(&outcome),
+        },
+        4,
+    );
+    runtime
+        .try_send(client, ClientMessage::Start(coordinator))
+        .unwrap();
+    while runtime.step() > 0 {}
+    let CallOutcome::Replied(CoordReply::Report(report)) =
+        outcome.lock().unwrap().take().expect("multishard report")
+    else {
+        panic!("cross-shard scatter did not reply")
+    };
+    assert_eq!(
+        report.outcomes,
+        vec![
+            (0, ScatterGatherTargetOutcome::Replied(10)),
+            (1, ScatterGatherTargetOutcome::MissingShard),
+        ]
+    );
+}
+
+#[test]
+fn threaded_multishard_uses_same_coordinator_for_cross_shard_calls() {
+    let runtime =
+        ThreadedMultiShardRuntime::new([AppShard(11), AppShard(22)], DefaultThreadedMailboxFactory);
+    let worker = runtime
+        .register_request_service_on(
+            ShardId::new(22),
+            Worker {
+                value: Some(10),
+                held: Vec::new(),
+            },
+            8,
+        )
+        .unwrap();
+    let coordinator = runtime
+        .register_split_service_on(
+            ShardId::new(11),
+            Coordinator {
+                workers: vec![worker],
+                operations: ScatterGatherOperations::with_capacity(MAX_IN_FLIGHT),
+                started: Arc::new(AtomicBool::new(false)),
+                max_live: Arc::new(AtomicUsize::new(0)),
+            },
+            16,
+        )
+        .unwrap()
+        .requests;
+    let outcome = runtime
+        .call_blocking_request(coordinator, CoordRequest::ReadAll, Duration::from_secs(1))
+        .unwrap();
+    let CallOutcome::Replied(CoordReply::Report(report)) = outcome else {
+        panic!("threaded cross-shard scatter did not reply")
+    };
+    assert_eq!(
+        report.outcomes,
+        vec![
+            (0, ScatterGatherTargetOutcome::Replied(10)),
+            (1, ScatterGatherTargetOutcome::MissingShard),
+        ]
+    );
     runtime.shutdown_report().ensure_clean().unwrap();
 }
