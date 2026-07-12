@@ -1,3 +1,4 @@
+use std::time::{Duration, Instant};
 use system_copied_service_path::{RunConfig, run};
 
 #[test]
@@ -89,6 +90,28 @@ fn caller_timeout_still_settles_linear_authority() {
 }
 
 #[test]
+fn caller_timeout_does_not_wait_for_held_work_before_owner_shutdown() {
+    let started = Instant::now();
+    let report = run(RunConfig {
+        capacity: 1,
+        work_ms: 30_000,
+        callers: 1,
+        call_timeout_ms: 1,
+        ..RunConfig::default()
+    })
+    .expect("owner shutdown must cancel long held work");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "run waited for the 30-second timer instead of shutting down: {report:?}"
+    );
+    assert_eq!(report.load.ops_timeout, 1, "report={report:?}");
+    assert_eq!(report.scope_admitted, 1, "report={report:?}");
+    assert_eq!(report.scope_released, 1, "report={report:?}");
+    assert_eq!(report.scope_current_at_drain, 0, "report={report:?}");
+}
+
+#[test]
 fn timer_pressure_is_typed_and_every_admission_settles() {
     let config = RunConfig {
         capacity: 4,
@@ -130,5 +153,19 @@ fn invalid_runtime_capacity_is_a_startup_error() {
     assert!(
         error.to_string().contains("timer_capacity"),
         "unexpected startup error: {error:#}"
+    );
+}
+
+#[test]
+fn reporting_failure_still_reaches_clean_shutdown() {
+    let error = run(RunConfig {
+        mailbox: 0,
+        ..RunConfig::default()
+    })
+    .expect_err("zero mailbox capacity must make the Stats call visibly full");
+
+    assert!(
+        error.to_string().contains("stats mailbox was full"),
+        "unexpected reporting error: {error:#}"
     );
 }

@@ -32,8 +32,8 @@ One `Gateway` isolate runs behind the `LocalSystem` application facade:
 Concurrent callers are driven through `tina_proof_harness::load`'s real
 load runner against the real runtime, and the run asserts
 `assert_cold_work_made_progress` and `assert_no_leaked_capacity_at_shutdown`
-against a leak-check closure that reads the scope's real post-run state
-— not a `LoadObservation::default()` placeholder.
+against the terminal scope snapshot recorded after `LocalSystem` shutdown,
+not a pre-shutdown or default observation.
 
 ## What this specimen leaves out
 
@@ -55,8 +55,8 @@ cargo test --manifest-path examples/systems/system_copied_service_path/Cargo.tom
 |---|---|
 | Admission is really bounded | `RunConfig::default()` races 6 callers against capacity 2; `report.full > 0` and `report.admitted + report.full == callers`. |
 | The durable-state step really runs | `report.ledger_final_len == report.ledger_seed_len + report.admitted` — one ledger append per admitted request, read back from the isolate via a `Stats` request before shutdown. |
-| Owner stop really releases every charge | `report.scope_current_at_drain == 0` and `report.scope_admitted == report.scope_released`, both read from the scope *after* `runtime.shutdown()`. Comment out the `drop(lease)` in `Gateway::hold_done` and `assert_no_leaked_capacity_at_shutdown` fails with a real leak, not a placeholder. |
-| The leak check actually ran | `report.load.leak_checked` is `true` because the run supplies a real observation closure; an unchecked run renders `leak=unchecked` and `assert_no_leaked_capacity_at_shutdown` fails closed. |
+| Owner stop really releases every charge | `report.scope_current_at_drain == 0` and `report.scope_admitted == report.scope_released`, both read from the scope after terminal `LocalSystem` shutdown. The request-aware flow owns each move-only lease until completion or owner stop, so there is no parallel cleanup path to keep in sync. |
+| The leak check actually ran | `report.load.leak_checked` is set only after terminal shutdown and `leak_clean` is derived from both exact lease settlement and the post-shutdown surface plateau; an unchecked run renders `leak=unchecked` and `assert_no_leaked_capacity_at_shutdown` fails closed. |
 
 ## Findings
 

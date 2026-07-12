@@ -18,8 +18,9 @@ request-aware raw flow for its held work. The flow carries the original
 `RequestContext`, durable record id, `SharedLease`, and exhaustive `SleepReply`
 without qids, `GuardedPendingReplies`, a redundant pending-capacity knob,
 take/reinsert logic, or manual service envelopes. The shared scope remains the
-honest bound on parked requests. Closed callers release before arming work;
-caller loss, timer failure, and owner stop all settle the move-only lease.
+honest bound on parked requests. Callers already closed when their queued turn
+runs never cross the durable admission boundary; later caller loss, timer
+failure, and owner stop all settle the move-only lease.
 
 Load callers and the Stats host call distinguish every `CallOutcome`; typed
 work failures retain their `CallError` class, including `TimerFull`, and outer
