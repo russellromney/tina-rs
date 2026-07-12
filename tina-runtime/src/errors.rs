@@ -415,7 +415,7 @@ impl<M> fmt::Display for ThreadedRegisterBootstrapError<M> {
             ),
             Self::WorkerStopped => write!(
                 f,
-                "worker thread stopped before it could process register-and-bootstrap"
+                "worker stopped before answering accepted register-and-bootstrap"
             ),
             Self::WorkerUnresponsive => write!(
                 f,
