@@ -163,6 +163,63 @@ fn simulated_tcp_recv_waits_until_peer_provides_input_or_eof() -> io::Result<()>
 }
 
 #[test]
+fn simulated_tcp_connect_keeps_finite_input_eof_contract() -> io::Result<()> {
+    let io = SimulatedIO::new();
+    let (accepted, _peer) = connected_stream(&io, b"finite")?;
+
+    let mut input = RecvCompletion::new();
+    accepted.recv(&mut input, 32)?;
+    pump_until(&io, || input.has_result())?;
+    assert_eq!(input.take_result().unwrap()?, b"finite");
+
+    let mut eof = RecvCompletion::new();
+    accepted.recv(&mut eof, 32)?;
+    pump_until(&io, || eof.has_result())?;
+    assert!(eof.take_result().unwrap()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn simulated_tcp_connect_open_never_publishes_transient_eof() -> io::Result<()> {
+    let io = SimulatedIO::new();
+    let loop_handle = io.loop_handle(Global);
+    let listener = loop_handle.io().socket()?;
+    listener.bind(localhost(0))?;
+    let bound = listener.local_addr()?;
+    let mut accept = AcceptCompletion::new();
+    listener.accept(&mut accept)?;
+    let peer = io.connect_open(bound, Vec::new())?;
+    pump_until(&io, || accept.has_result())?;
+    let accepted = accept.take_result().unwrap()?;
+
+    let mut recv = RecvCompletion::new();
+    accepted.recv(&mut recv, 32)?;
+    for _ in 0..8 {
+        assert!(!io.step()?);
+        assert!(
+            !recv.has_result(),
+            "an atomically open peer must not transiently complete as EOF"
+        );
+    }
+
+    peer.push_input(b"later");
+    pump_until(&io, || recv.has_result())?;
+    assert_eq!(recv.take_result().unwrap()?, b"later");
+
+    let mut eof = RecvCompletion::new();
+    accepted.recv(&mut eof, 32)?;
+    assert!(!io.step()?);
+    assert!(
+        !eof.has_result(),
+        "open input must remain pending once drained"
+    );
+    peer.close_input();
+    pump_until(&io, || eof.has_result())?;
+    assert!(eof.take_result().unwrap()?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn simulated_tcp_reports_listener_and_stream_addresses() -> io::Result<()> {
     let io = SimulatedIO::new();
     let loop_handle = io.loop_handle(Global);

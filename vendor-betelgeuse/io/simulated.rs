@@ -94,6 +94,29 @@ impl SimulatedIO {
     /// Connects a simulated peer to a bound listener and queues `input` for
     /// the server side to read.
     pub fn connect(&self, listener_addr: SocketAddr, input: Vec<u8>) -> io::Result<SimulatedPeer> {
+        self.connect_with_input_state(listener_addr, input, true)
+    }
+
+    /// Connects a simulated peer whose input remains open after `input` is
+    /// consumed.
+    ///
+    /// The open state and listener-backlog publication happen under one lock,
+    /// so a concurrent accept/read cannot observe a transient EOF before the
+    /// test has a chance to call [`SimulatedPeer::push_input`].
+    pub fn connect_open(
+        &self,
+        listener_addr: SocketAddr,
+        input: Vec<u8>,
+    ) -> io::Result<SimulatedPeer> {
+        self.connect_with_input_state(listener_addr, input, false)
+    }
+
+    fn connect_with_input_state(
+        &self,
+        listener_addr: SocketAddr,
+        input: Vec<u8>,
+        peer_input_closed: bool,
+    ) -> io::Result<SimulatedPeer> {
         let mut state = self.state.lock().expect("simulated io mutex");
         let listener_id = *state.listeners_by_addr.get(&listener_addr).ok_or_else(|| {
             io::Error::new(
@@ -123,7 +146,7 @@ impl SimulatedIO {
                 peer_addr: Some(peer_addr),
                 closed: false,
                 inbound: VecDeque::from(input),
-                peer_input_closed: true,
+                peer_input_closed,
                 peer_output: Vec::new(),
                 peer_stream_id: None,
                 backlog: VecDeque::new(),
