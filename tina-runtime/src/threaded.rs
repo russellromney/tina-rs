@@ -1361,6 +1361,9 @@ where
     /// Registers a typed result waiter for the isolate at `address` on the
     /// worker shard. See [`Runtime::observe_result`] for semantics.
     ///
+    /// A foreign system or unowned shard is returned as a typed eager error;
+    /// no worker command, result authority, or observation capacity is claimed.
+    ///
     /// Worker stopped → `RuntimeStopped`.
     pub fn observe_result<T: Send + 'static, M: 'static, R: 'static>(
         &self,
@@ -1371,6 +1374,10 @@ where
                 expected: self.system_incarnation,
                 actual: address.system(),
             });
+        }
+        let owned_shard = self.metrics.shard();
+        if address.shard() != owned_shard {
+            return Err(observation::ResultWaitError::UnknownShard(address.shard()));
         }
         match self.call(move |runtime| runtime.observe_result::<T, M, R>(address)) {
             Ok(result) => result,
@@ -1391,7 +1398,7 @@ where
                 actual: address.system(),
             });
         }
-        let owned_shard = self.dispatchers[0].shard();
+        let owned_shard = self.metrics.shard();
         if address.shard() != owned_shard {
             return Err(ThreadedRuntimeError::UnknownShard(address.shard()));
         }
@@ -2035,6 +2042,8 @@ where
     /// this OS thread waits for the driver result. If the host wait expires
     /// first, the target call is still governed by `target_timeout` and this
     /// method returns [`ThreadedRuntimeError::HostWaitTimeout`].
+    /// Foreign systems and unowned shards are rejected before a host command
+    /// or call driver is admitted.
     pub fn call_blocking_with_host_timeout<M, R>(
         &self,
         address: Address<M, R>,
@@ -2046,12 +2055,7 @@ where
         M: Send + 'static,
         R: Send + 'static,
     {
-        if address.system() != self.system_incarnation {
-            return Err(ThreadedRuntimeError::ForeignSystem {
-                expected: self.system_incarnation,
-                actual: address.system(),
-            });
-        }
+        self.ensure_local_system(address)?;
         // If the worker died before publishing the dispatcher pool (e.g. a
         // panicking mailbox factory blew up registration), the runtime has
         // no usable host-call path. Surface that as `WorkerStopped` instead of

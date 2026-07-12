@@ -13,12 +13,17 @@ valid; the long-form history lives in
 
 ### 2026-07-13 Typed multi-shard host routing
 
-`ThreadedMultiShardRuntime` and `LocalMultiShardSystem` reject host calls and
-result observations before admission when an address has foreign provenance or
-targets a shard outside the local topology. Foreign provenance remains
-`ForeignSystem`; a same-incarnation address for an unowned shard remains
-`UnknownShard`. Neither path panics, claims result-observation capacity, nor
-creates a host-call driver on a routing failure.
+`ThreadedRuntime`, `ThreadedMultiShardRuntime`, `LocalSystem`, and
+`LocalMultiShardSystem` reject host calls and result observations before
+admission when an address has foreign provenance or targets a shard outside the
+local topology. Foreign provenance remains `ForeignSystem`; a same-incarnation
+address for an unowned shard remains `UnknownShard`. Neither path panics,
+claims result-observation capacity, nor creates a host-call driver on a routing
+failure.
+
+`LocalSystem` and `LocalMultiShardSystem` also expose the lower owner's
+`call_blocking_with_host_timeout` form, preserving separate target and host
+budgets without leaving the preferred application facade.
 
 ### 2026-07-12 Rate-limit decision ergonomics (closed)
 
