@@ -1,0 +1,14 @@
+error[E0382]: use of moved value
+  --> tests/flow_macro_compile_fail/raw_request_double_reply.rs:20:35
+   |
+13 | / tina::flow! {
+14 | |     flow RawRequestDoubleReplyFlow for Driver {
+15 | |         reply u32;
+...  |
+19 | |             let first = reply_to(req, 1);
+   | |                                  --- value moved here
+20 | |             let second = reply_to(req, 2);
+   | |                                   ^^^ value used here after move
+...  |
+24 | | }
+   | |_- move occurs because value has type `RequestContext<u32>`, which does not implement the `Copy` trait

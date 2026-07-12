@@ -115,8 +115,46 @@ impl Controller {
 ```
 
 Step names become enum variant names. Captured state is exactly the field list
-you wrote. `req` is always the first field and `outcome` is always the last
-field. The generated handler has the same visibility as the flow enum.
+you wrote. In authority-carrying call and raw-request steps, `req` is the first
+field; `outcome` is always the last field. The generated handler has the same
+visibility as the flow enum.
+
+### Typed timer and I/O steps
+
+Use `-> raw request T` when a non-isolate runtime call must carry the original
+caller into the next step. Unlike a normal call step, `T` is stored verbatim:
+a sleep step receives `SleepReply` (`Result<(), CallError>`) rather than a
+fabricated `CallOutcome<()>`.
+
+```rust
+tina::flow! {
+    flow TimedFlow for Controller {
+        reply HttpResponse;
+
+        step Woke(lease: SharedLease) -> raw request tina_runtime::SleepReply {
+            drop(lease);
+            match outcome {
+                Ok(()) => reply_to(req, response_ok()),
+                Err(error) => reply_to(req, timer_error(error)),
+            }
+        }
+    }
+}
+```
+
+The generated variant is
+`Woke(RequestContext<HttpResponse>, SharedLease, SleepReply)`. Start or thread
+it with `then_service_event_with_request`; that helper preserves both the
+typed result and caller authority while hiding only the private split-service
+envelope. Move-only captures remain owned by the continuation and are dropped
+if owner shutdown cancels the pending runtime call.
+
+At a stage boundary, check `req.is_open()` before admitting the next resource.
+A caller timeout closes authority but does not physically cancel a timer that
+already fired; the check prevents caller-gone work from entering another
+stage.
+
+Use `-> raw T` only when there is genuinely no caller authority to carry.
 
 ## Rules
 
@@ -128,6 +166,8 @@ field. The generated handler has the same visibility as the flow enum.
 - Match `CallOutcome<T>` in the step body. `Full`, `Closed`, `Timeout`,
   `Rejected`, and domain errors inside `Replied(...)` are still application
   decisions.
+- Match request-aware raw outcomes exhaustively in their native type. Timer
+  steps must handle both `Ok(())` and `Err(CallError)`.
 - Keep cancelable admission explicit. If a step starts `call_cancelable`, store
   the returned handle in bounded state before returning the effect.
 - Do not use a flow for fan-out, joins, or open-ended loops. Use explicit state,
