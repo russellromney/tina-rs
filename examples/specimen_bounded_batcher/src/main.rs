@@ -19,12 +19,18 @@ fn main() -> anyhow::Result<()> {
 fn print_side(side: &str, r: Report) {
     println!(
         "comparison=specimen_bounded_batcher side={} callers={} successes={} \
-         full={} failed={} size_flushes={} timer_flushes={} exit_clean={}",
+         full={} failed={} transport_full={} closed={} timeouts={} rejected={} timer_failures={} \
+         size_flushes={} timer_flushes={} exit_clean={}",
         side,
         r.callers,
         r.successes,
         r.full_rejects,
         r.failed,
+        r.transport_full,
+        r.closed,
+        r.timeouts,
+        r.rejected,
+        r.timer_failures,
         r.batches_size_flushed,
         r.batches_timer_flushed,
         r.exit_clean,

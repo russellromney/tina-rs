@@ -1,46 +1,40 @@
 # specimen_bounded_batcher
 
-Many callers each `call(batcher, Submit(item))`. The batcher captures
-every caller's `DeferredReply`, holds them in `PendingReplies`, and
-replies to all of them with the batch total when either:
+Many callers submit one item and wait on the original request. The batcher
+replies to every caller with the batch total when either the batch reaches
+`BATCH_SIZE` or `BATCH_TIMEOUT_MS` elapses from its first item.
 
-- the batch hits `BATCH_SIZE`, or
-- `BATCH_TIMEOUT_MS` elapses since the first item.
+## Tina shape
 
-## Primitives Used
+- `SharedWork<generation, BatcherReply>` owns the bounded set of callers for
+  each batch. The batch generation is the real domain key; there is no
+  synthetic request id or parallel reply-order sidecar.
+- `RequestCall` and the linear permit returned by `SharedWork::wait` keep
+  caller authority explicit. A saturated table returns that authority so the
+  batcher can reply `Full` immediately.
+- `reply_all_clone(generation, Batched(total))` settles the whole batch in
+  FIFO admission order and frees its capacity for the next batch.
+- `sleep(interval).then_service_event(...)` delivers a typed timer event. The
+  generation makes an old timer harmless when a size flush wins the race. A
+  current timer failure settles the batch with typed `TimerFailed(CallError)`
+  replies instead of abandoning callers.
+- The live host uses fallible `LocalSystem` startup, typed
+  `call_blocking_request`, exhaustive terminal outcomes, and bounded truthful
+  shutdown observation.
 
-- `PendingReplies::with_capacity(MAX_PENDING)` — bounded promise box.
-- `Context::take_request_context` via `try_capture` — capture each
-  caller as a deferred slot.
-- `take(qid)` + `reply_to(slot, BatcherReply::Batched(total))` —
-  flush the batch in one effect batch.
-- `sleep(interval).then(move |_| Tick(gen))` with a generation
-  counter — invalidate the timer when a size-flush beats it.
+Caller timeout does not retract submitted work. `SharedWork` reclaims the
+closed reply slot at the next admission, while the accepted item remains in
+its batch. This is intentional: cancellation of a caller's wait is not
+cancellation of an already accepted submission.
 
-## Run
+## Verification
+
+The Tina tests directly cover size and timer flushes, pending-cap `Full`, a
+timed-out caller followed by capacity refill, exact reclamation and rejection
+counters, stale timer invalidation, timer failure settlement and refill, and
+bounded clean shutdown. The smoke test runs both the Tokio and Tina
+implementations.
 
 ```sh
-cargo test --manifest-path examples/specimen_bounded_batcher/Cargo.toml
+cargo test --manifest-path examples/specimen_bounded_batcher/Cargo.toml --all-targets
 ```
-
-## What feels good
-
-- A flush is one `Effect::Batch(reply_to(slot, ...))` per pending
-  caller. The batcher does not have to track addresses, type
-  parameters, or correlation — `PendingReplies` owns it.
-- Caller timeout is the runtime's job. If a caller's
-  `call(...).then(...)` deadline fires first, the slot becomes
-  `Closed`; the next `pending.sweep()` (called inside `try_capture`)
-  reclaims it.
-
-## What feels worse
-
-- The batcher mixes "rate-limit timer" state with "pending replies"
-  state. The generation counter for the timer (`timer_gen` /
-  `pending_timer_gen`) handles the case where a size flush
-  invalidates a still-pending Tick. `SingleCallGate` names "one timer
-  in flight, plus N queued" but does not
-  cover stale-tick invalidation, so it does not apply here.
-- `Effect::Batch(reply_to(...))` constructs a Vec of effects per
-  flush. Fine for small batches; for thousand-caller batches this
-  is real allocation.
