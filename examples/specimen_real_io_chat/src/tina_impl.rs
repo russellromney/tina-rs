@@ -12,10 +12,10 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    BroadcastReport, BroadcastTargets, BroadcastTracker, DefaultThreadedMailboxFactory,
-    ListenerId, SendOutcome, StreamId, TcpAcceptReply, TcpBindReply, TcpListenerCloseReply,
-    TcpReadReply, TcpStreamCloseReply, TcpWriteReply, ThreadedRuntime, broadcast_observed,
-    tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
+    BroadcastReport, BroadcastTargets, BroadcastTracker, DefaultThreadedMailboxFactory, ListenerId,
+    SendOutcome, StreamId, TcpAcceptReply, TcpBindReply, TcpListenerCloseReply, TcpReadReply,
+    TcpStreamCloseReply, TcpWriteReply, ThreadedRuntime, broadcast_observed, tcp_accept, tcp_bind,
+    tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
 };
 
 use crate::{Report, RunConfig};
@@ -33,7 +33,11 @@ struct SlowClient;
 
 #[tina::isolate(message = DeliverMsg)]
 impl SlowClient {
-    fn handle(&mut self, _msg: DeliverMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        _msg: DeliverMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         noop()
     }
 }
@@ -74,13 +78,19 @@ impl FanoutState {
         self.burst = requested_burst;
         let admitted_targets = requested_burst.min(max_targets);
         self.pre_shed_full = requested_burst.saturating_sub(admitted_targets);
-        let targets =
-            BroadcastTargets::try_from_iter(max_targets, (0..admitted_targets).map(|index| (index, slow_client)))?;
+        let targets = BroadcastTargets::try_from_iter(
+            max_targets,
+            (0..admitted_targets).map(|index| (index, slow_client)),
+        )?;
         self.tracker = Some(targets.tracker());
         Ok(targets)
     }
 
-    fn record(&mut self, key: usize, outcome: SendOutcome) -> anyhow::Result<Option<(usize, usize, usize)>> {
+    fn record(
+        &mut self,
+        key: usize,
+        outcome: SendOutcome,
+    ) -> anyhow::Result<Option<(usize, usize, usize)>> {
         let tracker = self
             .tracker
             .as_mut()
@@ -111,19 +121,23 @@ struct Connection {
     send = Outbound<DeliverMsg>,
 )]
 impl Connection {
-    fn handle(&mut self, msg: ConnectionMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ConnectionMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ConnectionMsg::Begin => tcp_read(self.stream, 32).then(ConnectionMsg::Read),
             ConnectionMsg::Read(Ok(bytes)) => {
                 let requested_burst = parse_burst(&bytes);
-                let targets =
-                    match self
-                        .fanout
-                        .start(requested_burst, self.max_broadcast_targets, self.slow_client)
-                    {
-                        Ok(targets) => targets,
-                        Err(_) => return stop(),
-                    };
+                let targets = match self.fanout.start(
+                    requested_burst,
+                    self.max_broadcast_targets,
+                    self.slow_client,
+                ) {
+                    Ok(targets) => targets,
+                    Err(_) => return stop(),
+                };
                 if targets.is_empty() {
                     return write_counts(self.stream, 0, self.fanout.pre_shed_full, 0);
                 }
@@ -173,7 +187,11 @@ struct Listener {
     spawn = ChildDefinition<Connection>,
 )]
 impl Listener {
-    fn handle(&mut self, msg: ListenerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ListenerMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ListenerMsg::Start => tcp_bind(self.bind_addr).then(ListenerMsg::Bound),
             ListenerMsg::Bound(Ok((listener, _local_addr))) => {
@@ -250,7 +268,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<Report> {
         .join()
         .map_err(|_| anyhow::anyhow!("client thread panicked"))??;
 
-    let _ = runtime.shutdown();
+    runtime.shutdown_report().ensure_clean()?;
 
     let (accepted, full, closed) = parse_response(&response)?;
     Ok(Report {
@@ -319,7 +337,10 @@ fn parse_response(bytes: &[u8]) -> anyhow::Result<(usize, usize, usize)> {
     ))
 }
 
-fn counts_from_report(report: &BroadcastReport<usize>, pre_shed_full: usize) -> (usize, usize, usize) {
+fn counts_from_report(
+    report: &BroadcastReport<usize>,
+    pre_shed_full: usize,
+) -> (usize, usize, usize) {
     (
         report.accepted(),
         report.full().saturating_add(pre_shed_full),
@@ -327,7 +348,12 @@ fn counts_from_report(report: &BroadcastReport<usize>, pre_shed_full: usize) -> 
     )
 }
 
-fn write_counts(stream: StreamId, accepted: usize, full: usize, closed: usize) -> Effect<Connection> {
+fn write_counts(
+    stream: StreamId,
+    accepted: usize,
+    full: usize,
+    closed: usize,
+) -> Effect<Connection> {
     let response = format!("accepted={accepted} full={full} closed={closed}\n").into_bytes();
     tcp_write(stream, response).then(ConnectionMsg::Wrote)
 }

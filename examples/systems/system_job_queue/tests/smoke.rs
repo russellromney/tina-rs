@@ -71,7 +71,10 @@ fn admission_recovers_after_respawn() {
     matches!(report.poison_outcome, JobOutcome::Failed { .. });
     // Follow-up call lands on the respawned worker and completes.
     let JobOutcome::Completed { value, .. } = report.follow_up_outcome else {
-        panic!("expected Completed follow-up, got {:?}", report.follow_up_outcome);
+        panic!(
+            "expected Completed follow-up, got {:?}",
+            report.follow_up_outcome
+        );
     };
     assert_eq!(value, 42); // 21 * 2
     assert_eq!(report.stats.jobs_completed, 1);

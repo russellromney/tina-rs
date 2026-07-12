@@ -48,7 +48,11 @@ struct Worker;
 
 #[tina_runtime::isolate(message = WorkerMsg)]
 impl Worker {
-    fn handle(&mut self, msg: WorkerMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: WorkerMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             WorkerMsg::Process(Job::Work(_)) => noop(),
             WorkerMsg::Process(Job::Poison) => panic!("supervised worker hit a poison job"),
@@ -73,7 +77,11 @@ struct Parent {
     spawn_observed = tina::SpawnObserved<RestartableChildDefinition<Worker>, ParentMsg, WorkerMsg>,
 )]
 impl Parent {
-    fn handle(&mut self, msg: ParentMsg, _ctx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> {
+    fn handle(
+        &mut self,
+        msg: ParentMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
         match msg {
             ParentMsg::Spawn => {
                 let capacity = self.worker_capacity;
@@ -166,7 +174,7 @@ pub fn run() -> anyhow::Result<Report> {
         }
     }
 
-    let _ = runtime.shutdown();
+    runtime.shutdown_report().ensure_clean()?;
 
     Ok(Report {
         processed: work_count,

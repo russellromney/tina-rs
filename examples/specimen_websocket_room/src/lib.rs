@@ -99,6 +99,27 @@ impl RoomReport {
     }
 }
 
+/// The room accepted shutdown but did not settle every requested close before
+/// the bounded host wait expired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomShutdownTimeout {
+    pub report: RoomReport,
+}
+
+impl std::fmt::Display for RoomShutdownTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "room shutdown did not settle within 2s: requested={} ok={} failed={}",
+            self.report.shutdown_close_requested,
+            self.report.shutdown_close_ok,
+            self.report.shutdown_close_failed
+        )
+    }
+}
+
+impl std::error::Error for RoomShutdownTimeout {}
+
 #[derive(Debug, Default)]
 struct SharedReport {
     report: Mutex<RoomReport>,
@@ -914,7 +935,7 @@ impl RoomServer {
         self.report.wait_until(timeout, f)
     }
 
-    pub fn shutdown_room(&self) -> RoomReport {
+    pub fn shutdown_room(&self) -> anyhow::Result<RoomReport> {
         self.runtime
             .try_send(
                 self.room,
@@ -923,22 +944,30 @@ impl RoomServer {
                     reason: b"server shutdown".to_vec(),
                 },
             )
-            .expect("send room shutdown");
-        self.wait_until(Duration::from_secs(2), |r| {
+            .map_err(|error| anyhow::anyhow!("send room shutdown: {error:?}"))?;
+        let report = self.wait_until(Duration::from_secs(2), |r| {
             r.shutdown_started
                 && r.shutdown_close_requested > 0
                 && r.shutdown_close_ok + r.shutdown_close_failed >= r.shutdown_close_requested
-        })
+        });
+        if !(report.shutdown_started
+            && report.shutdown_close_requested > 0
+            && report.shutdown_close_ok + report.shutdown_close_failed
+                >= report.shutdown_close_requested)
+        {
+            return Err(RoomShutdownTimeout { report }.into());
+        }
+        Ok(report)
     }
 
     pub fn stop(self) -> anyhow::Result<RoomReport> {
         let report = self.report();
         let stop = self.runtime.try_send(self.listener, HttpListenerMsg::Stop);
-        let shutdown = self.runtime.shutdown();
+        let shutdown = self.runtime.shutdown_report().ensure_clean();
         match (stop, shutdown) {
-            (Ok(()), Ok(_)) => {}
-            (Err(stop), Ok(_)) => anyhow::bail!("stop HTTP listener: {stop:?}"),
-            (Ok(()), Err(shutdown)) => anyhow::bail!("shutdown room runtime: {shutdown:?}"),
+            (Ok(()), Ok(())) => {}
+            (Err(stop), Ok(())) => anyhow::bail!("stop HTTP listener: {stop:?}"),
+            (Ok(()), Err(shutdown)) => anyhow::bail!("shutdown room runtime: {shutdown}"),
             (Err(stop), Err(shutdown)) => anyhow::bail!(
                 "stop HTTP listener: {stop:?}; shutdown room runtime also failed: {shutdown:?}"
             ),
@@ -1049,11 +1078,11 @@ impl TlsRoomServer {
     pub fn stop(self) -> anyhow::Result<RoomReport> {
         let report = self.report();
         let stop = self.runtime.try_send(self.listener, HttpsListenerMsg::Stop);
-        let shutdown = self.runtime.shutdown();
+        let shutdown = self.runtime.shutdown_report().ensure_clean();
         match (stop, shutdown) {
-            (Ok(()), Ok(_)) => {}
-            (Err(stop), Ok(_)) => anyhow::bail!("stop HTTPS listener: {stop:?}"),
-            (Ok(()), Err(shutdown)) => anyhow::bail!("shutdown TLS room runtime: {shutdown:?}"),
+            (Ok(()), Ok(())) => {}
+            (Err(stop), Ok(())) => anyhow::bail!("stop HTTPS listener: {stop:?}"),
+            (Ok(()), Err(shutdown)) => anyhow::bail!("shutdown TLS room runtime: {shutdown}"),
             (Err(stop), Err(shutdown)) => anyhow::bail!(
                 "stop HTTPS listener: {stop:?}; shutdown TLS room runtime also failed: {shutdown:?}"
             ),
@@ -1453,7 +1482,7 @@ mod tests {
         let mut client = connect_room(url.as_str());
         assert!(client.read().expect("join").is_text());
 
-        let report = server.shutdown_room();
+        let report = server.shutdown_room().expect("shut down room");
         assert!(report.shutdown_started, "{report:?}");
         assert_eq!(report.shutdown_close_requested, 1, "{report:?}");
         assert_eq!(report.shutdown_close_ok, 1, "{report:?}");
@@ -1543,7 +1572,7 @@ mod tests {
             "room:before-shutdown"
         );
 
-        let report = server.shutdown_room();
+        let report = server.shutdown_room().expect("shut down room");
         assert_eq!(report.shutdown_close_requested, 2, "{report:?}");
         assert_eq!(
             report.shutdown_close_ok + report.shutdown_close_failed,
@@ -1651,7 +1680,7 @@ mod tests {
         assert_eq!(report.joined, 8, "{report:?}");
         assert_eq!(report.live_members, 8, "{report:?}");
 
-        let report = server.shutdown_room();
+        let report = server.shutdown_room().expect("shut down room");
         assert_eq!(report.shutdown_close_requested, 8, "{report:?}");
         assert_eq!(
             report.shutdown_close_ok + report.shutdown_close_failed,
@@ -1693,7 +1722,7 @@ mod tests {
         assert_eq!(report.session_high_water, 6, "{report:?}");
         assert_eq!(report.room_high_water, 1, "{report:?}");
 
-        let report = server.shutdown_room();
+        let report = server.shutdown_room().expect("shut down room");
         assert_eq!(report.shutdown_close_requested, 6, "{report:?}");
         assert_eq!(
             report.shutdown_close_ok + report.shutdown_close_failed,
@@ -1823,10 +1852,10 @@ mod tests {
         fn stop(self) -> anyhow::Result<crate::RoomReport> {
             let report = self.report.snapshot();
             let stop = self.runtime.try_send(self.listener, HttpsListenerMsg::Stop);
-            let shutdown = self.runtime.shutdown();
+            let shutdown = self.runtime.shutdown_report().ensure_clean();
             match (stop, shutdown) {
-                (Ok(()), Ok(_)) => {}
-                (Err(stop), Ok(_)) => anyhow::bail!("stop test HTTPS listener: {stop:?}"),
+                (Ok(()), Ok(())) => {}
+                (Err(stop), Ok(())) => anyhow::bail!("stop test HTTPS listener: {stop:?}"),
                 (Ok(()), Err(shutdown)) => {
                     anyhow::bail!("shutdown test TLS runtime: {shutdown:?}")
                 }

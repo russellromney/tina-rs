@@ -160,7 +160,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<Report> {
         .join()
         .map_err(|_| anyhow::anyhow!("client thread panicked"))??;
 
-    let _ = runtime.shutdown();
+    runtime.shutdown_report().ensure_clean()?;
     Ok(report)
 }
 

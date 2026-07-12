@@ -312,8 +312,8 @@ impl Tree {
         }
 
         let timer_id = timer.id();
-        let deadline_effect: Effect<Self> = sleep(REQUEST_DEADLINE)
-            .then_service_event(move |_| TreeEvent::Deadline(id, timer_id));
+        let deadline_effect: Effect<Self> =
+            sleep(REQUEST_DEADLINE).then_service_event(move |_| TreeEvent::Deadline(id, timer_id));
 
         let source = stream.source;
         let expected = stream.content_length;
@@ -445,12 +445,12 @@ impl Tree {
         };
         // Tombstone the deadline timer (a real sleep may still fire late).
         let _ = self.timers.cancel(tree.timer.id());
-        let (cancel_report, cancel_effect) =
-            tree.scope
-                .cancel_into_service_event_effect::<Self, _, _, _>(
-                    cause,
-                    move |_scope, label, outcome| TreeEvent::ChildCancelled(label, outcome),
-                );
+        let (cancel_report, cancel_effect) = tree
+            .scope
+            .cancel_into_service_event_effect::<Self, _, _, _>(
+                cause,
+                move |_scope, label, outcome| TreeEvent::ChildCancelled(label, outcome),
+            );
         // Remove from the set, then snapshot capacity so the report shows
         // the slot reclaimed.
         let _ = self.scopes.remove(&id);
@@ -572,8 +572,12 @@ pub fn run() -> anyhow::Result<ScopedTreeReport> {
         obs.lock().expect("obs").timers_ignored_late >= 1
     });
 
-    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
-    let _ = runtime.shutdown();
+    let listener_shutdown = runtime
+        .try_send(listener, HttpListenerMsg::Stop)
+        .map_err(|error| anyhow::anyhow!("stop listener: {error:?}"));
+    let runtime_shutdown = runtime.shutdown_report().ensure_clean();
+    listener_shutdown?;
+    runtime_shutdown?;
 
     let snapshot = obs.lock().expect("obs");
     let disconnect = snapshot

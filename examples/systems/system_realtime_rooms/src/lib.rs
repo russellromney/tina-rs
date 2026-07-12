@@ -125,6 +125,27 @@ pub struct RoomStats {
     pub shutdown_close_failed: u64,
 }
 
+/// The room accepted shutdown but did not settle every requested close before
+/// the bounded host wait expired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomShutdownTimeout {
+    pub stats: RoomStats,
+}
+
+impl std::fmt::Display for RoomShutdownTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "room shutdown did not settle within 2s: requested={} ok={} failed={}",
+            self.stats.shutdown_close_requested,
+            self.stats.shutdown_close_ok,
+            self.stats.shutdown_close_failed
+        )
+    }
+}
+
+impl std::error::Error for RoomShutdownTimeout {}
+
 #[derive(Debug, Default)]
 struct SharedReport {
     stats: Mutex<RoomStats>,
@@ -724,29 +745,39 @@ impl RoomServer {
         self.report.wait_until(timeout, f)
     }
 
-    pub fn shutdown_room(&self) -> RoomStats {
-        let _ = self.runtime.try_send(
-            self.room.send.address(),
-            WebSocketSessionMsg::Shutdown {
-                code: Some(WebSocketCloseCode(1001)),
-                reason: b"server shutdown".to_vec(),
-            },
-        );
-        self.wait_until(Duration::from_secs(2), |s| {
+    pub fn shutdown_room(&self) -> anyhow::Result<RoomStats> {
+        self.runtime
+            .try_send(
+                self.room.send.address(),
+                WebSocketSessionMsg::Shutdown {
+                    code: Some(WebSocketCloseCode(1001)),
+                    reason: b"server shutdown".to_vec(),
+                },
+            )
+            .map_err(|error| anyhow::anyhow!("send room shutdown: {error:?}"))?;
+        let stats = self.wait_until(Duration::from_secs(2), |s| {
             s.shutdown_started
                 && s.shutdown_close_requested > 0
                 && s.shutdown_close_ok + s.shutdown_close_failed >= s.shutdown_close_requested
-        })
+        });
+        if !(stats.shutdown_started
+            && stats.shutdown_close_requested > 0
+            && stats.shutdown_close_ok + stats.shutdown_close_failed
+                >= stats.shutdown_close_requested)
+        {
+            return Err(RoomShutdownTimeout { stats }.into());
+        }
+        Ok(stats)
     }
 
     pub fn stop(self) -> anyhow::Result<RoomStats> {
         let stats = self.snapshot();
         let stop = self.runtime.try_send(self.listener, HttpListenerMsg::Stop);
-        let shutdown = self.runtime.shutdown();
+        let shutdown = self.runtime.shutdown_report().ensure_clean();
         match (stop, shutdown) {
-            (Ok(()), Ok(_)) => {}
-            (Err(stop), Ok(_)) => anyhow::bail!("stop room listener: {stop:?}"),
-            (Ok(()), Err(shutdown)) => anyhow::bail!("shutdown room runtime: {shutdown:?}"),
+            (Ok(()), Ok(())) => {}
+            (Err(stop), Ok(())) => anyhow::bail!("stop room listener: {stop:?}"),
+            (Ok(()), Err(shutdown)) => anyhow::bail!("shutdown room runtime: {shutdown}"),
             (Err(stop), Err(shutdown)) => anyhow::bail!(
                 "stop room listener: {stop:?}; shutdown room runtime also failed: {shutdown:?}"
             ),
@@ -882,7 +913,7 @@ pub fn run_shutdown(config: RunConfig) -> anyhow::Result<ShutdownReport> {
     let a_drainer = std::thread::spawn(move || (a.recv_close_timeout(Duration::from_secs(2)), a));
     let b_drainer = std::thread::spawn(move || (b.recv_close_timeout(Duration::from_secs(2)), b));
 
-    let _stats_after_shutdown = server.shutdown_room();
+    let _stats_after_shutdown = server.shutdown_room()?;
 
     // Each client should observe a close frame.
     let (a_saw, a_client) = a_drainer.join().expect("a drainer joins");

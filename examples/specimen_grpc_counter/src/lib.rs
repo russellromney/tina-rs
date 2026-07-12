@@ -55,11 +55,15 @@ impl SpecimenServer {
         let Some(runtime) = self.runtime.take() else {
             return Ok(());
         };
-        let _ = runtime.try_send(self.listener, Http2ListenerMsg::Stop);
-        runtime
-            .shutdown()
-            .map(|_| ())
-            .map_err(|error| format!("shutdown: {error:?}"))
+        let listener_stop = runtime
+            .try_send(self.listener, Http2ListenerMsg::Stop)
+            .map_err(|error| format!("stop listener: {error:?}"));
+        let runtime_shutdown = runtime
+            .shutdown_report()
+            .ensure_clean()
+            .map_err(|error| format!("shutdown: {error}"));
+        listener_stop?;
+        runtime_shutdown
     }
 
     /// Exercise the native gRPC client (no Tokio, no blocking helper):
@@ -135,7 +139,9 @@ impl SpecimenServer {
             let reply = runtime
                 .call_blocking(client.connection(), submit, Duration::from_secs(2))
                 .map_err(|error| format!("cancel call: {error:?}"))?;
-            canceller.join().ok();
+            canceller
+                .join()
+                .map_err(|_| "cancellation thread panicked".to_owned())?;
             Ok::<String, String>(format!("{reply:?}"))
         })?;
 
@@ -150,7 +156,9 @@ impl SpecimenServer {
             other => return Err(format!("post-cancel call: expected Status, got {other:?}")),
         }
 
-        let _ = runtime.try_send(conn, Http2ClientMsg::Stop);
+        runtime
+            .try_send(conn, Http2ClientMsg::Stop)
+            .map_err(|error| format!("stop native gRPC connection: {error:?}"))?;
         Ok(NativeGrpcSmoke {
             increment_value,
             forbidden_status,

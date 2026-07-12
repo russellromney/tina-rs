@@ -158,7 +158,7 @@ pub enum SessionAuthRequest {
     Stats,
 }
 
-/// Split-service envelope for [`SessionBucket`].
+/// Split-service envelope for `SessionBucket`.
 pub type SessionAuthMsg = tina::ServiceMessage<SessionAuthEvent, SessionAuthRequest>;
 
 #[derive(Debug)]
@@ -258,11 +258,7 @@ impl SessionBucket {
         call.reply(SessionAuthReply::Admitted { token })
     }
 
-    fn touch(
-        &mut self,
-        token: SessionToken,
-        call: RequestCall<'_, Self>,
-    ) -> RequestEffect<Self> {
+    fn touch(&mut self, token: SessionToken, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
         match self.rows.get_mut(&token) {
             Some(row) => {
                 row.last_touched_at = Instant::now();
@@ -276,11 +272,7 @@ impl SessionBucket {
         }
     }
 
-    fn logout(
-        &mut self,
-        token: SessionToken,
-        call: RequestCall<'_, Self>,
-    ) -> RequestEffect<Self> {
+    fn logout(&mut self, token: SessionToken, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
         if self.rows.remove(&token).is_some() {
             self.stats.logged_out += 1;
             self.stats.active = self.rows.len() as u64;
@@ -442,10 +434,11 @@ impl AuthWorld {
         };
         for (idx, shard_id) in self.shard_ids.iter().enumerate() {
             let addr = self.addrs_by_shard[shard_id];
-            match self
-                .runtime
-                .call_blocking_request(addr, SessionAuthRequest::Stats, self.timeout)?
-            {
+            match self.runtime.call_blocking_request(
+                addr,
+                SessionAuthRequest::Stats,
+                self.timeout,
+            )? {
                 CallOutcome::Replied(SessionAuthReply::Stats(s)) => {
                     combined.active += s.active as usize;
                     combined.admitted += s.admitted;
@@ -465,10 +458,9 @@ impl AuthWorld {
         Ok(combined)
     }
 
-    /// Tear down through the cloneable shutdown handle so this specimen
-    /// does not need `Arc::try_unwrap(runtime)` ceremony.
+    /// Tear down through the runtime owner and validate terminal accounting.
     fn shutdown(self) -> anyhow::Result<()> {
-        let _ = self.runtime.shutdown();
+        self.runtime.shutdown_report().ensure_clean()?;
         Ok(())
     }
 }

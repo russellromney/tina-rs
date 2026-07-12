@@ -112,6 +112,7 @@ pub fn run() -> anyhow::Result<Report> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
 
     let worker_addr = runtime
         .register_with_capacity::<_, Infallible>(
@@ -166,9 +167,8 @@ pub fn run() -> anyhow::Result<Report> {
         exit_clean: report.exit_clean,
     };
 
-    let rt = Arc::try_unwrap(runtime)
-        .map_err(|_| anyhow::anyhow!("runtime still had outstanding references at shutdown"))?;
-    rt.shutdown()
-        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
     Ok(final_report)
 }

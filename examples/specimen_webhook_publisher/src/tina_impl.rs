@@ -167,6 +167,7 @@ pub fn run() -> anyhow::Result<Report> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
 
     let webhook = WebhookServer::spawn();
     let url = webhook.url();
@@ -199,12 +200,19 @@ pub fn run() -> anyhow::Result<Report> {
     // Let the webhook server's writer task land before snapshotting.
     std::thread::sleep(Duration::from_millis(20));
     let bodies = webhook.snapshot();
-    webhook.stop();
-
-    let runtime = Arc::try_unwrap(runtime)
-        .map_err(|_| anyhow::anyhow!("Tina runtime still has owners at shutdown"))?;
-    runtime
-        .shutdown()
-        .map_err(|error| anyhow::anyhow!("shutdown Tina runtime: {error:?}"))?;
-    Ok(Report { bodies })
+    let webhook_shutdown = webhook.stop();
+    let runtime_shutdown: anyhow::Result<()> = (|| {
+        let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+        terminal.ensure_clean()?;
+        Ok(())
+    })();
+    drop(runtime);
+    match (webhook_shutdown, runtime_shutdown) {
+        (Ok(()), Ok(())) => Ok(Report { bodies }),
+        (Err(webhook), Ok(())) => Err(webhook),
+        (Ok(()), Err(runtime)) => Err(runtime),
+        (Err(webhook), Err(runtime)) => Err(anyhow::anyhow!(
+            "webhook shutdown failed: {webhook:#}; Tina runtime shutdown also failed: {runtime:#}"
+        )),
+    }
 }

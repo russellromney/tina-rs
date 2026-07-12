@@ -1,5 +1,5 @@
 //! Tiny "API gateway" specimen that proves
-//! [`SharedCapacityScope`](tina_runtime::SharedCapacityScope).
+//! [`SharedCapacityScope`].
 //!
 //! Two routes ("upload", "list") share one shard-local in-flight cap.
 //! Callers race; one route can drain the shared scope; the other
@@ -235,13 +235,13 @@ impl Gateway {
             {
                 Ok(_ticket) => {
                     self.next_qid = qid + 1;
-                    sleep(hold).then_service_event(move |result| {
-                        GatewayEvent::HoldDone { qid, route, result }
+                    sleep(hold).then_service_event(move |result| GatewayEvent::HoldDone {
+                        qid,
+                        route,
+                        result,
                     })
                 }
-                Err(ConcurrencyGuardedInsertError::Admission {
-                    reply, failure, ..
-                }) => {
+                Err(ConcurrencyGuardedInsertError::Admission { reply, failure, .. }) => {
                     let report = failure.report();
                     reply_to::<Self>(
                         reply,
@@ -265,17 +265,15 @@ impl Gateway {
                         },
                     )
                 }
-                Err(ConcurrencyGuardedInsertError::DuplicateKey { reply, .. }) => {
-                    reply_to::<Self>(
-                        reply,
-                        GatewayReply::Full {
-                            filled: "gateway.duplicate".into(),
-                            requested: 1,
-                            current: 0,
-                            max: 0,
-                        },
-                    )
-                }
+                Err(ConcurrencyGuardedInsertError::DuplicateKey { reply, .. }) => reply_to::<Self>(
+                    reply,
+                    GatewayReply::Full {
+                        filled: "gateway.duplicate".into(),
+                        requested: 1,
+                        current: 0,
+                        max: 0,
+                    },
+                ),
             }
         })
     }
@@ -298,6 +296,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         SingleShard,
         DefaultThreadedMailboxFactory,
     )?);
+    let shutdown = runtime.shutdown_handle();
     let scope = SharedCapacityScope::new("gateway.in_flight", "weight", config.shared_cap);
     let body_scope = SharedCapacityScope::new("gateway.body_bytes", "bytes", config.body_cap);
     let gateway: SplitServiceHandle<GatewayEvent, GatewayRequest, GatewayReply> = runtime
@@ -412,7 +411,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     // The post-shutdown snapshot is the load-bearing
     // proof: `current` must be 0 even if callers were still timing
     // out at shutdown time.
-    shutdown(runtime);
+    shutdown_runtime(shutdown, runtime)?;
     let snap = scope.snapshot();
     let body_snap = body_scope.snapshot();
 
@@ -455,8 +454,12 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     })
 }
 
-fn shutdown(runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>) {
-    if let Ok(rt) = Arc::try_unwrap(runtime) {
-        let _ = rt.shutdown();
-    }
+fn shutdown_runtime(
+    shutdown: tina_runtime::ThreadedShutdownHandle,
+    runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
+) -> anyhow::Result<()> {
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
+    Ok(())
 }

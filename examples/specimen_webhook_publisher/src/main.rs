@@ -7,10 +7,10 @@ fn main() -> anyhow::Result<()> {
 
     match mode.as_str() {
         "both" | "compare" => {
-            print_report("tokio", tokio_impl::run());
+            print_report("tokio", tokio_impl::run()?);
             print_report("tina", tina_impl::run()?);
         }
-        "tokio" => print_report("tokio", tokio_impl::run()),
+        "tokio" => print_report("tokio", tokio_impl::run()?),
         "tina" => print_report("tina", tina_impl::run()?),
         other => panic!(
             "unknown mode {other:?}; usage: specimen-webhook-publisher [both|compare|tokio|tina]"

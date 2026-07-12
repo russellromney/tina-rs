@@ -416,9 +416,7 @@ pub fn run() -> anyhow::Result<BugboxReport> {
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    runtime
-        .shutdown()
-        .map_err(|e| anyhow::anyhow!("live runtime shutdown: {e:?}"))?;
+    runtime.shutdown_report().ensure_clean()?;
     let live_received_count = live_received.lock().expect("live sink lock").len();
     let live_shape = live_trace.snapshot();
     let live_events = live_trace.events();

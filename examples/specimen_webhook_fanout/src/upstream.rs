@@ -32,12 +32,21 @@ pub struct Upstream {
 }
 
 impl Upstream {
-    pub fn stop(mut self) {
+    pub fn stop(mut self) -> anyhow::Result<()> {
+        let mut closed_receivers = 0usize;
         for tx in self.shutdown.drain(..) {
-            let _ = tx.send(());
+            closed_receivers += usize::from(tx.send(()).is_err());
         }
+        let mut panicked_threads = 0usize;
         for t in self.threads.drain(..) {
-            let _ = t.join();
+            panicked_threads += usize::from(t.join().is_err());
+        }
+        if closed_receivers == 0 && panicked_threads == 0 {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "upstream shutdown failed: closed_receivers={closed_receivers} panicked_threads={panicked_threads}"
+            )
         }
     }
 }

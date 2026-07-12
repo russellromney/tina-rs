@@ -154,10 +154,10 @@ pub fn run() -> anyhow::Result<Report> {
     runtime
         .try_send(listener_addr, HttpListenerMsg::Stop)
         .map_err(|e| anyhow::anyhow!("send Stop: {e:?}"))?;
-    let trace = runtime
-        .shutdown()
-        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
-    let accepts = trace
+    let terminal = runtime.shutdown_report();
+    terminal.ensure_clean()?;
+    let accepts = terminal
+        .trace()
         .iter()
         .filter(|event| {
             matches!(
@@ -182,7 +182,9 @@ fn acquire_connection(
     pool: PoolAddr,
 ) -> anyhow::Result<tina::pool::PoolLease<KeepaliveConnAddr>> {
     match runtime.call_blocking(pool, WorkerPoolMsg::Acquire, REQUEST_TIMEOUT)? {
-        CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Acquired(lease))) => Ok(lease),
+        CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Acquired(lease))) => {
+            Ok(lease)
+        }
         other => anyhow::bail!("expected keepalive pool acquire, got {other:?}"),
     }
 }
@@ -223,7 +225,11 @@ fn release_connection(
     }
 }
 
-fn record_get(report: &mut Report, response: &HttpResponse, expected_body: Option<&str>) -> anyhow::Result<()> {
+fn record_get(
+    report: &mut Report,
+    response: &HttpResponse,
+    expected_body: Option<&str>,
+) -> anyhow::Result<()> {
     if response.status == StatusCode::OK {
         report.successful_get += 1;
     }

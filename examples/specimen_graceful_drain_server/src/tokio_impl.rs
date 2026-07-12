@@ -71,7 +71,9 @@ pub fn run() -> anyhow::Result<Report> {
         // dropping `tx` here makes `recv()` return `None` first, the
         // consumer breaks via the channel-closed path, and the
         // explicit shutdown signal is lost).
-        let _ = shutdown_tx.send(());
+        shutdown_tx
+            .send(())
+            .map_err(|_| anyhow::anyhow!("consumer shutdown receiver dropped"))?;
 
         let consumer_report = consumer
             .await

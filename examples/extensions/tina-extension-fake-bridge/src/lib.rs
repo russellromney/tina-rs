@@ -337,14 +337,12 @@ impl FakeBridgeInstall {
             thread::sleep(Duration::from_millis(1));
         }
         let drained = worker.is_finished();
-        if drained {
-            let _ = worker.join();
-        }
+        let joined = !drained || worker.join().is_ok();
         // Dropping an unfinished JoinHandle detaches the thread.
         let remaining = self.metrics.state.current.load(Ordering::Acquire);
         BridgeDrainReport::new(
             true,
-            drained && remaining == 0,
+            drained && joined && remaining == 0,
             remaining,
             vec![("compute", remaining)],
             start.elapsed(),

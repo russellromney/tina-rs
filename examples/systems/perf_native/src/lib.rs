@@ -19,10 +19,10 @@ use axum::routing::get;
 use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::prelude::*;
 use tina_http::{
-    BodyMetrics, FixedEndpointPoolConfig, GrpcBufferedServerStreamingResponse, GrpcClient,
-    GrpcBufferedStreamLimits, GrpcClientPool, GrpcLimits, GrpcPreframedUnary, GrpcRequest,
-    GrpcResponse, GrpcRouter, GrpcRouterMsg, GrpcStatusCode, GrpcStreamDecoder, GrpcTarget,
-    GrpcUnaryOutcome, Http2ClientConnection, Http2ClientLimits, Http2ClientMsg,
+    BodyMetrics, FixedEndpointPoolConfig, GrpcBufferedServerStreamingResponse,
+    GrpcBufferedStreamLimits, GrpcClient, GrpcClientPool, GrpcLimits, GrpcPreframedUnary,
+    GrpcRequest, GrpcResponse, GrpcRouter, GrpcRouterMsg, GrpcStatusCode, GrpcStreamDecoder,
+    GrpcTarget, GrpcUnaryOutcome, Http2ClientConnection, Http2ClientLimits, Http2ClientMsg,
     Http2ClientOutcome, Http2ClientReply, Http2ClientRequest, Http2Listener, Http2ListenerMsg,
     Http2PickOutcome, Http2ResponseChunk, Http2ServerConfig, Http2Target, HttpLimits, HttpListener,
     HttpListenerAddress, HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig, StatusCode,
@@ -36,7 +36,7 @@ use tina_proof_harness::{
 use tina_runtime::{
     CallKind, CallOutcome, DefaultThreadedMailboxFactory, RuntimeEvent, RuntimeEventKind,
     ServicePressureReport, ThreadedRuntime, ThreadedRuntimeConfig, ThreadedSendObservedError,
-    TraceObserver, call,
+    ThreadedShutdownHandle, TraceObserver, call,
 };
 use tokio::net::TcpListener;
 use tokio::runtime::Builder;
@@ -236,7 +236,7 @@ pub fn http_body_pressure_probe() -> anyhow::Result<LoadReport> {
         .wait(Duration::from_secs(2))
         .map_err(|e| anyhow::anyhow!("observe tina http pressure bind: {e:?}"))?;
 
-    let (load, _allocations) = run_counted(
+    let (mut load, _allocations) = run_counted(
         LoadRun {
             workers: 1,
             stop: LoadStop::ops(PRESSURE_OPS),
@@ -252,8 +252,7 @@ pub fn http_body_pressure_probe() -> anyhow::Result<LoadReport> {
         }),
     );
 
-    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, Some(&mut load))?;
     Ok(load)
 }
 
@@ -431,9 +430,7 @@ impl ChainService {
         match request {
             ChainRequest::Run => call_ctx
                 .defer(call(self.ping, PingMsg::Ping, CALL_TIMEOUT))
-                .reply(|req, outcome| {
-                    ChainMsg::Event(ChainEvent::PingReturned(req, outcome))
-                }),
+                .reply(|req, outcome| ChainMsg::Event(ChainEvent::PingReturned(req, outcome))),
         }
     }
 }
@@ -471,8 +468,8 @@ fn tina_host_enqueue_row() -> anyhow::Result<PerfReport> {
         .map_err(|e| anyhow::anyhow!("warm tina enqueue: {e:?}"))?;
     wait_count(&count, 1);
 
-    let rt = Arc::clone(&runtime);
-    let (load, allocations) = run_counted(
+    let rt = runtime.shared();
+    let (mut load, allocations) = run_counted(
         LoadRun {
             workers: WORKERS,
             stop: LoadStop::ops(OPS),
@@ -490,7 +487,7 @@ fn tina_host_enqueue_row() -> anyhow::Result<PerfReport> {
             }
         }),
     );
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, Some(&mut load))?;
     Ok(PerfReport::from_load_with_allocations(
         "tina_host_enqueue",
         "host_enqueue",
@@ -504,7 +501,7 @@ fn tokio_host_enqueue_row() -> anyhow::Result<PerfReport> {
     tx.try_send(()).expect("warm tokio enqueue");
     wait_count(&count, 1);
 
-    let (load, allocations) = run_counted(
+    let (mut load, allocations) = run_counted(
         LoadRun {
             workers: WORKERS,
             stop: LoadStop::ops(OPS),
@@ -523,6 +520,7 @@ fn tokio_host_enqueue_row() -> anyhow::Result<PerfReport> {
         }),
     );
     stop_tokio_counter(stop_tx, handle)?;
+    record_clean_lifecycle(&mut load);
     Ok(PerfReport::from_load_with_allocations(
         "tokio_host_enqueue",
         "host_enqueue",
@@ -541,8 +539,8 @@ fn tina_observed_admission_row() -> anyhow::Result<PerfReport> {
         .map_err(|e| anyhow::anyhow!("warm tina observed send: {e:?}"))?;
     wait_count(&count, 1);
 
-    let rt = Arc::clone(&runtime);
-    let (load, allocations) = run_counted(
+    let rt = runtime.shared();
+    let (mut load, allocations) = run_counted(
         LoadRun {
             workers: WORKERS,
             stop: LoadStop::ops(OPS),
@@ -564,7 +562,7 @@ fn tina_observed_admission_row() -> anyhow::Result<PerfReport> {
             }
         }),
     );
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, Some(&mut load))?;
     Ok(PerfReport::from_load_with_allocations(
         "tina_observed_admission",
         "observed_admission",
@@ -596,7 +594,7 @@ fn tokio_observed_admission_row() -> anyhow::Result<PerfReport> {
     tx.blocking_send(warm_tx).expect("warm tokio observed send");
     warm_rx.blocking_recv().expect("warm tokio observed ack");
 
-    let (load, allocations) = run_counted(
+    let (mut load, allocations) = run_counted(
         LoadRun {
             workers: WORKERS,
             stop: LoadStop::ops(OPS),
@@ -614,10 +612,13 @@ fn tokio_observed_admission_row() -> anyhow::Result<PerfReport> {
         },
         None::<fn() -> LoadObservation>,
     );
-    let _ = stop_tx.send(());
+    stop_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("tokio observed stop receiver dropped"))?;
     handle
         .join()
         .map_err(|_| anyhow::anyhow!("tokio observed worker panicked"))?;
+    record_clean_lifecycle(&mut load);
     Ok(PerfReport::from_load_with_allocations(
         "tokio_observed_admission",
         "observed_admission",
@@ -636,8 +637,8 @@ fn tina_host_call_row() -> anyhow::Result<PerfReport> {
         CallOutcome::Replied(PingReply::Pong),
     );
 
-    let rt = Arc::clone(&runtime);
-    let (load, allocations) = run_counted(
+    let rt = runtime.shared();
+    let (mut load, allocations) = run_counted(
         LoadRun {
             workers: WORKERS,
             stop: LoadStop::ops(OPS),
@@ -651,7 +652,7 @@ fn tina_host_call_row() -> anyhow::Result<PerfReport> {
         },
         None::<fn() -> LoadObservation>,
     );
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, Some(&mut load))?;
     Ok(PerfReport::from_load_with_allocations(
         "tina_host_call",
         "host_call",
@@ -666,7 +667,7 @@ fn tokio_host_call_row() -> anyhow::Result<PerfReport> {
     tx.blocking_send(warm_tx).expect("warm tokio call send");
     warm_rx.blocking_recv().expect("warm tokio call reply");
 
-    let (load, allocations) = run_counted(
+    let (mut load, allocations) = run_counted(
         LoadRun {
             workers: WORKERS,
             stop: LoadStop::ops(OPS),
@@ -675,10 +676,13 @@ fn tokio_host_call_row() -> anyhow::Result<PerfReport> {
         move |_| tokio_call_op(&tx),
         None::<fn() -> LoadObservation>,
     );
-    let _ = stop_tx.send(());
+    stop_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("tokio call stop receiver dropped"))?;
     handle
         .join()
         .map_err(|_| anyhow::anyhow!("tokio call worker panicked"))?;
+    record_clean_lifecycle(&mut load);
     Ok(PerfReport::from_load_with_allocations(
         "tokio_host_call",
         "host_call",
@@ -702,26 +706,18 @@ fn tina_service_call_chain_row() -> anyhow::Result<PerfReport> {
         .address()
         .address();
     assert_eq!(
-        runtime.call_blocking(
-            chain,
-            ChainMsg::Request(ChainRequest::Run),
-            CALL_TIMEOUT
-        )?,
+        runtime.call_blocking(chain, ChainMsg::Request(ChainRequest::Run), CALL_TIMEOUT)?,
         CallOutcome::Replied(ChainReply::Done),
     );
 
-    let rt = Arc::clone(&runtime);
-    let (load, allocations) = run_counted(
+    let rt = runtime.shared();
+    let (mut load, allocations) = run_counted(
         LoadRun {
             workers: WORKERS,
             stop: LoadStop::ops(OPS),
             label: "tina_service_call_chain",
         },
-        move |_| match rt.call_blocking(
-            chain,
-            ChainMsg::Request(ChainRequest::Run),
-            CALL_TIMEOUT,
-        ) {
+        move |_| match rt.call_blocking(chain, ChainMsg::Request(ChainRequest::Run), CALL_TIMEOUT) {
             Ok(CallOutcome::Replied(ChainReply::Done)) => OpOutcome::Ok,
             Ok(CallOutcome::Full) => OpOutcome::Err { kind: "full" },
             Ok(CallOutcome::Timeout) => OpOutcome::Timeout,
@@ -729,7 +725,7 @@ fn tina_service_call_chain_row() -> anyhow::Result<PerfReport> {
         },
         None::<fn() -> LoadObservation>,
     );
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, Some(&mut load))?;
     Ok(PerfReport::from_load_with_allocations(
         "tina_service_call_chain",
         "service_call_chain",
@@ -749,7 +745,7 @@ fn tokio_service_call_chain_row() -> anyhow::Result<PerfReport> {
         .blocking_recv()
         .expect("warm tokio service chain reply");
 
-    let (load, allocations) = run_counted(
+    let (mut load, allocations) = run_counted(
         LoadRun {
             workers: WORKERS,
             stop: LoadStop::ops(OPS),
@@ -758,14 +754,19 @@ fn tokio_service_call_chain_row() -> anyhow::Result<PerfReport> {
         move |_| tokio_call_op(&service_tx),
         None::<fn() -> LoadObservation>,
     );
-    let _ = service_stop.send(());
-    let _ = ping_stop.send(());
+    service_stop
+        .send(())
+        .map_err(|_| anyhow::anyhow!("tokio chain service stop receiver dropped"))?;
+    ping_stop
+        .send(())
+        .map_err(|_| anyhow::anyhow!("tokio chain ping stop receiver dropped"))?;
     service_handle
         .join()
         .map_err(|_| anyhow::anyhow!("tokio chain service panicked"))?;
     ping_handle
         .join()
         .map_err(|_| anyhow::anyhow!("tokio chain ping panicked"))?;
+    record_clean_lifecycle(&mut load);
     Ok(PerfReport::from_load_with_allocations(
         "tokio_service_call_chain",
         "service_call_chain",
@@ -897,7 +898,7 @@ fn tina_http_row(
     http_get(addr, keepalive, if keepalive { 2 } else { 1 }, expected_len)?;
 
     let process_before = ProcessSnapshot::now();
-    let (load, allocations) = run_counted(
+    let (mut load, allocations) = run_counted(
         LoadRun {
             workers: WORKERS,
             stop: LoadStop::ops(HTTP_OPS),
@@ -912,8 +913,7 @@ fn tina_http_row(
     let (allocs_delta, allocated_bytes_delta, rss_delta) =
         ProcessSnapshot::now().delta_from(process_before);
     print_process_metrics(label, allocs_delta, allocated_bytes_delta, rss_delta);
-    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, Some(&mut load))?;
     Ok(PerfReport::from_load_with_allocations(
         label,
         kind,
@@ -952,9 +952,8 @@ fn tina_http_steady_state_row(
     let addr = bound
         .wait(Duration::from_secs(2))
         .map_err(|e| anyhow::anyhow!("observe tina steady http bind: {e:?}"))?;
-    let report = http_steady_state_load(label, kind, addr, expected_len)?;
-    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
-    shutdown_runtime(runtime)?;
+    let mut report = http_steady_state_load(label, kind, addr, expected_len)?;
+    shutdown_runtime(runtime, Some(&mut report.load))?;
     Ok(report)
 }
 
@@ -995,7 +994,7 @@ fn tokio_http_row(
     let addr = addr_rx.recv_timeout(Duration::from_secs(2))?;
     request(addr)?;
     let process_before = ProcessSnapshot::now();
-    let (load, allocations) = run_counted(
+    let (mut load, allocations) = run_counted(
         LoadRun {
             workers: WORKERS,
             stop: LoadStop::ops(HTTP_OPS),
@@ -1010,11 +1009,14 @@ fn tokio_http_row(
     let (allocs_delta, allocated_bytes_delta, rss_delta) =
         ProcessSnapshot::now().delta_from(process_before);
     print_process_metrics(label, allocs_delta, allocated_bytes_delta, rss_delta);
-    let _ = stop_tx.send(());
+    stop_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("tokio HTTP stop receiver dropped"))?;
     done_rx.recv_timeout(Duration::from_secs(2))?;
     handle
         .join()
         .map_err(|_| anyhow::anyhow!("tokio http worker panicked"))?;
+    record_clean_lifecycle(&mut load);
     Ok(PerfReport::from_load_with_allocations(
         label,
         kind,
@@ -1058,12 +1060,15 @@ fn tokio_http_steady_state_row(
         });
     });
     let addr = addr_rx.recv_timeout(Duration::from_secs(2))?;
-    let report = http_steady_state_load(label, kind, addr, expected_len)?;
-    let _ = stop_tx.send(());
+    let mut report = http_steady_state_load(label, kind, addr, expected_len)?;
+    stop_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("tokio steady HTTP stop receiver dropped"))?;
     done_rx.recv_timeout(Duration::from_secs(2))?;
     handle
         .join()
         .map_err(|_| anyhow::anyhow!("tokio steady http worker panicked"))?;
+    record_clean_lifecycle(&mut report.load);
     Ok(report)
 }
 
@@ -1118,7 +1123,9 @@ fn stop_tokio_counter(
     stop_tx: oneshot::Sender<()>,
     handle: thread::JoinHandle<()>,
 ) -> anyhow::Result<()> {
-    let _ = stop_tx.send(());
+    stop_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("tokio counter stop receiver dropped"))?;
     handle
         .join()
         .map_err(|_| anyhow::anyhow!("tokio counter worker panicked"))
@@ -1557,29 +1564,54 @@ fn wait_count(count: &AtomicU64, expected: u64) {
     }
 }
 
-fn new_runtime() -> anyhow::Result<Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>> {
-    Ok(Arc::new(ThreadedRuntime::try_with_config(
+struct PerfRuntime {
+    runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
+    shutdown: ThreadedShutdownHandle,
+}
+
+impl std::ops::Deref for PerfRuntime {
+    type Target = ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.runtime
+    }
+}
+
+impl PerfRuntime {
+    fn shared(&self) -> Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>> {
+        Arc::clone(&self.runtime)
+    }
+}
+
+fn new_runtime() -> anyhow::Result<PerfRuntime> {
+    let runtime = Arc::new(ThreadedRuntime::try_with_config(
         SingleShard,
         DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
             command_capacity: CAPACITY,
             ..ThreadedRuntimeConfig::default()
         },
-    )?))
+    )?);
+    let shutdown = runtime.shutdown_handle();
+    Ok(PerfRuntime { runtime, shutdown })
 }
 
-fn shutdown_runtime(
-    runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
-) -> anyhow::Result<()> {
-    match Arc::try_unwrap(runtime) {
-        Ok(runtime) => {
-            runtime
-                .shutdown()
-                .map_err(|e| anyhow::anyhow!("shutdown tina runtime: {e:?}"))?;
-            Ok(())
-        }
-        Err(_) => anyhow::bail!("runtime still shared after perf row"),
+fn shutdown_runtime(runtime: PerfRuntime, load: Option<&mut LoadReport>) -> anyhow::Result<()> {
+    let terminal = runtime
+        .shutdown
+        .request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime.runtime);
+    terminal.ensure_clean()?;
+    if let Some(load) = load {
+        record_clean_lifecycle(load);
     }
+    Ok(())
+}
+
+fn record_clean_lifecycle(load: &mut LoadReport) {
+    let prior_observation_clean = !load.leak_checked || load.leak_clean;
+    load.leak_checked = true;
+    load.leak_clean = prior_observation_clean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1614,8 +1646,6 @@ const H2_KEEPALIVE_REQUESTS_PER_CONN: usize = KEEPALIVE_REQUESTS_PER_CONN;
 // timeout only exists to fail a genuine hang, not to clip a slow-but-real op on
 // a contended machine. Kept well above the worst observed tail.
 const PROTOCOL_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
-
-type PerfRuntime = Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>;
 
 /// All Tina-only native protocol rows. Returned as `PerfReport`s (not
 /// comparisons): each prints a `perf ...` line with `comparison_baseline=none`.
@@ -1842,12 +1872,12 @@ fn h2c_get(
 }
 
 fn http2_h2c_close_row() -> anyhow::Result<PerfReport> {
-    let (runtime, listener, addr) = start_h2_server(small_body())?;
+    let (runtime, _listener, addr) = start_h2_server(small_body())?;
     let expected = small_body().len();
     h2c_one_request(addr, expected)?; // warm one full connection + request
 
     let process_before = ProcessSnapshot::now();
-    let (load, allocations) = run_counted(
+    let (mut load, allocations) = run_counted(
         LoadRun {
             workers: WORKERS,
             stop: LoadStop::ops(PROTOCOL_OPS),
@@ -1863,8 +1893,7 @@ fn http2_h2c_close_row() -> anyhow::Result<PerfReport> {
     );
     let (allocs, bytes, rss) = ProcessSnapshot::now().delta_from(process_before);
     print_process_metrics("tina_http2_h2c_close_request", allocs, bytes, rss);
-    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, Some(&mut load))?;
     Ok(PerfReport::from_load_with_allocations(
         "http2_h2c_close_request",
         "connection_setup",
@@ -1879,12 +1908,12 @@ fn h2c_one_request(addr: SocketAddr, expected: usize) -> anyhow::Result<()> {
 }
 
 fn http2_h2c_keepalive_row() -> anyhow::Result<PerfReport> {
-    let (runtime, listener, addr) = start_h2_server(small_body())?;
+    let (runtime, _listener, addr) = start_h2_server(small_body())?;
     let expected = small_body().len();
     h2c_keepalive_op(addr, expected)?; // warm
 
     let process_before = ProcessSnapshot::now();
-    let (load, allocations) = run_counted(
+    let (mut load, allocations) = run_counted(
         LoadRun {
             workers: WORKERS,
             stop: LoadStop::ops(PROTOCOL_OPS),
@@ -1900,8 +1929,7 @@ fn http2_h2c_keepalive_row() -> anyhow::Result<PerfReport> {
     );
     let (allocs, bytes, rss) = ProcessSnapshot::now().delta_from(process_before);
     print_process_metrics("tina_http2_h2c_keepalive_sequential", allocs, bytes, rss);
-    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, Some(&mut load))?;
     Ok(PerfReport::from_load_with_allocations(
         "http2_h2c_keepalive_sequential",
         "connection_setup_amortized",
@@ -1920,7 +1948,7 @@ fn h2c_keepalive_op(addr: SocketAddr, expected: usize) -> anyhow::Result<()> {
 }
 
 fn http2_h2c_steady_state_small_row() -> anyhow::Result<PerfReport> {
-    let (runtime, listener, addr) = start_h2_server(small_body())?;
+    let (runtime, _listener, addr) = start_h2_server(small_body())?;
     let expected = small_body().len();
 
     // One warmed connection per load worker. Each carries its own next odd
@@ -1934,7 +1962,7 @@ fn http2_h2c_steady_state_small_row() -> anyhow::Result<PerfReport> {
     let conns = Arc::new(conns);
 
     let process_before = ProcessSnapshot::now();
-    let (load, allocations) = {
+    let (mut load, allocations) = {
         let conns = Arc::clone(&conns);
         run_counted(
             LoadRun {
@@ -1971,8 +1999,7 @@ fn http2_h2c_steady_state_small_row() -> anyhow::Result<PerfReport> {
     for slot in conns.iter() {
         let _ = slot.lock().expect("h2 steady lock").take();
     }
-    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, Some(&mut load))?;
     Ok(PerfReport::from_load_with_allocations(
         "http2_h2c_steady_state_small",
         "steady_state_reuse",
@@ -2000,7 +2027,7 @@ fn start_h2_client(
 }
 
 fn h2c_client_submit(
-    runtime: &PerfRuntime,
+    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
     client: Address<Http2ClientMsg, Http2ClientReply>,
     request_body: &[u8],
     expected_response_len: usize,
@@ -2034,15 +2061,15 @@ fn h2c_client_submit(
 }
 
 fn http2_h2c_client_steady_state_post_row() -> anyhow::Result<PerfReport> {
-    let (runtime, listener, addr) = start_h2_server(small_body())?;
+    let (runtime, _listener, addr) = start_h2_server(small_body())?;
     let client = start_h2_client(&runtime, addr)?;
     let expected = small_body().len();
     let request_body = Arc::new(vec![b'p'; FIXED_BODY_BYTES]);
     h2c_client_submit(&runtime, client, &request_body, expected)?; // warm connect + stream state
 
     let process_before = ProcessSnapshot::now();
-    let (load, allocations) = {
-        let runtime = Arc::clone(&runtime);
+    let (mut load, allocations) = {
+        let runtime = runtime.shared();
         let request_body = Arc::clone(&request_body);
         run_counted(
             LoadRun {
@@ -2066,9 +2093,7 @@ fn http2_h2c_client_steady_state_post_row() -> anyhow::Result<PerfReport> {
         bytes,
         rss,
     );
-    let _ = runtime.try_send(client, Http2ClientMsg::Stop);
-    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, Some(&mut load))?;
     Ok(PerfReport::from_load_with_allocations(
         "http2_h2c_client_steady_state_post",
         "steady_state_reuse",
@@ -2153,20 +2178,19 @@ fn start_grpc_server_with_router(
 }
 
 fn start_grpc_streaming_server()
-    -> anyhow::Result<(PerfRuntime, Address<Http2ListenerMsg>, SocketAddr)>
-{
+-> anyhow::Result<(PerfRuntime, Address<Http2ListenerMsg>, SocketAddr)> {
     let runtime = new_runtime()?;
     let limits = GrpcLimits::default();
     let buffered_limits = GrpcBufferedStreamLimits::new(limits, GRPC_STREAM_MESSAGES, 16 * 1024);
-    let messages = (0..GRPC_STREAM_MESSAGES).map(|i| GrpcPerfReply { value: 40 + i as u64 });
+    let messages = (0..GRPC_STREAM_MESSAGES).map(|i| GrpcPerfReply {
+        value: 40 + i as u64,
+    });
     let buffered_response =
         GrpcBufferedServerStreamingResponse::from_messages(messages, buffered_limits)
             .map_err(|e| anyhow::anyhow!("build grpc buffered stream response: {e:?}"))?;
     let router = grpc_unary_router(limits).server_streaming_buffered(
         GRPC_STREAM_PATH,
-        move |_request: GrpcRequest<GrpcPerfRequest>| {
-            Ok(buffered_response.clone())
-        },
+        move |_request: GrpcRequest<GrpcPerfRequest>| Ok(buffered_response.clone()),
     );
     start_grpc_server_with_router(runtime, router)
 }
@@ -2190,11 +2214,11 @@ fn grpc_unary_op(addr: SocketAddr) -> anyhow::Result<()> {
 }
 
 fn grpc_h2c_unary_close_row() -> anyhow::Result<PerfReport> {
-    let (runtime, listener, addr) = start_grpc_server()?;
+    let (runtime, _listener, addr) = start_grpc_server()?;
     grpc_unary_op(addr)?; // warm one full connection + unary call
 
     let process_before = ProcessSnapshot::now();
-    let (load, allocations) = run_counted(
+    let (mut load, allocations) = run_counted(
         LoadRun {
             workers: WORKERS,
             stop: LoadStop::ops(PROTOCOL_OPS),
@@ -2208,8 +2232,7 @@ fn grpc_h2c_unary_close_row() -> anyhow::Result<PerfReport> {
     );
     let (allocs, bytes, rss) = ProcessSnapshot::now().delta_from(process_before);
     print_process_metrics("tina_grpc_h2c_unary_close", allocs, bytes, rss);
-    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, Some(&mut load))?;
     Ok(PerfReport::from_load_with_allocations(
         "grpc_h2c_unary_close",
         "connection_setup",
@@ -2231,7 +2254,7 @@ fn start_grpc_client(runtime: &PerfRuntime, addr: SocketAddr) -> anyhow::Result<
 }
 
 fn grpc_unary_with_client(
-    runtime: &PerfRuntime,
+    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
     client: &GrpcClient,
     preframed: &GrpcPreframedUnary,
 ) -> anyhow::Result<()> {
@@ -2318,7 +2341,7 @@ pub struct ProtocolTurnReport {
 }
 
 fn new_runtime_with_observer(observer: Arc<dyn TraceObserver>) -> anyhow::Result<PerfRuntime> {
-    Ok(Arc::new(ThreadedRuntime::try_with_config_and_trace_observer(
+    let runtime = Arc::new(ThreadedRuntime::try_with_config_and_trace_observer(
         SingleShard,
         DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
@@ -2326,7 +2349,9 @@ fn new_runtime_with_observer(observer: Arc<dyn TraceObserver>) -> anyhow::Result
             ..ThreadedRuntimeConfig::default()
         },
         observer,
-    )?))
+    )?);
+    let shutdown = runtime.shutdown_handle();
+    Ok(PerfRuntime { runtime, shutdown })
 }
 
 /// Run one warmed gRPC unary call under a live trace observer and report its
@@ -2337,7 +2362,7 @@ pub fn grpc_unary_warmed_turn_report() -> anyhow::Result<ProtocolTurnReport> {
     let observer = Arc::new(ProtocolTurnObserver::new());
     let runtime = new_runtime_with_observer(observer.clone() as Arc<dyn TraceObserver>)?;
     let router = grpc_unary_router(GrpcLimits::default());
-    let (runtime, listener, addr) = start_grpc_server_with_router(runtime, router)?;
+    let (runtime, _listener, addr) = start_grpc_server_with_router(runtime, router)?;
     let client = start_grpc_client(&runtime, addr)?;
     let template = client
         .unary_template(GRPC_UNARY_PATH)
@@ -2353,9 +2378,7 @@ pub fn grpc_unary_warmed_turn_report() -> anyhow::Result<ProtocolTurnReport> {
     grpc_unary_with_client(&runtime, &client, &preframed)?;
     observer.armed.store(false, Ordering::Relaxed);
     let report = observer.report();
-    let _ = runtime.try_send(client.connection(), Http2ClientMsg::Stop);
-    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, None)?;
     Ok(report)
 }
 
@@ -2399,9 +2422,7 @@ pub fn http2_steady_state_turn_report() -> anyhow::Result<ProtocolTurnReport> {
     h2c_client_submit(&runtime, client, &body, expected)?;
     observer.armed.store(false, Ordering::Relaxed);
     let report = observer.report();
-    let _ = runtime.try_send(client, Http2ClientMsg::Stop);
-    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, None)?;
     Ok(report)
 }
 
@@ -2414,7 +2435,9 @@ pub fn grpc_server_streaming_turn_report() -> anyhow::Result<ProtocolTurnReport>
     let runtime = new_runtime_with_observer(observer.clone() as Arc<dyn TraceObserver>)?;
     let limits = GrpcLimits::default();
     let buffered_limits = GrpcBufferedStreamLimits::new(limits, GRPC_STREAM_MESSAGES, 16 * 1024);
-    let messages = (0..GRPC_STREAM_MESSAGES).map(|i| GrpcPerfReply { value: 40 + i as u64 });
+    let messages = (0..GRPC_STREAM_MESSAGES).map(|i| GrpcPerfReply {
+        value: 40 + i as u64,
+    });
     let buffered_response =
         GrpcBufferedServerStreamingResponse::from_messages(messages, buffered_limits)
             .map_err(|e| anyhow::anyhow!("build grpc buffered stream response: {e:?}"))?;
@@ -2422,7 +2445,7 @@ pub fn grpc_server_streaming_turn_report() -> anyhow::Result<ProtocolTurnReport>
         GRPC_STREAM_PATH,
         move |_request: GrpcRequest<GrpcPerfRequest>| Ok(buffered_response.clone()),
     );
-    let (runtime, listener, addr) = start_grpc_server_with_router(runtime, router)?;
+    let (runtime, _listener, addr) = start_grpc_server_with_router(runtime, router)?;
     let client = start_grpc_client(&runtime, addr)?;
     // Warm the connection and stream state so the measured call is steady-state.
     for _ in 0..8 {
@@ -2432,14 +2455,12 @@ pub fn grpc_server_streaming_turn_report() -> anyhow::Result<ProtocolTurnReport>
     grpc_server_streaming_with_client(&runtime, &client)?;
     observer.armed.store(false, Ordering::Relaxed);
     let report = observer.report();
-    let _ = runtime.try_send(client.connection(), Http2ClientMsg::Stop);
-    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, None)?;
     Ok(report)
 }
 
 fn grpc_h2c_unary_warmed_row() -> anyhow::Result<PerfReport> {
-    let (runtime, listener, addr) = start_grpc_server()?;
+    let (runtime, _listener, addr) = start_grpc_server()?;
     let client = start_grpc_client(&runtime, addr)?;
     let template = client
         .unary_template(GRPC_UNARY_PATH)
@@ -2450,8 +2471,8 @@ fn grpc_h2c_unary_warmed_row() -> anyhow::Result<PerfReport> {
     grpc_unary_with_client(&runtime, &client, &preframed)?; // warm connection + stream state
 
     let process_before = ProcessSnapshot::now();
-    let (load, allocations) = {
-        let runtime = Arc::clone(&runtime);
+    let (mut load, allocations) = {
+        let runtime = runtime.shared();
         let client = client.clone();
         let preframed = preframed.clone();
         run_counted(
@@ -2469,9 +2490,7 @@ fn grpc_h2c_unary_warmed_row() -> anyhow::Result<PerfReport> {
     };
     let (allocs, bytes, rss) = ProcessSnapshot::now().delta_from(process_before);
     print_process_metrics("tina_grpc_h2c_unary_warmed", allocs, bytes, rss);
-    let _ = runtime.try_send(client.connection(), Http2ClientMsg::Stop);
-    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, Some(&mut load))?;
     Ok(PerfReport::from_load_with_allocations(
         "grpc_h2c_unary_warmed",
         "steady_state_reuse",
@@ -2501,17 +2520,13 @@ fn start_grpc_pool(
         clients.push(GrpcClient::new(conn, target.limits()));
     }
     let http2_targets: Vec<_> = targets.iter().map(|target| target.http2.clone()).collect();
-    let pool = GrpcClientPool::new(
-        &http2_targets,
-        conns,
-        FixedEndpointPoolConfig::balanced(),
-    )
-    .map_err(|e| anyhow::anyhow!("build grpc pool: {e:?}"))?;
+    let pool = GrpcClientPool::new(&http2_targets, conns, FixedEndpointPoolConfig::balanced())
+        .map_err(|e| anyhow::anyhow!("build grpc pool: {e:?}"))?;
     Ok((pool, clients))
 }
 
 fn grpc_unary_with_pool(
-    runtime: &PerfRuntime,
+    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
     pool: &Mutex<GrpcClientPool>,
     clients: &[GrpcClient],
     preframed: &[GrpcPreframedUnary],
@@ -2539,7 +2554,7 @@ fn grpc_unary_with_pool(
 }
 
 fn grpc_h2c_unary_pooled_concurrent_row() -> anyhow::Result<PerfReport> {
-    let (runtime, listener, addr) = start_grpc_server()?;
+    let (runtime, _listener, addr) = start_grpc_server()?;
     let (pool, clients) = start_grpc_pool(&runtime, addr)?;
     let preframed: Vec<_> = clients
         .iter()
@@ -2554,8 +2569,8 @@ fn grpc_h2c_unary_pooled_concurrent_row() -> anyhow::Result<PerfReport> {
     grpc_unary_with_pool(&runtime, &pool, &clients, &preframed)?; // warm one route
 
     let process_before = ProcessSnapshot::now();
-    let (load, allocations) = {
-        let runtime = Arc::clone(&runtime);
+    let (mut load, allocations) = {
+        let runtime = runtime.shared();
         let pool = Arc::clone(&pool);
         let clients = Arc::new(clients.clone());
         let preframed = Arc::new(preframed.clone());
@@ -2574,11 +2589,7 @@ fn grpc_h2c_unary_pooled_concurrent_row() -> anyhow::Result<PerfReport> {
     };
     let (allocs, bytes, rss) = ProcessSnapshot::now().delta_from(process_before);
     print_process_metrics("tina_grpc_h2c_unary_pooled_concurrent", allocs, bytes, rss);
-    for client in &clients {
-        let _ = runtime.try_send(client.connection(), Http2ClientMsg::Stop);
-    }
-    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, Some(&mut load))?;
     Ok(PerfReport::from_load_with_allocations(
         "grpc_h2c_unary_pooled_concurrent",
         "steady_state_reuse",
@@ -2588,7 +2599,7 @@ fn grpc_h2c_unary_pooled_concurrent_row() -> anyhow::Result<PerfReport> {
 }
 
 fn grpc_server_streaming_with_client(
-    runtime: &PerfRuntime,
+    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
     client: &GrpcClient,
 ) -> anyhow::Result<()> {
     let open = client
@@ -2672,13 +2683,13 @@ fn grpc_server_streaming_with_client(
 }
 
 fn grpc_h2c_server_streaming_steady_state_row() -> anyhow::Result<PerfReport> {
-    let (runtime, listener, addr) = start_grpc_streaming_server()?;
+    let (runtime, _listener, addr) = start_grpc_streaming_server()?;
     let client = start_grpc_client(&runtime, addr)?;
     grpc_server_streaming_with_client(&runtime, &client)?; // warm connection + stream state
 
     let process_before = ProcessSnapshot::now();
-    let (load, allocations) = {
-        let runtime = Arc::clone(&runtime);
+    let (mut load, allocations) = {
+        let runtime = runtime.shared();
         let client = client.clone();
         run_counted(
             LoadRun {
@@ -2700,9 +2711,7 @@ fn grpc_h2c_server_streaming_steady_state_row() -> anyhow::Result<PerfReport> {
         bytes,
         rss,
     );
-    let _ = runtime.try_send(client.connection(), Http2ClientMsg::Stop);
-    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, Some(&mut load))?;
     Ok(PerfReport::from_load_with_allocations(
         "grpc_h2c_server_streaming_steady_state",
         "steady_state_reuse",
@@ -2976,7 +2985,7 @@ fn ws_setup_row(
     run_label: &'static str,
     op: fn(SocketAddr) -> anyhow::Result<()>,
 ) -> anyhow::Result<PerfReport> {
-    let (runtime, listener, addr) = start_ws_server(
+    let (runtime, _listener, addr) = start_ws_server(
         WebSocketLimits::default(),
         0,
         Arc::new(AtomicU64::new(0)),
@@ -2985,7 +2994,7 @@ fn ws_setup_row(
     op(addr)?; // warm
 
     let process_before = ProcessSnapshot::now();
-    let (load, allocations) = run_counted(
+    let (mut load, allocations) = run_counted(
         LoadRun {
             workers: WORKERS,
             stop: LoadStop::ops(PROTOCOL_OPS),
@@ -2999,8 +3008,7 @@ fn ws_setup_row(
     );
     let (allocs, bytes, rss) = ProcessSnapshot::now().delta_from(process_before);
     print_process_metrics(run_label, allocs, bytes, rss);
-    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, Some(&mut load))?;
     Ok(PerfReport::from_load_with_allocations(
         label,
         kind,
@@ -3010,7 +3018,7 @@ fn ws_setup_row(
 }
 
 fn websocket_steady_state_small_row() -> anyhow::Result<PerfReport> {
-    let (runtime, listener, addr) = start_ws_server(
+    let (runtime, _listener, addr) = start_ws_server(
         WebSocketLimits::default(),
         0,
         Arc::new(AtomicU64::new(0)),
@@ -3026,7 +3034,7 @@ fn websocket_steady_state_small_row() -> anyhow::Result<PerfReport> {
     let streams = Arc::new(streams);
 
     let process_before = ProcessSnapshot::now();
-    let (load, allocations) = {
+    let (mut load, allocations) = {
         let streams = Arc::clone(&streams);
         run_counted(
             LoadRun {
@@ -3061,8 +3069,7 @@ fn websocket_steady_state_small_row() -> anyhow::Result<PerfReport> {
             let _ = ws_send_close(&mut stream);
         }
     }
-    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, Some(&mut load))?;
     Ok(PerfReport::from_load_with_allocations(
         "websocket_steady_state_small",
         "steady_state_reuse",
@@ -3083,7 +3090,7 @@ fn websocket_steady_state_small_row() -> anyhow::Result<PerfReport> {
 /// the pre-dedup path could not satisfy.
 pub fn websocket_text_round_trip_app_turns(messages: usize) -> anyhow::Result<u64> {
     let app_turns = Arc::new(AtomicU64::new(0));
-    let (runtime, listener, addr) = start_ws_server(
+    let (runtime, _listener, addr) = start_ws_server(
         WebSocketLimits::default(),
         0,
         Arc::new(AtomicU64::new(0)),
@@ -3094,8 +3101,7 @@ pub fn websocket_text_round_trip_app_turns(messages: usize) -> anyhow::Result<u6
         ws_send_text_recv(&mut stream, b"turns")?;
     }
     ws_send_close(&mut stream)?;
-    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, None)?;
     Ok(app_turns.load(Ordering::Relaxed))
 }
 
@@ -3122,14 +3128,14 @@ pub fn websocket_capacity_fill_probe() -> anyhow::Result<LoadReport> {
         max_queued_outbound_bytes: MAX_OUTBOUND_BYTES,
         ..WebSocketLimits::default()
     };
-    let (runtime, listener, addr) = start_ws_server(
+    let (runtime, _listener, addr) = start_ws_server(
         limits,
         OVERFILL_BYTES,
         Arc::clone(&pressure_count),
         Arc::new(AtomicU64::new(0)),
     )?;
 
-    let (load, _allocations) = run_counted(
+    let (mut load, _allocations) = run_counted(
         LoadRun {
             workers: 1,
             stop: LoadStop::ops(PRESSURE_OPS),
@@ -3168,8 +3174,7 @@ pub fn websocket_capacity_fill_probe() -> anyhow::Result<LoadReport> {
         pressure_count.load(Ordering::Relaxed),
         PRESSURE_OPS,
     );
-    let _ = runtime.try_send(listener, HttpListenerMsg::Stop);
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, Some(&mut load))?;
     Ok(load)
 }
 
@@ -3182,7 +3187,7 @@ pub fn websocket_capacity_fill_probe() -> anyhow::Result<LoadReport> {
 /// the constant raw-client cost), which the buffered-response framing reduces:
 /// one fewer body-sized allocation per DATA frame.
 pub fn http2_steady_state_response_process_allocations(requests: usize) -> anyhow::Result<u64> {
-    let (runtime, listener, addr) = start_h2_server(small_body())?;
+    let (runtime, _listener, addr) = start_h2_server(small_body())?;
     let expected = small_body().len();
     let mut stream = h2c_connect(addr)?;
     let mut next_id = 1u32;
@@ -3204,8 +3209,7 @@ pub fn http2_steady_state_response_process_allocations(requests: usize) -> anyho
         return Err(err);
     }
     drop(stream);
-    let _ = runtime.try_send(listener, Http2ListenerMsg::Stop);
-    shutdown_runtime(runtime)?;
+    shutdown_runtime(runtime, None)?;
     Ok(process)
 }
 

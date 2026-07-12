@@ -3,37 +3,35 @@ use std::time::{Duration, Instant};
 
 use http::StatusCode;
 use tina::capacity::{CapacityMode, CapacitySurfaceReport};
-use tina::pool::{
-    CloseMode, PoolConfig,
-};
+use tina::pool::{CloseMode, PoolConfig};
 use tina::prelude::*;
 use tina_http::{
-    BodyMetrics, BodyPressureReport, HttpClientConfig, HttpListener, HttpListenerMsg, HttpTarget, KeepalivePoolDrainOutcome,
-    build_keepalive_pool, shutdown_keepalive_pool,
+    BodyMetrics, BodyPressureReport, HttpClientConfig, HttpListener, HttpListenerMsg, HttpTarget,
+    KeepalivePoolDrainOutcome, build_keepalive_pool, shutdown_keepalive_pool,
 };
 use tina_runtime::lifecycle::{
-    CloseAdmission, Health, Lifecycle,
-    ResourceCloseReport, ResourceKind, ShutdownChoreography, ShutdownStep,
-    StepOutcome,
+    CloseAdmission, Health, Lifecycle, ResourceCloseReport, ResourceKind, ShutdownChoreography,
+    ShutdownStep, StepOutcome,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeEvent, RuntimeEventKind,
-    ThreadedRuntime, ThreadedRuntimeConfig,
+    CallOutcome, DefaultThreadedMailboxFactory, RuntimeEvent, RuntimeEventKind, ThreadedRuntime,
+    ThreadedRuntimeConfig,
 };
 use tina_sim::dst::{
     LiveReplayCapture, LiveReplayFact, LiveReplayReport, ReplayCase as DstReplayCase, ReplayConfig,
     ReplayReport, check_captured_replay,
 };
-use tina_sqlite_bridge::{
-    SqliteConfig, SqlitePressureReport, SqliteWorker,
-};
+use tina_sqlite_bridge::{SqliteConfig, SqlitePressureReport, SqliteWorker};
 
-use crate::{RunMode, RunReport, UserObservation, get, post, put};
 use crate::budget::BODY_CAP_BYTES;
+use crate::{RunMode, RunReport, UserObservation, get, post, put};
 
 use super::controller::{Controller, ControllerMsg, NotifyMsg, NotifySink};
 use super::shutdown::pool_shutdown_to_close_report;
-use super::{REQUEST_TIMEOUT, ScopeSetMetrics, build_startup_summary, listener_config, response_body_text, seed_db};
+use super::{
+    REQUEST_TIMEOUT, ScopeSetMetrics, build_startup_summary, listener_config, response_body_text,
+    seed_db,
+};
 
 pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     // Validate the budget manifest before binding anything. A bad cap
@@ -312,17 +310,17 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
         "stop_main_listener",
     );
     let t_runtime = Instant::now();
-    let trace = runtime
-        .shutdown()
-        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
+    let terminal = runtime.shutdown_report();
+    terminal.ensure_clean()?;
     choreo.record(
         ShutdownStep::StopOwner,
         "shutdown_runtime",
         t_runtime.elapsed(),
         StepOutcome::Clean,
     );
-    let pressure = tina_runtime::pressure::PressureSummary::from_events(&trace);
-    let deferred_replies = trace
+    let pressure = tina_runtime::pressure::PressureSummary::from_events(terminal.trace());
+    let deferred_replies = terminal
+        .trace()
         .iter()
         .filter(|event| matches!(event.kind(), RuntimeEventKind::DeferredReplySent { .. }))
         .count();
@@ -378,7 +376,6 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
 
     Ok(report)
 }
-
 
 /// Owner-stop sweep proof: a notify request is held mid-outbound so its
 /// scope has a still-pending child rail, then the scope set is drained.
@@ -512,18 +509,21 @@ pub fn prove_drain_cancels_active_scope() -> anyhow::Result<crate::DrainActiveRe
         .try_send(main_listener, HttpListenerMsg::Stop)
         .map_err(|e| anyhow::anyhow!("stop main listener: {e:?}"))?;
     sqlite.closer.close();
-    let _ = shutdown_keepalive_pool(
+    let outbound_shutdown = shutdown_keepalive_pool(
         &runtime,
         &outbound,
         CloseMode::Force,
         Duration::from_secs(2),
-    );
-    let _ = runtime.shutdown();
+    )
+    .map_err(|error| anyhow::anyhow!("shutdown keepalive pool: {error:?}"));
+    let runtime_shutdown = runtime.shutdown_report().ensure_clean();
 
     let slow_aborted = match slow.join() {
         Ok(Ok(parts)) => !(parts.status == 200 && parts.body.contains("notified")),
         Ok(Err(_)) | Err(_) => true,
     };
+    outbound_shutdown?;
+    runtime_shutdown?;
 
     Ok(crate::DrainActiveReport {
         scopes_cancelled,
@@ -543,7 +543,6 @@ fn parse_drain_field(line: &str, key: &str) -> Option<usize> {
         })
         .and_then(|value| value.parse().ok())
 }
-
 
 fn drive_script(addr: std::net::SocketAddr, mode: RunMode) -> anyhow::Result<RunReport> {
     let mut report = RunReport::default();
@@ -1033,10 +1032,9 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
         .try_send(main_listener, HttpListenerMsg::Stop)
         .map_err(|e| anyhow::anyhow!("stop main listener: {e:?}"))?;
     sqlite.closer.close();
-    let trace = runtime
-        .shutdown()
-        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
-    let pressure = tina_runtime::pressure::PressureSummary::from_events(&trace);
+    let terminal = runtime.shutdown_report();
+    terminal.ensure_clean()?;
+    let pressure = tina_runtime::pressure::PressureSummary::from_events(terminal.trace());
     let shutdown_clean = matches!(outbound_shutdown.drain, KeepalivePoolDrainOutcome::Drained)
         && outbound_shutdown.requested == outbound_shutdown.stopped
         && outbound_shutdown.timed_out == 0
