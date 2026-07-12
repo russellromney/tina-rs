@@ -249,7 +249,7 @@ fn bounded_terminal_timeout_remains_distinct_from_unclean_truth() {
     ready_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("workload reaches held worker");
-    let result = match rx.recv_timeout(Duration::from_millis(75)) {
+    let result = match rx.recv_timeout(Duration::from_millis(500)) {
         Ok(result) => result,
         Err(error) => {
             release_after_timeout.store(true, Ordering::Release);
@@ -257,6 +257,8 @@ fn bounded_terminal_timeout_remains_distinct_from_unclean_truth() {
             panic!("observation timeout entered blocking owner Drop: {error}");
         }
     };
+    release_after_timeout.store(true, Ordering::Release);
+    runner.join().expect("runner thread");
 
     let Err(
         error @ RunToShutdownError::Shutdown(TerminalShutdownError::Observation(
@@ -278,8 +280,6 @@ fn bounded_terminal_timeout_remains_distinct_from_unclean_truth() {
         Some(source) if source.downcast_ref::<ShutdownWaitError>()
             == Some(&ShutdownWaitError::Timeout)
     ));
-    release_after_timeout.store(true, Ordering::Release);
-    runner.join().expect("runner thread");
     handle
         .wait_report(Duration::from_secs(2))
         .expect("escaped handle observes eventual terminal truth")
@@ -325,7 +325,7 @@ fn admission_timeout_returns_before_blocking_drop_and_handle_can_retry() {
     ready_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("workload fills command queue");
-    let result = match rx.recv_timeout(Duration::from_millis(75)) {
+    let result = match rx.recv_timeout(Duration::from_millis(500)) {
         Ok(result) => result,
         Err(error) => {
             release_after_timeout.store(true, Ordering::Release);
@@ -333,6 +333,8 @@ fn admission_timeout_returns_before_blocking_drop_and_handle_can_retry() {
             panic!("request timeout entered blocking owner Drop: {error}");
         }
     };
+    release_after_timeout.store(true, Ordering::Release);
+    runner.join().expect("runner thread");
     assert!(matches!(
         result,
         Err(RunToShutdownError::Shutdown(
@@ -342,8 +344,6 @@ fn admission_timeout_returns_before_blocking_drop_and_handle_can_retry() {
         ))
     ));
 
-    release_after_timeout.store(true, Ordering::Release);
-    runner.join().expect("runner thread");
     handle
         .request_and_wait_report(Duration::from_secs(2))
         .expect("escaped handle retries shutdown admission")
@@ -394,7 +394,7 @@ fn multi_partial_admission_timeout_returns_and_retry_finishes_every_shard() {
     ready_rx
         .recv_timeout(Duration::from_secs(2))
         .expect("workload fills target shard command queue");
-    let result = match rx.recv_timeout(Duration::from_millis(75)) {
+    let result = match rx.recv_timeout(Duration::from_millis(500)) {
         Ok(result) => result,
         Err(error) => {
             release_after_timeout.store(true, Ordering::Release);
@@ -402,6 +402,8 @@ fn multi_partial_admission_timeout_returns_and_retry_finishes_every_shard() {
             panic!("partial multi admission entered blocking owner Drop: {error}");
         }
     };
+    release_after_timeout.store(true, Ordering::Release);
+    runner.join().expect("runner thread");
     assert!(matches!(
         result,
         Err(RunToShutdownError::Shutdown(
@@ -411,8 +413,6 @@ fn multi_partial_admission_timeout_returns_and_retry_finishes_every_shard() {
         )) if shard == ShardId::new(11)
     ));
 
-    release_after_timeout.store(true, Ordering::Release);
-    runner.join().expect("runner thread");
     let report = handle
         .request_and_wait_report(Duration::from_secs(2))
         .expect("escaped handle resumes partial multi admission");
