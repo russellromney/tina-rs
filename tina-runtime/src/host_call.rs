@@ -138,14 +138,21 @@ where
     /// Registers a typed waiter for the next supervised restart of any
     /// direct child of the parent identified by `parent_address`.
     ///
+    /// Matching uses the full parent shard, isolate id, and generation. A
+    /// forged foreign-shard or stale-generation address cannot observe a live
+    /// parent's replacement.
+    ///
     /// The resolved [`crate::ChildRestarted`] carries the new child
     /// incarnation's isolate id and generation. Bounded one-slot.
     pub fn observe_child_restarted<M, R>(
         &mut self,
         parent_address: Address<M, R>,
     ) -> ChildRestartedWaiter {
-        self.observation
-            .register_child_restarted(parent_address.isolate())
+        self.observation.register_child_restarted(
+            parent_address.shard(),
+            parent_address.isolate(),
+            parent_address.generation(),
+        )
     }
 
     /// Returns the live runtime-owned lifecycle report for direct children of

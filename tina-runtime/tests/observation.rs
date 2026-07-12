@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use tina::{Mailbox, TrySendError, prelude::*};
+use tina::{AddressGeneration, Mailbox, TrySendError, prelude::*};
 use tina::{RestartBudget, RestartPolicy};
 use tina_runtime::{
     CallError, CallKind, ListenerId, MailboxFactory, ResultWaitError, RuntimeEventKind,
@@ -493,7 +493,21 @@ fn child_restarted_waiter_resolves_after_panic_and_restart() {
         )
         .expect("supervise");
 
+    let stale_parent = Address::<ParentMsg>::new_with_generation(
+        parent.shard(),
+        parent.isolate(),
+        AddressGeneration::new(parent.generation().get() + 1),
+    );
+    let foreign_parent = Address::<ParentMsg>::new_with_generation(
+        ShardId::new(parent.shard().get() + 1),
+        parent.isolate(),
+        parent.generation(),
+    );
+    let stale_waiter = runtime.observe_child_restarted(stale_parent);
+    let foreign_waiter = runtime.observe_child_restarted(foreign_parent);
+    let dropped_waiter = runtime.observe_child_restarted(parent);
     let restart_waiter = runtime.observe_child_restarted(parent);
+    drop(dropped_waiter);
     runtime
         .try_send(parent, ParentMsg::Spawn)
         .expect("ask parent to spawn");
@@ -501,6 +515,23 @@ fn child_restarted_waiter_resolves_after_panic_and_restart() {
     let restarted = restart_waiter
         .wait(Duration::from_secs(3))
         .expect("restart event resolves");
+    assert_eq!(
+        stale_waiter.wait(Duration::from_millis(10)),
+        Err(WaitError::Timeout),
+        "a stale generation must not claim the live parent's restart"
+    );
+    assert_eq!(
+        foreign_waiter.wait(Duration::from_millis(10)),
+        Err(WaitError::Timeout),
+        "a foreign shard with the same isolate id must not claim the restart"
+    );
+    assert_eq!(
+        runtime
+            .observe_child_restarted(parent)
+            .wait(Duration::from_millis(10)),
+        Err(WaitError::Timeout),
+        "restart observations are not replayed to late waiters"
+    );
     assert_eq!(restarted.child_ordinal, 0);
     let old_child = runtime
         .trace()
@@ -521,6 +552,50 @@ fn child_restarted_waiter_resolves_after_panic_and_restart() {
     // fresh incarnation id (and generation policy is owned by the runtime,
     // not by this test), so just check that the runtime saw the panic.
     assert!(crashed.load(Ordering::Relaxed) >= 1);
+
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn child_restarted_waiter_reports_runtime_stopped() {
+    let runtime = make_runtime();
+    let parent = runtime
+        .register_with_capacity::<Parent, Infallible>(
+            Parent {
+                crashed: Arc::new(AtomicU32::new(0)),
+            },
+            8,
+        )
+        .expect("register parent");
+    let waiter = runtime.observe_child_restarted(parent);
+
+    drop(runtime);
+
+    assert_eq!(
+        waiter.wait(Duration::from_secs(1)),
+        Err(WaitError::RuntimeStopped)
+    );
+}
+
+#[test]
+fn abandoned_child_restart_authorities_do_not_exhaust_observation_capacity() {
+    let runtime = make_runtime();
+
+    for isolate in 1..=(2 * 1024) {
+        let forged = Address::<ParentMsg>::new_with_generation(
+            ShardId::new(99),
+            tina::IsolateId::new(isolate),
+            AddressGeneration::new(7),
+        );
+        let waiter = runtime.observe_child_restarted(forged);
+        drop(waiter);
+    }
+
+    assert_eq!(
+        runtime.observe_next_bound().wait(Duration::from_millis(10)),
+        Err(WaitError::Timeout),
+        "abandoned foreign restart authorities must release the shared cap"
+    );
 
     let _ = runtime.shutdown();
 }

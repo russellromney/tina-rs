@@ -2448,13 +2448,14 @@ where
         cause: CauseId,
         route_remote: &mut impl FnMut(ShardId, QueuedRemoteEnvelope) -> Result<(), SendRejectedReason>,
     ) {
+        let Some(parent_generation) = self.entry_by_isolate(parent).map(|entry| entry.generation)
+        else {
+            return;
+        };
         let owner = RegisteredAddress {
             shard: self.shard.id(),
             isolate: parent,
-            generation: self
-                .entry_by_isolate(parent)
-                .map(|entry| entry.generation)
-                .unwrap_or_else(|| AddressGeneration::new(0)),
+            generation: parent_generation,
         };
         let attempted = self.push_event(
             parent,
@@ -2959,6 +2960,10 @@ where
         cause: CauseId,
         round_messages: &mut [Option<DeliveredMessage>],
     ) {
+        let Some(parent_generation) = self.entry_by_isolate(parent).map(|entry| entry.generation)
+        else {
+            return;
+        };
         let child_ordinal = self.child_records[child_record_index].child_ordinal;
         let old_child = self.child_records[child_record_index].child;
         let attempted = self.push_event(
@@ -3048,7 +3053,9 @@ where
         // that wakes from `wait()` cannot race a `try_send` ahead of the
         // bootstrap delivery.
         self.observation.notify_child_restarted(
+            self.shard.id(),
             parent,
+            parent_generation,
             observation::ChildRestarted {
                 child_ordinal,
                 new_shard: new_child.shard,
