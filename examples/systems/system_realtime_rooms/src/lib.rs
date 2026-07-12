@@ -741,12 +741,16 @@ impl RoomServer {
 
     pub fn stop(self) -> anyhow::Result<RoomStats> {
         let stats = self.snapshot();
-        self.runtime
-            .try_send(self.listener, HttpListenerMsg::Stop)
-            .map_err(|error| anyhow::anyhow!("stop room listener: {error:?}"))?;
-        self.runtime
-            .shutdown()
-            .map_err(|error| anyhow::anyhow!("shutdown room runtime: {error:?}"))?;
+        let stop = self.runtime.try_send(self.listener, HttpListenerMsg::Stop);
+        let shutdown = self.runtime.shutdown();
+        match (stop, shutdown) {
+            (Ok(()), Ok(_)) => {}
+            (Err(stop), Ok(_)) => anyhow::bail!("stop room listener: {stop:?}"),
+            (Ok(()), Err(shutdown)) => anyhow::bail!("shutdown room runtime: {shutdown:?}"),
+            (Err(stop), Err(shutdown)) => anyhow::bail!(
+                "stop room listener: {stop:?}; shutdown room runtime also failed: {shutdown:?}"
+            ),
+        }
         Ok(stats)
     }
 }

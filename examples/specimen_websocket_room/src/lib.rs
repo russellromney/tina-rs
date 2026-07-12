@@ -933,12 +933,16 @@ impl RoomServer {
 
     pub fn stop(self) -> anyhow::Result<RoomReport> {
         let report = self.report();
-        self.runtime
-            .try_send(self.listener, HttpListenerMsg::Stop)
-            .map_err(|error| anyhow::anyhow!("stop HTTP listener: {error:?}"))?;
-        self.runtime
-            .shutdown()
-            .map_err(|error| anyhow::anyhow!("shutdown room runtime: {error:?}"))?;
+        let stop = self.runtime.try_send(self.listener, HttpListenerMsg::Stop);
+        let shutdown = self.runtime.shutdown();
+        match (stop, shutdown) {
+            (Ok(()), Ok(_)) => {}
+            (Err(stop), Ok(_)) => anyhow::bail!("stop HTTP listener: {stop:?}"),
+            (Ok(()), Err(shutdown)) => anyhow::bail!("shutdown room runtime: {shutdown:?}"),
+            (Err(stop), Err(shutdown)) => anyhow::bail!(
+                "stop HTTP listener: {stop:?}; shutdown room runtime also failed: {shutdown:?}"
+            ),
+        }
         Ok(report)
     }
 }
@@ -1044,12 +1048,16 @@ impl TlsRoomServer {
 
     pub fn stop(self) -> anyhow::Result<RoomReport> {
         let report = self.report();
-        self.runtime
-            .try_send(self.listener, HttpsListenerMsg::Stop)
-            .map_err(|error| anyhow::anyhow!("stop HTTPS listener: {error:?}"))?;
-        self.runtime
-            .shutdown()
-            .map_err(|error| anyhow::anyhow!("shutdown TLS room runtime: {error:?}"))?;
+        let stop = self.runtime.try_send(self.listener, HttpsListenerMsg::Stop);
+        let shutdown = self.runtime.shutdown();
+        match (stop, shutdown) {
+            (Ok(()), Ok(_)) => {}
+            (Err(stop), Ok(_)) => anyhow::bail!("stop HTTPS listener: {stop:?}"),
+            (Ok(()), Err(shutdown)) => anyhow::bail!("shutdown TLS room runtime: {shutdown:?}"),
+            (Err(stop), Err(shutdown)) => anyhow::bail!(
+                "stop HTTPS listener: {stop:?}; shutdown TLS room runtime also failed: {shutdown:?}"
+            ),
+        }
         Ok(report)
     }
 }
@@ -1814,12 +1822,18 @@ mod tests {
 
         fn stop(self) -> anyhow::Result<crate::RoomReport> {
             let report = self.report.snapshot();
-            self.runtime
-                .try_send(self.listener, HttpsListenerMsg::Stop)
-                .map_err(|error| anyhow::anyhow!("stop test HTTPS listener: {error:?}"))?;
-            self.runtime
-                .shutdown()
-                .map_err(|error| anyhow::anyhow!("shutdown test TLS runtime: {error:?}"))?;
+            let stop = self.runtime.try_send(self.listener, HttpsListenerMsg::Stop);
+            let shutdown = self.runtime.shutdown();
+            match (stop, shutdown) {
+                (Ok(()), Ok(_)) => {}
+                (Err(stop), Ok(_)) => anyhow::bail!("stop test HTTPS listener: {stop:?}"),
+                (Ok(()), Err(shutdown)) => {
+                    anyhow::bail!("shutdown test TLS runtime: {shutdown:?}")
+                }
+                (Err(stop), Err(shutdown)) => anyhow::bail!(
+                    "stop test HTTPS listener: {stop:?}; test runtime shutdown also failed: {shutdown:?}"
+                ),
+            }
             Ok(report)
         }
     }
