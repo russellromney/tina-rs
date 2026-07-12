@@ -8,7 +8,7 @@ These are not product examples. They are small pressure points for API feel:
   available quote, cancels the loser, records the late cancelled reply, and
   carries one original caller through the whole workflow. A no-winner variant
   waits for both unavailable replies before answering `Unavailable`.
-- `debounced_batch`: callers submit work into a bounded pending-reply box; a
+- `debounced_batch`: callers join one bounded `SharedWork` batch; a
   timer flush replies to the admitted callers as one batch while excess callers
   get visible `Full`. A drain variant closes admission and replies `Closed` to
   already parked callers.
@@ -32,8 +32,8 @@ What felt good:
   winner, losers, and cancel outcomes named.
 - `CallGroup::start_cancelable` is the copied path now: it reserves the token,
   stores the cancel handle, and only then returns the child effect.
-- `PendingReplies::drain_replies_with_into_effect` is exactly the helper a batch
-  service wants at flush time.
+- `SharedWork::reply_all_clone` and `drain_all_with` express batch completion
+  and service drain without caller ids or a sidecar correlation table.
 - Single-flight cache fill is a natural Tina shape: one explicit fill call, one
   bounded `SharedWork`, one flush of replies.
 
@@ -44,9 +44,9 @@ What felt rough:
   still be recorded.
 - A service that replies to the original caller before loser cancellations settle
   needs a little state dance: the request is gone, but the race is not complete.
-- `PendingReplies` is smooth from `handle(...)` via `try_capture`; from
-  `handle_call(...)`, you currently pre-check capacity and insert
-  `call.into_request_context().into_deferred()` manually.
+- A timer-backed batch is one `SharedWork<BatchId, Reply>` plus one typed
+  `flow!` step. `TimerFull` remains a work failure rather than masquerading as
+  application admission pressure.
 - `SharedWork` removes the old qid side table for single-flight cache waiters;
   the remaining ceremony is the honest fill-in-flight state.
 
@@ -57,3 +57,5 @@ Verdict:
   token/insert/cancel plumbing without needing custom branch state.
 - Keep `SharedWork` as the keyed-waiter helper until another system proves it
   needs a higher-level `SingleFlight` wrapper.
+- Do not add a batch-specific framework abstraction yet; the shared-work form
+  is already smaller and keeps batch identity, admission, and settlement named.

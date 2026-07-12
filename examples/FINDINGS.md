@@ -52,6 +52,20 @@ capability. It is a transparent alias, so it adds no conversion layer and does
 not weaken the separate event/request address rails. Runtime and compile-fail
 proofs use the public spelling, and the motivating batching migration can now
 contain no direct service-envelope vocabulary.
+### 2026-07-12 Debounced batch shared-work migration
+
+The `ergonomics_playground` batch probe now models the actual operation: many
+callers join one bounded batch. `SharedWork<BatchId, BatchReply>` replaces the
+monotonic qid, `PendingReplies`, `(qid, value)` sidecar rows, and manual drain
+correlation. One raw typed `flow!` step carries the batch id and exhaustive
+`SleepReply`; `TimerFull` is a distinct `TimerFailed(CallError)` reply rather
+than being collapsed into application `Full`.
+
+The simulator client records and classifies every `CallOutcome` instead of
+discarding non-reply terminals. Drain closes every waiter, clears the active
+batch, and makes the physically armed late timer harmless. No batch-specific
+framework helper was added: `SharedWork::reply_all_clone` and
+`drain_all_with` already produce the smaller, honest application form.
 
 ### 2026-07-12 Request-aware raw flow prerequisite
 

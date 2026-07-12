@@ -7,10 +7,9 @@ use tina::{
     send_event,
 };
 use tina_runtime::{
-    CallGroupToken, CallOutcome, CallReplyRejectedReason, CallSelectSet,
-    DeferredReplyRejectedReason, PendingReplies, RuntimeEventKind, SharedWork,
-    SharedWorkError, SleepReply, call_cancelable_request, call_request, cancel_call,
-    request_effect_after_park, request_effect_after_shared_wait, sleep,
+    CallError, CallGroupToken, CallOutcome, CallReplyRejectedReason, CallSelectSet,
+    DeferredReplyRejectedReason, RuntimeEventKind, SharedWork, SharedWorkError, SleepReply,
+    call_cancelable_request, call_request, cancel_call, request_effect_after_shared_wait, sleep,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -383,6 +382,12 @@ pub struct DebouncedBatchReport {
     pub admitted: usize,
     pub full: usize,
     pub closed: usize,
+    pub timer_failed: usize,
+    pub call_full: usize,
+    pub call_closed: usize,
+    pub call_timeout: usize,
+    pub call_rejected: usize,
+    pub batch_ids: Vec<u64>,
     pub batch_sizes: Vec<usize>,
     pub sums: Vec<u64>,
     pub rough_edges: Vec<&'static str>,
@@ -397,12 +402,12 @@ pub enum BatchReply {
     },
     Full,
     Closed,
+    TimerFailed(CallError),
 }
 
-#[derive(Debug)]
 enum BatcherEvent {
     Drain,
-    Flush(SleepReply),
+    Flow(BatcherFlow),
 }
 
 #[derive(Debug)]
@@ -412,13 +417,27 @@ enum BatcherRequest {
 
 #[derive(Debug)]
 struct Batcher {
-    pending: PendingReplies<u64, BatchReply>,
-    values: Vec<(u64, u64)>,
-    next_qid: u64,
+    waiters: SharedWork<u64, BatchReply>,
+    active: Option<ActiveBatch>,
     next_batch: u64,
-    timer_armed: bool,
     closed: bool,
     window: Duration,
+}
+
+#[derive(Debug)]
+struct ActiveBatch {
+    id: u64,
+    values: Vec<u64>,
+}
+
+tina::flow! {
+    flow BatcherFlow for Batcher {
+        reply BatchReply;
+
+        step Flush(batch_id: u64) -> raw SleepReply {
+            self.flush(batch_id, outcome)
+        }
+    }
 }
 
 #[tina_runtime::isolate(event = BatcherEvent, request = BatcherRequest, reply = BatchReply)]
@@ -431,25 +450,10 @@ impl Batcher {
         match event {
             BatcherEvent::Drain => {
                 self.closed = true;
-                self.timer_armed = false;
-                self.values.clear();
-                self.pending.drain_replies_into_effect(BatchReply::Closed)
+                self.active = None;
+                Effect::Batch(self.waiters.drain_all_with(|| BatchReply::Closed))
             }
-            BatcherEvent::Flush(Ok(())) => {
-                self.timer_armed = false;
-                let size = self.values.len();
-                let sum = self.values.iter().map(|(_, value)| *value).sum();
-                let batch_id = self.next_batch;
-                self.next_batch += 1;
-                self.values.clear();
-                self.pending
-                    .drain_replies_with_into_effect(move |_| BatchReply::Batched {
-                        batch_id,
-                        size,
-                        sum,
-                    })
-            }
-            BatcherEvent::Flush(Err(_)) => self.pending.drain_replies_into_effect(BatchReply::Full),
+            BatcherEvent::Flow(flow) => self.handle_batcher_flow(flow),
         }
     }
 
@@ -463,32 +467,60 @@ impl Batcher {
                 if self.closed {
                     return call.reply(BatchReply::Closed);
                 }
-                let qid = self.next_qid;
-                let next_qid = qid + 1;
-                match self.pending.park_request(qid, call) {
+                let batch_id = self
+                    .active
+                    .as_ref()
+                    .map_or(self.next_batch, |batch| batch.id);
+                match self.waiters.wait(batch_id, call) {
                     Ok((_ticket, permit)) => {
-                        self.next_qid = next_qid;
-                        self.values.push((qid, value));
-                        let effect = if self.timer_armed {
-                            noop()
+                        let should_arm = self.active.is_none();
+                        let batch = self.active.get_or_insert_with(|| {
+                            self.next_batch += 1;
+                            ActiveBatch {
+                                id: batch_id,
+                                values: Vec::new(),
+                            }
+                        });
+                        batch.values.push(value);
+                        let effect = if should_arm {
+                            sleep(self.window).then_service_event(move |outcome| {
+                                BatcherEvent::Flow(BatcherFlow::Flush(batch_id, outcome))
+                            })
                         } else {
-                            self.timer_armed = true;
-                            sleep(self.window).then_service_event(BatcherEvent::Flush)
+                            noop()
                         };
-                        request_effect_after_park(permit, effect)
+                        request_effect_after_shared_wait(permit, effect)
                     }
-                    Err(tina_runtime::ParkError::Full { call, .. }) => call.reply(BatchReply::Full),
-                    Err(tina_runtime::ParkError::DuplicateKey { call, .. }) => {
-                        // qid is monotonic so duplicate is unreachable.
-                        call.reject(tina::CallRejectedReason::UnsupportedMessage)
-                    }
+                    Err(SharedWorkError::Full { call, .. })
+                    | Err(SharedWorkError::KeyFull { call, .. }) => call.reply(BatchReply::Full),
                 }
             }
         }
     }
 }
 
-#[derive(Debug)]
+impl Batcher {
+    fn flush(&mut self, batch_id: u64, outcome: SleepReply) -> Effect<Self> {
+        let Some(batch) = self.active.take() else {
+            return noop();
+        };
+        if batch.id != batch_id {
+            self.active = Some(batch);
+            return noop();
+        }
+
+        let reply = match outcome {
+            Ok(()) => BatchReply::Batched {
+                batch_id,
+                size: batch.values.len(),
+                sum: batch.values.iter().sum(),
+            },
+            Err(error) => BatchReply::TimerFailed(error),
+        };
+        Effect::Batch(self.waiters.reply_all_clone(&batch_id, reply))
+    }
+}
+
 enum BatchClientMsg {
     Begin(tina_runtime::SplitServiceHandle<BatcherEvent, BatcherRequest, BatchReply>),
     Returned(CallOutcome<BatchReply>),
@@ -497,7 +529,7 @@ enum BatchClientMsg {
 #[derive(Debug)]
 struct BatchClient {
     values: Vec<u64>,
-    replies: Rc<RefCell<Vec<BatchReply>>>,
+    outcomes: Rc<RefCell<Vec<CallOutcome<BatchReply>>>>,
     drain_after_submit: bool,
 }
 
@@ -531,11 +563,10 @@ impl BatchClient {
                 }
                 Effect::Batch(calls)
             }
-            BatchClientMsg::Returned(CallOutcome::Replied(reply)) => {
-                self.replies.borrow_mut().push(reply);
+            BatchClientMsg::Returned(outcome) => {
+                self.outcomes.borrow_mut().push(outcome);
                 noop()
             }
-            BatchClientMsg::Returned(_) => noop(),
         }
     }
 }
@@ -545,56 +576,79 @@ pub fn run_debounced_batch_probe() -> anyhow::Result<DebouncedBatchReport> {
     let batcher = sim
         .register_split_service::<Batcher, BatcherEvent, BatcherRequest, std::convert::Infallible>(
             Batcher {
-                pending: PendingReplies::with_capacity(3).named("ergonomics.batch.pending"),
-                values: Vec::new(),
-                next_qid: 1,
+                waiters: SharedWork::with_capacity(3).named("ergonomics.batch.waiters"),
+                active: None,
                 next_batch: 1,
-                timer_armed: false,
                 closed: false,
                 window: Duration::from_millis(10),
             },
             8,
         );
-    let replies = Rc::new(RefCell::new(Vec::new()));
+    let outcomes = Rc::new(RefCell::new(Vec::new()));
     let client = sim.register(BatchClient {
         values: vec![2, 3, 5, 7, 11],
-        replies: Rc::clone(&replies),
+        outcomes: Rc::clone(&outcomes),
         drain_after_submit: false,
     });
 
     sim.try_send(client, BatchClientMsg::Begin(batcher))
-        .map_err(|e| anyhow::anyhow!("send batch client: {e:?}"))?;
+        .map_err(|error| match error {
+            tina::TrySendError::Full(_) => anyhow::anyhow!("batch client mailbox full"),
+            tina::TrySendError::Closed(_) => anyhow::anyhow!("batch client closed"),
+        })?;
     sim.run_until_quiescent();
 
-    let replies = replies.borrow();
+    Ok(classify_batch_outcomes(&outcomes.borrow()))
+}
+
+fn classify_batch_outcomes(outcomes: &[CallOutcome<BatchReply>]) -> DebouncedBatchReport {
     let mut admitted = 0;
     let mut full = 0;
     let mut closed = 0;
+    let mut timer_failed = 0;
+    let mut call_full = 0;
+    let mut call_closed = 0;
+    let mut call_timeout = 0;
+    let mut call_rejected = 0;
+    let mut batch_ids = Vec::new();
     let mut batch_sizes = Vec::new();
     let mut sums = Vec::new();
-    for reply in replies.iter().copied() {
-        match reply {
-            BatchReply::Batched { size, sum, .. } => {
+    for outcome in outcomes.iter() {
+        match outcome {
+            CallOutcome::Replied(BatchReply::Batched {
+                batch_id,
+                size,
+                sum,
+            }) => {
                 admitted += 1;
-                batch_sizes.push(size);
-                sums.push(sum);
+                batch_ids.push(*batch_id);
+                batch_sizes.push(*size);
+                sums.push(*sum);
             }
-            BatchReply::Full => full += 1,
-            BatchReply::Closed => closed += 1,
+            CallOutcome::Replied(BatchReply::Full) => full += 1,
+            CallOutcome::Replied(BatchReply::Closed) => closed += 1,
+            CallOutcome::Replied(BatchReply::TimerFailed(_)) => timer_failed += 1,
+            CallOutcome::Full => call_full += 1,
+            CallOutcome::Closed => call_closed += 1,
+            CallOutcome::Timeout => call_timeout += 1,
+            CallOutcome::Rejected(_) => call_rejected += 1,
         }
     }
 
-    Ok(DebouncedBatchReport {
+    DebouncedBatchReport {
         admitted,
         full,
         closed,
+        timer_failed,
+        call_full,
+        call_closed,
+        call_timeout,
+        call_rejected,
+        batch_ids,
         batch_sizes,
         sums,
-        rough_edges: vec![
-            "handle_call path needs manual PendingReplies insertion",
-            "timer state is explicit and pleasant, but still another enum variant",
-        ],
-    })
+        rough_edges: Vec::new(),
+    }
 }
 
 pub fn run_debounced_batch_drain_probe() -> anyhow::Result<DebouncedBatchReport> {
@@ -602,50 +656,29 @@ pub fn run_debounced_batch_drain_probe() -> anyhow::Result<DebouncedBatchReport>
     let batcher = sim
         .register_split_service::<Batcher, BatcherEvent, BatcherRequest, std::convert::Infallible>(
             Batcher {
-                pending: PendingReplies::with_capacity(4).named("ergonomics.batch.drain.pending"),
-                values: Vec::new(),
-                next_qid: 1,
+                waiters: SharedWork::with_capacity(4).named("ergonomics.batch.drain.waiters"),
+                active: None,
                 next_batch: 1,
-                timer_armed: false,
                 closed: false,
                 window: Duration::from_millis(50),
             },
             8,
         );
-    let replies = Rc::new(RefCell::new(Vec::new()));
+    let outcomes = Rc::new(RefCell::new(Vec::new()));
     let client = sim.register(BatchClient {
         values: vec![2, 3, 5],
-        replies: Rc::clone(&replies),
+        outcomes: Rc::clone(&outcomes),
         drain_after_submit: true,
     });
 
     sim.try_send(client, BatchClientMsg::Begin(batcher))
-        .map_err(|e| anyhow::anyhow!("send drain batch client: {e:?}"))?;
+        .map_err(|error| match error {
+            tina::TrySendError::Full(_) => anyhow::anyhow!("drain batch client mailbox full"),
+            tina::TrySendError::Closed(_) => anyhow::anyhow!("drain batch client closed"),
+        })?;
     sim.run_until_quiescent();
 
-    let replies = replies.borrow();
-    let mut admitted = 0;
-    let mut full = 0;
-    let mut closed = 0;
-    for reply in replies.iter().copied() {
-        match reply {
-            BatchReply::Batched { .. } => admitted += 1,
-            BatchReply::Full => full += 1,
-            BatchReply::Closed => closed += 1,
-        }
-    }
-
-    Ok(DebouncedBatchReport {
-        admitted,
-        full,
-        closed,
-        batch_sizes: Vec::new(),
-        sums: Vec::new(),
-        rough_edges: vec![
-            "drain is explicit and boring once PendingReplies owns the slots",
-            "the already-armed timer still needs a later harmless Flush turn",
-        ],
-    })
+    Ok(classify_batch_outcomes(&outcomes.borrow()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -705,7 +738,8 @@ impl Upstream {
         match request {
             UpstreamRequest::Fetch => {
                 *self.calls.borrow_mut() += 1;
-                call.defer(sleep(self.delay)).reply_service_event(UpstreamEvent::Done)
+                call.defer(sleep(self.delay))
+                    .reply_service_event(UpstreamEvent::Done)
             }
         }
     }
@@ -773,12 +807,9 @@ impl Cache {
                             request_effect_after_shared_wait(permit, noop())
                         } else {
                             self.filling = true;
-                            let effect = call_request(
-                                self.upstream,
-                                UpstreamRequest::Fetch,
-                                CALL_TIMEOUT,
-                            )
-                            .then_service_event(CacheEvent::FillReturned);
+                            let effect =
+                                call_request(self.upstream, UpstreamRequest::Fetch, CALL_TIMEOUT)
+                                    .then_service_event(CacheEvent::FillReturned);
                             request_effect_after_shared_wait(permit, effect)
                         }
                     }
@@ -813,12 +844,8 @@ impl CacheClient {
             CacheClientMsg::Begin(cache) => {
                 let calls = (0..self.callers)
                     .map(|_| {
-                        call_request(
-                            cache,
-                            CacheRequest::Get("price:alpaca"),
-                            CALL_TIMEOUT,
-                        )
-                        .then(CacheClientMsg::Returned)
+                        call_request(cache, CacheRequest::Get("price:alpaca"), CALL_TIMEOUT)
+                            .then(CacheClientMsg::Returned)
                     })
                     .collect();
                 Effect::Batch(calls)
@@ -928,8 +955,15 @@ mod tests {
         assert_eq!(report.admitted, 3);
         assert_eq!(report.full, 2);
         assert_eq!(report.closed, 0);
+        assert_eq!(report.timer_failed, 0);
+        assert_eq!(report.call_full, 0);
+        assert_eq!(report.call_closed, 0);
+        assert_eq!(report.call_timeout, 0);
+        assert_eq!(report.call_rejected, 0);
+        assert_eq!(report.batch_ids, vec![1, 1, 1]);
         assert_eq!(report.batch_sizes, vec![3, 3, 3]);
         assert_eq!(report.sums, vec![10, 10, 10]);
+        assert!(report.rough_edges.is_empty());
     }
 
     #[test]
@@ -938,6 +972,104 @@ mod tests {
         assert_eq!(report.admitted, 0);
         assert_eq!(report.full, 0);
         assert_eq!(report.closed, 3);
+        assert_eq!(report.timer_failed, 0);
+        assert_eq!(report.call_full, 0);
+        assert_eq!(report.call_closed, 0);
+        assert_eq!(report.call_timeout, 0);
+        assert_eq!(report.call_rejected, 0);
+        assert!(report.batch_ids.is_empty());
+        assert!(report.rough_edges.is_empty());
+    }
+
+    #[test]
+    fn stale_batch_timer_cannot_complete_the_active_batch() {
+        let mut batcher = Batcher {
+            waiters: SharedWork::with_capacity(2),
+            active: Some(ActiveBatch {
+                id: 2,
+                values: vec![7, 11],
+            }),
+            next_batch: 3,
+            closed: false,
+            window: Duration::from_millis(10),
+        };
+
+        let _ = batcher.flush(1, Ok(()));
+        let active = batcher.active.expect("newer batch must remain active");
+        assert_eq!(active.id, 2);
+        assert_eq!(active.values, vec![7, 11]);
+    }
+
+    #[test]
+    fn batch_accounting_keeps_application_and_call_terminals_distinct() {
+        let report = classify_batch_outcomes(&[
+            CallOutcome::Replied(BatchReply::Batched {
+                batch_id: 1,
+                size: 2,
+                sum: 13,
+            }),
+            CallOutcome::Replied(BatchReply::Full),
+            CallOutcome::Replied(BatchReply::Closed),
+            CallOutcome::Replied(BatchReply::TimerFailed(CallError::TimerFull)),
+            CallOutcome::Full,
+            CallOutcome::Closed,
+            CallOutcome::Timeout,
+            CallOutcome::Rejected(tina::CallRejectedReason::UnsupportedMessage),
+        ]);
+
+        assert_eq!(report.admitted, 1);
+        assert_eq!(report.full, 1);
+        assert_eq!(report.closed, 1);
+        assert_eq!(report.timer_failed, 1);
+        assert_eq!(report.call_full, 1);
+        assert_eq!(report.call_closed, 1);
+        assert_eq!(report.call_timeout, 1);
+        assert_eq!(report.call_rejected, 1);
+        assert_eq!(report.batch_ids, vec![1]);
+        assert_eq!(report.batch_sizes, vec![2]);
+        assert_eq!(report.sums, vec![13]);
+    }
+
+    #[test]
+    fn debounced_batch_refills_on_the_same_service() {
+        let mut sim = Simulator::new(SingleShard, SimulatorConfig::default());
+        let batcher = sim.register_split_service::<
+            Batcher,
+            BatcherEvent,
+            BatcherRequest,
+            std::convert::Infallible,
+        >(
+            Batcher {
+                waiters: SharedWork::with_capacity(2),
+                active: None,
+                next_batch: 1,
+                closed: false,
+                window: Duration::from_millis(10),
+            },
+            8,
+        );
+        let outcomes = Rc::new(RefCell::new(Vec::new()));
+        let client = sim.register(BatchClient {
+            values: vec![2, 3],
+            outcomes: Rc::clone(&outcomes),
+            drain_after_submit: false,
+        });
+
+        for _ in 0..2 {
+            match sim.try_send(client, BatchClientMsg::Begin(batcher)) {
+                Ok(()) => {}
+                Err(tina::TrySendError::Full(_)) => panic!("batch client mailbox unexpectedly full"),
+                Err(tina::TrySendError::Closed(_)) => panic!("batch client unexpectedly closed"),
+            }
+            sim.run_until_quiescent();
+        }
+
+        let report = classify_batch_outcomes(&outcomes.borrow());
+        assert_eq!(report.admitted, 4);
+        assert_eq!(report.full, 0);
+        assert_eq!(report.batch_ids, vec![1, 1, 2, 2]);
+        assert_eq!(report.batch_sizes, vec![2, 2, 2, 2]);
+        assert_eq!(report.sums, vec![5, 5, 5, 5]);
     }
 
     #[test]
