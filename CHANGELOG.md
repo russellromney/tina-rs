@@ -4,6 +4,14 @@ This file records completed work.
 
 ## Unreleased
 
+### Deterministic application shutdown proof
+
+- Added atomic open-input peer creation to the simulated TCP backend. Shutdown
+  tests can now prove a specific read remains pending without racing a
+  post-connect call that reopens input after a transient EOF was already
+  visible. The application-surface shutdown proof pins the pending read's call
+  ID and requires its one exact `RequesterClosed` terminal rejection.
+
 ### Keepalive drain timeout truth
 
 - Keepalive pool drain polling now classifies an exhausted host wait budget as

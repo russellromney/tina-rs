@@ -1460,10 +1460,9 @@ fn local_server_shutdown_cancels_pending_accept_read_timer_and_call_work() {
         .lock()
         .expect("bound addr mutex")
         .expect("listener bound addr");
-    let pending_read_peer = simulated_io
-        .connect(local_addr, Vec::new())
+    let _pending_read_peer = simulated_io
+        .connect_open(local_addr, Vec::new())
         .expect("pending-read peer connects");
-    pending_read_peer.push_input(&[]);
 
     runtime
         .try_send(long_work, LongWorkMsg::Start { worker })
@@ -1497,9 +1496,33 @@ fn local_server_shutdown_cancels_pending_accept_read_timer_and_call_work() {
                 >= 2
     });
 
+    let pre_shutdown_trace = runtime.complete_trace().expect("trace query succeeds");
+    let pending_read_call = pre_shutdown_trace
+        .iter()
+        .find_map(|event| match event.kind() {
+            RuntimeEventKind::CallDispatchAttempted {
+                call_id,
+                call_kind: CallKind::TcpRead,
+            } => Some(call_id),
+            _ => None,
+        })
+        .expect("the open simulated peer must dispatch one pending read");
+    assert!(
+        !pre_shutdown_trace.iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompleted { call_id, .. }
+                    | RuntimeEventKind::CallFailed { call_id, .. }
+                    | RuntimeEventKind::CallCompletionRejected { call_id, .. }
+                    if call_id == pending_read_call
+            )
+        }),
+        "the read call must still be pending before shutdown; trace = {pre_shutdown_trace:#?}"
+    );
+
     let trace = runtime.shutdown().expect("runtime shutdown succeeds");
     assert_dispatch_attempts_have_terminal_outcomes(&trace);
-    for call_kind in [CallKind::TcpAccept, CallKind::TcpRead, CallKind::Sleep] {
+    for call_kind in [CallKind::TcpAccept, CallKind::Sleep] {
         assert_event_exists(
             &trace,
             &format!("shutdown should reject pending {call_kind:?} completion"),
@@ -1515,6 +1538,21 @@ fn local_server_shutdown_cancels_pending_accept_read_timer_and_call_work() {
             },
         );
     }
+    assert_event_count(
+        &trace,
+        "shutdown should reject the proven-pending TcpRead exactly once",
+        1,
+        |kind| {
+            matches!(
+                kind,
+                RuntimeEventKind::CallCompletionRejected {
+                    call_id,
+                    call_kind: CallKind::TcpRead,
+                    reason: CallCompletionRejectedReason::RequesterClosed,
+                } if call_id == pending_read_call
+            )
+        },
+    );
     // Pending isolate-calls now settle as `CallCancelled { RuntimeStopped }`
     // at shutdown so observers can attribute the cause and so any caller
     // still holding a `CallHandle` sees `state() == Cancelled` (not a
