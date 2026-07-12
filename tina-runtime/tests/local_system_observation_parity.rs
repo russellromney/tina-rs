@@ -3,7 +3,9 @@ use std::net::SocketAddr;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tina::{RestartBudget, RestartPolicy, RestartableChildDefinition, prelude::*};
+use tina::{
+    AddressGeneration, RestartBudget, RestartPolicy, RestartableChildDefinition, prelude::*,
+};
 use tina_runtime::{
     CallError, DefaultThreadedMailboxFactory, ListenerId, LocalSystem, RuntimeEventKind,
     SuperviseError, ThreadedRuntimeError, ThreadedSendObservedError, TraceSnapshot, WaitError,
@@ -270,12 +272,25 @@ fn local_system_try_supervise_keeps_unknown_parent_typed_and_worker_alive() {
     let parent = app
         .register_root::<Stopper, Infallible>(Stopper, 4)
         .expect("worker remains alive");
+    let stale_parent = Address::<StopMsg>::new_with_generation(
+        parent.shard(),
+        parent.isolate(),
+        AddressGeneration::new(parent.generation().get() + 1),
+    );
+    assert_eq!(
+        app.try_supervise(stale_parent, supervisor_config()),
+        Ok(Err(SuperviseError::UnknownParent))
+    );
     assert_eq!(app.try_supervise(parent, supervisor_config()), Ok(Ok(())));
-    app.shutdown()
-        .drain()
-        .join_report()
+    app.shutdown_handle()
+        .request_and_wait_report(Duration::from_secs(2))
+        .expect("runtime shutdown")
         .ensure_clean()
         .expect("clean shutdown");
+    assert_eq!(
+        app.try_supervise(parent, supervisor_config()),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    );
 }
 
 #[test]
@@ -291,6 +306,18 @@ fn local_system_child_restart_waiter_reports_replacement_truth() {
     app.try_send(parent, ParentMsg::Spawn).expect("spawn child");
     let original = wait_for_spawn(|| app.trace());
 
+    let stale_parent = Address::<ParentMsg>::new_with_generation(
+        parent.shard(),
+        parent.isolate(),
+        AddressGeneration::new(parent.generation().get() + 1),
+    );
+    let foreign_parent = Address::<ParentMsg>::new_with_generation(
+        AppShard(500).id(),
+        parent.isolate(),
+        parent.generation(),
+    );
+    let stale_waiter = app.observe_child_restarted(stale_parent);
+    let foreign_waiter = app.observe_child_restarted(foreign_parent);
     let waiter = app.observe_child_restarted(parent);
     app.try_send(parent, ParentMsg::Restart)
         .expect("restart child");
@@ -299,11 +326,32 @@ fn local_system_child_restart_waiter_reports_replacement_truth() {
     assert_eq!(restarted.child_ordinal, 0);
     assert_eq!(restarted.new_shard, AppShard(5).id());
     assert_ne!(restarted.new_isolate, original);
-    app.shutdown()
-        .drain()
-        .join_report()
+    assert_eq!(
+        stale_waiter.wait(Duration::from_millis(10)),
+        Err(WaitError::Timeout),
+        "stale parent authority must not claim a restart"
+    );
+    assert_eq!(
+        foreign_waiter.wait(Duration::from_millis(10)),
+        Err(WaitError::Timeout),
+        "same-id foreign parent authority must not claim a restart"
+    );
+    assert_eq!(
+        app.observe_child_restarted(parent)
+            .wait(Duration::from_millis(10)),
+        Err(WaitError::Timeout),
+        "restart facts are not replayed to late facade waiters"
+    );
+    app.shutdown_handle()
+        .request_and_wait_report(Duration::from_secs(2))
+        .expect("runtime shutdown")
         .ensure_clean()
         .expect("clean shutdown");
+    assert_eq!(
+        app.observe_child_restarted(parent)
+            .wait(Duration::from_secs(1)),
+        Err(WaitError::RuntimeStopped)
+    );
 }
 
 #[test]
@@ -392,9 +440,13 @@ fn local_system_pressure_summary_observes_full_then_refill() {
     }
     assert!(observed_full > 0);
     assert!(app.pressure_summary().expect("final summary").any_full());
-    app.shutdown()
-        .drain()
-        .join_report()
+    app.shutdown_handle()
+        .request_and_wait_report(Duration::from_secs(2))
+        .expect("runtime shutdown")
         .ensure_clean()
         .expect("clean shutdown");
+    assert!(matches!(
+        app.pressure_summary(),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    ));
 }
