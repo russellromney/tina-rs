@@ -17,7 +17,7 @@ use tina::{Mailbox, TrySendError};
 use tina_runtime::{
     DefaultThreadedMailboxFactory, HostBurstOutcomes, HostBurstWaitError, MailboxFactory,
     SendObservedUntilError, ThreadedRuntime, ThreadedRuntimeConfig, ThreadedRuntimeError,
-    ThreadedTrySendError,
+    ThreadedSendObservedError, ThreadedTrySendError,
 };
 
 /// A mailbox that accepts up to `capacity` and then never yields anything: it
@@ -557,18 +557,28 @@ fn accepted_observed_sends_settle_when_worker_fails_before_execution() {
     gate.wait_until_entered();
 
     let message_drops = Arc::new(AtomicU32::new(0));
+    let observed_message_drops = Arc::new(AtomicU32::new(0));
+    let observed_message_drops_for_observer = Arc::clone(&observed_message_drops);
+    let drops_seen_by_observer = Arc::new(AtomicU32::new(0));
+    let drops_seen_by_observer_for_send = Arc::clone(&drops_seen_by_observer);
     let preflight_calls = Arc::new(AtomicU32::new(0));
     let preflight_calls_for_send = Arc::clone(&preflight_calls);
     let (observer_tx, observer_rx) = std::sync::mpsc::channel();
     runtime
         .try_send_and_observe_with_preflight(
             worker,
-            SlowMsg::Owned(DropProbe(Arc::clone(&message_drops))),
+            SlowMsg::Owned(DropProbe(Arc::clone(&observed_message_drops))),
             move |_| {
                 preflight_calls_for_send.fetch_add(1, Ordering::Release);
                 None
             },
-            move |outcome| observer_tx.send(outcome).expect("record observer outcome"),
+            move |outcome| {
+                drops_seen_by_observer_for_send.store(
+                    observed_message_drops_for_observer.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+                observer_tx.send(outcome).expect("record observer outcome");
+            },
         )
         .expect("command queue accepts observed send before worker failure");
 
@@ -617,7 +627,13 @@ fn accepted_observed_sends_settle_when_worker_fails_before_execution() {
     assert_eq!(snapshot.mailbox_full, 0);
     assert_eq!(snapshot.mailbox_closed, 0);
     assert_eq!(snapshot.ingress_full, 1);
-    assert_eq!(message_drops.load(Ordering::Acquire), 3);
+    assert_eq!(observed_message_drops.load(Ordering::Acquire), 1);
+    assert_eq!(message_drops.load(Ordering::Acquire), 2);
+    assert_eq!(
+        drops_seen_by_observer.load(Ordering::Acquire),
+        1,
+        "queued message ownership must settle before WorkerStopped observation"
+    );
     assert_eq!(preflight_calls.load(Ordering::Acquire), 0);
     assert_eq!(processed.load(Ordering::Acquire), 0);
 
@@ -626,6 +642,67 @@ fn accepted_observed_sends_settle_when_worker_fails_before_execution() {
         Err(_) => panic!("all runtime clones must retire before shutdown"),
     };
     assert_eq!(runtime.shutdown(), Err(ThreadedRuntimeError::WorkerStopped));
+}
+
+#[test]
+fn preflight_rejection_drops_owned_message_before_observer_and_settles_once() {
+    let runtime = make_runtime();
+    let processed = Arc::new(AtomicU32::new(0));
+    let worker = runtime
+        .register_with_capacity::<Slow, Infallible>(
+            Slow {
+                processed: Arc::clone(&processed),
+            },
+            4,
+        )
+        .expect("register slow");
+    let preflight_calls = Arc::new(AtomicU32::new(0));
+    let preflight_calls_for_send = Arc::clone(&preflight_calls);
+    let drops = Arc::new(AtomicU32::new(0));
+    let drops_for_observer = Arc::clone(&drops);
+    let drops_seen_by_observer = Arc::new(AtomicU32::new(0));
+    let drops_seen_by_observer_for_send = Arc::clone(&drops_seen_by_observer);
+    let (observer_tx, observer_rx) = std::sync::mpsc::channel();
+
+    runtime
+        .try_send_and_observe_with_preflight(
+            worker,
+            SlowMsg::Owned(DropProbe(Arc::clone(&drops))),
+            move |_| {
+                preflight_calls_for_send.fetch_add(1, Ordering::Release);
+                Some(ThreadedSendObservedError::MailboxClosed)
+            },
+            move |outcome| {
+                drops_seen_by_observer_for_send.store(
+                    drops_for_observer.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+                observer_tx.send(outcome).expect("report observer outcome");
+            },
+        )
+        .expect("worker accepts preflight command");
+
+    assert_eq!(
+        observer_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("preflight settles observer"),
+        Err(ThreadedSendObservedError::MailboxClosed)
+    );
+    assert!(observer_rx.recv_timeout(Duration::from_millis(20)).is_err());
+    assert_eq!(preflight_calls.load(Ordering::Acquire), 1);
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    assert_eq!(
+        drops_seen_by_observer.load(Ordering::Acquire),
+        1,
+        "rejected message ownership must settle before terminal observation"
+    );
+    assert_eq!(processed.load(Ordering::Acquire), 0);
+    runtime
+        .send_and_observe(worker, SlowMsg::Job(1))
+        .expect("preflight rejection does not poison worker");
+    wait_until(|| processed.load(Ordering::Acquire) == 1);
+
+    assert!(runtime.shutdown().is_ok());
 }
 
 #[test]

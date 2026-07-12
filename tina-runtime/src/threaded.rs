@@ -470,6 +470,7 @@ impl<M, R> Drop for DeadlineObservedCommand<M, R> {
         if !self.report_worker_stopped_on_drop {
             return;
         }
+        drop(self.message.take());
         let outcome = Err(ThreadedSendObservedError::WorkerStopped);
         let mut state = self
             .state
@@ -575,6 +576,7 @@ where
             .take()
             .expect("observed command preflight runs once");
         if let Some(error) = preflight(&message) {
+            drop(message);
             let observer = self
                 .observer
                 .take()
@@ -614,6 +616,7 @@ where
         if !self.report_worker_stopped_on_drop {
             return;
         }
+        drop(self.message.take());
         let Some(observer) = self.observer.take() else {
             return;
         };

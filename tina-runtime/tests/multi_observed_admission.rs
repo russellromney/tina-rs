@@ -201,6 +201,9 @@ fn multi_preflight_rejection_settles_once_without_mailbox_delivery() {
     let preflight_calls = Arc::new(AtomicU32::new(0));
     let preflight_calls_for_send = Arc::clone(&preflight_calls);
     let drops = Arc::new(AtomicU32::new(0));
+    let drops_for_observer = Arc::clone(&drops);
+    let drops_seen_by_observer = Arc::new(AtomicU32::new(0));
+    let drops_seen_by_observer_for_send = Arc::clone(&drops_seen_by_observer);
     let (observer_tx, observer_rx) = std::sync::mpsc::channel();
 
     runtime
@@ -211,7 +214,13 @@ fn multi_preflight_rejection_settles_once_without_mailbox_delivery() {
                 preflight_calls_for_send.fetch_add(1, Ordering::Release);
                 Some(ThreadedSendObservedError::MailboxClosed)
             },
-            move |outcome| observer_tx.send(outcome).expect("report observer outcome"),
+            move |outcome| {
+                drops_seen_by_observer_for_send.store(
+                    drops_for_observer.load(Ordering::Acquire),
+                    Ordering::Release,
+                );
+                observer_tx.send(outcome).expect("report observer outcome");
+            },
         )
         .expect("owning worker accepts preflight command");
 
@@ -224,6 +233,11 @@ fn multi_preflight_rejection_settles_once_without_mailbox_delivery() {
     assert!(observer_rx.recv_timeout(Duration::from_millis(20)).is_err());
     assert_eq!(preflight_calls.load(Ordering::Acquire), 1);
     assert_eq!(drops.load(Ordering::Acquire), 1);
+    assert_eq!(
+        drops_seen_by_observer.load(Ordering::Acquire),
+        1,
+        "rejected message ownership must settle before terminal observation"
+    );
     assert_eq!(processed.load(Ordering::Acquire), 0);
     runtime
         .send_and_observe(address, TestMsg::Count)
