@@ -52,6 +52,7 @@ capability. It is a transparent alias, so it adds no conversion layer and does
 not weaken the separate event/request address rails. Runtime and compile-fail
 proofs use the public spelling, and the motivating batching migration can now
 contain no direct service-envelope vocabulary.
+
 ### 2026-07-12 Debounced batch shared-work migration
 
 The `ergonomics_playground` batch probe now models the actual operation: many
