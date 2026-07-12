@@ -34,6 +34,36 @@ visibility, exact authority settlement, rollback, bounded refusal, closed
 startup lanes, and owner parity. Migrating `system_job_queue` remains a
 separate dependent example cohort.
 
+### 2026-07-12 Guaranteed LocalSystem terminal runner prerequisite
+
+Application-shaped `LocalSystem` hosts repeatedly capture a workload result,
+request and observe bounded shutdown unconditionally, require a clean terminal
+report, then manually merge four cases. Returning early with `?` before that
+helper falls back to drop teardown and loses the workload's explicit terminal
+contract. String-formatted dual failures also erase the independent shutdown
+error and its source chain.
+
+The framework now provides the same consuming form on single- and multi-shard
+owners:
+
+```rust
+app.run_to_shutdown(Duration::from_secs(5), |app| {
+    let service = app.register_request_service(Service::new(), 64)?;
+    app.call_blocking_request(service, Request::Report, timeout)
+})
+```
+
+`RunToShutdownError<E>` represents workload-only, shutdown-only, and dual
+failure. `TerminalShutdownError` keeps bounded admission/observation failure
+distinct from an observed `UncleanShutdownError`. No failure is flattened and
+the dual variant owns both values. The closure's panic continues unwinding;
+the owner's existing bounded drop contract remains its panic teardown path.
+
+Framework tests cover clean authority settlement, workload-only,
+shutdown-only, dual failure, bounded terminal timeout, real registration and
+host-call early returns, panic propagation, and single-/multi-shard parity.
+Motivating example migrations remain separate follow-up cohorts.
+
 ### 2026-07-12 Copied service path flow migration
 
 The canonical `system_copied_service_path` now uses `LocalSystem` and a

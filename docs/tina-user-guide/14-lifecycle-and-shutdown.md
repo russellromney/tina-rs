@@ -356,6 +356,48 @@ For any service with real I/O, test:
 
 This is where many runtime bugs hide.
 
+## Fallible Host Workloads
+
+For an application-shaped owner with one fallible host workload, prefer the
+consuming runner on `LocalSystem` (or the identical multi-shard facade):
+
+```rust
+let report = app.run_to_shutdown(Duration::from_secs(5), |app| {
+    let service = app.register_request_service(MyService::new(), 64)?;
+    let report = app.call_blocking_request(service, Request::Report, timeout)?;
+    validate(report)?;
+    Ok::<_, AppError>(report)
+})?;
+```
+
+The closure makes early `?` safe: after success or failure, the owner requests
+shutdown, observes terminal truth within one total budget, and requires the
+terminal report to prove clean. `RunToShutdownError<E>` distinguishes
+workload-only, shutdown-only, and dual failure without converting either error
+to text. Its dual variant retains both typed values, and the `workload()` and
+`shutdown()` accessors expose both source chains.
+
+This runner does not replace an application's service-level drain protocol.
+Drive `Stop` / `Drain` inside the closure when the service contract requires it;
+the runner guarantees the final runtime-owner teardown. A workload panic still
+propagates as a panic. Unwinding uses the owner's existing bounded `Drop`
+teardown rather than converting panic payloads into `RunToShutdownError`.
+
+Without the runner, every honest host has to reproduce the same four-way merge:
+
+```rust
+let workload = run_application(&app);
+let terminal = shutdown.request_and_wait_report(Duration::from_secs(5));
+drop(app);
+match (workload, terminal.and_then(require_clean)) {
+    // success, workload failure, shutdown failure, both failures
+}
+```
+
+Use a raw shutdown handle when another host thread controls lifetime, when the
+owner is shared, or when shutdown request and terminal observation deliberately
+happen in different parts of the program.
+
 ## Host Shutdown Handle
 
 `ThreadedRuntime` and `ThreadedMultiShardRuntime` expose a cloneable
