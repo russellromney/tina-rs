@@ -12,7 +12,7 @@ scan() {
             # fixture text inside a string cannot corrupt or trigger a rule.
             s{r(\#*)".*?"\1}{ my $literal = $&; $literal =~ s/[^\n]/ /g; $literal }gse;
             s{"(?:\\.|[^"\\])*"}{ my $literal = $&; $literal =~ s/[^\n]/ /g; $literal }gse;
-            s{//[^\n]*}{}g;
+            s{//[^\n]*}{ }g;
             s{/\*.*?\*/}{ my $comment = $&; $comment =~ s/[^\n]/ /g; $comment }gse;
             my @rules = (
                 [qr/\bArc::try_unwrap\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)*(?:rt|[A-Za-z_]*(?:runtime|system)[A-Za-z0-9_]*)\s*\)/i, "exclusive-owner runtime shutdown"],
