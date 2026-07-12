@@ -9,7 +9,7 @@ use std::alloc::Global;
 use std::fmt;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use betelgeuse::IOLoopHandle;
 use tina::{Address, Isolate, Outbound as TinaOutbound, Shard, ShardId};
@@ -26,9 +26,10 @@ use crate::mailbox::MailboxFactory;
 use crate::observer::TraceObserver;
 use crate::trace::{RuntimeEvent, RuntimeEventKind};
 use crate::{
-    DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, IntoErasedSpawn, IntoErasedSpawnObserved,
-    IntoSendErasedSpawnObserved, PreallocationConfig, Runtime, ThreadedMultiShardRuntime,
-    ThreadedRuntime, ThreadedRuntimeConfig, TraceRetention,
+    DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, HostBurstOutcomes, IntoErasedSpawn,
+    IntoErasedSpawnObserved, IntoSendErasedSpawnObserved, PreallocationConfig, Runtime,
+    SendObservedUntilError, ThreadedMultiShardRuntime, ThreadedRuntime, ThreadedRuntimeConfig,
+    TraceRetention,
 };
 
 /// Preferred public bounded-shape config for local Tina systems.
@@ -1019,6 +1020,81 @@ where
         self.runtime().send_and_observe(address, message)
     }
 
+    /// Sends one typed service event and observes the exact mailbox outcome
+    /// without exposing the private service envelope.
+    pub fn send_event_and_observe<Event, Request>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        event: Event,
+    ) -> Result<(), ThreadedSendObservedError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+    {
+        self.runtime().send_event_and_observe(address, event)
+    }
+
+    /// Attempts one typed ingress send and records its eventual mailbox outcome.
+    ///
+    /// This is the [`LocalSystem`] facade for
+    /// [`ThreadedRuntime::try_send_outcome`]. It preserves the lower-level
+    /// ownership contract: `message` is consumed even when ingress or mailbox
+    /// admission fails. The shared counter records exactly one terminal bucket
+    /// for every submitted message.
+    pub fn try_send_outcome<M, R>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        outcomes: &HostBurstOutcomes,
+    ) -> Result<(), ThreadedTrySendError>
+    where
+        M: Send + 'static,
+        R: 'static,
+    {
+        self.runtime().try_send_outcome(address, message, outcomes)
+    }
+
+    /// Retries observed admission until the message lands or `deadline` passes.
+    ///
+    /// This forwards [`ThreadedRuntime::send_observed_until`] without changing
+    /// its terminal vocabulary or ownership semantics. `make_message` runs once
+    /// per real attempt, allowing non-`Clone` messages to be rebuilt after
+    /// `Full`; an already elapsed deadline does not invoke it and cannot cause a
+    /// later delivery.
+    pub fn send_observed_until<M, R, MakeMessage>(
+        &self,
+        address: Address<M, R>,
+        deadline: Instant,
+        backoff: Duration,
+        make_message: MakeMessage,
+    ) -> Result<(), SendObservedUntilError>
+    where
+        M: Send + 'static,
+        R: 'static,
+        MakeMessage: FnMut() -> M,
+    {
+        self.runtime()
+            .send_observed_until(address, deadline, backoff, make_message)
+    }
+
+    /// Retries typed split-service event admission until it lands or the
+    /// deadline passes, without exposing the private service envelope.
+    pub fn send_event_observed_until<Event, Request, MakeEvent>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        deadline: Instant,
+        backoff: Duration,
+        make_event: MakeEvent,
+    ) -> Result<(), SendObservedUntilError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+        MakeEvent: FnMut() -> Event,
+    {
+        self.runtime()
+            .send_event_observed_until(address, deadline, backoff, make_event)
+    }
+
     /// Registers a typed waiter for the terminal value produced by
     /// [`tina::stop_with`] at `address`.
     ///
@@ -1614,6 +1690,9 @@ where
     }
 
     /// Attempts one bounded ingress handoff to the owning worker shard.
+    ///
+    /// Returns [`ThreadedTrySendError::UnknownShard`] when the address targets
+    /// a shard not owned by this local system.
     pub fn try_send<M: Send + 'static, R: 'static>(
         &self,
         address: Address<M, R>,
@@ -1624,9 +1703,8 @@ where
 
     /// Attempts bounded ingress through a service event capability.
     ///
-    /// # Panics
-    ///
-    /// Panics when the address targets a shard not owned by this local system.
+    /// Returns [`ThreadedTrySendError::UnknownShard`] when the address targets
+    /// a shard not owned by this local system.
     pub fn try_send_event<Event, Request>(
         &self,
         address: tina::ServiceEventAddress<Event, Request>,
@@ -1637,6 +1715,102 @@ where
         Request: Send + 'static,
     {
         self.runtime().try_send_event(address, event)
+    }
+
+    /// Sends one raw typed message and observes the exact mailbox outcome on
+    /// its owning shard.
+    ///
+    /// Returns [`ThreadedSendObservedError::UnknownShard`] when the address
+    /// targets a shard not owned by this local system.
+    pub fn send_and_observe<M: Send + 'static, R: 'static>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+    ) -> Result<(), ThreadedSendObservedError> {
+        self.runtime().send_and_observe(address, message)
+    }
+
+    /// Sends one typed service event and observes the exact mailbox outcome on
+    /// its owning shard without exposing the private service envelope.
+    ///
+    /// Returns [`ThreadedSendObservedError::UnknownShard`] when the address
+    /// targets a shard not owned by this local system.
+    pub fn send_event_and_observe<Event, Request>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        event: Event,
+    ) -> Result<(), ThreadedSendObservedError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+    {
+        self.runtime().send_event_and_observe(address, event)
+    }
+
+    /// Attempts one typed ingress send on the address's owning shard and
+    /// records its eventual mailbox outcome.
+    ///
+    /// `message` is consumed on every host- and worker-side outcome. Accepted
+    /// observations settle exactly once through `outcomes`.
+    ///
+    /// Returns [`ThreadedTrySendError::UnknownShard`] before registering a
+    /// burst submission when `address` targets another shard topology.
+    pub fn try_send_outcome<M, R>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        outcomes: &HostBurstOutcomes,
+    ) -> Result<(), ThreadedTrySendError>
+    where
+        M: Send + 'static,
+        R: 'static,
+    {
+        self.runtime().try_send_outcome(address, message, outcomes)
+    }
+
+    /// Retries observed admission on the address's owning shard until the
+    /// message lands or `deadline` passes.
+    ///
+    /// A `Timeout` cannot deliver later, and `make_message` runs only for a real
+    /// bounded attempt.
+    ///
+    /// Returns [`SendObservedUntilError::UnknownShard`] before invoking
+    /// `make_message` when `address` targets another shard topology.
+    pub fn send_observed_until<M, R, MakeMessage>(
+        &self,
+        address: Address<M, R>,
+        deadline: Instant,
+        backoff: Duration,
+        make_message: MakeMessage,
+    ) -> Result<(), SendObservedUntilError>
+    where
+        M: Send + 'static,
+        R: 'static,
+        MakeMessage: FnMut() -> M,
+    {
+        self.runtime()
+            .send_observed_until(address, deadline, backoff, make_message)
+    }
+
+    /// Retries typed split-service event admission on the owning shard without
+    /// exposing the private service envelope.
+    ///
+    /// Returns [`SendObservedUntilError::UnknownShard`] before invoking
+    /// `make_event` when `address` targets another shard topology.
+    pub fn send_event_observed_until<Event, Request, MakeEvent>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        deadline: Instant,
+        backoff: Duration,
+        make_event: MakeEvent,
+    ) -> Result<(), SendObservedUntilError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+        MakeEvent: FnMut() -> Event,
+    {
+        self.runtime()
+            .send_event_observed_until(address, deadline, backoff, make_event)
     }
 
     /// Performs one typed isolate call from the host thread, routed by the

@@ -396,9 +396,12 @@ impl fmt::Display for SuperviseError {
 
 impl Error for SuperviseError {}
 
-/// Error returned by [`crate::ThreadedRuntime::try_send`].
+/// Error returned by threaded bounded ingress sends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadedTrySendError {
+    /// The address names a shard not owned by the multi-shard runtime.
+    UnknownShard(ShardId),
+
     /// The bounded worker ingress queue is full.
     IngressFull,
 
@@ -409,6 +412,13 @@ pub enum ThreadedTrySendError {
 impl fmt::Display for ThreadedTrySendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnknownShard(shard) => {
+                write!(
+                    f,
+                    "target shard {} is not owned by this runtime",
+                    shard.get()
+                )
+            }
             Self::IngressFull => write!(f, "worker ingress queue is full"),
             Self::WorkerStopped => write!(f, "worker thread stopped before ingress was accepted"),
         }
@@ -417,9 +427,12 @@ impl fmt::Display for ThreadedTrySendError {
 
 impl Error for ThreadedTrySendError {}
 
-/// Error returned by [`crate::ThreadedRuntime::send_and_observe`].
+/// Error returned by threaded observed ingress sends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadedSendObservedError {
+    /// The address names a shard not owned by the multi-shard runtime.
+    UnknownShard(ShardId),
+
     /// The bounded worker ingress queue is full.
     IngressFull,
 
@@ -436,6 +449,13 @@ pub enum ThreadedSendObservedError {
 impl fmt::Display for ThreadedSendObservedError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnknownShard(shard) => {
+                write!(
+                    f,
+                    "target shard {} is not owned by this runtime",
+                    shard.get()
+                )
+            }
             Self::IngressFull => write!(f, "worker ingress queue is full"),
             Self::MailboxFull => write!(f, "target isolate mailbox is full"),
             Self::MailboxClosed => write!(f, "target isolate mailbox is closed or stale"),
@@ -448,7 +468,7 @@ impl fmt::Display for ThreadedSendObservedError {
 
 impl Error for ThreadedSendObservedError {}
 
-/// Error returned by [`crate::ThreadedRuntime::send_observed_until`].
+/// Error returned by deadline-bounded threaded observed ingress sends.
 ///
 /// Retry helper. Retries on `MailboxFull` and `IngressFull` until the
 /// caller-supplied deadline; a deadline miss surfaces as [`Self::Timeout`].
@@ -456,6 +476,8 @@ impl Error for ThreadedSendObservedError {}
 /// is no longer accepting at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendObservedUntilError {
+    /// The address names a shard not owned by the multi-shard runtime.
+    UnknownShard(ShardId),
     /// Deadline elapsed while still racing the mailbox/ingress for a slot.
     /// The timed-out attempt no longer owns delivery authority and cannot
     /// deliver later.
@@ -469,6 +491,13 @@ pub enum SendObservedUntilError {
 impl fmt::Display for SendObservedUntilError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnknownShard(shard) => {
+                write!(
+                    f,
+                    "target shard {} is not owned by this runtime",
+                    shard.get()
+                )
+            }
             Self::Timeout => write!(f, "deadline elapsed before mailbox accepted the message"),
             Self::Closed => write!(f, "target isolate mailbox is closed or stale"),
             Self::WorkerStopped => {
@@ -684,12 +713,20 @@ mod tests {
 
     #[test]
     fn threaded_try_send_error_implements_display_and_error() {
+        assert_error(
+            ThreadedTrySendError::UnknownShard(ShardId::new(17)),
+            "shard 17",
+        );
         assert_error(ThreadedTrySendError::IngressFull, "ingress");
         assert_error(ThreadedTrySendError::WorkerStopped, "worker thread");
     }
 
     #[test]
     fn threaded_send_observed_error_implements_display_and_error() {
+        assert_error(
+            ThreadedSendObservedError::UnknownShard(ShardId::new(17)),
+            "shard 17",
+        );
         assert_error(ThreadedSendObservedError::IngressFull, "ingress");
         assert_error(ThreadedSendObservedError::MailboxFull, "mailbox is full");
         assert_error(ThreadedSendObservedError::MailboxClosed, "closed or stale");

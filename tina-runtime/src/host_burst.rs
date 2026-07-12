@@ -147,6 +147,9 @@ impl HostBurstOutcomes {
     /// Internal: caller-side error path; observer never fires for these.
     pub(crate) fn note_host_side_error(&self, err: ThreadedTrySendError) {
         match err {
+            ThreadedTrySendError::UnknownShard(_) => {
+                unreachable!("unknown shards are rejected before burst submission")
+            }
             ThreadedTrySendError::IngressFull => {
                 self.inner.ingress_full.fetch_add(1, Ordering::Release);
             }
@@ -166,6 +169,9 @@ impl HostBurstOutcomes {
             match outcome {
                 Ok(()) => {
                     inner.admitted.fetch_add(1, Ordering::Release);
+                }
+                Err(ThreadedSendObservedError::UnknownShard(_)) => {
+                    unreachable!("unknown shards are rejected before observer registration")
                 }
                 Err(ThreadedSendObservedError::MailboxFull) => {
                     inner.mailbox_full.fetch_add(1, Ordering::Release);

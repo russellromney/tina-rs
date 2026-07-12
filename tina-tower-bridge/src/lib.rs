@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! Tina Full     -> Service future returns Err(BridgeError::Full)
-//! Tina Closed   -> Service future returns Err(BridgeError::Closed)
+//! Tina Closed/unknown shard -> Service future returns the matching BridgeError
 //! Tina Timeout  -> Service future returns Err(BridgeError::Timeout)
 //! ```
 //!
@@ -128,7 +128,7 @@
 //!     let mut svc = svc;
 //!     match svc.call(7).await {
 //!         Ok(v) => Ok(v.to_string()),
-//!         Err(BridgeError::Full | BridgeError::Closed) => Err(StatusCode::SERVICE_UNAVAILABLE),
+//!         Err(BridgeError::Full | BridgeError::Closed | BridgeError::UnknownShard(_)) => Err(StatusCode::SERVICE_UNAVAILABLE),
 //!         Err(BridgeError::Timeout) => Err(StatusCode::GATEWAY_TIMEOUT),
 //!     }
 //! }
@@ -176,6 +176,7 @@ const TRACE_TARGET_BRIDGE: &str = "tina_tower.bridge";
 #[cfg(feature = "tracing")]
 fn bridge_error_reason(error: BridgeError) -> &'static str {
     match error {
+        BridgeError::UnknownShard(_) => "UnknownShard",
         BridgeError::Full => "Full",
         BridgeError::Closed => "Closed",
         BridgeError::Timeout => "Timeout",

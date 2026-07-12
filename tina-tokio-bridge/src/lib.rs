@@ -112,7 +112,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use tina::{Address, Isolate, Outbound as TinaOutbound, Shard};
+use tina::{Address, Isolate, Outbound as TinaOutbound, Shard, ShardId};
 use tina_runtime::{
     CallError, IntoErasedCall, LocalSystem, MailboxFactory, RuntimeEvent, SendRejectedReason,
     ThreadedRuntime, ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError,
@@ -138,6 +138,7 @@ const TRACE_TARGET_BRIDGE: &str = "tina_tokio.bridge";
 #[cfg(feature = "tracing")]
 fn bridge_error_reason(error: BridgeError) -> &'static str {
     match error {
+        BridgeError::UnknownShard(_) => "UnknownShard",
         BridgeError::Full => "Full",
         BridgeError::Closed => "Closed",
         BridgeError::Timeout => "Timeout",
@@ -147,6 +148,8 @@ fn bridge_error_reason(error: BridgeError) -> &'static str {
 /// Error returned by a Tokio-to-Tina bridge call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BridgeError {
+    /// The target address belongs to a shard outside this runtime topology.
+    UnknownShard(ShardId),
     /// The bounded Tina worker ingress queue is full.
     Full,
     /// Tina worker or responder was closed before a response arrived.
@@ -158,6 +161,9 @@ pub enum BridgeError {
 impl std::fmt::Display for BridgeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnknownShard(shard) => {
+                write!(f, "tina bridge: unknown target shard {}", shard.get())
+            }
             Self::Full => f.write_str("tina bridge: bounded ingress full"),
             Self::Closed => f.write_str("tina bridge: worker or responder closed"),
             Self::Timeout => f.write_str("tina bridge: call timed out"),
@@ -171,6 +177,7 @@ impl BridgeError {
     /// Converts only the bridge errors that are true send-rejection reasons.
     pub fn send_rejected_reason(self) -> Option<SendRejectedReason> {
         match self {
+            Self::UnknownShard(_) => None,
             Self::Full => Some(SendRejectedReason::Full),
             Self::Closed => Some(SendRejectedReason::Closed),
             Self::Timeout => None,
@@ -193,7 +200,28 @@ mod tests {
             Some(SendRejectedReason::Closed)
         );
         assert_eq!(BridgeError::Timeout.send_rejected_reason(), None);
+        assert_eq!(
+            BridgeError::UnknownShard(ShardId::new(17)).send_rejected_reason(),
+            None
+        );
         assert_eq!(CallError::from(BridgeError::Timeout), CallError::Timeout);
+        assert_eq!(
+            CallError::from(BridgeError::UnknownShard(ShardId::new(17))),
+            CallError::InvalidResource
+        );
+    }
+
+    #[test]
+    fn unknown_shard_has_a_distinct_metrics_bucket() {
+        let state = BridgeState::default();
+
+        state.record_error(BridgeError::UnknownShard(ShardId::new(17)));
+
+        let metrics = state.metrics.snapshot();
+        assert_eq!(metrics.unknown_shard, 1);
+        assert_eq!(metrics.closed, 0);
+        assert_eq!(metrics.full, 0);
+        assert_eq!(metrics.timeout, 0);
     }
 }
 
@@ -304,6 +332,8 @@ pub struct BridgeMetricsSnapshot {
     pub accepted: u64,
     /// Requests rejected because worker ingress or target mailbox was full.
     pub full: u64,
+    /// Requests rejected because the target shard is outside the topology.
+    pub unknown_shard: u64,
     /// Requests rejected because the bridge, worker, mailbox, or responder was
     /// closed.
     pub closed: u64,
@@ -320,6 +350,7 @@ struct BridgeMetrics {
     attempts: AtomicU64,
     accepted: AtomicU64,
     full: AtomicU64,
+    unknown_shard: AtomicU64,
     closed: AtomicU64,
     timeout: AtomicU64,
     responses: AtomicU64,
@@ -332,6 +363,7 @@ impl BridgeMetrics {
             attempts: self.attempts.load(Ordering::Relaxed),
             accepted: self.accepted.load(Ordering::Relaxed),
             full: self.full.load(Ordering::Relaxed),
+            unknown_shard: self.unknown_shard.load(Ordering::Relaxed),
             closed: self.closed.load(Ordering::Relaxed),
             timeout: self.timeout.load(Ordering::Relaxed),
             responses: self.responses.load(Ordering::Relaxed),
@@ -362,6 +394,34 @@ impl BridgeState {
 
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    fn record_error(&self, error: BridgeError) {
+        match error {
+            BridgeError::UnknownShard(_) => {
+                self.metrics.unknown_shard.fetch_add(1, Ordering::Relaxed);
+            }
+            BridgeError::Closed => {
+                self.metrics.closed.fetch_add(1, Ordering::Relaxed);
+            }
+            BridgeError::Full => {
+                self.metrics.full.fetch_add(1, Ordering::Relaxed);
+            }
+            BridgeError::Timeout => {
+                self.metrics.timeout.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // Bridge timeouts emit at the timeout site so they carry elapsed_ms;
+        // here we cover admission failures at the shared recording boundary.
+        #[cfg(feature = "tracing")]
+        if !matches!(error, BridgeError::Timeout) {
+            event!(
+                target: TRACE_TARGET_CALL,
+                Level::WARN,
+                kind = "admission_rejected",
+                reason = bridge_error_reason(error),
+            );
+        }
     }
 }
 
@@ -501,6 +561,7 @@ where
 impl From<ThreadedTrySendError> for BridgeError {
     fn from(error: ThreadedTrySendError) -> Self {
         match error {
+            ThreadedTrySendError::UnknownShard(shard) => Self::UnknownShard(shard),
             ThreadedTrySendError::IngressFull => Self::Full,
             ThreadedTrySendError::WorkerStopped => Self::Closed,
         }
@@ -510,6 +571,7 @@ impl From<ThreadedTrySendError> for BridgeError {
 impl From<ThreadedSendObservedError> for BridgeError {
     fn from(error: ThreadedSendObservedError) -> Self {
         match error {
+            ThreadedSendObservedError::UnknownShard(shard) => Self::UnknownShard(shard),
             ThreadedSendObservedError::IngressFull | ThreadedSendObservedError::MailboxFull => {
                 Self::Full
             }
@@ -523,6 +585,7 @@ impl From<ThreadedSendObservedError> for BridgeError {
 impl From<BridgeError> for CallError {
     fn from(error: BridgeError) -> Self {
         match error {
+            BridgeError::UnknownShard(_) => Self::InvalidResource,
             BridgeError::Full => Self::TargetFull,
             BridgeError::Closed => Self::TargetClosed,
             BridgeError::Timeout => Self::Timeout,
@@ -999,7 +1062,7 @@ where
                     Ok(outcome) => outcome,
                     Err(_) => {
                         self.record_error(BridgeError::Timeout);
-                        // record_error_on skips Timeout because the
+                        // record_error skips Timeout tracing because the
                         // per-attempt site emits it with elapsed_ms
                         // (see call_once). The RetryWithin total
                         // budget has its own timeout site, so emit
@@ -1100,7 +1163,7 @@ where
                             let _ = observed_tx.send(Ok(()));
                         }
                         Err(error) => {
-                            Self::record_error_on(&state, error);
+                            state.record_error(error);
                             let _ = observed_tx.send(Err(error));
                         }
                     }
@@ -1168,32 +1231,6 @@ where
     }
 
     fn record_error(&self, error: BridgeError) {
-        Self::record_error_on(&self.state, error);
-    }
-
-    fn record_error_on(state: &BridgeState, error: BridgeError) {
-        match error {
-            BridgeError::Full => {
-                state.metrics.full.fetch_add(1, Ordering::Relaxed);
-            }
-            BridgeError::Closed => {
-                state.metrics.closed.fetch_add(1, Ordering::Relaxed);
-            }
-            BridgeError::Timeout => {
-                state.metrics.timeout.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        // Bridge timeouts emit at the timeout site so they carry
-        // elapsed_ms; here we cover Full and Closed admission paths
-        // (record_error_on is the single record-side mutator).
-        #[cfg(feature = "tracing")]
-        if !matches!(error, BridgeError::Timeout) {
-            event!(
-                target: TRACE_TARGET_CALL,
-                Level::WARN,
-                kind = "admission_rejected",
-                reason = bridge_error_reason(error),
-            );
-        }
+        self.state.record_error(error);
     }
 }

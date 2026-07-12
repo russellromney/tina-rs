@@ -61,7 +61,9 @@ type CounterService = TinaService<CounterRequest, CounterReply>;
 /// within the per-call deadline).
 fn map_error(error: BridgeError) -> StatusCode {
     match error {
-        BridgeError::Full | BridgeError::Closed => StatusCode::SERVICE_UNAVAILABLE,
+        BridgeError::Full | BridgeError::Closed | BridgeError::UnknownShard(_) => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         BridgeError::Timeout => StatusCode::GATEWAY_TIMEOUT,
     }
 }

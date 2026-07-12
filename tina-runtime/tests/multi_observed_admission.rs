@@ -863,29 +863,55 @@ fn multi_observed_admission_rejects_unknown_shard() {
         .expect("register foreign isolate");
     let outcomes = HostBurstOutcomes::new();
     let rejected_drops = Arc::new(AtomicU32::new(0));
-    let outcome_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    assert_eq!(
         owner.try_send_outcome(
             address,
             TestMsg::Owned(DropProbe(Arc::clone(&rejected_drops))),
             &outcomes,
-        )
-    }));
-    assert!(outcome_result.is_err());
+        ),
+        Err(ThreadedTrySendError::UnknownShard(ShardId::new(99)))
+    );
     assert_eq!(rejected_drops.load(Ordering::Acquire), 1);
     assert_eq!(outcomes.snapshot().submitted, 0);
     assert_eq!(outcomes.snapshot().observed, 0);
 
     let drops = Arc::new(AtomicU32::new(0));
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    assert_eq!(
         owner.send_observed_until(
             address,
             Instant::now() + Duration::from_secs(1),
             Duration::from_millis(1),
             || TestMsg::Owned(DropProbe(Arc::clone(&drops))),
-        )
-    }));
-    assert!(result.is_err());
+        ),
+        Err(SendObservedUntilError::UnknownShard(ShardId::new(99)))
+    );
     assert_eq!(drops.load(Ordering::Acquire), 0, "factory must not run");
+
+    let observer_calls = Arc::new(AtomicU32::new(0));
+    let observer_calls_for_send = Arc::clone(&observer_calls);
+    let observed_drops = Arc::new(AtomicU32::new(0));
+    assert_eq!(
+        owner.try_send_and_observe_with(
+            address,
+            TestMsg::Owned(DropProbe(Arc::clone(&observed_drops))),
+            move |_| {
+                observer_calls_for_send.fetch_add(1, Ordering::Release);
+            },
+        ),
+        Err(ThreadedTrySendError::UnknownShard(ShardId::new(99)))
+    );
+    assert_eq!(observed_drops.load(Ordering::Acquire), 1);
+    assert_eq!(observer_calls.load(Ordering::Acquire), 0);
+
+    let synchronous_drops = Arc::new(AtomicU32::new(0));
+    assert_eq!(
+        owner.send_and_observe(
+            address,
+            TestMsg::Owned(DropProbe(Arc::clone(&synchronous_drops))),
+        ),
+        Err(ThreadedSendObservedError::UnknownShard(ShardId::new(99)))
+    );
+    assert_eq!(synchronous_drops.load(Ordering::Acquire), 1);
 
     assert!(foreign.shutdown().is_ok());
     assert!(owner.shutdown().is_ok());
