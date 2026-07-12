@@ -25,7 +25,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use http::Method;
-use tina::CallContext;
 use tina::prelude::*;
 use tina_http::{
     AdmitOutcome, HttpConnectionMsg, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest,
@@ -34,7 +33,7 @@ use tina_http::{
     WebSocketSessionMsg, WebSocketSessionOutcome, websocket_upgrade,
 };
 use tina_runtime::{
-    DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig, sleep_then,
+    DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig, sleep_then,
 };
 
 /// Tunables for one specimen run.
@@ -191,16 +190,13 @@ struct Room {
     _shard: PhantomData<RoomShard>,
 }
 
-impl Isolate for Room {
-    tina::isolate_types! {
-        message: WebSocketSessionMsg,
-        reply: WebSocketSessionOutcome,
-        send: tina::Outbound<HttpConnectionMsg>,
-        spawn: Infallible,
-        io: RuntimeCall<WebSocketSessionMsg>,
-        shard: RoomShard,
-    }
-
+#[tina_runtime::isolate(
+    message = WebSocketSessionMsg,
+    reply = WebSocketSessionOutcome,
+    send = tina::Outbound<HttpConnectionMsg>,
+    shard = RoomShard
+)]
+impl Room {
     fn handle(
         &mut self,
         msg: WebSocketSessionMsg,
@@ -220,15 +216,7 @@ impl Isolate for Room {
         // the same `dispatch` so the room stays single-source-of-truth.
         self.dispatch(msg, call.now())
     }
-}
 
-// Hand-rolled `tina::isolate_types!` block above does not detect
-// `handle_call`, so the macro-generated `CallableIsolate` impl from
-// `#[tina_runtime::isolate]` is not present. The trait-level rail must still
-// be stamped to register through `register_service`.
-impl tina::CallableIsolate for Room {}
-
-impl Room {
     fn dispatch(&mut self, msg: WebSocketSessionMsg, now: Instant) -> Effect<Self> {
         match msg {
             WebSocketSessionMsg::AppControl(WebSocketSessionControl::Start) => self.on_bootstrap(),
@@ -548,16 +536,12 @@ struct Gateway {
     report: Arc<SharedReport>,
 }
 
-impl Isolate for Gateway {
-    tina::isolate_types! {
-        message: HttpRequest,
-        reply: HttpResponse,
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        io: RuntimeCall<HttpRequest>,
-        shard: RoomShard,
-    }
-
+#[tina_runtime::isolate(
+    message = HttpRequest,
+    reply = HttpResponse,
+    shard = RoomShard
+)]
+impl Gateway {
     fn handle(
         &mut self,
         request: HttpRequest,
@@ -569,11 +553,7 @@ impl Isolate for Gateway {
     fn handle_call(&mut self, request: HttpRequest, call: CallContext<'_, Self>) -> Effect<Self> {
         call.reply(self.respond(request))
     }
-}
 
-impl tina::CallableIsolate for Gateway {}
-
-impl Gateway {
     fn respond(&mut self, request: HttpRequest) -> HttpResponse {
         match (request.method.clone(), request.path.as_str()) {
             (Method::GET, "/ws") => match websocket_upgrade(&request, self.limits) {

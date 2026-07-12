@@ -246,16 +246,12 @@ impl StreamingEchoSource {
     }
 }
 
-impl Isolate for StreamingEchoSource {
-    tina::isolate_types! {
-        message: ResponseChunkMsg,
-        reply: ResponseChunkReply,
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        io: tina_runtime::RuntimeCall<ResponseChunkMsg>,
-        shard: SpecimenShard,
-    }
-
+#[tina_runtime::isolate(
+    message = ResponseChunkMsg,
+    reply = ResponseChunkReply,
+    shard = SpecimenShard
+)]
+impl StreamingEchoSource {
     fn handle(
         &mut self,
         msg: ResponseChunkMsg,
