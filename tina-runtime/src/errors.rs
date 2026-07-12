@@ -534,6 +534,40 @@ impl fmt::Display for ShutdownWaitError {
 
 impl Error for ShutdownWaitError {}
 
+/// Error returned by
+/// [`crate::ThreadedShutdownHandle::request_and_wait_report`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownAndWaitError {
+    /// The total timeout elapsed while shutdown admission was still being
+    /// retried. `last` preserves the final bounded request failure.
+    RequestTimeout {
+        /// Last request error observed before the total deadline elapsed.
+        last: ShutdownRequestError,
+    },
+    /// Shutdown was admitted, but terminal-report observation failed.
+    Wait(ShutdownWaitError),
+}
+
+impl fmt::Display for ShutdownAndWaitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RequestTimeout { last } => {
+                write!(f, "shutdown request timed out after: {last}")
+            }
+            Self::Wait(error) => write!(f, "shutdown terminal-report wait failed: {error}"),
+        }
+    }
+}
+
+impl Error for ShutdownAndWaitError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::RequestTimeout { last } => Some(last),
+            Self::Wait(error) => Some(error),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,6 +630,30 @@ mod tests {
     fn shutdown_wait_error_implements_display_and_error() {
         assert_error(ShutdownWaitError::Timeout, "timed out");
         assert_error(ShutdownWaitError::WorkerStopped, "joiner stopped");
+    }
+
+    #[test]
+    fn shutdown_and_wait_error_preserves_phase_source() {
+        let request = ShutdownAndWaitError::RequestTimeout {
+            last: ShutdownRequestError::CommandFull { shard: None },
+        };
+        assert!(request.to_string().contains("request timed out"));
+        assert!(
+            request
+                .source()
+                .expect("request source")
+                .to_string()
+                .contains("command queue is full")
+        );
+
+        let wait = ShutdownAndWaitError::Wait(ShutdownWaitError::WorkerStopped);
+        assert!(wait.to_string().contains("terminal-report wait"));
+        assert!(
+            wait.source()
+                .expect("wait source")
+                .to_string()
+                .contains("joiner stopped")
+        );
     }
 
     #[test]

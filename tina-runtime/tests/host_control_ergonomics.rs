@@ -16,8 +16,9 @@ use std::time::{Duration, Instant};
 use tina::prelude::*;
 use tina::{CallRejectedReason, RequestContext, reply_to};
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ShutdownRequestError, ShutdownWaitError,
-    ThreadedMultiShardRuntime, ThreadedRuntime, ThreadedRuntimeConfig, ThreadedRuntimeError, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, ShutdownAndWaitError, ShutdownRequestError,
+    ShutdownWaitError, ThreadedMultiShardRuntime, ThreadedRuntime, ThreadedRuntimeConfig,
+    ThreadedRuntimeError, sleep,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -508,10 +509,9 @@ fn multi_shard_call_blocking_panics_on_unknown_shard() {
 fn shutdown_handle_request_then_wait_returns_terminal_report_without_consuming_runtime() {
     let runtime = Arc::new(single_runtime(64));
     let handle = runtime.shutdown_handle();
-    handle.request_shutdown().expect("request shutdown");
     let report = handle
-        .wait_report(Duration::from_secs(2))
-        .expect("wait report");
+        .request_and_wait_report(Duration::from_secs(2))
+        .expect("request and wait report");
     assert!(report.error().is_none(), "clean shutdown expected");
     assert_eq!(Arc::strong_count(&runtime), 1);
     drop(runtime);
@@ -526,6 +526,79 @@ fn shutdown_handle_is_idempotent() {
     handle.request_shutdown().expect("third request");
     let _ = handle.wait_report(Duration::from_secs(2));
     drop(runtime);
+}
+
+#[test]
+fn shutdown_handle_request_and_wait_retries_a_full_queue() {
+    let runtime = single_runtime(1);
+    let flag = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let spinner = runtime
+        .register_with_capacity::<SpinnerSimple, Infallible>(
+            SpinnerSimple {
+                flag: Arc::clone(&flag),
+                entered: Arc::clone(&entered),
+            },
+            8,
+        )
+        .expect("register spinner");
+    runtime
+        .try_send(spinner, SpinnerSimpleMsg::Tick)
+        .expect("kick spinner");
+    while !entered.load(Ordering::Relaxed) {
+        thread::yield_now();
+    }
+    runtime
+        .try_send(spinner, SpinnerSimpleMsg::Tick)
+        .expect("fill command queue");
+    let release = Arc::clone(&flag);
+    let releaser = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(20));
+        release.store(true, Ordering::Relaxed);
+    });
+    let report = runtime
+        .shutdown_handle()
+        .request_and_wait_report(Duration::from_secs(2))
+        .expect("full queue drains before total deadline");
+    releaser.join().expect("releaser");
+    assert!(report.error().is_none(), "clean terminal report");
+    drop(runtime);
+}
+
+#[test]
+fn shutdown_handle_request_and_wait_reports_request_phase_timeout() {
+    let runtime = single_runtime(1);
+    let flag = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let spinner = runtime
+        .register_with_capacity::<SpinnerSimple, Infallible>(
+            SpinnerSimple {
+                flag: Arc::clone(&flag),
+                entered: Arc::clone(&entered),
+            },
+            8,
+        )
+        .expect("register spinner");
+    runtime
+        .try_send(spinner, SpinnerSimpleMsg::Tick)
+        .expect("kick spinner");
+    while !entered.load(Ordering::Relaxed) {
+        thread::yield_now();
+    }
+    runtime
+        .try_send(spinner, SpinnerSimpleMsg::Tick)
+        .expect("fill command queue");
+    let result = runtime
+        .shutdown_handle()
+        .request_and_wait_report(Duration::from_millis(10));
+    assert!(matches!(
+        result,
+        Err(ShutdownAndWaitError::RequestTimeout {
+            last: ShutdownRequestError::CommandFull { shard: None }
+        })
+    ));
+    flag.store(true, Ordering::Relaxed);
+    let _ = runtime.shutdown();
 }
 
 #[test]
@@ -776,30 +849,21 @@ fn multi_shard_partial_command_full_does_not_deadlock_subsequent_shutdown() {
     while !entered_b.load(Ordering::Relaxed) {
         thread::yield_now();
     }
+    runtime
+        .try_send(spinner_b, SpinnerMsg::Tick)
+        .expect("fill shard B command queue");
     let _ = spinner_a;
 
     let handle = runtime.shutdown_handle();
-    // Retry until the runtime fully shuts down (or CommandFull becomes
-    // Ok after the queue drains). request_shutdown is bounded and
-    // nonblocking; the loop must converge to Ok well before any deadline.
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        let result = handle.request_shutdown();
-        match result {
-            Ok(()) => break,
-            Err(ShutdownRequestError::CommandFull { .. }) => {
-                if Instant::now() >= deadline {
-                    panic!("request_shutdown never converged within deadline");
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(other) => panic!("unexpected shutdown error {other:?}"),
-        }
-    }
-    flag.store(true, Ordering::Relaxed);
+    let release = Arc::clone(&flag);
+    let releaser = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(20));
+        release.store(true, Ordering::Relaxed);
+    });
     let report = handle
-        .wait_report(Duration::from_secs(3))
-        .expect("wait report");
+        .request_and_wait_report(Duration::from_secs(3))
+        .expect("partial request resumes after shard B drains");
+    releaser.join().expect("releaser");
     assert!(report.error().is_none(), "clean shutdown after partial");
     // Drop completes without hanging.
     drop(runtime);

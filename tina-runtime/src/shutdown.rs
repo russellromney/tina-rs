@@ -27,7 +27,9 @@ use std::time::{Duration, Instant};
 
 use tina::{Shard, ShardId};
 
-use crate::errors::{ShutdownRequestError, ShutdownWaitError, ThreadedRuntimeError};
+use crate::errors::{
+    ShutdownAndWaitError, ShutdownRequestError, ShutdownWaitError, ThreadedRuntimeError,
+};
 use crate::live_report::{
     LiveQueueMetrics, LiveRemoteQueueReport, LiveShardMetrics, LiveShardState, LiveTopologyReport,
 };
@@ -95,6 +97,48 @@ impl ThreadedShutdownHandle {
         timeout: Duration,
     ) -> Result<LocalSystemTerminalReport, ShutdownWaitError> {
         self.inner.wait_report(timeout)
+    }
+
+    /// Requests shutdown, retrying bounded admission failures, then waits for
+    /// terminal truth within one total timeout.
+    ///
+    /// Both [`ShutdownRequestError::CommandFull`] and
+    /// [`ShutdownRequestError::WorkerStopped`] are retried. Multi-shard
+    /// request progress is retained by the underlying idempotent request
+    /// state, so a retry resumes with the first shard not yet signaled.
+    /// Retries sleep for at most one millisecond and never extend the caller's
+    /// total deadline. Once admission succeeds, only the remaining budget is
+    /// passed to [`Self::wait_report`].
+    ///
+    /// `Ok(report)` means terminal truth was observed, not that shutdown was
+    /// clean. Callers must inspect [`LocalSystemTerminalReport::error`] or the
+    /// report state; a joined worker failure is truthful terminal data.
+    pub fn request_and_wait_report(
+        &self,
+        total_timeout: Duration,
+    ) -> Result<LocalSystemTerminalReport, ShutdownAndWaitError> {
+        let started = Instant::now();
+        loop {
+            match self.request_shutdown() {
+                Ok(()) => break,
+                Err(last) => {
+                    let Some(remaining) = total_timeout.checked_sub(started.elapsed()) else {
+                        return Err(ShutdownAndWaitError::RequestTimeout { last });
+                    };
+                    if remaining.is_zero() {
+                        return Err(ShutdownAndWaitError::RequestTimeout { last });
+                    }
+                    thread::sleep(remaining.min(Duration::from_millis(1)));
+                    if started.elapsed() >= total_timeout {
+                        return Err(ShutdownAndWaitError::RequestTimeout { last });
+                    }
+                }
+            }
+        }
+
+        let remaining = total_timeout.saturating_sub(started.elapsed());
+        self.wait_report(remaining)
+            .map_err(ShutdownAndWaitError::Wait)
     }
 }
 
@@ -616,8 +660,62 @@ mod tests {
     use super::*;
     use crate::mailbox::DefaultMailboxFactory;
     use crate::threaded::ThreadedRuntimeConfig;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::sync::mpsc::sync_channel;
+
+    struct ScriptedShutdownInner {
+        requests: Mutex<VecDeque<Result<(), ShutdownRequestError>>>,
+        report: LocalSystemTerminalReport,
+        wait_error: Option<ShutdownWaitError>,
+        wait_timeouts: Mutex<Vec<Duration>>,
+        request_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedShutdownInner {
+        fn new(
+            requests: impl IntoIterator<Item = Result<(), ShutdownRequestError>>,
+            report: LocalSystemTerminalReport,
+        ) -> Self {
+            Self {
+                requests: Mutex::new(requests.into_iter().collect()),
+                report,
+                wait_error: None,
+                wait_timeouts: Mutex::new(Vec::new()),
+                request_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn with_wait_error(mut self, error: ShutdownWaitError) -> Self {
+            self.wait_error = Some(error);
+            self
+        }
+    }
+
+    impl ShutdownInner for ScriptedShutdownInner {
+        fn request_shutdown(&self) -> Result<(), ShutdownRequestError> {
+            self.request_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.requests
+                .lock()
+                .expect("scripted requests")
+                .pop_front()
+                .unwrap_or(Ok(()))
+        }
+
+        fn wait_report(
+            &self,
+            timeout: Duration,
+        ) -> Result<LocalSystemTerminalReport, ShutdownWaitError> {
+            self.wait_timeouts
+                .lock()
+                .expect("scripted wait timeouts")
+                .push(timeout);
+            match self.wait_error {
+                Some(error) => Err(error),
+                None => Ok(self.report.clone()),
+            }
+        }
+    }
 
     struct TestShard;
     impl Shard for TestShard {
@@ -677,5 +775,207 @@ mod tests {
         );
         let report = state.report.as_ref().expect("terminal report cached");
         assert_eq!(report.state(), LocalSystemState::Closed);
+    }
+
+    #[test]
+    fn request_and_wait_retries_full_then_returns_report() {
+        let inner = Arc::new(ScriptedShutdownInner::new(
+            [
+                Err(ShutdownRequestError::CommandFull { shard: None }),
+                Ok(()),
+            ],
+            LocalSystemTerminalReport::new(LocalSystemState::Closed, Vec::new()),
+        ));
+        let handle = ThreadedShutdownHandle::new(inner.clone());
+        let report = handle
+            .request_and_wait_report(Duration::from_secs(1))
+            .expect("retry converges");
+        assert_eq!(report.state(), LocalSystemState::Closed);
+        assert_eq!(
+            inner
+                .request_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[test]
+    fn request_and_wait_times_out_in_request_phase_with_last_error() {
+        let last = ShutdownRequestError::CommandFull {
+            shard: Some(ShardId::new(7)),
+        };
+        let inner = Arc::new(ScriptedShutdownInner::new(
+            std::iter::repeat_n(Err(last), 64),
+            LocalSystemTerminalReport::new(LocalSystemState::Closed, Vec::new()),
+        ));
+        let handle = ThreadedShutdownHandle::new(inner);
+        assert!(matches!(
+            handle.request_and_wait_report(Duration::from_millis(3)),
+            Err(ShutdownAndWaitError::RequestTimeout { last: observed }) if observed == last
+        ));
+    }
+
+    #[test]
+    fn request_and_wait_does_not_admit_a_late_success_after_deadline() {
+        let last = ShutdownRequestError::CommandFull { shard: None };
+        let inner = Arc::new(ScriptedShutdownInner::new(
+            [Err(last), Ok(())],
+            LocalSystemTerminalReport::new(LocalSystemState::Closed, Vec::new()),
+        ));
+        let handle = ThreadedShutdownHandle::new(inner.clone());
+        assert!(matches!(
+            handle.request_and_wait_report(Duration::ZERO),
+            Err(ShutdownAndWaitError::RequestTimeout { last: observed }) if observed == last
+        ));
+        assert_eq!(
+            inner
+                .request_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the scripted late success must not be attempted after the deadline"
+        );
+    }
+
+    #[test]
+    fn request_and_wait_zero_timeout_preserves_the_first_request_error() {
+        let last = ShutdownRequestError::WorkerStopped { shard: None };
+        let inner = Arc::new(ScriptedShutdownInner::new(
+            [Err(last)],
+            LocalSystemTerminalReport::failed(ThreadedRuntimeError::WorkerStopped),
+        ));
+        let handle = ThreadedShutdownHandle::new(inner);
+        assert!(matches!(
+            handle.request_and_wait_report(Duration::ZERO),
+            Err(ShutdownAndWaitError::RequestTimeout { last: observed }) if observed == last
+        ));
+    }
+
+    #[test]
+    fn request_and_wait_zero_timeout_allows_immediate_cached_success() {
+        let inner = Arc::new(ScriptedShutdownInner::new(
+            [Ok(())],
+            LocalSystemTerminalReport::new(LocalSystemState::Closed, Vec::new()),
+        ));
+        let handle = ThreadedShutdownHandle::new(inner.clone());
+        let report = handle
+            .request_and_wait_report(Duration::ZERO)
+            .expect("immediate request and cached report need no wait budget");
+        assert_eq!(report.state(), LocalSystemState::Closed);
+        assert_eq!(
+            inner
+                .request_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn request_and_wait_continues_after_worker_stopped_and_preserves_terminal_truth() {
+        // There is intentionally no public API for killing one runtime worker
+        // behind a live multi-shard owner. This private scripted seam is the
+        // deterministic proof that WorkerStopped advances to the next request;
+        // the live multi-shard test below proves retained CommandFull progress,
+        // and existing worker-failure tests prove failed terminal reports.
+        let stopped = ShutdownRequestError::WorkerStopped {
+            shard: Some(ShardId::new(1)),
+        };
+        let inner = Arc::new(ScriptedShutdownInner::new(
+            [Err(stopped), Ok(())],
+            LocalSystemTerminalReport::failed(ThreadedRuntimeError::WorkerStopped),
+        ));
+        let handle = ThreadedShutdownHandle::new(inner.clone());
+        let report = handle
+            .request_and_wait_report(Duration::from_secs(1))
+            .expect("remaining shards are still signaled");
+        assert_eq!(report.error(), Some(ThreadedRuntimeError::WorkerStopped));
+        assert_eq!(
+            inner
+                .request_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[test]
+    fn request_and_wait_is_idempotent_over_cached_report() {
+        let inner = Arc::new(ScriptedShutdownInner::new(
+            [Ok(())],
+            LocalSystemTerminalReport::new(LocalSystemState::Closed, Vec::new()),
+        ));
+        let handle = ThreadedShutdownHandle::new(inner);
+        let first = handle
+            .request_and_wait_report(Duration::from_secs(1))
+            .expect("first report");
+        let second = handle
+            .request_and_wait_report(Duration::from_secs(1))
+            .expect("cached report");
+        assert_eq!(first.state(), second.state());
+        assert_eq!(first.error(), second.error());
+    }
+
+    #[test]
+    fn request_and_wait_preserves_wait_phase_error() {
+        let inner = Arc::new(
+            ScriptedShutdownInner::new(
+                [Ok(())],
+                LocalSystemTerminalReport::new(LocalSystemState::Closed, Vec::new()),
+            )
+            .with_wait_error(ShutdownWaitError::WorkerStopped),
+        );
+        let handle = ThreadedShutdownHandle::new(inner);
+        assert!(matches!(
+            handle.request_and_wait_report(Duration::from_secs(1)),
+            Err(ShutdownAndWaitError::Wait(ShutdownWaitError::WorkerStopped))
+        ));
+    }
+
+    struct SlowFirstRequestInner {
+        calls: std::sync::atomic::AtomicUsize,
+        wait_timeout: Mutex<Option<Duration>>,
+    }
+
+    impl ShutdownInner for SlowFirstRequestInner {
+        fn request_shutdown(&self) -> Result<(), ShutdownRequestError> {
+            if self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                == 0
+            {
+                thread::sleep(Duration::from_millis(10));
+                Err(ShutdownRequestError::CommandFull { shard: None })
+            } else {
+                Ok(())
+            }
+        }
+
+        fn wait_report(
+            &self,
+            timeout: Duration,
+        ) -> Result<LocalSystemTerminalReport, ShutdownWaitError> {
+            *self.wait_timeout.lock().expect("wait timeout") = Some(timeout);
+            Ok(LocalSystemTerminalReport::new(
+                LocalSystemState::Closed,
+                Vec::new(),
+            ))
+        }
+    }
+
+    #[test]
+    fn request_and_wait_passes_only_remaining_budget_to_wait_phase() {
+        let inner = Arc::new(SlowFirstRequestInner {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            wait_timeout: Mutex::new(None),
+        });
+        let handle = ThreadedShutdownHandle::new(inner.clone());
+        handle
+            .request_and_wait_report(Duration::from_millis(100))
+            .expect("terminal report");
+        let wait_timeout = inner
+            .wait_timeout
+            .lock()
+            .expect("wait timeout")
+            .expect("wait was called");
+        assert!(wait_timeout < Duration::from_millis(90), "{wait_timeout:?}");
+        assert!(!wait_timeout.is_zero());
     }
 }
