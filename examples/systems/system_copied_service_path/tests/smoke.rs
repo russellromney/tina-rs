@@ -1,3 +1,4 @@
+use std::time::{Duration, Instant};
 use system_copied_service_path::{RunConfig, run};
 
 #[test]
@@ -63,5 +64,108 @@ fn copied_service_path_smoke() {
             .starts_with("system=system_copied_service_path "),
         "summary_line shape: {}",
         report.summary_line
+    );
+}
+
+#[test]
+fn caller_timeout_still_settles_linear_authority() {
+    let config = RunConfig {
+        capacity: 1,
+        work_ms: 30,
+        callers: 1,
+        call_timeout_ms: 1,
+        ..RunConfig::default()
+    };
+    let report = run(config).expect("timeout run must drain and shut down cleanly");
+
+    assert_eq!(report.load.ops_timeout, 1, "report={report:?}");
+    assert_eq!(report.admitted, 1, "report={report:?}");
+    assert_eq!(
+        report.ledger_final_len,
+        report.ledger_seed_len + report.admitted,
+        "durable admission remains committed after caller loss: {report:?}",
+    );
+    assert_eq!(report.scope_current_at_drain, 0, "report={report:?}");
+    assert_eq!(report.scope_admitted, report.scope_released);
+}
+
+#[test]
+fn caller_timeout_does_not_wait_for_held_work_before_owner_shutdown() {
+    let started = Instant::now();
+    let report = run(RunConfig {
+        capacity: 1,
+        work_ms: 30_000,
+        callers: 1,
+        call_timeout_ms: 1,
+        ..RunConfig::default()
+    })
+    .expect("owner shutdown must cancel long held work");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "run waited for the 30-second timer instead of shutting down: {report:?}"
+    );
+    assert_eq!(report.load.ops_timeout, 1, "report={report:?}");
+    assert_eq!(report.scope_admitted, 1, "report={report:?}");
+    assert_eq!(report.scope_released, 1, "report={report:?}");
+    assert_eq!(report.scope_current_at_drain, 0, "report={report:?}");
+}
+
+#[test]
+fn timer_pressure_is_typed_and_every_admission_settles() {
+    let config = RunConfig {
+        capacity: 4,
+        work_ms: 50,
+        callers: 4,
+        timer_capacity: 1,
+        ..RunConfig::default()
+    };
+    let report = run(config).expect("timer pressure run");
+    let timer_full = report
+        .load
+        .err_kinds
+        .iter()
+        .find(|(kind, _)| kind == "work_timer_full")
+        .map_or(0, |(_, count)| *count);
+
+    assert!(
+        timer_full > 0,
+        "timer pressure was not observed: {report:?}"
+    );
+    assert_eq!(report.admitted, config.callers, "report={report:?}");
+    assert_eq!(
+        report.ledger_final_len,
+        report.ledger_seed_len + report.admitted,
+        "every admitted record is durable even if work admission fails: {report:?}",
+    );
+    assert_eq!(report.scope_current_at_drain, 0, "report={report:?}");
+    assert_eq!(report.scope_admitted, report.scope_released);
+}
+
+#[test]
+fn invalid_runtime_capacity_is_a_startup_error() {
+    let error = run(RunConfig {
+        timer_capacity: 0,
+        ..RunConfig::default()
+    })
+    .expect_err("zero timer capacity must fail startup");
+
+    assert!(
+        error.to_string().contains("timer_capacity"),
+        "unexpected startup error: {error:#}"
+    );
+}
+
+#[test]
+fn reporting_failure_still_reaches_clean_shutdown() {
+    let error = run(RunConfig {
+        mailbox: 0,
+        ..RunConfig::default()
+    })
+    .expect_err("zero mailbox capacity must make the Stats call visibly full");
+
+    assert!(
+        error.to_string().contains("stats mailbox was full"),
+        "unexpected reporting error: {error:#}"
     );
 }
