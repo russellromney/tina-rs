@@ -90,6 +90,27 @@ impl TestIsolate {
     }
 }
 
+#[derive(Debug)]
+enum ServiceEvent {
+    Count,
+}
+
+struct EventService {
+    processed: Arc<AtomicU32>,
+}
+
+#[tina_runtime::isolate(event = ServiceEvent, shard = TestShard)]
+impl EventService {
+    fn handle_event(
+        &mut self,
+        _event: ServiceEvent,
+        _ctx: &mut Context<'_, TestShard>,
+    ) -> Effect<Self> {
+        self.processed.fetch_add(1, Ordering::Release);
+        noop()
+    }
+}
+
 fn wait_until(mut predicate: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while !predicate() {
@@ -165,6 +186,84 @@ fn multi_observed_admission_routes_exact_outcomes_to_owning_shard() {
 }
 
 #[test]
+fn multi_preflight_rejection_settles_once_without_mailbox_delivery() {
+    let runtime = runtime(8);
+    let processed = Arc::new(AtomicU32::new(0));
+    let address = runtime
+        .register_with_capacity_on::<TestIsolate, Infallible>(
+            ShardId::new(22),
+            TestIsolate {
+                processed: Arc::clone(&processed),
+            },
+            4,
+        )
+        .expect("register target");
+    let preflight_calls = Arc::new(AtomicU32::new(0));
+    let preflight_calls_for_send = Arc::clone(&preflight_calls);
+    let drops = Arc::new(AtomicU32::new(0));
+    let (observer_tx, observer_rx) = std::sync::mpsc::channel();
+
+    runtime
+        .try_send_and_observe_with_preflight(
+            address,
+            TestMsg::Owned(DropProbe(Arc::clone(&drops))),
+            move |_| {
+                preflight_calls_for_send.fetch_add(1, Ordering::Release);
+                Some(ThreadedSendObservedError::MailboxClosed)
+            },
+            move |outcome| observer_tx.send(outcome).expect("report observer outcome"),
+        )
+        .expect("owning worker accepts preflight command");
+
+    assert_eq!(
+        observer_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("preflight settles observer"),
+        Err(ThreadedSendObservedError::MailboxClosed)
+    );
+    assert!(observer_rx.recv_timeout(Duration::from_millis(20)).is_err());
+    assert_eq!(preflight_calls.load(Ordering::Acquire), 1);
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    assert_eq!(processed.load(Ordering::Acquire), 0);
+    runtime
+        .send_and_observe(address, TestMsg::Count)
+        .expect("preflight rejection does not poison worker");
+    wait_until(|| processed.load(Ordering::Acquire) == 1);
+
+    assert!(runtime.shutdown().is_ok());
+}
+
+#[test]
+fn multi_event_observation_helpers_preserve_capability_and_deadline_shapes() {
+    let runtime = runtime(8);
+    let processed = Arc::new(AtomicU32::new(0));
+    let events = runtime
+        .register_event_service_on::<EventService, ServiceEvent, Infallible>(
+            ShardId::new(22),
+            EventService {
+                processed: Arc::clone(&processed),
+            },
+            4,
+        )
+        .expect("register event service");
+
+    runtime
+        .send_event_and_observe(events, ServiceEvent::Count)
+        .expect("observe direct event admission");
+    runtime
+        .send_event_observed_until(
+            events,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(1),
+            || ServiceEvent::Count,
+        )
+        .expect("observe deadline event admission");
+    wait_until(|| processed.load(Ordering::Acquire) == 2);
+
+    assert!(runtime.shutdown().is_ok());
+}
+
+#[test]
 fn multi_ingress_full_settles_once_and_refills() {
     let runtime = runtime(1);
     let processed = Arc::new(AtomicU32::new(0));
@@ -204,6 +303,13 @@ fn multi_ingress_full_settles_once_and_refills() {
     assert_eq!(snapshot.observed, 1);
     assert_eq!(snapshot.ingress_full, 1);
     assert_eq!(drops.load(Ordering::Acquire), 1);
+    let topology = runtime.topology();
+    let owning = topology
+        .shards()
+        .iter()
+        .find(|report| report.shard() == ShardId::new(22))
+        .expect("owning shard report");
+    assert_eq!(owning.ingress().rejected_full(), Some(1));
 
     gate.release();
     wait_until(|| processed.load(Ordering::Acquire) == 1);
@@ -364,6 +470,301 @@ impl MailboxFactory for PanicFactory {
         }
         DefaultThreadedMailboxFactory.create(capacity)
     }
+}
+
+struct PanicOnSendMailbox<T> {
+    capacity: usize,
+    _message: std::marker::PhantomData<T>,
+}
+
+impl<T> Mailbox<T> for PanicOnSendMailbox<T> {
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn try_send(&self, _message: T) -> Result<(), TrySendError<T>> {
+        panic!("intentional mailbox admission failure");
+    }
+
+    fn recv(&self) -> Option<T> {
+        None
+    }
+
+    fn is_empty(&self) -> bool {
+        true
+    }
+
+    fn close(&self) {}
+}
+
+#[derive(Clone, Copy)]
+struct SendPanicFactory;
+
+impl MailboxFactory for SendPanicFactory {
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        if capacity == 13 {
+            return Box::new(PanicOnSendMailbox {
+                capacity,
+                _message: std::marker::PhantomData,
+            });
+        }
+        DefaultThreadedMailboxFactory.create(capacity)
+    }
+}
+
+struct GatedSendMailbox<T> {
+    inner: Box<dyn Mailbox<T>>,
+    gate: Arc<Gate>,
+}
+
+impl<T> Mailbox<T> for GatedSendMailbox<T> {
+    fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+
+    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
+        self.gate.enter_and_wait();
+        self.inner.try_send(message)
+    }
+
+    fn recv(&self) -> Option<T> {
+        self.inner.recv()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    fn close(&self) {
+        self.inner.close();
+    }
+}
+
+#[derive(Clone)]
+struct GatedSendFactory {
+    gate: Arc<Gate>,
+}
+
+impl MailboxFactory for GatedSendFactory {
+    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
+        let inner = DefaultThreadedMailboxFactory.create(capacity);
+        if capacity == 13 {
+            return Box::new(GatedSendMailbox {
+                inner,
+                gate: Arc::clone(&self.gate),
+            });
+        }
+        inner
+    }
+}
+
+#[test]
+fn multi_preflight_panic_settles_once_and_stops_only_the_owning_worker() {
+    let runtime = ThreadedMultiShardRuntime::new(
+        [TestShard(11), TestShard(22)],
+        DefaultThreadedMailboxFactory,
+    );
+    let processed = Arc::new(AtomicU32::new(0));
+    let healthy_processed = Arc::new(AtomicU32::new(0));
+    let healthy = runtime
+        .register_with_capacity_on::<TestIsolate, Infallible>(
+            ShardId::new(11),
+            TestIsolate {
+                processed: Arc::clone(&healthy_processed),
+            },
+            4,
+        )
+        .expect("register healthy peer shard target");
+    let address = runtime
+        .register_with_capacity_on::<TestIsolate, Infallible>(
+            ShardId::new(22),
+            TestIsolate {
+                processed: Arc::clone(&processed),
+            },
+            4,
+        )
+        .expect("register target");
+    let drops = Arc::new(AtomicU32::new(0));
+    let (observer_tx, observer_rx) = std::sync::mpsc::channel();
+
+    runtime
+        .try_send_and_observe_with_preflight(
+            address,
+            TestMsg::Owned(DropProbe(Arc::clone(&drops))),
+            |_| panic!("intentional multi preflight failure"),
+            move |outcome| observer_tx.send(outcome).expect("report observer outcome"),
+        )
+        .expect("owning worker accepts preflight command");
+
+    assert_eq!(
+        observer_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("unwind settles observer"),
+        Err(ThreadedSendObservedError::WorkerStopped)
+    );
+    assert!(observer_rx.recv_timeout(Duration::from_millis(20)).is_err());
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    assert_eq!(processed.load(Ordering::Acquire), 0);
+    runtime
+        .send_and_observe(healthy, TestMsg::Count)
+        .expect("peer shard survives owning-worker preflight panic");
+    wait_until(|| healthy_processed.load(Ordering::Acquire) == 1);
+    assert!(matches!(
+        runtime.shutdown(),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    ));
+}
+
+#[test]
+fn multi_mailbox_panic_settles_once_and_stops_only_the_owning_worker() {
+    let runtime = ThreadedMultiShardRuntime::new([TestShard(11), TestShard(22)], SendPanicFactory);
+    let processed = Arc::new(AtomicU32::new(0));
+    let healthy_processed = Arc::new(AtomicU32::new(0));
+    let healthy = runtime
+        .register_with_capacity_on::<TestIsolate, Infallible>(
+            ShardId::new(11),
+            TestIsolate {
+                processed: Arc::clone(&healthy_processed),
+            },
+            4,
+        )
+        .expect("register healthy peer shard target");
+    let address = runtime
+        .register_with_capacity_on::<TestIsolate, Infallible>(
+            ShardId::new(22),
+            TestIsolate {
+                processed: Arc::clone(&processed),
+            },
+            13,
+        )
+        .expect("register panic-on-send target");
+    let drops = Arc::new(AtomicU32::new(0));
+    let (observer_tx, observer_rx) = std::sync::mpsc::channel();
+
+    runtime
+        .try_send_and_observe_with(
+            address,
+            TestMsg::Owned(DropProbe(Arc::clone(&drops))),
+            move |outcome| observer_tx.send(outcome).expect("report observer outcome"),
+        )
+        .expect("owning worker accepts mailbox command");
+
+    assert_eq!(
+        observer_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("unwind settles observer"),
+        Err(ThreadedSendObservedError::WorkerStopped)
+    );
+    assert!(observer_rx.recv_timeout(Duration::from_millis(20)).is_err());
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    assert_eq!(processed.load(Ordering::Acquire), 0);
+    runtime
+        .send_and_observe(healthy, TestMsg::Count)
+        .expect("peer shard survives owning-worker mailbox panic");
+    wait_until(|| healthy_processed.load(Ordering::Acquire) == 1);
+    assert!(matches!(
+        runtime.shutdown(),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    ));
+}
+
+#[test]
+fn multi_deadline_claim_reports_worker_stopped_when_mailbox_admission_panics() {
+    let runtime = ThreadedMultiShardRuntime::new([TestShard(11), TestShard(22)], SendPanicFactory);
+    let processed = Arc::new(AtomicU32::new(0));
+    let healthy_processed = Arc::new(AtomicU32::new(0));
+    let healthy = runtime
+        .register_with_capacity_on::<TestIsolate, Infallible>(
+            ShardId::new(11),
+            TestIsolate {
+                processed: Arc::clone(&healthy_processed),
+            },
+            4,
+        )
+        .expect("register healthy peer shard target");
+    let address = runtime
+        .register_with_capacity_on::<TestIsolate, Infallible>(
+            ShardId::new(22),
+            TestIsolate {
+                processed: Arc::clone(&processed),
+            },
+            13,
+        )
+        .expect("register panic-on-send target");
+    let drops = Arc::new(AtomicU32::new(0));
+
+    assert_eq!(
+        runtime.send_observed_until(
+            address,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(1),
+            || TestMsg::Owned(DropProbe(Arc::clone(&drops))),
+        ),
+        Err(SendObservedUntilError::WorkerStopped)
+    );
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+    assert_eq!(processed.load(Ordering::Acquire), 0);
+    runtime
+        .send_and_observe(healthy, TestMsg::Count)
+        .expect("peer shard survives deadline mailbox panic");
+    wait_until(|| healthy_processed.load(Ordering::Acquire) == 1);
+    assert!(matches!(
+        runtime.shutdown(),
+        Err(ThreadedRuntimeError::WorkerStopped)
+    ));
+}
+
+#[test]
+fn multi_worker_claim_wins_deadline_race_on_the_owning_shard() {
+    let gate = Arc::new(Gate::default());
+    let runtime = Arc::new(ThreadedMultiShardRuntime::new(
+        [TestShard(11), TestShard(22)],
+        GatedSendFactory {
+            gate: Arc::clone(&gate),
+        },
+    ));
+    let processed = Arc::new(AtomicU32::new(0));
+    let address = runtime
+        .register_with_capacity_on::<TestIsolate, Infallible>(
+            ShardId::new(22),
+            TestIsolate {
+                processed: Arc::clone(&processed),
+            },
+            13,
+        )
+        .expect("register gated target");
+    let runtime_for_send = Arc::clone(&runtime);
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let send = std::thread::spawn(move || {
+        let result = runtime_for_send.send_observed_until(
+            address,
+            Instant::now() + Duration::from_millis(30),
+            Duration::from_millis(1),
+            || TestMsg::Count,
+        );
+        result_tx.send(result).expect("report deadline outcome");
+    });
+
+    gate.wait_until_entered();
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        result_rx.try_recv().is_err(),
+        "host cannot cancel after the owning worker claims mailbox authority"
+    );
+    gate.release();
+    assert_eq!(
+        result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("claimed admission settles"),
+        Ok(())
+    );
+    send.join().expect("deadline sender joins");
+    wait_until(|| processed.load(Ordering::Acquire) == 1);
+
+    Arc::try_unwrap(runtime)
+        .unwrap_or_else(|_| panic!("sole runtime owner"))
+        .shutdown()
+        .expect("clean multi shutdown");
 }
 
 #[test]

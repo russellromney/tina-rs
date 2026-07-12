@@ -100,6 +100,9 @@ This file records completed work.
   The raw observed-admission, outcome-accounting, and split-service event
   helpers are also available on `ThreadedMultiShardRuntime` with owning-shard
   routing and the same exact terminal vocabulary as the single-shard owner.
+- Accepted observed sends retain their observer through preflight and mailbox
+  admission: a panic settles `WorkerStopped` exactly once during worker unwind,
+  while a panic inside the observer itself is contained after settlement.
 
 ### Typed clean-shutdown check
 

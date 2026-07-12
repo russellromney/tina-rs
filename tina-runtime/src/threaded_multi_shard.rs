@@ -815,6 +815,13 @@ where
     /// Attempts one ingress send and waits for the owning worker to report the
     /// exact mailbox outcome.
     ///
+    /// # Intentionally unbounded
+    ///
+    /// Like [`crate::ThreadedRuntime::send_and_observe`], this waits without a
+    /// host timeout. A worker wedged in user code can block this host thread
+    /// indefinitely. Use [`Self::send_observed_until`] when the host needs a
+    /// deadline and a no-late-delivery guarantee.
+    ///
     /// # Panics
     ///
     /// Panics when the address targets a shard not owned by this runtime.
@@ -900,9 +907,43 @@ where
         R: 'static,
         O: FnOnce(Result<(), ThreadedSendObservedError>) + Send + 'static,
     {
-        let Some(sender) = self.commands.get(&address.shard()) else {
+        if !self.commands.contains_key(&address.shard()) {
             panic!(
                 "ThreadedMultiShardRuntime::try_send_and_observe_with targeted unknown shard {}",
+                address.shard().get()
+            );
+        }
+        self.try_send_and_observe_with_preflight(address, message, |_| None, observer)
+    }
+
+    /// Attempts one bounded observed send with a worker-side preflight on the
+    /// address's owning shard.
+    ///
+    /// The preflight runs immediately before mailbox admission and must stay
+    /// nonblocking. Accepted observers settle exactly once. If preflight or
+    /// mailbox admission panics, worker unwind settles the retained observer
+    /// with `WorkerStopped`; an observer callback panic is contained after
+    /// settlement.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the address targets a shard not owned by this runtime.
+    pub fn try_send_and_observe_with_preflight<M, R, P, O>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        preflight: P,
+        observer: O,
+    ) -> Result<(), ThreadedTrySendError>
+    where
+        M: Send + 'static,
+        R: 'static,
+        P: FnOnce(&M) -> Option<ThreadedSendObservedError> + Send + 'static,
+        O: FnOnce(Result<(), ThreadedSendObservedError>) + Send + 'static,
+    {
+        let Some(sender) = self.commands.get(&address.shard()) else {
+            panic!(
+                "ThreadedMultiShardRuntime::try_send_and_observe_with_preflight targeted unknown shard {}",
                 address.shard().get()
             );
         };
@@ -914,7 +955,7 @@ where
             metrics.ingress.rejected_closed();
             return Err(ThreadedTrySendError::WorkerStopped);
         }
-        let command = observed_send_command(address, message, |_| None, observer);
+        let command = observed_send_command(address, message, preflight, observer);
         match sender.try_send(command) {
             Ok(()) => {
                 metrics.ingress.accepted();

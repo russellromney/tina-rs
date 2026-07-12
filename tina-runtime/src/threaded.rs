@@ -569,28 +569,36 @@ where
     O: FnOnce(Result<(), ThreadedSendObservedError>) + Send + 'static,
 {
     fn run(mut self: Box<Self>, runtime: &mut Runtime<S, F>) {
-        self.report_worker_stopped_on_drop = false;
         let message = self.message.take().expect("observed command runs once");
         let preflight = self
             .preflight
             .take()
             .expect("observed command preflight runs once");
+        if let Some(error) = preflight(&message) {
+            let observer = self
+                .observer
+                .take()
+                .expect("observed command observer runs once");
+            self.report_worker_stopped_on_drop = false;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer(Err(error));
+            }));
+            return;
+        }
+        let outcome = runtime
+            .try_send(self.address, message)
+            .map_err(|error| match error {
+                TrySendError::Full(_) => ThreadedSendObservedError::MailboxFull,
+                TrySendError::Closed(_) => ThreadedSendObservedError::MailboxClosed,
+            });
         let observer = self
             .observer
             .take()
             .expect("observed command observer runs once");
-        if let Some(error) = preflight(&message) {
-            observer(Err(error));
-            return;
-        }
-        observer(
-            runtime
-                .try_send(self.address, message)
-                .map_err(|error| match error {
-                    TrySendError::Full(_) => ThreadedSendObservedError::MailboxFull,
-                    TrySendError::Closed(_) => ThreadedSendObservedError::MailboxClosed,
-                }),
-        );
+        self.report_worker_stopped_on_drop = false;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            observer(outcome);
+        }));
     }
 
     fn disarm(mut self: Box<Self>) {
@@ -1490,7 +1498,8 @@ where
     /// mailbox admission, the observer receives
     /// [`ThreadedSendObservedError::WorkerStopped`]. A host-side
     /// `Err(IngressFull | WorkerStopped)` means the observer will not run.
-    /// The observer must stay nonblocking.
+    /// The observer must stay nonblocking. A panic from the observer is
+    /// contained after settlement and does not stop the worker.
     pub fn try_send_and_observe_with<M, R, O>(
         &self,
         address: Address<M, R>,
@@ -1712,6 +1721,8 @@ where
     /// before the worker could observe them; it must stay nonblocking. Its
     /// observer has the same exact-once contract as
     /// [`Self::try_send_and_observe_with`].
+    /// If preflight or mailbox admission panics, the worker stops and the
+    /// retained observer settles once with `WorkerStopped` during unwind.
     pub fn try_send_and_observe_with_preflight<M, R, P, O>(
         &self,
         address: Address<M, R>,
