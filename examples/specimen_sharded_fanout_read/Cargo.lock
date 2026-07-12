@@ -234,6 +234,7 @@ name = "tina-runtime"
 version = "0.1.0"
 dependencies = [
  "betelgeuse",
+ "libc",
  "rustls",
  "signal-hook",
  "tina",

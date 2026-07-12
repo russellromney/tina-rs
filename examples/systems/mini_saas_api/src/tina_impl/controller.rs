@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::time::Duration;
 
 use http::StatusCode;
@@ -20,7 +19,7 @@ use tina_runtime::lifecycle::{
 use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
     CallOutcome, DrainStage, DrainState, RequestScope,
-    RequestScopeId, RequestScopeSet, RuntimeCall, call, call_cancelable, sleep,
+    RequestScopeId, RequestScopeSet, call, call_cancelable, sleep,
 };
 use tina_sqlite_bridge::{
     SqliteAddress, SqliteError, SqliteMetricsHandle, SqlitePressureReport,
@@ -48,19 +47,11 @@ impl From<HttpRequest> for NotifyMsg {
     }
 }
 
-impl Isolate for NotifySink {
-    tina::isolate_types! {
-        message: NotifyMsg,
-        reply: HttpResponse,
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        io: RuntimeCall<NotifyMsg>,
-        shard: SingleShard,
-    }
-
+#[tina_runtime::isolate(message = NotifyMsg, reply = HttpResponse)]
+impl NotifySink {
     fn handle(
         &mut self,
-        msg: Self::Message,
+        msg: NotifyMsg,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
@@ -72,7 +63,7 @@ impl Isolate for NotifySink {
         }
     }
 
-    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+    fn handle_call(&mut self, msg: NotifyMsg, call: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
             NotifyMsg::Request(request) => {
                 if request.method != http::Method::POST || request.path != "/notify" {
@@ -371,19 +362,11 @@ tina::flow! {
     }
 }
 
-impl Isolate for Controller {
-    tina::isolate_types! {
-        message: ControllerMsg,
-        reply: HttpResponse,
-        send: tina::Outbound<Infallible>,
-        spawn: Infallible,
-        io: RuntimeCall<ControllerMsg>,
-        shard: SingleShard,
-    }
-
+#[tina_runtime::isolate(message = ControllerMsg, reply = HttpResponse)]
+impl Controller {
     fn handle(
         &mut self,
-        msg: Self::Message,
+        msg: ControllerMsg,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
@@ -470,7 +453,7 @@ impl Isolate for Controller {
         }
     }
 
-    fn handle_call(&mut self, msg: Self::Message, call: CallContext<'_, Self>) -> Effect<Self> {
+    fn handle_call(&mut self, msg: ControllerMsg, call: CallContext<'_, Self>) -> Effect<Self> {
         match msg {
             ControllerMsg::Http(request) => self.route(request, call),
             ControllerMsg::CloseIngress => {

@@ -11,6 +11,22 @@ valid; the long-form history lives in
 
 ## Active
 
+### 2026-07-12 Remaining raw Isolate → macro (rooms / fanout / grpc / mini_saas)
+
+Converted the last hand-rolled `impl Isolate` / `isolate_types!` blocks:
+
+- `specimen_sharded_fanout_read` ShardCounter (`send` + `AppShard`) + ScatterCoord (`tina::isolate`, `Io=Infallible`)
+- `specimen_grpc_counter` StreamingEchoSource
+- `specimen_websocket_room` Gateway + Room
+- `system_realtime_rooms` Room + Gateway (dropped manual `CallableIsolate` stamps; macro now owns them)
+- `mini_saas_api` NotifySink + Controller
+
+**Still open (not raw Isolate):**
+- Bind/Start paired-registration ceremony in scatter fanout (finding 3)
+- LocalSystem / fallible startup migration for production-shaped hosts
+- event-only / request-only form sweep where placeholders remain
+
+
 ### 2026-07-11 Raw `impl Isolate` → macro cohort (local I/O + sqlite + cross-shard)
 
 - `specimen_local_io_codec_ipc` — Ingest/Seeder/CopyPump, AdminServer/Client,
