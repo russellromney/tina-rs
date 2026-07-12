@@ -16,7 +16,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::post;
 use tina::prelude::*;
-use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntimeConfig};
+use tina_runtime::{DefaultThreadedMailboxFactory, LocalSystem};
 use tina_tokio_bridge::{BridgeError, BridgeHost, BridgeRequest};
 use tina_tower_bridge::{Service, TinaService, TinaTowerService};
 
@@ -62,15 +62,11 @@ async fn brush(State(svc): State<CounterService>) -> Result<String, StatusCode> 
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let host = BridgeHost::new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 16,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    );
+    let tina_app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+        .ingress_capacity(16)
+        .idle_wait(Duration::from_millis(1))
+        .try_build()?;
+    let host = BridgeHost::from_app(tina_app);
     let bridge = host
         .register_bridge::<Counter, BrushRequest, BrushReply, Infallible>(
             Counter::default(),

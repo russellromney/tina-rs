@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina::{Mailbox, TrySendError};
-use tina_runtime::{MailboxFactory, ThreadedRuntimeConfig};
+use tina_runtime::{LocalSystem, MailboxFactory};
 use tina_tokio_bridge::{BridgeHost, BridgeRequest};
 
 #[derive(Debug, Clone, Copy)]
@@ -106,36 +106,34 @@ impl Tina {
     }
 }
 
-fn main() {
-    let host = BridgeHost::new(
-        BarnShard,
-        BarnMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 16,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    );
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let app = LocalSystem::single_shard(BarnShard, BarnMailboxFactory)
+        .ingress_capacity(16)
+        .idle_wait(Duration::from_millis(1))
+        .try_build()?;
+    let host = BridgeHost::from_app(app);
     let bridge = host
         .register_bridge::<Tina, LlamaQuestion, LlamaAnswer, Infallible>(
             Tina { snacks_eaten: 0 },
             16,
             Duration::from_secs(1),
         )
-        .expect("register Tina");
+        .map_err(|error| format!("register Tina: {error:?}"))?;
 
     let tokio = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
-        .expect("tokio runtime");
+        .map_err(|error| format!("build Tokio runtime: {error}"))?;
     let answer = tokio
         .block_on(bridge.call(LlamaQuestion { snack: "ham" }))
-        .expect("bridge response");
+        .map_err(|error| format!("bridge response: {error}"))?;
 
     assert_eq!(answer.line, "ate ham (1)");
     println!("{}", answer.line);
 
     assert_eq!(bridge.metrics().responses, 1);
     drop(bridge);
-    host.shutdown().expect("shutdown");
+    host.shutdown()
+        .map_err(|error| format!("shutdown bridge host: {error:?}"))?;
+    Ok(())
 }

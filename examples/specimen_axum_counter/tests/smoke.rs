@@ -11,6 +11,6 @@ fn tokio_smoke() {
 
 #[test]
 fn tina_smoke() {
-    let report = tina_impl::run();
+    let report = tina_impl::run().expect("start Tina app");
     report.assert_expected();
 }

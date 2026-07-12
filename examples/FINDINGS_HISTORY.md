@@ -89,7 +89,8 @@ sugar over the generic `.route(method, path, handler)`, plus opt-in
 ### 7. Bridge specimen cleanup — landed in 059 Rock 7
 
 `specimen_axum_counter` and `specimen_ws_room` rewritten to the specimens-rule
-shape. Both use the `BridgeHost::new` / `register_bridge` /
+shape. Both use the `LocalSystem::try_build` / `BridgeHost::from_app` /
+`register_bridge` /
 `drain_and_shutdown` lifecycle. Follow-up bridge polish rebased the
 HTTP-shaped bridge specimens onto `tina_tower_bridge::TinaTowerService`,
 added the `TinaService<M, R>` alias, and re-exported Tower's `Service` trait.

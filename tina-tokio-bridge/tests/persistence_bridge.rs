@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tina::{Mailbox, TrySendError, prelude::*};
 use tina_runtime::{
-    CallError, JournalReplay, MailboxFactory, SnapshotImage, ThreadedRuntimeConfig, journal_append,
+    CallError, JournalReplay, LocalSystem, MailboxFactory, SnapshotImage, journal_append,
     journal_replay, snapshot_load,
 };
 use tina_tokio_bridge::{BridgeHost, BridgeMessage, BridgeRequest, BridgeResponder};
@@ -266,21 +266,22 @@ fn unique_dir(name: &str) -> PathBuf {
     dir
 }
 
+fn make_bridge_host() -> BridgeHost<BridgeShard, BridgeMailboxFactory> {
+    let app = LocalSystem::single_shard(BridgeShard, BridgeMailboxFactory)
+        .ingress_capacity(16)
+        .idle_wait(Duration::from_millis(1))
+        .try_build()
+        .expect("start local bridge app");
+    BridgeHost::from_app(app)
+}
+
 #[tokio::test]
 async fn tokio_bridge_request_persists_and_fresh_host_recovers() {
     let dir = unique_dir("bridge-persistence");
     let snapshot_path = dir.join("state.snapshot");
     let journal_path = dir.join("state.journal");
 
-    let mut host = BridgeHost::new(
-        BridgeShard,
-        BridgeMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 16,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    );
+    let mut host = make_bridge_host();
     let bridge = host
         .register_bridge::<PersistService, PersistRequest, PersistReply, Infallible>(
             PersistService::new(snapshot_path.clone(), journal_path.clone()),
@@ -325,15 +326,7 @@ async fn tokio_bridge_request_persists_and_fresh_host_recovers() {
     drop(bridge);
     let _trace = host.try_shutdown().expect("shutdown first host");
 
-    let mut fresh_host = BridgeHost::new(
-        BridgeShard,
-        BridgeMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 16,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    );
+    let mut fresh_host = make_bridge_host();
     let fresh_bridge = fresh_host
         .register_bridge::<PersistService, PersistRequest, PersistReply, Infallible>(
             PersistService::new(snapshot_path, journal_path),

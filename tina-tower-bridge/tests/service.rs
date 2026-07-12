@@ -5,7 +5,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntimeConfig};
+use tina_runtime::{DefaultThreadedMailboxFactory, LocalSystem};
 use tina_tokio_bridge::{BridgeError, BridgeHost, BridgeMessage, BridgeRequest, BridgeResponder};
 use tina_tower_bridge::{Service, TinaTowerService};
 
@@ -106,15 +106,12 @@ impl Isolate for SlowIsolate {
 }
 
 fn make_host() -> BridgeHost<SingleShard, DefaultThreadedMailboxFactory> {
-    BridgeHost::new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 16,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    )
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+        .ingress_capacity(16)
+        .idle_wait(Duration::from_millis(1))
+        .try_build()
+        .expect("start local bridge app");
+    BridgeHost::from_app(app)
 }
 
 // --- happy path ---------------------------------------------------------

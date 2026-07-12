@@ -115,8 +115,7 @@ use std::time::Duration;
 use tina::{Address, Isolate, Outbound as TinaOutbound, Shard};
 use tina_runtime::{
     CallError, IntoErasedCall, LocalSystem, MailboxFactory, RuntimeEvent, SendRejectedReason,
-    ThreadedRuntime, ThreadedRuntimeConfig, ThreadedRuntimeError, ThreadedSendObservedError,
-    ThreadedTrySendError,
+    ThreadedRuntime, ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError,
 };
 use tokio::sync::oneshot;
 #[cfg(feature = "tracing")]
@@ -656,18 +655,7 @@ where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
 {
-    /// Starts a bridge host over one shard-owned Tina runtime.
-    pub fn new(shard: S, mailbox_factory: F, config: ThreadedRuntimeConfig) -> Self {
-        Self {
-            runtime: Some(Arc::new(ThreadedRuntime::with_config(
-                shard,
-                mailbox_factory,
-                config,
-            ))),
-        }
-    }
-
-    /// Builds a bridge host from the canonical local app owner.
+    /// Builds a bridge host from the canonical, fallibly started local app owner.
     pub fn from_app(app: LocalSystem<S, F>) -> Self {
         Self {
             runtime: Some(Arc::new(app.into_threaded_runtime())),

@@ -14,7 +14,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use tina::prelude::*;
-use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntimeConfig};
+use tina_runtime::{DefaultThreadedMailboxFactory, LocalSystem, StartupError};
 use tina_tokio_bridge::{BridgeHost, BridgeRequest};
 use tina_tower_bridge::{Service, TinaService, TinaTowerService};
 use tokio::net::TcpListener as TokioTcpListener;
@@ -100,16 +100,12 @@ async fn handle_socket(socket: WebSocket, svc: RoomService) {
     let _ = writer.await;
 }
 
-pub fn run() -> Report {
-    let mut host = BridgeHost::new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 32,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    );
+pub fn run() -> Result<Report, StartupError> {
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+        .ingress_capacity(32)
+        .idle_wait(Duration::from_millis(1))
+        .try_build()?;
+    let mut host = BridgeHost::from_app(app);
     let bridge = host
         .register_bridge::<Room, RoomRequest, RoomReply, Infallible>(
             Room::default(),
@@ -149,5 +145,5 @@ pub fn run() -> Report {
         .drain_and_shutdown(Duration::from_secs(2))
         .expect("bridge host drains and shuts down cleanly");
 
-    report
+    Ok(report)
 }

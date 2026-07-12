@@ -13,7 +13,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use tina::prelude::*;
-use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntimeConfig};
+use tina_runtime::{DefaultThreadedMailboxFactory, LocalSystem, StartupError};
 use tina_tokio_bridge::{BridgeError, BridgeHost, BridgeRequest};
 use tina_tower_bridge::{Service, TinaService, TinaTowerService};
 use tokio::net::TcpListener as TokioTcpListener;
@@ -82,16 +82,12 @@ async fn increment_counter(State(svc): State<CounterService>) -> (StatusCode, St
     }
 }
 
-pub fn run() -> Report {
-    let mut host = BridgeHost::new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 16,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    );
+pub fn run() -> Result<Report, StartupError> {
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+        .ingress_capacity(16)
+        .idle_wait(Duration::from_millis(1))
+        .try_build()?;
+    let mut host = BridgeHost::from_app(app);
     let bridge = host
         .register_bridge::<Counter, CounterRequest, CounterReply, Infallible>(
             Counter { value: 0 },
@@ -136,5 +132,5 @@ pub fn run() -> Report {
         .drain_and_shutdown(Duration::from_secs(2))
         .expect("bridge host drains and shuts down cleanly");
 
-    report
+    Ok(report)
 }

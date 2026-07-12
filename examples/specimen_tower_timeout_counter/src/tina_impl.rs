@@ -9,7 +9,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina_runtime::{DefaultThreadedMailboxFactory, SleepReply, sleep};
+use tina_runtime::{DefaultThreadedMailboxFactory, LocalSystem, SleepReply, sleep};
 use tina_tokio_bridge::{BridgeError, BridgeHost, BridgeMessage, BridgeRequest, BridgeResponder};
 use tina_tower_bridge::TinaTowerService;
 use tokio::runtime::Builder;
@@ -115,11 +115,9 @@ pub fn run() -> anyhow::Result<Report> {
         .enable_all()
         .build()?;
     rt.block_on(async {
-        let mut host = BridgeHost::new(
-            SingleShard,
-            DefaultThreadedMailboxFactory,
-            Default::default(),
-        );
+        let app =
+            LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+        let mut host = BridgeHost::from_app(app);
         let bridge = host
             .register_bridge::<Counter, BrushRequest, BrushReply, Infallible>(
                 Counter {

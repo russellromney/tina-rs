@@ -105,9 +105,13 @@ Tokio code holds a `BridgeHandle`, which is the Tokio-side proxy for a
 registered Tina isolate. Calling it is one `await`:
 
 ```rust
+use tina_runtime::LocalSystem;
 use tina_tokio_bridge::{BridgeHost, BridgeRequest};
 
-let mut host = BridgeHost::new(shard, factory, runtime_config);
+let app = LocalSystem::single_shard(shard, factory)
+    .config(local_system_config)
+    .try_build()?;
+let mut host = BridgeHost::from_app(app);
 let bridge = host.register_bridge::<MyService, Req, Reply, Infallible>(
     MyService::default(),
     mailbox_capacity,
