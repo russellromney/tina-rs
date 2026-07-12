@@ -10,7 +10,14 @@ fn soak_emits_grep_friendly_discovery_lines() {
     let report = run(config).expect("soak ran");
 
     assert_eq!(
-        report.ok + report.http_full + report.db_full + report.pending_full,
+        report.ok
+            + report.http_full
+            + report.db_full
+            + report.timer_failed
+            + report.call_full
+            + report.call_closed
+            + report.call_timeout
+            + report.call_rejected,
         report.total_requests,
         "every request must produce one outcome (report={report:?})",
     );
@@ -18,6 +25,7 @@ fn soak_emits_grep_friendly_discovery_lines() {
         report.ok > 0,
         "at least some requests should succeed (report={report:?})",
     );
+    assert_eq!(report.timer_failed, 0, "timers should settle cleanly");
     // With http cap=4 and db cap=2 against 8 workers x 16 reqs, the
     // scopes must fill at least sometimes.
     assert!(
@@ -95,6 +103,24 @@ fn soak_emits_grep_friendly_discovery_lines() {
 }
 
 #[test]
+fn caller_timeout_releases_parked_http_authority_on_shutdown() {
+    let report = run(RunConfig {
+        workers: 1,
+        requests_per_worker: 1,
+        http_in_flight_cap: 1,
+        db_in_flight_cap: 1,
+        fake_http_ms: 100,
+        fake_db_ms: 100,
+        call_timeout_ms: 1,
+        ..RunConfig::default()
+    })
+    .expect("timed-out soak shuts down cleanly");
+
+    assert_eq!(report.call_timeout, 1);
+    assert_eq!(report.ok + report.http_full + report.db_full, 0);
+}
+
+#[test]
 fn event_sink_drops_visibly_under_load() {
     // Force the slow-event sink to overflow by setting its cap small
     // and the slow threshold low enough that most requests exceed it.
@@ -145,7 +171,6 @@ fn soak_with_no_pressure_passes_assert_no_full() {
         requests_per_worker: 4,
         http_in_flight_cap: 32,
         db_in_flight_cap: 32,
-        pending_capacity: 64,
         slow_threshold_ms: 1_000,
         event_sink_cap: 32,
         ..RunConfig::default()

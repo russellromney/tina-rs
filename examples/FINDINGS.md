@@ -87,6 +87,23 @@ exercise registration and typed lookup on explicit, threaded, LocalSystem, and
 simulated multi-shard owners; generation tests prove tables remain snapshots
 until rebuilt after restart.
 
+### 2026-07-12 Soak HTTP/DB request-aware flow migration
+
+`system_soak_http_db` now applies the request-aware raw flow directly. The
+service carries the original `RequestContext`, HTTP lease, and DB lease through
+two exhaustive `SleepReply` stages without qids, `GuardedPendingReplies`,
+take/reinsert cycles, or manual `ServiceMessage` construction. The former
+`pending_capacity`, `PendingFull`, and `PendingDuplicate` surface was
+implementation state rather than business pressure; the HTTP shared scope now
+provides the honest bound on parked work.
+
+The host uses `call_blocking_request` and exhaustively counts Replied, Full,
+Closed, Timeout, and Rejected outcomes. Timer failure remains a distinct reply.
+Every run verifies both shared scopes return to zero after terminal shutdown;
+a focused caller-timeout smoke proves a parked HTTP lease is cancelled and
+released. This closes the motivating example for the request-aware flow
+prerequisite.
+
 ### 2026-07-12 Lock-manager keyed FIFO canonicalization
 
 Migrated `system_lock_manager` from the historical

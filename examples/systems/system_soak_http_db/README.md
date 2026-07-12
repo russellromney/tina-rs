@@ -66,13 +66,15 @@ What felt good:
 - `assert_no_full()` returns every offender at once, so one CI run
   surfaces all caps that need tuning instead of one-at-a-time
   whack-a-mole.
+- `flow!` carries the original request and move-only HTTP/DB leases
+  through both raw timer outcomes. There is no qid, pending-reply map,
+  take/reinsert cycle, or service-envelope construction in the service.
+- Caller timeout and shutdown both release the parked lease exactly;
+  the smoke suite asserts a timed-out request leaves both shared scopes
+  at zero after clean terminal shutdown.
 
-What felt rough:
+What remains policy-specific:
 
-- The post-sleep dispatch needs two timer wakes (`HttpReleased`,
-  `DbReleased`) per request. Chaining bounded calls inside an isolate
-  is repetitive in this shape; a "request rail" affordance would
-  read better.
 - The DB cap can lose a request after HTTP admit if DB is full. The
   specimen accepts that as "DbFull" but a real service might want a
   shared scope policy that holds the upstream lease until DB admits.
@@ -80,13 +82,9 @@ What felt rough:
 Tina capability pulled:
 
 - `SharedCapacityScope`, `BoundedEventSink`, `ServicePressureReport`.
+- `flow!` raw request steps and `then_service_event_with_request`.
 - `CapacitySummary::assert_no_full` + `format_assertion_failure`.
 - `format_discovery_line` (with the new `util_bp` field).
-
-Suggested follow-up:
-
-- Single-call dispatch helper that chains HTTP -> DB releases
-  without a manually-typed message envelope.
 
 Verdict:
 
