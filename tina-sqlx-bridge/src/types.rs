@@ -1375,7 +1375,7 @@ impl Default for PgConfig {
 /// Why install failed. Each variant points at one phase of bring-up.
 #[derive(Debug)]
 pub enum InstallError {
-    /// Config rejected by [`PgConfig::validate`].
+    /// Config rejected by the install path's relevant [`PgConfig`] validation.
     Config(PgConfigError),
     /// A config-built install was called without `config.pool`. Either set the
     /// pool config or use a supplied-pool install with a `sqlx::PgPool`.

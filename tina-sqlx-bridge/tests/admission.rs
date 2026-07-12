@@ -130,7 +130,7 @@ fn install_lazy(
     let bridge = PgWorker::<SingleShard>::install_with_pool(
         runtime,
         config,
-        pool,
+        &pool,
         tokio_rt.handle().clone(),
     )
     .expect("install_with_pool");

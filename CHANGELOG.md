@@ -58,7 +58,8 @@ This file records completed work.
   ownership, and typed install-error phases. Saturated registration returns
   `CommandFull` without leaking a built worker; stopped-worker registration
   cleans up before returning `WorkerStopped`. SQLx supplied-pool installs
-  ignore pool/cancel construction fields and never close caller pool ownership.
+  borrow the pool, ignore pool/cancel construction fields, and preserve the
+  caller's pool handle across success and registration failure.
 
 ### Authoritative child-restart observation
 

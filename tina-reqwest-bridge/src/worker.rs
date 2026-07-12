@@ -184,7 +184,7 @@ impl std::fmt::Display for InstallError {
         match self {
             Self::Config(e) => write!(f, "reqwest bridge install: {e}"),
             Self::Build(e) => write!(f, "reqwest bridge install: {e}"),
-            Self::Register(e) => write!(f, "reqwest bridge install: register: {e:?}"),
+            Self::Register(e) => write!(f, "reqwest bridge install: register: {e}"),
         }
     }
 }

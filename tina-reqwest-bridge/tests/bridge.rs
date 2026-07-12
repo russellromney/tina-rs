@@ -1183,6 +1183,10 @@ fn install_errors_keep_typed_build_and_registration_sources() {
     );
 
     let register = InstallError::Register(tina_runtime::ThreadedRuntimeError::WorkerStopped);
+    assert_eq!(
+        register.to_string(),
+        "reqwest bridge install: register: worker thread stopped before it could process the command"
+    );
     assert!(
         register
             .source()

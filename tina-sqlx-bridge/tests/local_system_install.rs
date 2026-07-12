@@ -74,7 +74,7 @@ fn install_local_with_pool_returns_callable_address_closer_metrics_and_clean_shu
     let bridge = PgWorker::<SingleShard>::install_local_with_pool(
         &app,
         config,
-        pool,
+        &pool,
         tokio_runtime.handle().clone(),
     )
     .expect("install pg bridge");
@@ -100,7 +100,8 @@ fn install_local_with_pool_returns_callable_address_closer_metrics_and_clean_shu
         .join_report()
         .ensure_clean()
         .expect("clean local-system shutdown");
-    drop(tokio_runtime);
+    assert!(!pool.is_closed(), "bridge drop must preserve caller pool");
+    tokio_runtime.block_on(pool.close());
 }
 
 #[test]
@@ -146,7 +147,7 @@ fn install_local_preserves_config_pool_and_register_error_sources() {
     let register_error = match PgWorker::<SingleShard>::install_local_with_pool(
         &app,
         PgConfig::bridge_only(),
-        pool,
+        &pool,
         tokio_runtime.handle().clone(),
     ) {
         Err(error) => error,
@@ -162,7 +163,11 @@ fn install_local_preserves_config_pool_and_register_error_sources() {
             .and_then(|source| source.downcast_ref::<ThreadedRuntimeError>())
             .is_some()
     );
-    drop(tokio_runtime);
+    assert!(
+        !pool.is_closed(),
+        "failed install must preserve caller pool"
+    );
+    tokio_runtime.block_on(pool.close());
 }
 
 #[test]
@@ -193,7 +198,7 @@ fn install_local_with_pool_reports_command_full_preserves_pool_and_refills() {
     let error = match PgWorker::<SingleShard>::install_local_with_pool(
         &app,
         PgConfig::bridge_only(),
-        pool.clone(),
+        &pool,
         tokio_runtime.handle().clone(),
     ) {
         Err(error) => error,
@@ -214,7 +219,7 @@ fn install_local_with_pool_reports_command_full_preserves_pool_and_refills() {
         match PgWorker::<SingleShard>::install_local_with_pool(
             &app,
             PgConfig::bridge_only(),
-            pool.clone(),
+            &pool,
             tokio_runtime.handle().clone(),
         ) {
             Ok(bridge) => break bridge,
