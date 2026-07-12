@@ -375,8 +375,12 @@ impl std::error::Error for UncleanShutdownError {
 /// Failure while consuming a local system through bounded terminal observation.
 ///
 /// The bound applies to shutdown admission and terminal-report observation.
-/// Consuming the owner still runs its ordinary `Drop` cleanup after that
-/// observation attempt, including when the attempt times out.
+/// On timeout, the consumed owner does not start a second blocking shutdown
+/// attempt; an admitted background joiner or escaped shutdown handle may still
+/// observe terminal truth later. After an admission timeout, an escaped handle
+/// retains shutdown control and must retry or be dropped. Without one, owner
+/// consumption disconnects the remaining control senders; it does not claim
+/// terminal truth was observed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalShutdownError {
     /// Shutdown admission or terminal-report observation exceeded its budget,
@@ -1355,21 +1359,31 @@ where
     /// The closure borrows the live system so `?` can be used for registration,
     /// host calls, sends, waits, and application validation without bypassing
     /// shutdown. `timeout` is one total budget for shutdown admission and
-    /// terminal observation; it does not include workload execution or the
-    /// owner's subsequent `Drop` cleanup. An observed report is also required
-    /// to prove clean shutdown.
+    /// terminal observation; it does not include workload execution. An
+    /// observed report is also required to prove clean shutdown. After this
+    /// bounded attempt, consuming the owner does not perform a second blocking
+    /// shutdown attempt. A timed-out worker may therefore finish later, and an
+    /// escaped shutdown handle retains control so it can retry admission or
+    /// observe its cached report; the handle must eventually retry or be
+    /// dropped. Without an escaped handle, consuming the owner disconnects the
+    /// remaining control senders rather than claiming terminal truth.
     ///
     /// Workload and shutdown failures remain independent in
     /// [`RunToShutdownError`]. If the closure panics, the panic is not converted
-    /// into an error; normal unwinding drops the owner through its existing
-    /// teardown contract.
+    /// into an error. The bounded shutdown attempt and destructor disarm happen
+    /// only after the closure returns, so panic unwinding uses the owner's
+    /// existing blocking teardown contract.
     pub fn run_to_shutdown<T, E>(
-        self,
+        mut self,
         timeout: Duration,
         workload: impl FnOnce(&Self) -> Result<T, E>,
     ) -> Result<T, RunToShutdownError<E>> {
         let result = workload(&self);
         let shutdown = self.shutdown_handle().request_and_wait_report(timeout);
+        self.runtime
+            .as_mut()
+            .expect("local system runtime is available")
+            .disarm_owner_drop();
         drop(self);
         finish_run_to_shutdown(result, shutdown)
     }
@@ -2169,14 +2183,21 @@ where
     /// Shutdown admission progress remains shard-aware and both workload and
     /// terminal failures are preserved in [`RunToShutdownError`]. As in the
     /// single-shard form, `timeout` covers admission and observation, not the
-    /// workload or subsequent owner `Drop` cleanup.
+    /// workload. Consuming the owner does not extend that deadline with its
+    /// ordinary blocking `Drop` shutdown path. The single-shard timeout and
+    /// escaped-handle ownership rules apply identically to partial multi-shard
+    /// admission.
     pub fn run_to_shutdown<T, E>(
-        self,
+        mut self,
         timeout: Duration,
         workload: impl FnOnce(&Self) -> Result<T, E>,
     ) -> Result<T, RunToShutdownError<E>> {
         let result = workload(&self);
         let shutdown = self.shutdown_handle().request_and_wait_report(timeout);
+        self.runtime
+            .as_mut()
+            .expect("local multi-shard runtime is available")
+            .disarm_owner_drop();
         drop(self);
         finish_run_to_shutdown(result, shutdown)
     }

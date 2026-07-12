@@ -69,6 +69,7 @@ where
     /// Upper bound on a per-shard host-control `call_on` awaiting the reply.
     control_call_timeout: Duration,
     system_incarnation: SystemIncarnation,
+    owner_drop_armed: bool,
 }
 
 struct ThreadedRemoteWiring {
@@ -495,7 +496,14 @@ where
             shutdown,
             control_call_timeout: config.control_call_timeout,
             system_incarnation,
+            owner_drop_armed: true,
         })
+    }
+
+    /// Prevents the owner destructor from starting a second, blocking shutdown
+    /// attempt after a caller has already performed bounded shutdown control.
+    pub(crate) fn disarm_owner_drop(&mut self) {
+        self.owner_drop_armed = false;
     }
 
     /// Registers one root isolate on a chosen shard.
@@ -1628,6 +1636,9 @@ where
     F: MailboxFactory + Send + Clone + 'static,
 {
     fn drop(&mut self) {
+        if !self.owner_drop_armed {
+            return;
+        }
         self.shutdown.shutdown_blocking();
         let _ = self.shutdown.wait_report_for_owner_with_timeout(
             crate::threaded::DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT,

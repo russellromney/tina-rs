@@ -9,8 +9,8 @@ use tina::prelude::*;
 use tina::{CallRejectedReason, Mailbox};
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, MailboxFactory, RunToShutdownError,
-    ShutdownAndWaitError, ShutdownUncleanReason, ShutdownWaitError, TerminalShutdownError,
-    ThreadedRuntimeError, UncleanShutdownError,
+    ShutdownAndWaitError, ShutdownRequestError, ShutdownUncleanReason, ShutdownWaitError,
+    TerminalShutdownError, ThreadedRuntimeError, UncleanShutdownError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -63,6 +63,26 @@ impl Probe {
             ProbeMsg::Ping => call.reply(7),
             ProbeMsg::Stop | ProbeMsg::Block => call.reject(CallRejectedReason::UnsupportedMessage),
         }
+    }
+}
+
+struct ShutdownGate {
+    entered: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+}
+
+#[tina_runtime::isolate(message = ProbeMsg, shard = TestShard)]
+impl ShutdownGate {
+    fn handle(
+        &mut self,
+        _message: ProbeMsg,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        self.entered.store(true, Ordering::Release);
+        while !self.release.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        noop()
     }
 }
 
@@ -197,14 +217,46 @@ fn dual_failure_keeps_workload_and_shutdown_values_separate() {
 
 #[test]
 fn bounded_terminal_timeout_remains_distinct_from_unclean_truth() {
-    let result = app().run_to_shutdown(Duration::from_millis(1), |app| {
-        let service = app
-            .register_root::<_, Infallible>(Probe { dropped: None }, 8)
-            .map_err(WorkError::Runtime)?;
-        app.try_send(service, ProbeMsg::Block)
-            .map_err(|_| WorkError::Expected("block send failed"))?;
-        Ok::<_, WorkError>(())
+    let app = app();
+    let handle = app.shutdown_handle();
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let release_after_timeout = Arc::clone(&release);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let runner = std::thread::spawn(move || {
+        let result = app.run_to_shutdown(Duration::from_millis(1), |app| {
+            let gate = app
+                .register_root::<_, Infallible>(
+                    ShutdownGate {
+                        entered: Arc::clone(&entered),
+                        release: Arc::clone(&release),
+                    },
+                    8,
+                )
+                .map_err(WorkError::Runtime)?;
+            app.try_send(gate, ProbeMsg::Block)
+                .map_err(|_| WorkError::Expected("block send failed"))?;
+            while !entered.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            ready_tx.send(()).expect("report held worker ready");
+            Ok::<_, WorkError>(())
+        });
+        tx.send(result).expect("report bounded runner result");
     });
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("workload reaches held worker");
+    let result = match rx.recv_timeout(Duration::from_millis(75)) {
+        Ok(result) => result,
+        Err(error) => {
+            release_after_timeout.store(true, Ordering::Release);
+            runner.join().expect("runner cleanup after timeout");
+            panic!("observation timeout entered blocking owner Drop: {error}");
+        }
+    };
 
     let Err(
         error @ RunToShutdownError::Shutdown(TerminalShutdownError::Observation(
@@ -226,6 +278,149 @@ fn bounded_terminal_timeout_remains_distinct_from_unclean_truth() {
         Some(source) if source.downcast_ref::<ShutdownWaitError>()
             == Some(&ShutdownWaitError::Timeout)
     ));
+    release_after_timeout.store(true, Ordering::Release);
+    runner.join().expect("runner thread");
+    handle
+        .wait_report(Duration::from_secs(2))
+        .expect("escaped handle observes eventual terminal truth")
+        .ensure_clean()
+        .expect("eventual terminal truth is clean");
+}
+
+#[test]
+fn admission_timeout_returns_before_blocking_drop_and_handle_can_retry() {
+    let app = LocalSystem::single_shard(TestShard(4), DefaultThreadedMailboxFactory)
+        .ingress_capacity(1)
+        .build();
+    let handle = app.shutdown_handle();
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let release_after_timeout = Arc::clone(&release);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let runner = std::thread::spawn(move || {
+        let result = app.run_to_shutdown(Duration::from_millis(1), |app| {
+            let gate = app
+                .register_root::<_, Infallible>(
+                    ShutdownGate {
+                        entered: Arc::clone(&entered),
+                        release: Arc::clone(&release),
+                    },
+                    8,
+                )
+                .map_err(WorkError::Runtime)?;
+            app.try_send(gate, ProbeMsg::Block)
+                .map_err(|_| WorkError::Expected("gate send failed"))?;
+            while !entered.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            app.try_send(gate, ProbeMsg::Ping)
+                .map_err(|_| WorkError::Expected("queue fill failed"))?;
+            ready_tx.send(()).expect("report full command queue");
+            Ok::<_, WorkError>(())
+        });
+        tx.send(result).expect("report admission timeout");
+    });
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("workload fills command queue");
+    let result = match rx.recv_timeout(Duration::from_millis(75)) {
+        Ok(result) => result,
+        Err(error) => {
+            release_after_timeout.store(true, Ordering::Release);
+            runner.join().expect("runner cleanup after timeout");
+            panic!("request timeout entered blocking owner Drop: {error}");
+        }
+    };
+    assert!(matches!(
+        result,
+        Err(RunToShutdownError::Shutdown(
+            TerminalShutdownError::Observation(ShutdownAndWaitError::RequestTimeout {
+                last: ShutdownRequestError::CommandFull { shard: None }
+            })
+        ))
+    ));
+
+    release_after_timeout.store(true, Ordering::Release);
+    runner.join().expect("runner thread");
+    handle
+        .request_and_wait_report(Duration::from_secs(2))
+        .expect("escaped handle retries shutdown admission")
+        .ensure_clean()
+        .expect("retried single-shard shutdown is clean");
+}
+
+#[test]
+fn multi_partial_admission_timeout_returns_and_retry_finishes_every_shard() {
+    let app = LocalSystem::<TestShard, DefaultThreadedMailboxFactory>::multi_shard(
+        DefaultThreadedMailboxFactory,
+    )
+    .shard(TestShard(10))
+    .shard(TestShard(11))
+    .ingress_capacity(1)
+    .build();
+    let handle = app.shutdown_handle();
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let release_after_timeout = Arc::clone(&release);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let runner = std::thread::spawn(move || {
+        let result = app.run_to_shutdown(Duration::from_millis(1), |app| {
+            let gate = app
+                .register_root_on::<_, Infallible>(
+                    ShardId::new(11),
+                    ShutdownGate {
+                        entered: Arc::clone(&entered),
+                        release: Arc::clone(&release),
+                    },
+                    8,
+                )
+                .map_err(WorkError::Runtime)?;
+            app.try_send(gate, ProbeMsg::Block)
+                .map_err(|_| WorkError::Expected("gate send failed"))?;
+            while !entered.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            app.try_send(gate, ProbeMsg::Ping)
+                .map_err(|_| WorkError::Expected("queue fill failed"))?;
+            ready_tx.send(()).expect("report full shard command queue");
+            Ok::<_, WorkError>(())
+        });
+        tx.send(result).expect("report multi admission timeout");
+    });
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("workload fills target shard command queue");
+    let result = match rx.recv_timeout(Duration::from_millis(75)) {
+        Ok(result) => result,
+        Err(error) => {
+            release_after_timeout.store(true, Ordering::Release);
+            runner.join().expect("runner cleanup after timeout");
+            panic!("partial multi admission entered blocking owner Drop: {error}");
+        }
+    };
+    assert!(matches!(
+        result,
+        Err(RunToShutdownError::Shutdown(
+            TerminalShutdownError::Observation(ShutdownAndWaitError::RequestTimeout {
+                last: ShutdownRequestError::CommandFull { shard: Some(shard) }
+            })
+        )) if shard == ShardId::new(11)
+    ));
+
+    release_after_timeout.store(true, Ordering::Release);
+    runner.join().expect("runner thread");
+    let report = handle
+        .request_and_wait_report(Duration::from_secs(2))
+        .expect("escaped handle resumes partial multi admission");
+    report.ensure_clean().expect("every shard finishes cleanly");
+    assert_eq!(
+        report.topology().expect("terminal topology").shards().len(),
+        2
+    );
 }
 
 #[test]

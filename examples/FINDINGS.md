@@ -59,11 +59,18 @@ distinct from an observed `UncleanShutdownError`. No failure is flattened and
 the dual variant owns both values. The closure's panic continues unwinding;
 the owner's existing drop contract remains its panic teardown path. The
 explicit timeout is one budget for shutdown admission and terminal
-observation, not for workload execution or the subsequent owner drop.
+observation, not for workload execution. The consumed owner does not start a
+second blocking shutdown attempt after that deadline; an escaped handle can
+retry partial admission or observe terminal truth that arrives later. Such a
+handle retains shutdown control and must retry or be dropped; without one,
+owner consumption disconnects the remaining control senders and does not claim
+terminal truth.
 
 Framework tests cover clean authority settlement, workload-only,
 shutdown-only, dual failure, bounded terminal timeout, real registration and
-host-call early returns, panic propagation, and single-/multi-shard parity.
+host-call early returns, panic propagation, admission timeout without a second
+blocking owner drop, escaped-handle retry, partial multi-shard progress, and
+single-/multi-shard parity.
 Motivating example migrations remain separate follow-up cohorts.
 
 ### 2026-07-12 Copied service path flow migration

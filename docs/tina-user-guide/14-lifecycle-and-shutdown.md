@@ -373,17 +373,24 @@ let report = app.run_to_shutdown(Duration::from_secs(5), |app| {
 The closure makes early `?` safe: after success or failure, the owner requests
 shutdown, uses one total budget for admission and terminal observation, and
 requires an observed terminal report to prove clean. The budget does not cover
-the workload itself or the owner's ordinary `Drop` cleanup after the
-observation attempt. `RunToShutdownError<E>` distinguishes
+the workload itself. After the bounded attempt, consuming the owner does not
+start a second blocking shutdown attempt. A timed-out worker may finish later;
+an escaped shutdown handle can retry partial admission or observe the eventual
+cached report. That escaped handle retains shutdown control and must eventually
+retry or be dropped. Without one, owner consumption disconnects the remaining
+control senders and makes no claim that terminal truth was observed.
+`RunToShutdownError<E>` distinguishes
 workload-only, shutdown-only, and dual failure without converting either error
 to text. Its dual variant retains both typed values, and the `workload()` and
 `shutdown()` accessors expose both source chains.
 
 This runner does not replace an application's service-level drain protocol.
 Drive `Stop` / `Drain` inside the closure when the service contract requires it;
-the runner guarantees the final runtime-owner teardown. A workload panic still
-propagates as a panic. Unwinding uses the owner's existing `Drop` teardown
-rather than converting panic payloads into `RunToShutdownError`.
+the runner guarantees the bounded final runtime-owner shutdown attempt. A
+workload panic still propagates as a panic. Unwinding uses the owner's existing
+blocking `Drop` teardown because the runner disarms that path only after the
+workload closure returns and its bounded shutdown attempt completes; panic
+payloads are not converted into `RunToShutdownError`.
 
 Without the runner, every honest host has to reproduce the same four-way merge:
 
