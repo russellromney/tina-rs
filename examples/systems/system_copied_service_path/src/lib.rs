@@ -540,10 +540,7 @@ mod adversarial_tests {
 
         assert_eq!(
             call_error_kind(tina_runtime::CallError::Rejected(
-                CallRejectedReason::ForeignSystem {
-                expected,
-                actual,
-                },
+                CallRejectedReason::ForeignSystem { expected, actual },
             )),
             "work_rejected_foreign_system"
         );
@@ -630,13 +627,25 @@ mod adversarial_tests {
         });
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        while scope.snapshot().current != 1 && Instant::now() < deadline {
+        let driver_call_is_pending = || {
+            runtime
+                .topology()
+                .shard(gateway.requests.address().shard())
+                .is_some_and(|shard| shard.pending_driver_call_count() > 0)
+        };
+        while (scope.snapshot().current != 1 || !driver_call_is_pending())
+            && Instant::now() < deadline
+        {
             thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(
             scope.snapshot().current,
             1,
             "request never reached held work"
+        );
+        assert!(
+            driver_call_is_pending(),
+            "held sleep never reached driver admission"
         );
 
         shutdown_runtime(shutdown, runtime).expect("owner shutdown must be clean");
