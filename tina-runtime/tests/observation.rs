@@ -457,8 +457,14 @@ impl Crashy {
     ) -> Effect<Self> {
         match msg {
             CrashMsg::Boom => {
-                self.crashed.fetch_add(1, Ordering::Relaxed);
-                panic!("boom");
+                if self
+                    .crashed
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    panic!("boom");
+                }
+                noop()
             }
         }
     }
@@ -582,15 +588,23 @@ fn child_restarted_waiter_resolves_after_panic_and_restart() {
         })
         .expect("initial child spawn traced");
     assert_ne!(old_child, restarted.new_isolate);
+    let replacement = Address::<CrashMsg>::new_with_generation_in(
+        parent.system(),
+        restarted.new_shard,
+        restarted.new_isolate,
+        restarted.new_generation,
+    );
+    runtime
+        .send_and_observe(replacement, CrashMsg::Boom)
+        .expect("replacement remains live after its non-crashing bootstrap");
     let stale = Address::<CrashMsg>::new_in(parent.system(), parent.shard(), old_child);
     assert!(matches!(
         runtime.send_and_observe(stale, CrashMsg::Boom),
         Err(ThreadedSendObservedError::MailboxClosed)
     ));
-    // The child has crashed at least once. The replacement carries a
-    // fresh incarnation id (and generation policy is owned by the runtime,
-    // not by this test), so just check that the runtime saw the panic.
-    assert!(crashed.load(Ordering::Relaxed) >= 1);
+    // The shared gate permits exactly one crash across the whole replacement
+    // lineage, so the late-waiter assertion above cannot race a fresh restart.
+    assert_eq!(crashed.load(Ordering::Acquire), 1);
 
     let _ = runtime.shutdown();
 }
