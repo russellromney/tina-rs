@@ -292,6 +292,8 @@ where
     ///
     /// Panics when `shard` is not owned or when `construct` panics. Constructor
     /// panic consumes the shard-local deterministic id without adding an entry.
+    /// Sending through an address leaked by a panicking constructor follows the
+    /// simulator's unknown-isolate contract and panics; the id is never reused.
     #[allow(private_bounds)]
     pub fn register_with_capacity_using_on<I, Msg, Outbound, Ctor>(
         &mut self,

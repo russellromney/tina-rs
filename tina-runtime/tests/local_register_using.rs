@@ -133,7 +133,11 @@ fn explicit_multi_shard_constructor_panic_publishes_no_entry_and_does_not_reuse_
             identity: identity(address),
         },
     );
-    assert_ne!(leaked.isolate(), next.isolate());
+    assert_eq!(leaked.shard(), ShardId::new(9));
+    assert_eq!(leaked.generation(), AddressGeneration::new(0));
+    assert_eq!(next.shard(), leaked.shard());
+    assert_eq!(next.isolate().get(), leaked.isolate().get() + 1);
+    assert_eq!(next.generation(), AddressGeneration::new(0));
     assert!(matches!(
         runtime.try_send(leaked, WhoMsg::Who),
         Err(TrySendError::Closed(WhoMsg::Who))

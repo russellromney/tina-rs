@@ -236,7 +236,11 @@ where
     ///
     /// This mirrors `tina_runtime::Runtime::register_with_capacity_using`.
     /// Constructor panic propagates, consumes the deterministic isolate id,
-    /// and leaves no registered entry.
+    /// and leaves no registered entry. If the constructor leaks its address,
+    /// later simulator ingress through that address panics under the
+    /// simulator's existing unknown-isolate contract; the leaked address does
+    /// not acquire authority over a later registration because ids are never
+    /// reused.
     #[allow(private_bounds)]
     pub fn register_with_capacity_using<I, Msg, Outbound, Ctor>(
         &mut self,

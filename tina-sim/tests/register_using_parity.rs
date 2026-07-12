@@ -105,7 +105,11 @@ fn constructor_panic_publishes_no_entry_and_consumes_id() {
             me,
             observed: Rc::new(RefCell::new(Vec::new())),
         });
-    assert_ne!(leaked.isolate(), next.isolate());
+    assert_eq!(leaked.shard(), SimShard(7).id());
+    assert_eq!(leaked.generation().get(), 0);
+    assert_eq!(next.shard(), leaked.shard());
+    assert_eq!(next.isolate().get(), leaked.isolate().get() + 1);
+    assert_eq!(next.generation().get(), 0);
     assert!(
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = sim.try_send(leaked, Msg::Record);
