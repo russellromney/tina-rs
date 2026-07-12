@@ -14,7 +14,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use tina::prelude::*;
-use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntimeConfig};
+use tina_runtime::{DefaultThreadedMailboxFactory, LocalSystem};
 use tina_tokio_bridge::{BridgeHost, BridgeRequest};
 use tina_tower_bridge::{Service, TinaService, TinaTowerService};
 use tokio::net::TcpListener as TokioTcpListener;
@@ -100,35 +100,28 @@ async fn handle_socket(socket: WebSocket, svc: RoomService) {
     let _ = writer.await;
 }
 
-pub fn run() -> Report {
-    let mut host = BridgeHost::new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 32,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    );
+pub fn run() -> Result<Report, Box<dyn std::error::Error>> {
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+        .ingress_capacity(32)
+        .idle_wait(Duration::from_millis(1))
+        .try_build()?;
+    let mut host = BridgeHost::from_app(app);
     let bridge = host
         .register_bridge::<Room, RoomRequest, RoomReply, Infallible>(
             Room::default(),
             32,
             Duration::from_secs(2),
         )
-        .expect("register room bridge");
+        .map_err(|error| std::io::Error::other(format!("register room bridge: {error:?}")))?;
     let svc: RoomService = TinaTowerService::new(bridge);
 
     let tokio_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()
-        .expect("build tokio runtime");
+        .build()?;
 
-    let report = tokio_runtime.block_on(async move {
-        let listener = TokioTcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind tokio listener");
-        let addr = listener.local_addr().expect("tokio listener local addr");
+    let report: Result<Report, Box<dyn std::error::Error>> = tokio_runtime.block_on(async move {
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
 
         let app = Router::new().route("/ws", get(ws_upgrade)).with_state(svc);
 
@@ -140,14 +133,22 @@ pub fn run() -> Report {
 
         server.abort();
         let _ = server.await;
-        report
+        Ok(report)
     });
+    let report = report?;
 
     drop(tokio_runtime);
 
-    let _ = host
+    let shutdown = host
         .drain_and_shutdown(Duration::from_secs(2))
-        .expect("bridge host drains and shuts down cleanly");
+        .map_err(|error| std::io::Error::other(format!("shut down bridge host: {error:?}")))?;
+    if !shutdown.drained_within_timeout {
+        return Err(std::io::Error::other(format!(
+            "bridge host still had {} handles after drain timeout",
+            shutdown.outstanding_handles_at_shutdown
+        ))
+        .into());
+    }
 
-    report
+    Ok(report)
 }

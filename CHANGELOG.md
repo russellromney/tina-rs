@@ -19,6 +19,15 @@ This file records completed work.
   topology; a worker blocked indefinitely in user startup code may outlive the
   timeout error (documented on `StartupError::WorkerHandshakeTimeout`).
 
+### Canonical bridge-host construction
+
+- `BridgeHost` now accepts only a fallibly started `LocalSystem` through
+  `BridgeHost::from_app`; the panic-on-startup `BridgeHost::new` constructor
+  has been removed.
+- Tokio/Tower bridge examples and specimens configure ingress and worker wait
+  through `LocalSystem::single_shard(...).try_build()` and propagate
+  `StartupError` from production entry points.
+
 ### Split-service set / scope event helpers
 
 - `CallGroup::start_cancelable_service_event`,

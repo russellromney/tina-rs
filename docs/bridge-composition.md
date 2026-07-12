@@ -71,7 +71,10 @@ unwrap silently fails.
 **Fix:** use `BridgeHost::drain_and_shutdown(drain_timeout)`:
 
 ```rust,ignore
-let mut host = BridgeHost::new(SingleShard, DefaultThreadedMailboxFactory, config);
+let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+    .config(local_system_config)
+    .try_build()?;
+let mut host = BridgeHost::from_app(app);
 let bridge = host.register_bridge::<MyIsolate, Req, Resp, Infallible>(
     isolate, mailbox_capacity, per_call_timeout,
 )?;

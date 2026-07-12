@@ -14,8 +14,9 @@ use axum::routing::get;
 use tina::prelude::*;
 use tina::{Mailbox, TrySendError};
 use tina_runtime::{
-    FileId, LocalSystem, MailboxFactory, RuntimeEventKind, ThreadedRuntime, ThreadedRuntimeConfig,
-    file_close, file_create, file_fsync, file_read, file_size, file_write, sleep,
+    FileId, LocalSystem, LocalSystemConfigError, MailboxFactory, RuntimeEventKind, StartupError,
+    ThreadedRuntime, ThreadedRuntimeConfig, file_close, file_create, file_fsync, file_read,
+    file_size, file_write, sleep,
 };
 use tina_tokio_bridge::{
     BRIDGE_CAPABILITIES, BridgeBackpressure, BridgeError, BridgeHandle, BridgeHealth, BridgeHost,
@@ -148,6 +149,31 @@ fn bridge_capability_table_keeps_preserved_and_weakened_claims_explicit() {
 
 type LlamaBridge = BridgeHandle<BrushRequest, BrushReply, BridgeShard, BridgeMailboxFactory, ()>;
 
+fn make_bridge_host(command_capacity: usize) -> BridgeHost<BridgeShard, BridgeMailboxFactory> {
+    let app = LocalSystem::single_shard(BridgeShard, BridgeMailboxFactory)
+        .ingress_capacity(command_capacity)
+        .idle_wait(Duration::from_millis(1))
+        .try_build()
+        .expect("start local bridge app");
+    BridgeHost::from_app(app)
+}
+
+#[test]
+fn bridge_host_setup_preserves_typed_local_system_startup_errors() {
+    let error = match LocalSystem::single_shard(BridgeShard, BridgeMailboxFactory)
+        .ingress_capacity(0)
+        .try_build()
+    {
+        Ok(_) => panic!("zero ingress capacity must fail before bridge-host construction"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        StartupError::InvalidLocalSystemConfig(LocalSystemConfigError::ZeroIngressCapacity)
+    ));
+}
+
 async fn brush(State(bridge): State<LlamaBridge>) -> (StatusCode, String) {
     match bridge.call(BrushRequest { llama: "Tina" }).await {
         Ok(reply) => (StatusCode::OK, reply.line),
@@ -205,15 +231,7 @@ async fn llama_http_bridge_service_routes_axum_to_tower_bridge() {
 
 #[tokio::test]
 async fn bridge_host_registers_service_and_shutdown_requires_dropped_handles() {
-    let mut host = BridgeHost::new(
-        BridgeShard,
-        BridgeMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 8,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    );
+    let mut host = make_bridge_host(8);
     let bridge = host
         .register_bridge::<LlamaCounter, BrushRequest, BrushReply, Infallible>(
             LlamaCounter { brushes: 0 },
@@ -235,15 +253,7 @@ async fn bridge_host_registers_service_and_shutdown_requires_dropped_handles() {
     drop(bridge);
     let _ = host.try_shutdown().expect("retryable host shutdown");
 
-    let mut host = BridgeHost::new(
-        BridgeShard,
-        BridgeMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 8,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    );
+    let mut host = make_bridge_host(8);
     let bridge = host
         .register_bridge::<LlamaCounter, BrushRequest, BrushReply, Infallible>(
             LlamaCounter { brushes: 0 },
@@ -259,7 +269,8 @@ async fn bridge_host_registers_service_and_shutdown_requires_dropped_handles() {
 async fn bridge_host_can_be_built_from_canonical_local_system() {
     let app = LocalSystem::single_shard(BridgeShard, BridgeMailboxFactory)
         .ingress_capacity(8)
-        .build();
+        .try_build()
+        .expect("start local bridge app");
     let mut host = BridgeHost::from_app(app);
     let bridge = host
         .register_bridge::<LlamaCounter, BrushRequest, BrushReply, Infallible>(
@@ -695,15 +706,7 @@ impl FileBridgeWorker {
 
 #[tokio::test]
 async fn bridge_host_can_register_runtime_call_service_message_enum() {
-    let host = BridgeHost::new(
-        BridgeShard,
-        BridgeMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 8,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    );
+    let host = make_bridge_host(8);
     let bridge = host
         .register_bridge::<ScheduledWorker, BrushRequest, BrushReply, Infallible>(
             ScheduledWorker { completed: 0 },
@@ -725,15 +728,7 @@ async fn bridge_host_can_register_runtime_call_service_message_enum() {
 
 #[tokio::test]
 async fn bridge_hosted_service_can_use_runtime_owned_file_io() {
-    let host = BridgeHost::new(
-        BridgeShard,
-        BridgeMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 8,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    );
+    let host = make_bridge_host(8);
     let bridge = host
         .register_bridge::<FileBridgeWorker, BrushRequest, BrushReply, Infallible>(
             FileBridgeWorker,
@@ -842,15 +837,7 @@ async fn bridge_does_not_count_preflight_cancel_as_closed_after_caller_timeout()
 
 #[tokio::test]
 async fn bridge_host_skips_cancelled_queued_request_before_user_state_mutates() {
-    let host = BridgeHost::new(
-        BridgeShard,
-        BridgeMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 8,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    );
+    let host = make_bridge_host(8);
     let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (release_tx, release_rx) = mpsc::sync_channel(1);
     let blocker = host

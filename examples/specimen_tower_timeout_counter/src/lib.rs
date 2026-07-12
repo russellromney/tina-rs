@@ -55,9 +55,8 @@ pub struct Report {
 /// stack fires `Timeout` for the late requests. Both shapes are
 /// correct under the same middleware — the README documents why.
 pub fn assert_report_invariants(side: &str, report: &Report) {
-    let total = report.successful_count
-        + report.service_unavailable_count
-        + report.gateway_timeout_count;
+    let total =
+        report.successful_count + report.service_unavailable_count + report.gateway_timeout_count;
     assert_eq!(
         total, BURST,
         "{side}: every call should produce one outcome, got {report:?}",
@@ -66,5 +65,8 @@ pub fn assert_report_invariants(side: &str, report: &Report) {
         report.successful_count > 0,
         "{side}: at least one call should succeed, got {report:?}",
     );
-    assert!(report.exit_clean, "{side}: expected exit_clean, got {report:?}");
+    assert!(
+        report.exit_clean,
+        "{side}: expected exit_clean, got {report:?}"
+    );
 }

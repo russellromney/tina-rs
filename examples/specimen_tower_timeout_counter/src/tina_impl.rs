@@ -9,7 +9,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina_runtime::{DefaultThreadedMailboxFactory, SleepReply, sleep};
+use tina_runtime::{DefaultThreadedMailboxFactory, LocalSystem, SleepReply, sleep};
 use tina_tokio_bridge::{BridgeError, BridgeHost, BridgeMessage, BridgeRequest, BridgeResponder};
 use tina_tower_bridge::TinaTowerService;
 use tokio::runtime::Builder;
@@ -115,11 +115,9 @@ pub fn run() -> anyhow::Result<Report> {
         .enable_all()
         .build()?;
     rt.block_on(async {
-        let mut host = BridgeHost::new(
-            SingleShard,
-            DefaultThreadedMailboxFactory,
-            Default::default(),
-        );
+        let app =
+            LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+        let mut host = BridgeHost::from_app(app);
         let bridge = host
             .register_bridge::<Counter, BrushRequest, BrushReply, Infallible>(
                 Counter {
@@ -152,14 +150,21 @@ pub fn run() -> anyhow::Result<Report> {
                 Outcome::GatewayTimeout => report.gateway_timeout_count += 1,
             }
         }
-        report.exit_clean = true;
-
         // Bridge lifecycle: the helper waits for in-flight clones to
         // drop, then shuts the runtime down. With JoinSet drained, the
         // only remaining handle is the one inside `stack`; dropping
         // `stack` releases it.
         drop(stack);
-        let _ = host.drain_and_shutdown(Duration::from_secs(2));
+        let shutdown = host
+            .drain_and_shutdown(Duration::from_secs(2))
+            .map_err(|error| anyhow::anyhow!("shut down bridge host: {error:?}"))?;
+        if !shutdown.drained_within_timeout {
+            anyhow::bail!(
+                "bridge host still had {} handles after drain timeout",
+                shutdown.outstanding_handles_at_shutdown
+            );
+        }
+        report.exit_clean = true;
 
         Ok(report)
     })
