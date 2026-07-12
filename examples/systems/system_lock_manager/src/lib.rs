@@ -3,8 +3,7 @@
 //!
 //! What this specimen pulls on:
 //!
-//! - [`PendingReplies`] for parked acquire-callers, keyed by waiter id.
-//!   Caps total parked waiters across every key in one bounded table.
+//! - [`SharedWork`] for bounded FIFO acquire waiters, keyed by lock key.
 //! - [`RequestCall`] for `Acquire` / `Release` / `Renew` / `Stats` caller
 //!   authority, with private internal `LeaseExpired` events outside the public
 //!   request lane.
@@ -21,13 +20,13 @@
 //!   one parked first.
 //! - Per-key wait queue length is capped (`max_waiters_per_key`). Hits
 //!   reply `Busy` without consuming a `pending` slot.
-//! - Total parked waiters across keys is capped by `pending_capacity`.
-//!   Hits reply `Busy` and bump `pending.full_rejects()`.
+//! - Total parked waiters across keys is capped by `waiter_capacity`.
+//!   Hits reply `Busy(GlobalFull)`.
 //! - Active key count is capped by `max_keys`. A first-time acquire on a
 //!   new key past the cap replies `KeyspaceFull`. Idle keys (no holder,
 //!   no waiters) are removed.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
@@ -35,14 +34,17 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, PendingReplies, ThreadedRuntime, sleep,
+    CallError, CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, SharedWork,
+    SharedWorkError, SleepReply, request_effect_after_shared_wait, sleep,
 };
+
+type App = LocalSystem<SingleShard, DefaultThreadedMailboxFactory>;
 
 /// Tunables for one specimen run.
 #[derive(Debug, Clone, Copy)]
 pub struct RunConfig {
     /// Total parked acquire-callers across every key.
-    pub pending_capacity: usize,
+    pub waiter_capacity: usize,
     /// Maximum waiters parked behind a single held key.
     pub max_waiters_per_key: usize,
     /// Maximum number of keys with a holder or waiters at once.
@@ -58,7 +60,7 @@ pub struct RunConfig {
 impl Default for RunConfig {
     fn default() -> Self {
         Self {
-            pending_capacity: 16,
+            waiter_capacity: 16,
             max_waiters_per_key: 8,
             max_keys: 64,
             mailbox: 64,
@@ -84,8 +86,8 @@ pub enum LockReply {
     Renewed {
         holder_id: u64,
     },
-    /// Wait queue rejected the caller (per-key cap or pending box full).
-    Busy,
+    /// Wait queue rejected the caller at a typed boundedness rail.
+    Busy(WaitBusyReason),
     /// Release/renew arrived for a holder that no longer owns the key.
     StaleHandle,
     /// First-time acquire on a new key while the keyspace was full.
@@ -93,12 +95,20 @@ pub enum LockReply {
     Stats(LockStats),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitBusyReason {
+    /// Total parked-caller capacity across every key is exhausted.
+    GlobalFull,
+    /// This key's FIFO is at its configured limit.
+    KeyFull,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LockStats {
     pub keys_live: usize,
     pub waiters_live: usize,
     pub waiters_high_water: usize,
-    pub pending_full_rejects: u64,
+    pub global_full_rejects: u64,
     pub per_key_full_rejects: u64,
     pub keyspace_full_rejects: u64,
     pub acquires_granted: u64,
@@ -109,6 +119,9 @@ pub struct LockStats {
     pub stale_renew_rejects: u64,
     pub expiries: u64,
     pub stale_expiries_ignored: u64,
+    pub timer_errors: u64,
+    pub last_timer_error: Option<CallError>,
+    pub waiters_reclaimed: u64,
 }
 
 #[derive(Debug)]
@@ -117,6 +130,7 @@ enum LockEvent {
         key: String,
         holder_id: u64,
         expiry_token: u64,
+        result: SleepReply,
     },
 }
 
@@ -131,15 +145,12 @@ enum LockRequest {
 struct LockState {
     holder_id: u64,
     expiry_token: u64,
-    waiters: VecDeque<u64>,
 }
 
 struct LockManager {
     lease: Duration,
-    max_waiters_per_key: usize,
     max_keys: usize,
-    pending: PendingReplies<u64, LockReply>,
-    next_waiter_id: u64,
+    waiters: SharedWork<String, LockReply>,
     next_holder_id: u64,
     locks: HashMap<String, LockState>,
     stats: LockStats,
@@ -157,7 +168,8 @@ impl LockManager {
                 key,
                 holder_id,
                 expiry_token,
-            } => self.lease_expired(key, holder_id, expiry_token),
+                result,
+            } => self.lease_expired(key, holder_id, expiry_token, result),
         }
     }
 
@@ -176,14 +188,12 @@ impl LockManager {
 }
 
 impl LockManager {
-    pub fn new(config: RunConfig) -> Self {
+    fn new(config: RunConfig) -> Self {
         Self {
             lease: Duration::from_millis(config.lease_ms),
-            max_waiters_per_key: config.max_waiters_per_key,
             max_keys: config.max_keys,
-            pending: PendingReplies::with_capacity(config.pending_capacity)
-                .named("system_lock_manager.pending"),
-            next_waiter_id: 1,
+            waiters: SharedWork::with_key_limit(config.waiter_capacity, config.max_waiters_per_key)
+                .named("system_lock_manager.waiters"),
             next_holder_id: 0,
             locks: HashMap::new(),
             stats: LockStats::default(),
@@ -199,38 +209,15 @@ impl LockManager {
             return self.grant_new(key, call);
         }
 
-        let waiters_len = self.locks.get(&key).expect("key present").waiters.len();
-        if waiters_len >= self.max_waiters_per_key {
-            self.stats.per_key_full_rejects += 1;
-            return call.reply(LockReply::Busy);
-        }
-
-        let waiter_id = self.next_waiter_id;
-        self.next_waiter_id += 1;
-        call.capture(|request| {
-            let slot = request.into_deferred();
-            if let Err(error) = self.pending.try_insert(waiter_id, slot) {
-                return match error {
-                    tina_runtime::PendingRepliesInsertError::Full(_, slot) => {
-                        reply_to::<Self>(slot, LockReply::Busy)
-                    }
-                    tina_runtime::PendingRepliesInsertError::DuplicateKey(_, slot) => {
-                        // waiter ids are minted monotonically, so this branch
-                        // is unreachable in practice; surface it loudly if it
-                        // ever fires.
-                        reply_to::<Self>(slot, LockReply::Busy)
-                    }
-                };
+        match self.waiters.wait(key, call) {
+            Ok((_ticket, permit)) => request_effect_after_shared_wait(permit, noop()),
+            Err(SharedWorkError::Full { call, .. }) => {
+                call.reply(LockReply::Busy(WaitBusyReason::GlobalFull))
             }
-
-            self.locks
-                .get_mut(&key)
-                .expect("key present")
-                .waiters
-                .push_back(waiter_id);
-            self.update_waiters_high_water();
-            noop()
-        })
+            Err(SharedWorkError::KeyFull { call, .. }) => {
+                call.reply(LockReply::Busy(WaitBusyReason::KeyFull))
+            }
+        }
     }
 
     fn release(&mut self, handle: LockHandle, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
@@ -266,16 +253,28 @@ impl LockManager {
         call.reply_and(
             LockReply::Renewed { holder_id },
             vec![
-                sleep(lease).then_service_event(move |_| LockEvent::LeaseExpired {
+                sleep(lease).then_service_event(move |result| LockEvent::LeaseExpired {
                     key: key_for_msg,
                     holder_id,
                     expiry_token: token,
+                    result,
                 }),
             ],
         )
     }
 
-    fn lease_expired(&mut self, key: String, holder_id: u64, expiry_token: u64) -> Effect<Self> {
+    fn lease_expired(
+        &mut self,
+        key: String,
+        holder_id: u64,
+        expiry_token: u64,
+        result: SleepReply,
+    ) -> Effect<Self> {
+        let timer_error = result.err();
+        if let Some(error) = timer_error {
+            self.stats.timer_errors += 1;
+            self.stats.last_timer_error = Some(error);
+        }
         let Some(entry) = self.locks.get(&key) else {
             self.stats.stale_expiries_ignored += 1;
             return noop();
@@ -284,7 +283,9 @@ impl LockManager {
             self.stats.stale_expiries_ignored += 1;
             return noop();
         }
-        self.stats.expiries += 1;
+        if timer_error.is_none() {
+            self.stats.expiries += 1;
+        }
         let effects = self.hand_off(key);
         if effects.is_empty() {
             noop()
@@ -293,47 +294,48 @@ impl LockManager {
         }
     }
 
-    /// Replace the holder for `key` with the next waiter, or drop the
-    /// entry if no waiters remain. Skips waiters whose caller went away
-    /// (their `pending` slot was already reclaimed).
+    /// Replace the holder for `key` with the oldest live waiter, or drop the
+    /// entry if none remain. `SharedWork` reclaims closed callers while
+    /// selecting the next FIFO slot.
     fn hand_off(&mut self, key: String) -> Vec<Effect<Self>> {
-        loop {
-            let Some(entry) = self.locks.get_mut(&key) else {
-                return Vec::new();
-            };
-            let Some(waiter_id) = entry.waiters.pop_front() else {
-                self.locks.remove(&key);
-                return Vec::new();
-            };
-            let Some(slot) = self.pending.take(&waiter_id) else {
-                // Caller went away; try the next waiter.
-                continue;
-            };
-            self.next_holder_id += 1;
-            let new_holder_id = self.next_holder_id;
-            entry.holder_id = new_holder_id;
-            entry.expiry_token = entry.expiry_token.wrapping_add(1);
-            let token = entry.expiry_token;
-            let key_for_msg = key.clone();
-            let lease = self.lease;
-            self.stats.acquires_handed_off += 1;
-            return vec![
-                reply_to::<Self>(
-                    slot,
-                    LockReply::Granted {
-                        handle: LockHandle {
-                            key: key.clone(),
-                            holder_id: new_holder_id,
-                        },
+        let Some(slot) = self.waiters.take_next(&key) else {
+            self.locks.remove(&key);
+            return Vec::new();
+        };
+        self.install_handoff(key, slot)
+    }
+
+    fn install_handoff(
+        &mut self,
+        key: String,
+        slot: DeferredReply<LockReply>,
+    ) -> Vec<Effect<Self>> {
+        let entry = self.locks.get_mut(&key).expect("held key remains present");
+        self.next_holder_id += 1;
+        let new_holder_id = self.next_holder_id;
+        entry.holder_id = new_holder_id;
+        entry.expiry_token = entry.expiry_token.wrapping_add(1);
+        let token = entry.expiry_token;
+        let key_for_msg = key.clone();
+        let lease = self.lease;
+        self.stats.acquires_handed_off += 1;
+        vec![
+            reply_to::<Self>(
+                slot,
+                LockReply::Granted {
+                    handle: LockHandle {
+                        key: key.clone(),
+                        holder_id: new_holder_id,
                     },
-                ),
-                sleep(lease).then_service_event(move |_| LockEvent::LeaseExpired {
-                    key: key_for_msg,
-                    holder_id: new_holder_id,
-                    expiry_token: token,
-                }),
-            ];
-        }
+                },
+            ),
+            sleep(lease).then_service_event(move |result| LockEvent::LeaseExpired {
+                key: key_for_msg,
+                holder_id: new_holder_id,
+                expiry_token: token,
+                result,
+            }),
+        ]
     }
 
     fn grant_new(&mut self, key: String, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
@@ -344,7 +346,6 @@ impl LockManager {
             LockState {
                 holder_id,
                 expiry_token: 1,
-                waiters: VecDeque::new(),
             },
         );
         self.stats.acquires_granted += 1;
@@ -355,27 +356,24 @@ impl LockManager {
                 handle: LockHandle { key, holder_id },
             },
             vec![
-                sleep(lease).then_service_event(move |_| LockEvent::LeaseExpired {
+                sleep(lease).then_service_event(move |result| LockEvent::LeaseExpired {
                     key: key_for_msg,
                     holder_id,
                     expiry_token: 1,
+                    result,
                 }),
             ],
         )
     }
 
-    fn update_waiters_high_water(&mut self) {
-        let live: usize = self.locks.values().map(|e| e.waiters.len()).sum();
-        if live > self.stats.waiters_high_water {
-            self.stats.waiters_high_water = live;
-        }
-    }
-
     fn snapshot(&self) -> LockStats {
         let mut s = self.stats.clone();
         s.keys_live = self.locks.len();
-        s.waiters_live = self.locks.values().map(|e| e.waiters.len()).sum();
-        s.pending_full_rejects = self.pending.full_rejects();
+        s.waiters_live = self.waiters.len();
+        s.waiters_high_water = self.waiters.high_water();
+        s.global_full_rejects = self.waiters.full_rejects();
+        s.per_key_full_rejects = self.waiters.key_full_rejects();
+        s.waiters_reclaimed = self.waiters.reclaimed();
         s
     }
 }
@@ -388,7 +386,10 @@ pub struct RunReport {
     pub expiry_handoff: ExpiryHandoffReport,
     pub renewal: RenewalReport,
     pub stale_release: StaleReleaseReport,
-    pub busy_overflow: BusyOverflowReport,
+    pub per_key_overflow: PerKeyOverflowReport,
+    pub global_overflow: GlobalOverflowReport,
+    pub caller_gone_refill: CallerGoneRefillReport,
+    pub keyspace_overflow: KeyspaceOverflowReport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -410,6 +411,7 @@ pub struct ExpiryHandoffReport {
 pub struct RenewalReport {
     pub still_held_after_original_lease: bool,
     pub final_release_ok: bool,
+    pub old_handle_renew_was_stale: bool,
     pub stats: LockStats,
 }
 
@@ -420,18 +422,41 @@ pub struct StaleReleaseReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BusyOverflowReport {
+pub struct PerKeyOverflowReport {
     pub busy: usize,
     pub stats: LockStats,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlobalOverflowReport {
+    pub global_full: bool,
+    pub stats: LockStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerGoneRefillReport {
+    pub first_timed_out: bool,
+    pub next_waiter_granted: bool,
+    pub stats: LockStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyspaceOverflowReport {
+    pub keyspace_full: bool,
+    pub stats: LockStats,
+}
+
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
+    validate_config(config)?;
     Ok(RunReport {
         fifo: run_fifo(config)?,
         expiry_handoff: run_expiry_handoff(config)?,
         renewal: run_renewal(config)?,
         stale_release: run_stale_release(config)?,
-        busy_overflow: run_busy_overflow(config)?,
+        per_key_overflow: run_per_key_overflow(config)?,
+        global_overflow: run_global_overflow(config)?,
+        caller_gone_refill: run_caller_gone_refill(config)?,
+        keyspace_overflow: run_keyspace_overflow(config)?,
     })
 }
 
@@ -439,15 +464,13 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
 /// remaining three park in FIFO order. Each holder releases as soon as
 /// it sees `Granted`, so the queue should drain in admission order.
 pub fn run_fifo(config: RunConfig) -> anyhow::Result<FifoReport> {
+    validate_config(config)?;
     // Use a long lease so expiry never fires during the test.
     let cfg = RunConfig {
         lease_ms: 5_000,
         ..config
     };
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
+    let runtime = start(cfg)?;
     let shutdown = runtime.shutdown_handle();
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
@@ -458,11 +481,7 @@ pub fn run_fifo(config: RunConfig) -> anyhow::Result<FifoReport> {
 
     // Hold the lock from the host first so every contender parks before
     // any of them can be granted.
-    let CallOutcome::Replied(LockReply::Granted { handle: holder }) = runtime
-        .call_blocking_request(lockmgr, LockRequest::Acquire { key: key.clone() }, timeout)?
-    else {
-        anyhow::bail!("primary acquire did not return Granted");
-    };
+    let holder = acquire_handle(&runtime, lockmgr, &key, timeout)?;
 
     let contenders = 4u32;
     // Each contender admits itself in a fixed order via a sequential
@@ -494,24 +513,19 @@ pub fn run_fifo(config: RunConfig) -> anyhow::Result<FifoReport> {
             thread::sleep(Duration::from_millis(20));
             *gate.lock().expect("gate") = id + 1;
 
-            match rt.call_blocking_request(
+            let handle = expect_granted(rt.call_blocking_request(
                 lockmgr,
                 LockRequest::Acquire {
                     key: key_for_thread.clone(),
                 },
                 timeout,
-            )? {
-                CallOutcome::Replied(LockReply::Granted { handle }) => {
-                    granted.lock().expect("granted").push(id);
-                    let _ = rt.call_blocking_request(
-                        lockmgr,
-                        LockRequest::Release { handle },
-                        timeout,
-                    )?;
-                    Ok(())
-                }
-                other => anyhow::bail!("unexpected acquire outcome: {other:?}"),
-            }
+            )?)?;
+            granted.lock().expect("granted").push(id);
+            expect_released(rt.call_blocking_request(
+                lockmgr,
+                LockRequest::Release { handle },
+                timeout,
+            )?)
         }));
     }
 
@@ -519,8 +533,11 @@ pub fn run_fifo(config: RunConfig) -> anyhow::Result<FifoReport> {
     // primary holder. Otherwise the first releaser's grant could race
     // the slowest contender's Acquire.
     wait_for_waiters(&runtime, lockmgr, contenders as usize, timeout)?;
-    let _ =
-        runtime.call_blocking_request(lockmgr, LockRequest::Release { handle: holder }, timeout)?;
+    expect_released(runtime.call_blocking_request(
+        lockmgr,
+        LockRequest::Release { handle: holder },
+        timeout,
+    )?)?;
 
     for t in threads {
         t.join().expect("contender thread")?;
@@ -539,24 +556,18 @@ pub fn run_fifo(config: RunConfig) -> anyhow::Result<FifoReport> {
 /// the lease elapses, the parked caller is granted automatically and the
 /// original release is rejected as stale.
 pub fn run_expiry_handoff(config: RunConfig) -> anyhow::Result<ExpiryHandoffReport> {
+    validate_config(config)?;
     let cfg = RunConfig {
         lease_ms: 100,
         ..config
     };
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
+    let runtime = start(cfg)?;
     let shutdown = runtime.shutdown_handle();
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
     let key = "expire-key".to_string();
 
-    let CallOutcome::Replied(LockReply::Granted { handle: original }) = runtime
-        .call_blocking_request(lockmgr, LockRequest::Acquire { key: key.clone() }, timeout)?
-    else {
-        anyhow::bail!("first acquire did not return Granted");
-    };
+    let original = acquire_handle(&runtime, lockmgr, &key, timeout)?;
 
     let rt2 = Arc::clone(&runtime);
     let key_for_waiter = key.clone();
@@ -576,30 +587,29 @@ pub fn run_expiry_handoff(config: RunConfig) -> anyhow::Result<ExpiryHandoffRepo
     // gets handed the lock without us doing anything.
     thread::sleep(Duration::from_millis(cfg.lease_ms + 80));
 
-    let waiter_handle = match waiter.join().expect("waiter thread")? {
-        CallOutcome::Replied(LockReply::Granted { handle }) => handle,
-        other => anyhow::bail!("waiter did not get Granted: {other:?}"),
-    };
+    let waiter_handle = expect_granted(waiter.join().expect("waiter thread")?)?;
     let waiter_received_grant = waiter_handle.key == key;
 
     // Original release should now be stale.
-    let stale_outcome = runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Release { handle: original },
-        timeout,
+    let stale_reply = expect_reply(
+        runtime.call_blocking_request(
+            lockmgr,
+            LockRequest::Release { handle: original },
+            timeout,
+        )?,
+        "stale release",
     )?;
-    let original_release_was_stale =
-        matches!(stale_outcome, CallOutcome::Replied(LockReply::StaleHandle));
+    let original_release_was_stale = matches!(stale_reply, LockReply::StaleHandle);
 
     // Tidy up: release the new holder. We still want to confirm normal
     // release works after a hand-off chain.
-    let _ = runtime.call_blocking_request(
+    expect_released(runtime.call_blocking_request(
         lockmgr,
         LockRequest::Release {
             handle: waiter_handle,
         },
         timeout,
-    )?;
+    )?)?;
 
     let stats = stats(&runtime, lockmgr, timeout)?;
     shutdown_runtime(shutdown, runtime)?;
@@ -613,27 +623,18 @@ pub fn run_expiry_handoff(config: RunConfig) -> anyhow::Result<ExpiryHandoffRepo
 /// Acquire, queue a waiter, renew before the lease expires, then verify
 /// the waiter is still parked once the original lease window is past.
 pub fn run_renewal(config: RunConfig) -> anyhow::Result<RenewalReport> {
+    validate_config(config)?;
     let cfg = RunConfig {
         lease_ms: 120,
         ..config
     };
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
+    let runtime = start(cfg)?;
     let shutdown = runtime.shutdown_handle();
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
     let key = "renew-key".to_string();
 
-    let CallOutcome::Replied(LockReply::Granted { handle }) = runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Acquire { key: key.clone() },
-        timeout,
-    )?
-    else {
-        anyhow::bail!("acquire did not return Granted");
-    };
+    let handle = acquire_handle(&runtime, lockmgr, &key, timeout)?;
 
     let waiter_done = Arc::new(Mutex::new(false));
     let waiter_done_for_thread = Arc::clone(&waiter_done);
@@ -655,14 +656,17 @@ pub fn run_renewal(config: RunConfig) -> anyhow::Result<RenewalReport> {
 
     // Renew at half-lease; waiter must remain parked.
     thread::sleep(Duration::from_millis(cfg.lease_ms / 2));
-    match runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Renew {
-            handle: handle.clone(),
-        },
-        timeout,
+    match expect_reply(
+        runtime.call_blocking_request(
+            lockmgr,
+            LockRequest::Renew {
+                handle: handle.clone(),
+            },
+            timeout,
+        )?,
+        "renew",
     )? {
-        CallOutcome::Replied(LockReply::Renewed { .. }) => {}
+        LockReply::Renewed { .. } => {}
         other => anyhow::bail!("renew did not return Renewed: {other:?}"),
     }
 
@@ -671,28 +675,41 @@ pub fn run_renewal(config: RunConfig) -> anyhow::Result<RenewalReport> {
     let still_held_after_original_lease = !*waiter_done.lock().expect("waiter done");
 
     // Final release should drain the waiter.
-    let final_release_ok = matches!(
-        runtime.call_blocking_request(lockmgr, LockRequest::Release { handle }, timeout)?,
-        CallOutcome::Replied(LockReply::Released)
+    let saved = handle.clone();
+    expect_released(runtime.call_blocking_request(
+        lockmgr,
+        LockRequest::Release { handle },
+        timeout,
+    )?)?;
+    let final_release_ok = true;
+
+    let old_handle_renew_was_stale = matches!(
+        expect_reply(
+            runtime.call_blocking_request(
+                lockmgr,
+                LockRequest::Renew { handle: saved },
+                timeout
+            )?,
+            "stale renew",
+        )?,
+        LockReply::StaleHandle
     );
 
-    let waiter_handle = match waiter.join().expect("waiter thread")? {
-        CallOutcome::Replied(LockReply::Granted { handle }) => handle,
-        other => anyhow::bail!("waiter did not get Granted after release: {other:?}"),
-    };
-    let _ = runtime.call_blocking_request(
+    let waiter_handle = expect_granted(waiter.join().expect("waiter thread")?)?;
+    expect_released(runtime.call_blocking_request(
         lockmgr,
         LockRequest::Release {
             handle: waiter_handle,
         },
         timeout,
-    )?;
+    )?)?;
 
     let stats = stats(&runtime, lockmgr, timeout)?;
     shutdown_runtime(shutdown, runtime)?;
     Ok(RenewalReport {
         still_held_after_original_lease,
         final_release_ok,
+        old_handle_renew_was_stale,
         stats,
     })
 }
@@ -700,32 +717,29 @@ pub fn run_renewal(config: RunConfig) -> anyhow::Result<RenewalReport> {
 /// Acquire, release, then release the same handle again. The second
 /// release must be rejected as stale.
 pub fn run_stale_release(config: RunConfig) -> anyhow::Result<StaleReleaseReport> {
+    validate_config(config)?;
     let cfg = RunConfig {
         lease_ms: 5_000,
         ..config
     };
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
+    let runtime = start(cfg)?;
     let shutdown = runtime.shutdown_handle();
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
     let key = "stale-key".to_string();
 
-    let CallOutcome::Replied(LockReply::Granted { handle }) = runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Acquire { key: key.clone() },
-        timeout,
-    )?
-    else {
-        anyhow::bail!("acquire did not return Granted");
-    };
+    let handle = acquire_handle(&runtime, lockmgr, &key, timeout)?;
     let saved = handle.clone();
-    let _ = runtime.call_blocking_request(lockmgr, LockRequest::Release { handle }, timeout)?;
-    let second =
-        runtime.call_blocking_request(lockmgr, LockRequest::Release { handle: saved }, timeout)?;
-    let second_release_was_stale = matches!(second, CallOutcome::Replied(LockReply::StaleHandle));
+    expect_released(runtime.call_blocking_request(
+        lockmgr,
+        LockRequest::Release { handle },
+        timeout,
+    )?)?;
+    let second = expect_reply(
+        runtime.call_blocking_request(lockmgr, LockRequest::Release { handle: saved }, timeout)?,
+        "second release",
+    )?;
+    let second_release_was_stale = matches!(second, LockReply::StaleHandle);
 
     let stats = stats(&runtime, lockmgr, timeout)?;
     shutdown_runtime(shutdown, runtime)?;
@@ -737,60 +751,54 @@ pub fn run_stale_release(config: RunConfig) -> anyhow::Result<StaleReleaseReport
 
 /// Hold one key, then burst more contenders than the per-key cap allows.
 /// Overflow callers must see `Busy`, not park silently.
-pub fn run_busy_overflow(config: RunConfig) -> anyhow::Result<BusyOverflowReport> {
+pub fn run_per_key_overflow(config: RunConfig) -> anyhow::Result<PerKeyOverflowReport> {
+    validate_config(config)?;
     let cfg = RunConfig {
         lease_ms: 5_000,
         max_waiters_per_key: 2,
         ..config
     };
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
+    let runtime = start(cfg)?;
     let shutdown = runtime.shutdown_handle();
     let lockmgr = register(&runtime, cfg)?;
     let timeout = Duration::from_millis(cfg.call_timeout_ms);
     let key = "busy-key".to_string();
 
-    let CallOutcome::Replied(LockReply::Granted { handle: holder }) = runtime
-        .call_blocking_request(lockmgr, LockRequest::Acquire { key: key.clone() }, timeout)?
-    else {
-        anyhow::bail!("primary acquire did not return Granted");
-    };
+    let holder = acquire_handle(&runtime, lockmgr, &key, timeout)?;
 
     // 2 admitted to the queue + 3 overflow callers that must see Busy.
     let overflow = 3;
     let contenders = (cfg.max_waiters_per_key + overflow) as u32;
     let barrier = Arc::new(Barrier::new(contenders as usize + 1));
-    let outcomes = Arc::new(Mutex::new(Vec::with_capacity(contenders as usize)));
     let mut threads = Vec::with_capacity(contenders as usize);
     for _ in 0..contenders {
         let rt = Arc::clone(&runtime);
         let gate = Arc::clone(&barrier);
-        let out = Arc::clone(&outcomes);
         let key_for_thread = key.clone();
-        threads.push(thread::spawn(move || {
-            gate.wait();
-            let outcome = rt.call_blocking_request(
-                lockmgr,
-                LockRequest::Acquire {
-                    key: key_for_thread,
-                },
-                timeout,
-            );
-            // Granted callers release immediately so the per-key
-            // hand-off chain drains within the call timeout.
-            if let Ok(CallOutcome::Replied(LockReply::Granted { handle })) = &outcome {
-                let _ = rt.call_blocking_request(
+        threads.push(thread::spawn(
+            move || -> anyhow::Result<CallOutcome<LockReply>> {
+                gate.wait();
+                let outcome = rt.call_blocking_request(
                     lockmgr,
-                    LockRequest::Release {
-                        handle: handle.clone(),
+                    LockRequest::Acquire {
+                        key: key_for_thread,
                     },
                     timeout,
-                );
-            }
-            out.lock().expect("outcomes").push(outcome);
-        }));
+                )?;
+                // Granted callers release immediately so the per-key
+                // hand-off chain drains within the call timeout.
+                if let CallOutcome::Replied(LockReply::Granted { handle }) = &outcome {
+                    expect_released(rt.call_blocking_request(
+                        lockmgr,
+                        LockRequest::Release {
+                            handle: handle.clone(),
+                        },
+                        timeout,
+                    )?)?;
+                }
+                Ok(outcome)
+            },
+        ));
     }
     barrier.wait();
 
@@ -810,32 +818,216 @@ pub fn run_busy_overflow(config: RunConfig) -> anyhow::Result<BusyOverflowReport
     let _ =
         runtime.call_blocking_request(lockmgr, LockRequest::Release { handle: holder }, timeout)?;
 
-    for t in threads {
-        t.join().expect("contender");
-    }
-
     let mut busy = 0;
-    for outcome in outcomes.lock().expect("outcomes").iter() {
-        match outcome {
-            Ok(CallOutcome::Replied(LockReply::Busy)) => busy += 1,
-            Ok(CallOutcome::Replied(LockReply::Granted { .. })) => {
+    for contender in threads {
+        match contender.join().expect("contender")? {
+            CallOutcome::Replied(LockReply::Busy(WaitBusyReason::KeyFull)) => busy += 1,
+            CallOutcome::Replied(LockReply::Busy(WaitBusyReason::GlobalFull)) => {
+                anyhow::bail!("per-key overflow unexpectedly hit the global cap")
+            }
+            CallOutcome::Replied(LockReply::Granted { .. }) => {
                 // Already released inside the worker thread.
             }
-            other => anyhow::bail!("unexpected busy-overflow outcome: {other:?}"),
+            CallOutcome::Replied(reply) => {
+                anyhow::bail!("unexpected per-key overflow reply: {reply:?}")
+            }
+            CallOutcome::Full => anyhow::bail!("per-key overflow acquire mailbox was full"),
+            CallOutcome::Closed => anyhow::bail!("lock manager closed during per-key overflow"),
+            CallOutcome::Timeout => anyhow::bail!("per-key overflow acquire timed out"),
+            CallOutcome::Rejected(reason) => {
+                anyhow::bail!("per-key overflow acquire rejected: {reason:?}")
+            }
         }
     }
 
     let stats = stats(&runtime, lockmgr, timeout)?;
     shutdown_runtime(shutdown, runtime)?;
-    Ok(BusyOverflowReport { busy, stats })
+    Ok(PerKeyOverflowReport { busy, stats })
+}
+
+/// Saturate the global waiter table across two held keys. The second key is
+/// below its per-key limit, so rejection must remain specifically global.
+pub fn run_global_overflow(config: RunConfig) -> anyhow::Result<GlobalOverflowReport> {
+    validate_config(config)?;
+    let cfg = RunConfig {
+        lease_ms: 5_000,
+        waiter_capacity: 1,
+        max_waiters_per_key: 2,
+        ..config
+    };
+    let runtime = start(cfg)?;
+    let shutdown = runtime.shutdown_handle();
+    let lockmgr = register(&runtime, cfg)?;
+    let timeout = Duration::from_millis(cfg.call_timeout_ms);
+
+    let first = acquire_handle(&runtime, lockmgr, "global-a", timeout)?;
+    let second = acquire_handle(&runtime, lockmgr, "global-b", timeout)?;
+    let rt = Arc::clone(&runtime);
+    let waiter = thread::spawn(move || {
+        rt.call_blocking_request(
+            lockmgr,
+            LockRequest::Acquire {
+                key: "global-a".into(),
+            },
+            timeout,
+        )
+    });
+    wait_for_waiters(&runtime, lockmgr, 1, timeout)?;
+
+    let global_full = matches!(
+        expect_reply(
+            runtime.call_blocking_request(
+                lockmgr,
+                LockRequest::Acquire {
+                    key: "global-b".into(),
+                },
+                timeout,
+            )?,
+            "global overflow acquire",
+        )?,
+        LockReply::Busy(WaitBusyReason::GlobalFull)
+    );
+    expect_released(runtime.call_blocking_request(
+        lockmgr,
+        LockRequest::Release { handle: first },
+        timeout,
+    )?)?;
+    let granted = expect_granted(waiter.join().expect("global waiter")?)?;
+    expect_released(runtime.call_blocking_request(
+        lockmgr,
+        LockRequest::Release { handle: granted },
+        timeout,
+    )?)?;
+    expect_released(runtime.call_blocking_request(
+        lockmgr,
+        LockRequest::Release { handle: second },
+        timeout,
+    )?)?;
+
+    let stats = stats(&runtime, lockmgr, timeout)?;
+    shutdown_runtime(shutdown, runtime)?;
+    Ok(GlobalOverflowReport { global_full, stats })
+}
+
+/// A timed-out FIFO head is reclaimed on refill. With capacity one, admitting
+/// the replacement proves the closed caller released its exact table slot.
+pub fn run_caller_gone_refill(config: RunConfig) -> anyhow::Result<CallerGoneRefillReport> {
+    validate_config(config)?;
+    let cfg = RunConfig {
+        lease_ms: 5_000,
+        waiter_capacity: 1,
+        max_waiters_per_key: 1,
+        ..config
+    };
+    let runtime = start(cfg)?;
+    let shutdown = runtime.shutdown_handle();
+    let lockmgr = register(&runtime, cfg)?;
+    let timeout = Duration::from_millis(cfg.call_timeout_ms);
+    let holder = acquire_handle(&runtime, lockmgr, "refill", timeout)?;
+
+    let rt = Arc::clone(&runtime);
+    let gone = thread::spawn(move || {
+        rt.call_blocking_request(
+            lockmgr,
+            LockRequest::Acquire {
+                key: "refill".into(),
+            },
+            Duration::from_millis(40),
+        )
+    });
+    wait_for_waiters(&runtime, lockmgr, 1, timeout)?;
+    let first_timed_out = match gone.join().expect("timed-out waiter")? {
+        CallOutcome::Timeout => true,
+        CallOutcome::Replied(reply) => {
+            anyhow::bail!("caller-gone probe unexpectedly replied: {reply:?}")
+        }
+        CallOutcome::Full => anyhow::bail!("caller-gone probe mailbox was full"),
+        CallOutcome::Closed => anyhow::bail!("lock manager closed during caller-gone probe"),
+        CallOutcome::Rejected(reason) => {
+            anyhow::bail!("caller-gone probe rejected: {reason:?}")
+        }
+    };
+
+    let rt = Arc::clone(&runtime);
+    let replacement = thread::spawn(move || {
+        rt.call_blocking_request(
+            lockmgr,
+            LockRequest::Acquire {
+                key: "refill".into(),
+            },
+            timeout,
+        )
+    });
+    wait_for_reclaimed(&runtime, lockmgr, 1, timeout)?;
+    expect_released(runtime.call_blocking_request(
+        lockmgr,
+        LockRequest::Release { handle: holder },
+        timeout,
+    )?)?;
+    let replacement_handle = expect_granted(replacement.join().expect("replacement waiter")?)?;
+    let next_waiter_granted = replacement_handle.key == "refill";
+    expect_released(runtime.call_blocking_request(
+        lockmgr,
+        LockRequest::Release {
+            handle: replacement_handle,
+        },
+        timeout,
+    )?)?;
+
+    let stats = stats(&runtime, lockmgr, timeout)?;
+    shutdown_runtime(shutdown, runtime)?;
+    Ok(CallerGoneRefillReport {
+        first_timed_out,
+        next_waiter_granted,
+        stats,
+    })
+}
+
+pub fn run_keyspace_overflow(config: RunConfig) -> anyhow::Result<KeyspaceOverflowReport> {
+    validate_config(config)?;
+    let cfg = RunConfig {
+        lease_ms: 5_000,
+        max_keys: 1,
+        ..config
+    };
+    let runtime = start(cfg)?;
+    let shutdown = runtime.shutdown_handle();
+    let lockmgr = register(&runtime, cfg)?;
+    let timeout = Duration::from_millis(cfg.call_timeout_ms);
+    let holder = acquire_handle(&runtime, lockmgr, "only-key", timeout)?;
+    let keyspace_full = matches!(
+        expect_reply(
+            runtime.call_blocking_request(
+                lockmgr,
+                LockRequest::Acquire {
+                    key: "second-key".into(),
+                },
+                timeout,
+            )?,
+            "keyspace overflow acquire",
+        )?,
+        LockReply::KeyspaceFull
+    );
+    expect_released(runtime.call_blocking_request(
+        lockmgr,
+        LockRequest::Release { handle: holder },
+        timeout,
+    )?)?;
+    let stats = stats(&runtime, lockmgr, timeout)?;
+    shutdown_runtime(shutdown, runtime)?;
+    Ok(KeyspaceOverflowReport {
+        keyspace_full,
+        stats,
+    })
 }
 
 // ---------- Helpers ----------
 
 fn register(
-    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
+    runtime: &App,
     config: RunConfig,
 ) -> anyhow::Result<tina::ServiceRequestAddress<LockEvent, LockRequest, LockReply>> {
+    validate_config(config)?;
     runtime
         .register_split_service::<LockManager, LockEvent, LockRequest, Infallible>(
             LockManager::new(config),
@@ -845,19 +1037,81 @@ fn register(
         .map_err(|e| anyhow::anyhow!("register lock manager: {e:?}"))
 }
 
+fn validate_config(config: RunConfig) -> anyhow::Result<()> {
+    if config.waiter_capacity == 0 {
+        anyhow::bail!("waiter_capacity must be greater than zero");
+    }
+    if config.max_waiters_per_key == 0 {
+        anyhow::bail!("max_waiters_per_key must be greater than zero");
+    }
+    if config.max_keys == 0 {
+        anyhow::bail!("max_keys must be greater than zero");
+    }
+    if config.mailbox == 0 {
+        anyhow::bail!("mailbox must be greater than zero");
+    }
+    if config.lease_ms == 0 {
+        anyhow::bail!("lease_ms must be greater than zero");
+    }
+    if config.call_timeout_ms == 0 {
+        anyhow::bail!("call_timeout_ms must be greater than zero");
+    }
+    Ok(())
+}
+
+fn acquire_handle(
+    runtime: &App,
+    lockmgr: tina::ServiceRequestAddress<LockEvent, LockRequest, LockReply>,
+    key: &str,
+    timeout: Duration,
+) -> anyhow::Result<LockHandle> {
+    expect_granted(runtime.call_blocking_request(
+        lockmgr,
+        LockRequest::Acquire { key: key.into() },
+        timeout,
+    )?)
+}
+
+fn expect_granted(outcome: CallOutcome<LockReply>) -> anyhow::Result<LockHandle> {
+    match expect_reply(outcome, "acquire")? {
+        LockReply::Granted { handle } => Ok(handle),
+        reply => anyhow::bail!("expected Granted, got {reply:?}"),
+    }
+}
+
+fn expect_released(outcome: CallOutcome<LockReply>) -> anyhow::Result<()> {
+    match expect_reply(outcome, "release")? {
+        LockReply::Released => Ok(()),
+        reply => anyhow::bail!("expected Released, got {reply:?}"),
+    }
+}
+
+fn expect_reply(outcome: CallOutcome<LockReply>, operation: &str) -> anyhow::Result<LockReply> {
+    match outcome {
+        CallOutcome::Replied(reply) => Ok(reply),
+        CallOutcome::Full => anyhow::bail!("{operation} mailbox was full"),
+        CallOutcome::Closed => anyhow::bail!("lock manager closed during {operation}"),
+        CallOutcome::Timeout => anyhow::bail!("{operation} timed out"),
+        CallOutcome::Rejected(reason) => anyhow::bail!("{operation} rejected: {reason:?}"),
+    }
+}
+
 fn stats(
-    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
+    runtime: &App,
     lockmgr: tina::ServiceRequestAddress<LockEvent, LockRequest, LockReply>,
     timeout: Duration,
 ) -> anyhow::Result<LockStats> {
-    match runtime.call_blocking_request(lockmgr, LockRequest::Stats, timeout)? {
-        CallOutcome::Replied(LockReply::Stats(s)) => Ok(s),
-        other => anyhow::bail!("stats call failed: {other:?}"),
+    match expect_reply(
+        runtime.call_blocking_request(lockmgr, LockRequest::Stats, timeout)?,
+        "stats",
+    )? {
+        LockReply::Stats(s) => Ok(s),
+        reply => anyhow::bail!("stats returned unexpected reply: {reply:?}"),
     }
 }
 
 fn wait_for_waiters(
-    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
+    runtime: &App,
     lockmgr: tina::ServiceRequestAddress<LockEvent, LockRequest, LockReply>,
     target: usize,
     timeout: Duration,
@@ -879,7 +1133,7 @@ fn wait_for_waiters(
 }
 
 fn wait_for_busy_settlement(
-    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
+    runtime: &App,
     lockmgr: tina::ServiceRequestAddress<LockEvent, LockRequest, LockReply>,
     waiters_target: usize,
     busy_target: u64,
@@ -902,12 +1156,159 @@ fn wait_for_busy_settlement(
     }
 }
 
+fn wait_for_reclaimed(
+    runtime: &App,
+    lockmgr: tina::ServiceRequestAddress<LockEvent, LockRequest, LockReply>,
+    target: u64,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        let s = stats(runtime, lockmgr, timeout)?;
+        if s.waiters_reclaimed >= target {
+            return Ok(());
+        }
+        if start.elapsed() > timeout {
+            anyhow::bail!(
+                "wait_for_reclaimed({target}) timed out at reclaimed={}",
+                s.waiters_reclaimed
+            );
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
 fn shutdown_runtime(
     shutdown: tina_runtime::ThreadedShutdownHandle,
-    runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
+    runtime: Arc<App>,
 ) -> anyhow::Result<()> {
     let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
     drop(runtime);
     terminal.ensure_clean()?;
     Ok(())
+}
+
+fn start(config: RunConfig) -> anyhow::Result<Arc<App>> {
+    validate_config(config)?;
+    Ok(Arc::new(
+        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
+    ))
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use std::any::TypeId;
+
+    fn fake_reply(slot_id: u64) -> (DeferredReply<LockReply>, Arc<tina::DeferredSlotShared>) {
+        let shared = Arc::new(tina::DeferredSlotShared::new(
+            slot_id,
+            TypeId::of::<LockReply>(),
+        ));
+        let reply = tina::runtime_internal::deferred_from_handle(
+            tina::runtime_internal::handle_from_shared(Arc::clone(&shared)),
+        );
+        (reply, shared)
+    }
+
+    #[test]
+    fn current_timer_failure_retires_the_unenforceable_lease() {
+        let mut manager = LockManager::new(RunConfig::default());
+        manager.locks.insert(
+            "held".into(),
+            LockState {
+                holder_id: 1,
+                expiry_token: 1,
+            },
+        );
+        let effect =
+            manager.lease_expired("held".into(), 1, 1, Err(tina_runtime::CallError::TimerFull));
+        assert!(matches!(effect, Effect::Noop));
+        assert_eq!(manager.stats.timer_errors, 1);
+        assert_eq!(manager.stats.last_timer_error, Some(CallError::TimerFull));
+        assert_eq!(manager.stats.expiries, 0);
+        assert_eq!(manager.stats.stale_expiries_ignored, 0);
+        assert!(manager.locks.is_empty());
+    }
+
+    #[test]
+    fn stale_timer_failure_is_typed_without_revoking_the_current_holder() {
+        let mut manager = LockManager::new(RunConfig::default());
+        manager.locks.insert(
+            "held".into(),
+            LockState {
+                holder_id: 2,
+                expiry_token: 3,
+            },
+        );
+        let effect =
+            manager.lease_expired("held".into(), 1, 1, Err(tina_runtime::CallError::TimerFull));
+        assert!(matches!(effect, Effect::Noop));
+        assert_eq!(manager.stats.timer_errors, 1);
+        assert_eq!(manager.stats.stale_expiries_ignored, 1);
+        assert_eq!(manager.locks["held"].holder_id, 2);
+    }
+
+    #[test]
+    fn selected_waiter_late_close_keeps_exclusivity_until_lease_expiry_rolls_back() {
+        let mut manager = LockManager::new(RunConfig::default());
+        manager.locks.insert(
+            "held".into(),
+            LockState {
+                holder_id: 1,
+                expiry_token: 1,
+            },
+        );
+        manager.next_holder_id = 1;
+        let (slot, shared) = fake_reply(7);
+        shared.set_state(tina::DeferredSlotState::Closed);
+
+        let effects = manager.install_handoff("held".into(), slot);
+        assert_eq!(effects.len(), 2, "reply and expiry must remain paired");
+        let holder = manager.locks["held"].holder_id;
+        let token = manager.locks["held"].expiry_token;
+        assert_ne!(holder, 1, "the old holder loses authority at handoff");
+
+        let expiry = manager.lease_expired("held".into(), holder, token, Ok(()));
+        assert!(matches!(expiry, Effect::Noop));
+        assert!(
+            manager.locks.is_empty(),
+            "ghost holder retires at lease expiry"
+        );
+    }
+
+    #[test]
+    fn shutdown_closes_a_parked_caller_and_reports_clean() {
+        let cfg = RunConfig {
+            lease_ms: 5_000,
+            ..RunConfig::default()
+        };
+        let runtime = start(cfg).expect("start");
+        let shutdown = runtime.shutdown_handle();
+        let lockmgr = register(&runtime, cfg).expect("register");
+        let timeout = Duration::from_secs(2);
+        let _holder = acquire_handle(&runtime, lockmgr, "shutdown", timeout).expect("holder");
+        let caller_runtime = Arc::clone(&runtime);
+        let caller = thread::spawn(move || {
+            caller_runtime.call_blocking_request(
+                lockmgr,
+                LockRequest::Acquire {
+                    key: "shutdown".into(),
+                },
+                timeout,
+            )
+        });
+        wait_for_waiters(&runtime, lockmgr, 1, timeout).expect("waiter parked");
+
+        let terminal = shutdown
+            .request_and_wait_report(Duration::from_secs(5))
+            .expect("shutdown report");
+        let outcome = caller.join().expect("caller thread");
+        assert!(matches!(
+            outcome,
+            Err(tina_runtime::ThreadedRuntimeError::WorkerStopped)
+        ));
+        drop(runtime);
+        terminal.ensure_clean().expect("clean terminal report");
+    }
 }
