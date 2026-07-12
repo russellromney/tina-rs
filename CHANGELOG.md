@@ -92,6 +92,10 @@ This file records completed work.
   observation and cloneable runtime shutdown control. Shared app hosts can
   retain `Arc` owners, observe exact `stop_with` values, and obtain cached
   terminal truth without exposing or unwrapping the lower threaded runtime.
+- `LocalSystem` now directly exposes bounded host-burst outcome accounting and
+  deadline-bounded observed admission. The facade preserves the threaded
+  backend's exact `Full`, `Closed`, timeout, and worker-stop outcomes plus its
+  message-factory ownership and no-late-delivery contract.
 
 ### Deadline-observed admission truth
 

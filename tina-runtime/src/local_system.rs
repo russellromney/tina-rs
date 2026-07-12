@@ -9,7 +9,7 @@ use std::alloc::Global;
 use std::fmt;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use betelgeuse::IOLoopHandle;
 use tina::{Address, Isolate, Outbound as TinaOutbound, Shard, ShardId};
@@ -26,9 +26,10 @@ use crate::mailbox::MailboxFactory;
 use crate::observer::TraceObserver;
 use crate::trace::{RuntimeEvent, RuntimeEventKind};
 use crate::{
-    DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, IntoErasedSpawn, IntoErasedSpawnObserved,
-    IntoSendErasedSpawnObserved, PreallocationConfig, Runtime, ThreadedMultiShardRuntime,
-    ThreadedRuntime, ThreadedRuntimeConfig, TraceRetention,
+    DEFAULT_SHUTDOWN_LANE_DRAIN_TIMEOUT, HostBurstOutcomes, IntoErasedSpawn,
+    IntoErasedSpawnObserved, IntoSendErasedSpawnObserved, PreallocationConfig, Runtime,
+    SendObservedUntilError, ThreadedMultiShardRuntime, ThreadedRuntime, ThreadedRuntimeConfig,
+    TraceRetention,
 };
 
 /// Preferred public bounded-shape config for local Tina systems.
@@ -1017,6 +1018,49 @@ where
         message: M,
     ) -> Result<(), ThreadedSendObservedError> {
         self.runtime().send_and_observe(address, message)
+    }
+
+    /// Attempts one typed ingress send and records its eventual mailbox outcome.
+    ///
+    /// This is the [`LocalSystem`] facade for
+    /// [`ThreadedRuntime::try_send_outcome`]. It preserves the lower-level
+    /// ownership contract: `message` is consumed even when ingress or mailbox
+    /// admission fails. The shared counter records exactly one terminal bucket
+    /// for every submitted message.
+    pub fn try_send_outcome<M, R>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        outcomes: &HostBurstOutcomes,
+    ) -> Result<(), ThreadedTrySendError>
+    where
+        M: Send + 'static,
+        R: 'static,
+    {
+        self.runtime().try_send_outcome(address, message, outcomes)
+    }
+
+    /// Retries observed admission until the message lands or `deadline` passes.
+    ///
+    /// This forwards [`ThreadedRuntime::send_observed_until`] without changing
+    /// its terminal vocabulary or ownership semantics. `make_message` runs once
+    /// per real attempt, allowing non-`Clone` messages to be rebuilt after
+    /// `Full`; an already elapsed deadline does not invoke it and cannot cause a
+    /// later delivery.
+    pub fn send_observed_until<M, R, MakeMessage>(
+        &self,
+        address: Address<M, R>,
+        deadline: Instant,
+        backoff: Duration,
+        make_message: MakeMessage,
+    ) -> Result<(), SendObservedUntilError>
+    where
+        M: Send + 'static,
+        R: 'static,
+        MakeMessage: FnMut() -> M,
+    {
+        self.runtime()
+            .send_observed_until(address, deadline, backoff, make_message)
     }
 
     /// Registers a typed waiter for the terminal value produced by
