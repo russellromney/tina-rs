@@ -33,6 +33,41 @@ caller that closes after FIFO selection leaves at most a lease-bounded ghost
 holder before expiry rollback. This fully applies closed finding 21 to its
 remaining motivating specimen; no new framework gap surfaced.
 
+### 2026-07-12 Bounded scatter/gather operation prerequisite
+
+`ScatterGather<K, R, Q>` now owns the original `RequestContext`, ordered target
+rows, and cancelable child authority through `CallJoinSet`. `start_service`
+accepts a fully `BoundedItems`-validated target list and a typed call factory;
+the factory receives the configured per-target timeout, so the documented
+deadline cannot drift from the executed call. Missing targets, replies, Full,
+Closed, Timeout, Rejected, and aggregate timeout remain distinct and preserve
+caller order.
+
+Every reply, aggregate timeout, and cancel acknowledgement carries the public
+operation token, so a bounded collection can route concurrent aggregates
+without private qids or colliding per-operation branch generations. Aggregate
+expiry marks only still-pending rows, emits a bounded cancellation
+batch, and withholds caller authority until every cancel acknowledgement is
+recorded. Generation tokens reject duplicate and late overwrites. The aggregate
+timer also carries an operation token, so a physically non-cancelable timer from
+a completed request cannot expire a newer request in the same coordinator.
+Start failures return the untouched `RequestContext`, and over-cap or duplicate
+input is rejected before the call factory or effect batch exists. One
+coordinator implementation is exercised unchanged on `Runtime`,
+`ThreadedRuntime`, `Simulator`, `MultiShardRuntime`, and
+`ThreadedMultiShardRuntime`; owner stop with child authority pending closes the
+original caller.
+
+`ScatterGatherOperations<K, R, Q>` closes the concurrent coordinator gap. It
+owns a fixed-capacity operation collection, rejects `Full` before building a
+call, and routes the unified `ScatterGatherEvent<K, R>` vocabulary. Application
+coordinators now need one event variant, one bounded field, one inferred
+`start_service` call, and one inferred `advance_service` call; they no longer
+spell reply/cancel/timer variants, qids, token lookup, or find/remove logic.
+
+This is the framework prerequisite for migrating `specimen_scatter_gather` and
+`specimen_sharded_fanout_read`; those example changes remain a separate cohort.
+
 ### 2026-07-11 Bounded shutdown truth across the example corpus
 
 Migrated production examples away from exclusive-`Arc` teardown and

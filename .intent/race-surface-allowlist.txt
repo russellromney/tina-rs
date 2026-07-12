@@ -76,6 +76,7 @@ tina-runtime/src/threaded.rs            scheduler-counter  host-call dispatcher 
 tina-runtime/src/lib.rs                 id-counter         IdSource next_event_id / next_call_id; shared Arc<AtomicU64> cloned to every shard thread in the threaded runtime (single-threaded in the explicit-step oracle)
 tina-runtime/src/admission.rs           id-counter         NEXT_GATE_ID
 tina-runtime/src/call/groups.rs         id-counter         call-group COUNTER
+tina-runtime/src/scatter_gather.rs      id-counter         scatter/gather operation-token COUNTER
 tina-runtime/src/deferred.rs            id-counter         deferred-slot COUNTER
 tina-runtime/src/guarded_pending.rs     id-counter         guarded-pending COUNTER
 tina/src/pool.rs                        id-counter         PoolAuthority process-wide NEXT_POOL_ID

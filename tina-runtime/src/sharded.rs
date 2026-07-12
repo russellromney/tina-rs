@@ -708,6 +708,8 @@ pub enum ScatterGatherTargetOutcome<T> {
     Closed,
     /// Target did not reply within its per-target timeout.
     Timeout,
+    /// Target rejected the call without an application reply.
+    Rejected(tina::CallRejectedReason),
     /// The aggregate deadline fired before this target replied.
     AggregateTimeout,
     /// Target name was not present in the service table; see
@@ -729,7 +731,7 @@ pub enum ScatterGatherTargetOutcome<T> {
 /// output deterministic across runs and seeds. Coordinator
 /// implementations must preserve this order at emission time.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ScatterGatherReport<T> {
+pub struct ScatterGatherReport<T, K = ShardId> {
     /// Config the fanout ran under.
     pub config: ScatterGatherConfig,
     /// Per-target outcomes in caller-supplied target-list order. See
@@ -740,10 +742,10 @@ pub struct ScatterGatherReport<T> {
     /// after the coord emits the report **breaks the ordering
     /// contract**; downstream consumers must treat it as read-only,
     /// even when they own the `ScatterGatherReport` value.
-    pub outcomes: Vec<(ShardId, ScatterGatherTargetOutcome<T>)>,
+    pub outcomes: Vec<(K, ScatterGatherTargetOutcome<T>)>,
 }
 
-impl<T> ScatterGatherReport<T> {
+impl<T, K> ScatterGatherReport<T, K> {
     /// Returns the number of targets that replied.
     pub fn replied_count(&self) -> usize {
         self.outcomes
@@ -776,6 +778,14 @@ impl<T> ScatterGatherReport<T> {
             .count()
     }
 
+    /// Returns the number of targets that rejected the call.
+    pub fn rejected_count(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|(_, o)| matches!(o, ScatterGatherTargetOutcome::Rejected(_)))
+            .count()
+    }
+
     /// Returns the number of targets cut off by the aggregate timeout.
     pub fn aggregate_timeout_count(&self) -> usize {
         self.outcomes
@@ -792,13 +802,17 @@ impl<T> ScatterGatherReport<T> {
             .filter(|(_, o)| matches!(o, ScatterGatherTargetOutcome::MissingShard))
             .count()
     }
+}
 
-    /// Iterator over `(ShardId, &T)` for targets that replied.
-    pub fn replied(&self) -> impl Iterator<Item = (ShardId, &T)> {
-        self.outcomes.iter().filter_map(|(s, o)| match o {
-            ScatterGatherTargetOutcome::Replied(t) => Some((*s, t)),
-            _ => None,
-        })
+impl<T, K: Copy> ScatterGatherReport<T, K> {
+    /// Iterator over `(target, &T)` for targets that replied.
+    pub fn replied(&self) -> impl Iterator<Item = (K, &T)> {
+        self.outcomes
+            .iter()
+            .filter_map(|(target, outcome)| match outcome {
+                ScatterGatherTargetOutcome::Replied(reply) => Some((*target, reply)),
+                _ => None,
+            })
     }
 }
 

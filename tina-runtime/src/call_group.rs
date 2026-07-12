@@ -1159,6 +1159,11 @@ where
             && self.expected_cancels.is_empty()
     }
 
+    /// Returns whether this key already produced a terminal reply outcome.
+    pub fn has_recorded_reply(&self, key: &K) -> bool {
+        self.branch_outcomes.iter().any(|branch| &branch.key == key)
+    }
+
     /// Consumes the set into a completed or partial report.
     pub fn into_report(self) -> CallJoinReport<K, R> {
         CallJoinReport {
