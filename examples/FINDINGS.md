@@ -234,6 +234,14 @@ within the original system incarnation. This prerequisite prevents an address
 from one example-owned runtime from accidentally targeting a coincident tuple
 in another as the corpus moves onto `LocalSystem`.
 
+Post-rebase review found two restart examples reconstructing replacement
+addresses with the unscoped marker; both now inherit the known owner
+incarnation and prove replacement delivery. The first PR matrix then caught
+example workspaces outside the root workspace that had exhaustive terminal
+classifiers predating `ForeignSystem`. Copied-path, bounded-batcher, bridge,
+worker-pool, and soak probes now classify or directly assert that terminal
+instead of adding wildcard arms or collapsing it into an unrelated outcome.
+
 ### 2026-07-12 Lock-manager keyed FIFO canonicalization
 
 Migrated `system_lock_manager` from the historical

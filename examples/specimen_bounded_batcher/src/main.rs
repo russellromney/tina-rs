@@ -20,7 +20,7 @@ fn print_side(side: &str, r: Report) {
     println!(
         "comparison=specimen_bounded_batcher side={} callers={} successes={} \
          full={} failed={} transport_full={} closed={} timeouts={} rejected={} timer_failures={} \
-         host_command_full={} host_worker_stopped={} host_wait_timeout={} \
+         host_foreign_system={} host_command_full={} host_worker_stopped={} host_wait_timeout={} \
          host_worker_unresponsive={} host_unknown_shard={} host_driver_shutdown_failed={} \
          host_driver_park_failed={} \
          size_flushes={} timer_flushes={} exit_clean={}",
@@ -34,6 +34,7 @@ fn print_side(side: &str, r: Report) {
         r.timeouts,
         r.rejected,
         r.timer_failures,
+        r.host_foreign_system,
         r.host_command_full,
         r.host_worker_stopped,
         r.host_wait_timeout,

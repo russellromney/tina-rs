@@ -448,6 +448,7 @@ fn call_error_kind(error: tina_runtime::CallError) -> &'static str {
         CallError::TargetClosed => "work_target_closed",
         CallError::Timeout => "work_timeout",
         CallError::Rejected(reason) => match reason {
+            CallRejectedReason::ForeignSystem { .. } => "work_rejected_foreign_system",
             CallRejectedReason::ReplyAbandoned => "work_rejected_reply_abandoned",
             CallRejectedReason::HandlerPanicked => "work_rejected_handler_panicked",
             CallRejectedReason::UnsupportedMessage => "work_rejected_unsupported_message",
@@ -471,6 +472,7 @@ fn call_error_kind(error: tina_runtime::CallError) -> &'static str {
 
 fn rejected_kind(reason: CallRejectedReason) -> &'static str {
     match reason {
+        CallRejectedReason::ForeignSystem { .. } => "rejected_foreign_system",
         CallRejectedReason::ReplyAbandoned => "rejected_reply_abandoned",
         CallRejectedReason::HandlerPanicked => "rejected_handler_panicked",
         CallRejectedReason::UnsupportedMessage => "rejected_unsupported_message",
@@ -479,6 +481,7 @@ fn rejected_kind(reason: CallRejectedReason) -> &'static str {
 
 fn host_error_kind(error: ThreadedRuntimeError) -> &'static str {
     match error {
+        ThreadedRuntimeError::ForeignSystem { .. } => "host_foreign_system",
         ThreadedRuntimeError::WorkerStopped => "host_worker_stopped",
         ThreadedRuntimeError::UnknownShard(_) => "host_unknown_shard",
         ThreadedRuntimeError::DriverShutdownFailed => "host_driver_shutdown_failed",
@@ -527,6 +530,30 @@ mod adversarial_tests {
             )
             .expect("register test gateway");
         (runtime, shutdown, gateway)
+    }
+
+    #[test]
+    fn foreign_system_terminals_remain_distinct_in_reports() {
+        let expected = tina::SystemIncarnation::new(1);
+        let actual = tina::SystemIncarnation::new(2);
+
+        assert_eq!(
+            call_error_kind(tina_runtime::CallError::Rejected(
+                CallRejectedReason::ForeignSystem {
+                expected,
+                actual,
+                },
+            )),
+            "work_rejected_foreign_system"
+        );
+        assert_eq!(
+            rejected_kind(CallRejectedReason::ForeignSystem { expected, actual }),
+            "rejected_foreign_system"
+        );
+        assert_eq!(
+            host_error_kind(ThreadedRuntimeError::ForeignSystem { expected, actual }),
+            "host_foreign_system"
+        );
     }
 
     #[test]

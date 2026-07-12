@@ -16,6 +16,7 @@ fn assert_shape(side: &str, r: Report) {
     assert_eq!(r.timeouts, 0, "{side}: {r:?}");
     assert_eq!(r.rejected, 0, "{side}: {r:?}");
     assert_eq!(r.timer_failures, 0, "{side}: {r:?}");
+    assert_eq!(r.host_foreign_system, 0, "{side}: {r:?}");
     assert_eq!(r.host_command_full, 0, "{side}: {r:?}");
     assert_eq!(r.host_worker_stopped, 0, "{side}: {r:?}");
     assert_eq!(r.host_wait_timeout, 0, "{side}: {r:?}");
