@@ -14,8 +14,7 @@ use tina_http::{
     WebSocketSessionId, WebSocketSessionMsg, WebSocketSessionOutcome, websocket_upgrade,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime,
-    ThreadedRuntimeConfig, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig, sleep,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1233,7 +1232,9 @@ mod tests {
             Err(error) => error,
         };
         assert!(
-            error.to_string().contains("supports one bounded named room"),
+            error
+                .to_string()
+                .contains("supports one bounded named room"),
             "{error:#}"
         );
     }
@@ -1735,7 +1736,8 @@ mod tests {
                     idle_wait: Duration::from_millis(1),
                     ..Default::default()
                 },
-            ).expect("start runtime");
+            )
+            .expect("start runtime");
             let room = runtime
                 .register_with_capacity::<crate::Room, Infallible>(
                     crate::Room {

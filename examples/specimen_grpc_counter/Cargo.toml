@@ -9,6 +9,7 @@ publish = false
 [workspace]
 
 [dependencies]
+anyhow = "1"
 tina = { path = "../../tina" }
 tina-http = { path = "../../tina-http" }
 tina-runtime = { path = "../../tina-runtime" }

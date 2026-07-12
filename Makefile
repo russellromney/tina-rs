@@ -57,6 +57,7 @@ rail-inventory-guard:
 	./scripts/rail_inventory_guard.sh
 
 examples-startup-api-guard:
+	./scripts/examples_startup_api_guard.sh --self-test
 	./scripts/examples_startup_api_guard.sh
 
 miri:

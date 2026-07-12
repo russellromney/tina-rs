@@ -220,9 +220,7 @@ impl StreamingEchoSource {
         reply: GrpcStreamReply<CounterRequest>,
     ) -> Effect<Self> {
         match reply {
-            GrpcStreamReply::Message(request) => {
-                reply_to(pending, self.reply_for_message(request))
-            }
+            GrpcStreamReply::Message(request) => reply_to(pending, self.reply_for_message(request)),
             GrpcStreamReply::NeedMore => {
                 self.pending = Some(pending);
                 self.pull_request()
@@ -231,9 +229,7 @@ impl StreamingEchoSource {
                 self.eof = true;
                 reply_to(pending, ResponseChunkReply::Eof)
             }
-            GrpcStreamReply::Status(status) => {
-                reply_to(pending, self.finish_with_status(status))
-            }
+            GrpcStreamReply::Status(status) => reply_to(pending, self.finish_with_status(status)),
             GrpcStreamReply::Cancelled => reply_to(
                 pending,
                 self.finish_with_status(GrpcStatus::new(GrpcStatusCode::Cancelled)),
@@ -353,7 +349,7 @@ impl StreamingEchoSourcePool {
     }
 }
 
-pub fn start_server() -> Result<SpecimenServer, String> {
+pub fn start_server() -> anyhow::Result<SpecimenServer> {
     let runtime = ThreadedRuntime::try_with_config(
         SpecimenShard,
         DefaultThreadedMailboxFactory,
@@ -362,7 +358,7 @@ pub fn start_server() -> Result<SpecimenServer, String> {
             idle_wait: Duration::from_millis(1),
             ..Default::default()
         },
-    ).map_err(|e| format!("start runtime: {e:?}"))?;
+    )?;
 
     let state = Arc::new(Mutex::new(0_u64));
     let router_state = Arc::clone(&state);
@@ -372,7 +368,8 @@ pub fn start_server() -> Result<SpecimenServer, String> {
             max_message_bytes: 1024,
             ..Default::default()
         },
-    )?;
+    )
+    .map_err(anyhow::Error::msg)?;
     let streaming_sources_for_route = Arc::clone(&streaming_sources);
     let watch_responses = Arc::new(Mutex::new(Vec::new()));
     for _ in 0..16 {
@@ -385,7 +382,7 @@ pub fn start_server() -> Result<SpecimenServer, String> {
             },
             16,
         )
-        .map_err(|error| format!("register watch response: {error:?}"))?;
+        .map_err(|error| anyhow::anyhow!("register watch response: {error:?}"))?;
         watch_responses
             .lock()
             .expect("watch responses")
@@ -444,7 +441,7 @@ pub fn start_server() -> Result<SpecimenServer, String> {
 
     let service = runtime
         .register_with_capacity::<GrpcRouter<SpecimenShard>, _>(router, 16)
-        .map_err(|error| format!("register router: {error:?}"))?;
+        .map_err(|error| anyhow::anyhow!("register router: {error:?}"))?;
     let config = Http2ServerConfig::default();
     let listener = runtime
         .register_with_capacity::<Http2Listener<SpecimenShard, GrpcRouterMsg>, _>(
@@ -453,18 +450,18 @@ pub fn start_server() -> Result<SpecimenServer, String> {
                 service,
                 config,
             )
-            .map_err(|error| format!("HTTP/2 server config: {error}"))?,
+            .map_err(|error| anyhow::anyhow!("HTTP/2 server config: {error}"))?,
             config.listener_mailbox_capacity,
         )
-        .map_err(|error| format!("register listener: {error:?}"))?;
+        .map_err(|error| anyhow::anyhow!("register listener: {error:?}"))?;
 
     let bound = runtime.observe_next_bound();
     runtime
         .try_send(listener, Http2ListenerMsg::Start)
-        .map_err(|error| format!("start listener: {error:?}"))?;
+        .map_err(|error| anyhow::anyhow!("start listener: {error:?}"))?;
     let addr = bound
         .wait(Duration::from_secs(2))
-        .map_err(|error| format!("listener did not publish bound address: {error:?}"))?;
+        .map_err(|error| anyhow::anyhow!("listener did not publish bound address: {error:?}"))?;
 
     Ok(SpecimenServer {
         addr,
@@ -510,15 +507,15 @@ fn unary_call<Resp: prost::Message + Default>(
 /// not `grpc_unary_call_h2c_blocking`. Returns the OK increment value so
 /// the smoke test can pin it; the non-OK status and client cancellation
 /// are exercised inside [`SpecimenServer::native_grpc_smoke`].
-pub fn run_smoke() -> Result<u64, String> {
+pub fn run_smoke() -> anyhow::Result<u64> {
     let server = start_server()?;
-    let smoke = server.native_grpc_smoke()?;
+    let smoke = server.native_grpc_smoke().map_err(anyhow::Error::msg)?;
     if smoke.forbidden_status != GrpcStatusCode::PermissionDenied {
-        return Err(format!(
+        anyhow::bail!(
             "expected PermissionDenied from Forbidden, got {:?}",
             smoke.forbidden_status
-        ));
+        );
     }
-    server.shutdown()?;
+    server.shutdown().map_err(anyhow::Error::msg)?;
     Ok(smoke.increment_value)
 }

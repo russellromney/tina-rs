@@ -23,7 +23,7 @@ pub mod compile_fail {
     ///
     /// #[tina::isolate(message = Msg)]
     /// impl I {
-    ///     fn handle(&mut self, _: Msg, _: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> { noop() }
+    ///     fn handle(&mut self, _msg: Msg, _cx: &mut Context<'_, SingleShard, Self::Reply>) -> Effect<Self> { noop() }
     /// }
     ///
     /// fn _smuggle() {

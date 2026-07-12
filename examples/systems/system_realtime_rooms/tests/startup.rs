@@ -7,5 +7,8 @@ fn invalid_room_mailbox_capacity_is_a_startup_error() {
         ..RunConfig::default()
     });
 
-    assert!(result.is_err(), "zero-capacity room mailbox must be rejected");
+    assert!(
+        result.is_err(),
+        "zero-capacity room mailbox must be rejected"
+    );
 }
