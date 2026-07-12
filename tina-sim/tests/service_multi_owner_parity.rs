@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use tina::TrySendError;
 use tina::prelude::*;
+use tina_runtime::sharded::{ShardPlacement, ShardRequestServiceTable};
 use tina_runtime::{
     CallOutcome, EventServiceHandle, RequestServiceHandle, SplitServiceHandle, call_request,
 };
@@ -209,6 +210,31 @@ fn simulator_multi_owner_preserves_service_capabilities_and_domain_errors() {
         .expect("client start accepted");
     simulator.run_until_quiescent();
     assert_eq!(request_seen.load(Ordering::Acquire), 23);
+}
+
+#[test]
+fn request_service_table_registers_and_routes_simulated_multi_owner_services() {
+    let placement =
+        ShardPlacement::new("sim requests", vec![ShardId::new(2), ShardId::new(1)]).unwrap();
+    let mut simulator = MultiShardSimulator::new(
+        [ServiceShard(2), ServiceShard(1)],
+        SimulatorConfig::default(),
+    );
+    let table = ShardRequestServiceTable::from_placement(placement.clone(), |shard| {
+        simulator.register_request_service_on(shard, RequestService(shard.get()), 2)
+    })
+    .unwrap();
+
+    let _: RequestServiceHandle<Request, u32> = table.address_for(ShardId::new(1)).unwrap();
+    assert_eq!(table.addresses().len(), 2);
+    assert_eq!(
+        table
+            .address_for_bytes(b"owned key")
+            .address()
+            .address()
+            .shard(),
+        placement.owner_for_bytes(b"owned key")
+    );
 }
 
 #[test]

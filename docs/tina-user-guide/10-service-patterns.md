@@ -293,7 +293,14 @@ Use when state has a natural key.
   Build with `ShardServiceTable::from_placement(placement, |shard|
   runtime.register_with_capacity_on(...))` (explicit-step) or
   `try_from_placement(placement, |shard| runtime.register_with_capacity_on(...))`
-  for runtimes whose registration returns a `Result`.
+  for runtimes whose registration returns a `Result`. Build errors retain the
+  successfully registered prefix because registration effects cannot be
+  rolled back by the table.
+- `ShardRequestServiceTable<Request, Reply>` — the capability-preserving form
+  for request-only services. It stores `ServiceRequestAddress` values, so
+  callers use `call_request` without exposing the service envelope. A
+  defaulted third `Event` parameter supports the request lane of a split
+  service without making the canonical request-only spelling longer.
 - `WrongShard { expected, actual }` — owners re-check the key before
   mutating keyed state and return this typed error on mismatch.
 - `ScatterGatherConfig` + `ScatterGatherReport<T>` — bounded fanout knobs

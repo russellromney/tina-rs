@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use tina::TrySendError;
 use tina::prelude::*;
+use tina_runtime::sharded::{ShardPlacement, ShardRequestServiceTable};
 use tina_runtime::{
     CallError, CallOutcome, DefaultMailboxFactory, DefaultThreadedMailboxFactory,
     EventServiceHandle, LocalSystem, MultiShardRuntime, RequestServiceHandle, SplitServiceHandle,
@@ -193,6 +194,32 @@ fn explicit_multi_owner_preserves_event_pressure_and_shard_choice() {
 }
 
 #[test]
+fn request_service_table_registers_and_routes_explicit_multi_owner_services() {
+    let placement = ShardPlacement::new(
+        "explicit requests",
+        vec![ShardId::new(20), ShardId::new(10)],
+    )
+    .unwrap();
+    let mut runtime =
+        MultiShardRuntime::new([ServiceShard(20), ServiceShard(10)], DefaultMailboxFactory);
+    let table = ShardRequestServiceTable::from_placement(placement.clone(), |shard| {
+        runtime.register_request_service_on(shard, RequestService(shard.get()), 2)
+    })
+    .unwrap();
+
+    let _: RequestServiceHandle<Request, u32> = table.address_for(ShardId::new(10)).unwrap();
+    assert_eq!(table.addresses().len(), 2);
+    assert_eq!(
+        table
+            .address_for_str("owned key")
+            .address()
+            .address()
+            .shard(),
+        placement.owner_for_str("owned key")
+    );
+}
+
+#[test]
 #[should_panic(expected = "unknown shard 99")]
 fn explicit_multi_registration_panics_on_unknown_shard() {
     let mut runtime =
@@ -252,6 +279,37 @@ fn threaded_multi_owner_registers_all_service_shapes() {
         CallOutcome::Replied(7)
     );
 
+    runtime.shutdown().expect("threaded multi owner shuts down");
+}
+
+#[test]
+fn request_service_table_registers_and_calls_threaded_multi_owner_services() {
+    let placement = ShardPlacement::new(
+        "threaded requests",
+        vec![ShardId::new(30), ShardId::new(40)],
+    )
+    .unwrap();
+    let runtime = ThreadedMultiShardRuntime::new(
+        [ServiceShard(30), ServiceShard(40)],
+        DefaultThreadedMailboxFactory,
+    );
+    let table = ShardRequestServiceTable::try_from_placement(placement, |shard| {
+        runtime.register_request_service_on(shard, RequestService(shard.get()), 4)
+    })
+    .unwrap();
+
+    for shard in [ShardId::new(30), ShardId::new(40)] {
+        assert_eq!(
+            runtime
+                .call_blocking_request(
+                    table.address_for(shard).unwrap(),
+                    Request::Read,
+                    Duration::from_secs(1),
+                )
+                .expect("request call routed"),
+            CallOutcome::Replied(shard.get())
+        );
+    }
     runtime.shutdown().expect("threaded multi owner shuts down");
 }
 
@@ -426,6 +484,34 @@ fn canonical_local_facades_delegate_service_registration_and_events() {
         .join()
         .expect("multi local system shuts down");
     assert_eq!(multi_seen.load(Ordering::Acquire), 70);
+}
+
+#[test]
+fn request_service_table_registers_and_calls_local_multi_services() {
+    let placement =
+        ShardPlacement::new("local requests", vec![ShardId::new(60), ShardId::new(70)]).unwrap();
+    let multi = LocalSystem::multi_shard(DefaultThreadedMailboxFactory)
+        .shard(ServiceShard(60))
+        .shard(ServiceShard(70))
+        .build();
+    let table = ShardRequestServiceTable::try_from_placement(placement, |shard| {
+        multi.register_request_service_on(shard, RequestService(shard.get()), 4)
+    })
+    .unwrap();
+
+    for shard in [ShardId::new(60), ShardId::new(70)] {
+        assert_eq!(
+            multi
+                .call_blocking_request(
+                    table.address_for(shard).unwrap(),
+                    Request::Read,
+                    Duration::from_secs(1),
+                )
+                .expect("request call routed"),
+            CallOutcome::Replied(shard.get())
+        );
+    }
+    multi.shutdown().join().expect("local multi shuts down");
 }
 
 #[test]

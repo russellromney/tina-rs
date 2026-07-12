@@ -69,14 +69,23 @@ registration and exhaustive Unix outcomes remains a separate example commit.
 
 ### 2026-07-12 Typed sharded request-service table prerequisite
 
-`ShardRequestServiceTable<Request, Reply>` preserves canonical request-only
-service capabilities through `new`, `from_placement`,
+`ShardRequestServiceTable<Request, Reply, Event = Infallible>` preserves
+canonical request-only service capabilities, and split-service request lanes
+when explicitly selected, through `new`, `from_placement`,
 `try_from_placement`, `address_for`, and key-owner lookup. It shares the
 existing placement-order, typed missing-shard, and fallible-registration
-contracts without exposing the internal `ServiceMessage<Infallible, Request>`
-envelope. This is the narrow prerequisite surfaced by
+contracts without exposing the internal `ServiceMessage` envelope. This is the
+narrow prerequisite surfaced by
 `specimen_sharded_fanout_read`; the motivating example migration remains a
 separate cohort.
+
+Adversarial review factored the raw and typed tables onto one invariant
+implementation, rejected mislabeled capabilities whose actual address shard
+does not match the entry shard, and made both fallible and infallible placement
+builders return all already-registered capabilities on failure. Direct tests
+exercise registration and typed lookup on explicit, threaded, LocalSystem, and
+simulated multi-shard owners; generation tests prove tables remain snapshots
+until rebuilt after restart.
 
 ### 2026-07-12 Lock-manager keyed FIFO canonicalization
 
