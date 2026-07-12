@@ -1063,6 +1063,24 @@ where
             .send_observed_until(address, deadline, backoff, make_message)
     }
 
+    /// Retries typed split-service event admission until it lands or the
+    /// deadline passes, without exposing the private service envelope.
+    pub fn send_event_observed_until<Event, Request, MakeEvent>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        deadline: Instant,
+        backoff: Duration,
+        make_event: MakeEvent,
+    ) -> Result<(), SendObservedUntilError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+        MakeEvent: FnMut() -> Event,
+    {
+        self.runtime()
+            .send_event_observed_until(address, deadline, backoff, make_event)
+    }
+
     /// Registers a typed waiter for the terminal value produced by
     /// [`tina::stop_with`] at `address`.
     ///
@@ -1681,6 +1699,76 @@ where
         Request: Send + 'static,
     {
         self.runtime().try_send_event(address, event)
+    }
+
+    /// Attempts one typed ingress send on the address's owning shard and
+    /// records its eventual mailbox outcome.
+    ///
+    /// `message` is consumed on every host- and worker-side outcome. Accepted
+    /// observations settle exactly once through `outcomes`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `address` targets a shard outside this local system,
+    /// preserving [`ThreadedMultiShardRuntime::try_send_outcome`].
+    pub fn try_send_outcome<M, R>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        outcomes: &HostBurstOutcomes,
+    ) -> Result<(), ThreadedTrySendError>
+    where
+        M: Send + 'static,
+        R: 'static,
+    {
+        self.runtime().try_send_outcome(address, message, outcomes)
+    }
+
+    /// Retries observed admission on the address's owning shard until the
+    /// message lands or `deadline` passes.
+    ///
+    /// A `Timeout` cannot deliver later, and `make_message` runs only for a real
+    /// bounded attempt.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `address` targets a shard outside this local system.
+    pub fn send_observed_until<M, R, MakeMessage>(
+        &self,
+        address: Address<M, R>,
+        deadline: Instant,
+        backoff: Duration,
+        make_message: MakeMessage,
+    ) -> Result<(), SendObservedUntilError>
+    where
+        M: Send + 'static,
+        R: 'static,
+        MakeMessage: FnMut() -> M,
+    {
+        self.runtime()
+            .send_observed_until(address, deadline, backoff, make_message)
+    }
+
+    /// Retries typed split-service event admission on the owning shard without
+    /// exposing the private service envelope.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `address` targets a shard outside this local system.
+    pub fn send_event_observed_until<Event, Request, MakeEvent>(
+        &self,
+        address: tina::ServiceEventAddress<Event, Request>,
+        deadline: Instant,
+        backoff: Duration,
+        make_event: MakeEvent,
+    ) -> Result<(), SendObservedUntilError>
+    where
+        Event: Send + 'static,
+        Request: Send + 'static,
+        MakeEvent: FnMut() -> Event,
+    {
+        self.runtime()
+            .send_event_observed_until(address, deadline, backoff, make_event)
     }
 
     /// Performs one typed isolate call from the host thread, routed by the
