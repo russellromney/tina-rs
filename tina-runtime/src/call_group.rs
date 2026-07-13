@@ -1551,8 +1551,11 @@ where
     /// classifier, mirroring [`CallGroup::record_reply`]'s race
     /// semantics.
     ///
-    /// `is_success` is called only for `CallOutcome::Replied`. When it
-    /// returns `true`, this branch is the race winner: every other live
+    /// `is_success` is called only for a validated, still-live
+    /// `CallOutcome::Replied`. A reply observed after its branch was drained
+    /// for cancellation is recorded as late terminal truth, but cannot become
+    /// another winner. When the classifier returns `true`, this branch is the
+    /// race winner: every other live
     /// branch is drained via
     /// [`drain_pending_for_cancel`](Self::drain_pending_for_cancel) and
     /// returned as `cancel_losers` for the caller to cancel explicitly —
@@ -1577,8 +1580,13 @@ where
         R: Clone,
         F: FnOnce(&R) -> bool,
     {
+        let may_win = self
+            .entries
+            .iter()
+            .any(|entry| entry.token == token && entry.key == key);
         let classified_success = match &outcome {
-            CallOutcome::Replied(reply) => is_success(reply),
+            CallOutcome::Replied(reply) if may_win => is_success(reply),
+            CallOutcome::Replied(_) => false,
             CallOutcome::Full
             | CallOutcome::Closed
             | CallOutcome::Timeout
@@ -2520,5 +2528,75 @@ mod tests {
             .unwrap();
         assert!(!step.classified_success);
         assert!(step.cancel_losers.is_empty());
+    }
+
+    #[test]
+    fn classified_reply_validates_authority_before_running_classifier() {
+        use std::cell::Cell;
+
+        let mut set: CallSelectSet<u8, Reply> = CallSelectSet::with_capacity(1);
+        let token = set.insert(1, make_handle()).unwrap();
+        let classifier_calls = Cell::new(0);
+
+        let mismatch =
+            set.record_classified_reply(2, token, CallOutcome::Replied(Reply(10)), |_| {
+                classifier_calls.set(classifier_calls.get() + 1);
+                true
+            });
+        assert!(matches!(
+            mismatch,
+            Err(CallSetRecordReplyError::KeyMismatch { key: 2, .. })
+        ));
+        assert_eq!(classifier_calls.get(), 0);
+        assert_eq!(set.len(), 1, "mismatched authority must remain live");
+
+        let selected = set
+            .record_classified_reply(1, token, CallOutcome::Replied(Reply(10)), |_| {
+                classifier_calls.set(classifier_calls.get() + 1);
+                false
+            })
+            .unwrap();
+        assert!(!selected.classified_success);
+        assert_eq!(classifier_calls.get(), 1);
+
+        let duplicate =
+            set.record_classified_reply(1, token, CallOutcome::Replied(Reply(10)), |_| {
+                classifier_calls.set(classifier_calls.get() + 1);
+                true
+            });
+        assert!(matches!(
+            duplicate,
+            Err(CallSetRecordReplyError::UnknownToken { key: 1, .. })
+        ));
+        assert_eq!(classifier_calls.get(), 1);
+    }
+
+    #[test]
+    fn classified_late_loser_reply_cannot_become_a_second_winner() {
+        let mut set: CallSelectSet<u8, Reply> = CallSelectSet::with_capacity(2);
+        let winner = set.insert(1, make_handle()).unwrap();
+        let loser = set.insert(2, make_handle()).unwrap();
+
+        let first = set
+            .record_classified_reply(1, winner, CallOutcome::Replied(Reply(10)), |_| true)
+            .unwrap();
+        assert!(first.classified_success);
+        assert_eq!(first.cancel_losers.len(), 1);
+
+        let late = set
+            .record_classified_reply(2, loser, CallOutcome::Replied(Reply(20)), |_| true)
+            .unwrap();
+        assert!(!late.classified_success);
+        assert!(late.cancel_losers.is_empty());
+        assert!(!set.report_ready(), "cancel truth is still required");
+
+        let cancel = set
+            .record_cancel(2, loser, CancelOutcome::AlreadyCompleted)
+            .unwrap();
+        assert!(matches!(
+            cancel.outcome,
+            SelectedCallOutcome::Cancel(CancelOutcome::AlreadyCompleted)
+        ));
+        assert!(set.report_ready());
     }
 }
