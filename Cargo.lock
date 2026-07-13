@@ -3601,6 +3601,7 @@ dependencies = [
 name = "tina-runtime"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "betelgeuse",
  "libc",
  "loom",

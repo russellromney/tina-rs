@@ -50,6 +50,7 @@ signal-hook = { version = "0.3", default-features = false }
 libc = "0.2"
 
 [dev-dependencies]
+anyhow = "1"
 proptest = { version = "1.6.0", default-features = false, features = ["std"] }
 rcgen = "0.13"
 # Safety-rails proof matrix: pin the diagnostic phrase emitted by

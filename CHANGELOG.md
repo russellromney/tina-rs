@@ -4,6 +4,15 @@ This file records completed work.
 
 ## Unreleased
 
+### Report-preserving application shutdown
+
+- `LocalSystem::run_to_shutdown_reported` and its multi-shard parity method
+  preserve owned report containers such as `anyhow::Error` while retaining
+  workload-only, shutdown-only, and dual terminal outcomes. The generic
+  `ReportedWorkloadError<E>` adapter exposes the original report and keeps its
+  referenced standard error in the source chain without adding a runtime
+  dependency on a report crate.
+
 ### Address-aware root construction parity
 
 - `LocalSystem::register_root_using` and

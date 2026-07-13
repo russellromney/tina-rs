@@ -384,6 +384,19 @@ workload-only, shutdown-only, and dual failure without converting either error
 to text. Its dual variant retains both typed values, and the `workload()` and
 `shutdown()` accessors expose both source chains.
 
+Report containers such as `anyhow::Error` intentionally expose a standard
+error by reference without implementing `std::error::Error` themselves. Use
+the report-preserving form for those workloads:
+
+```rust
+let report = app.run_to_shutdown_reported(Duration::from_secs(5), run_application)?;
+```
+
+The returned `ReportedWorkloadError<E>` owns the original report, exposes it
+through `get_ref` and `into_inner`, and links the report's underlying error into
+the standard source chain. Shutdown-only and dual failures keep the same typed
+terminal contract as `run_to_shutdown`.
+
 This runner does not replace an application's service-level drain protocol.
 Drive `Stop` / `Drain` inside the closure when the service contract requires it;
 the runner guarantees the bounded final runtime-owner shutdown attempt. A

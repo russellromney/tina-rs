@@ -408,6 +408,52 @@ impl std::error::Error for TerminalShutdownError {
     }
 }
 
+/// Sized error adapter for workload report types that expose a standard error.
+///
+/// Some report containers, including `anyhow::Error`, intentionally do not
+/// implement [`std::error::Error`] themselves but do implement
+/// `AsRef<dyn Error + Send + Sync>`. This adapter preserves the owned report
+/// while making its referenced error available through [`std::error::Error::source`].
+#[derive(Debug)]
+pub struct ReportedWorkloadError<E>(E);
+
+impl<E> ReportedWorkloadError<E> {
+    /// Wraps one owned workload report without formatting or downcasting it.
+    pub const fn new(report: E) -> Self {
+        Self(report)
+    }
+
+    /// Borrows the original workload report.
+    pub const fn get_ref(&self) -> &E {
+        &self.0
+    }
+
+    /// Recovers the original workload report.
+    pub fn into_inner(self) -> E {
+        self.0
+    }
+}
+
+impl<E: fmt::Display> fmt::Display for ReportedWorkloadError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl<E> std::error::Error for ReportedWorkloadError<E>
+where
+    E: fmt::Debug
+        + fmt::Display
+        + AsRef<dyn std::error::Error + Send + Sync + 'static>
+        + Send
+        + Sync
+        + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 /// Typed result of a fallible workload followed by guaranteed local-system shutdown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunToShutdownError<E> {
@@ -1414,6 +1460,32 @@ where
         finish_run_to_shutdown(result, shutdown)
     }
 
+    /// Runs a fallible workload whose report exposes a standard error, then
+    /// performs the same bounded consuming shutdown as [`Self::run_to_shutdown`].
+    ///
+    /// This is the report-container form for types such as `anyhow::Error`
+    /// that implement `AsRef<dyn Error + Send + Sync>` without implementing
+    /// [`std::error::Error`] directly. The owned report is retained inside
+    /// [`ReportedWorkloadError`], its real error remains the source, and
+    /// workload-only, shutdown-only, and dual failures remain distinct.
+    pub fn run_to_shutdown_reported<T, E>(
+        self,
+        timeout: Duration,
+        workload: impl FnOnce(&Self) -> Result<T, E>,
+    ) -> Result<T, RunToShutdownError<ReportedWorkloadError<E>>>
+    where
+        E: fmt::Debug
+            + fmt::Display
+            + AsRef<dyn std::error::Error + Send + Sync + 'static>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.run_to_shutdown(timeout, |app| {
+            workload(app).map_err(ReportedWorkloadError::new)
+        })
+    }
+
     /// Begins graceful shutdown.
     pub fn shutdown(self) -> LocalSystemShutdown<S, F> {
         LocalSystemShutdown {
@@ -2253,6 +2325,28 @@ where
             .disarm_owner_drop();
         drop(self);
         finish_run_to_shutdown(result, shutdown)
+    }
+
+    /// Multi-shard parity form of [`LocalSystem::run_to_shutdown_reported`].
+    ///
+    /// The workload report stays owned and source-linked while the existing
+    /// shard-aware bounded shutdown and dual-failure contract remains unchanged.
+    pub fn run_to_shutdown_reported<T, E>(
+        self,
+        timeout: Duration,
+        workload: impl FnOnce(&Self) -> Result<T, E>,
+    ) -> Result<T, RunToShutdownError<ReportedWorkloadError<E>>>
+    where
+        E: fmt::Debug
+            + fmt::Display
+            + AsRef<dyn std::error::Error + Send + Sync + 'static>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.run_to_shutdown(timeout, |app| {
+            workload(app).map_err(ReportedWorkloadError::new)
+        })
     }
 
     /// Begins graceful shutdown.
