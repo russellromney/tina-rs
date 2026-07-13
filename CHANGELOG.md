@@ -61,6 +61,11 @@ This file records completed work.
   saved trace hash. Ships live, simulator, README byte-sync, and host-burst
   load-shed tests. Documented in a new README section after "Bounded By
   Construction".
+- The runnable binary is now a standing server: default `cargo run` binds an
+  ephemeral loopback port, prints its address, accepts forever, and echoes any
+  `nc` client until you press Enter (`EchoListener::target_accepts` became
+  `Option<usize>`, `None` for the server, `Some(n)` to bound tests/demo). The
+  bounded-mailbox story moved to a self-terminating `-- load-shed` subcommand.
 
 ### Truthful observed send after worker failure
 

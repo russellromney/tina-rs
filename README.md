@@ -178,26 +178,53 @@ and clean threaded-runtime shutdown. Continue with the
 ## Real I/O: A TCP Echo Server
 
 A TCP echo server is one listener isolate plus one isolate per connection. The
-listener binds a loopback port, accepts in a bounded loop, and spawns a fresh
+listener binds a loopback port, accepts forever, and spawns a fresh
 `EchoConnection` for each accepted stream. Each connection reads a chunk, writes
 the identical bytes back, and repeats until the peer half-closes. One connection
 is one isolate; nothing is shared between them.
 
-Clone the repository and run:
+Clone the repository and start the server:
 
 ```sh
 cargo run --manifest-path examples/specimen_tcp_echo/Cargo.toml
 ```
 
 ```text
-echo: sent 38 bytes, got them back unchanged
+echo server listening on 127.0.0.1:54321
+connect with:  nc 127.0.0.1 54321
+press Enter to stop
+```
+
+The OS picks the port and the server prints it at startup, so yours will differ.
+In a second terminal, connect with `nc`, type a line, and it comes straight back:
+
+```text
+$ nc 127.0.0.1 54321
+hello
+hello
+```
+
+Each connection makes the server log `accepted connection` in its own terminal.
+Press Enter there to stop it with a clean shutdown. This is a minimal demo: a
+failed `accept` stops the server rather than retrying, so an accept error stays
+visible instead of being swallowed.
+
+The bounded-mailbox contract has its own self-terminating demo. It bursts a
+worker whose mailbox holds only four records; the surplus comes back as a typed
+`Full` instead of an unbounded queue:
+
+```sh
+cargo run --manifest-path examples/specimen_tcp_echo/Cargo.toml -- load-shed
+```
+
+```text
 load shed: burst=32 cap=4 -> admitted=4 Full=28 (listener cap for reference: 8)
 ```
 
-The exact admitted/shed split on that second line shifts run to run — it is a
-race between the producer and the worker. What is guaranteed, and all the test
-pins, is that every one of the 32 records is accounted for and at least one is
-shed as a typed `Full`.
+The exact admitted/shed split shifts run to run — it is a race between the
+producer and the worker. What is guaranteed, and all the test pins, is that
+every one of the 32 records is accounted for and at least one is shed as a typed
+`Full`.
 
 The connection isolate is the whole story. Its checked-in source is
 [`examples/specimen_tcp_echo/src/lib.rs`](examples/specimen_tcp_echo/src/lib.rs).
