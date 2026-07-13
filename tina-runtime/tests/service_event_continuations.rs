@@ -5,8 +5,9 @@ use std::time::{Duration, Instant};
 use tina::prelude::*;
 use tina_runtime::{
     CallError, CallGroup, CallGroupToken, CallJoinSet, CallOutcome, CallSelectSet,
-    DefaultThreadedMailboxFactory, FileId, RequestScope, RequestScopeId, ScopeCancelCause,
-    SplitServiceHandle, ThreadedRuntime, call, call_cancelable, cancel_call, file_close, sleep,
+    DefaultThreadedMailboxFactory, FileId, PendingCancelableCallSet, PendingCancelableTicket,
+    RequestScope, RequestScopeId, ScopeCancelCause, SplitServiceHandle, ThreadedRuntime, call,
+    call_cancelable, cancel_call, file_close, sleep,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(1);
@@ -63,6 +64,8 @@ impl Probe {
 enum ServiceEvent {
     StartOrdinary,
     StartCancellation,
+    StartSpawn,
+    CancelPending,
     Slept(Result<(), CallError>),
     FileClosed(Result<(), CallError>),
     Called(CallOutcome<u32>),
@@ -71,6 +74,13 @@ enum ServiceEvent {
     DeferredSleep(tina::RequestContext<u32>, Result<(), CallError>),
     DeferredCall(tina::RequestContext<u32>, CallOutcome<u32>),
     FlowCall(tina::RequestContext<u32>, CallOutcome<u32>),
+    Spawned(tina::SpawnObservedResult<ProbeMessage, u32>),
+    PendingReturned {
+        key: u32,
+        ticket: PendingCancelableTicket,
+        outcome: CallOutcome<u32>,
+    },
+    PendingCancelled(tina::RequestContext<u32>, tina::CancelOutcome),
 }
 
 #[derive(Debug)]
@@ -78,14 +88,27 @@ enum ServiceRequest {
     DeferredSleep,
     DeferredCall,
     FlowCall,
+    PendingComplete,
+    PendingCancel,
 }
 
 struct Service {
     probe: Address<ProbeMessage, u32>,
     observed: Arc<Mutex<Vec<&'static str>>>,
+    pending: PendingCancelableCallSet<u32, u32, u32>,
 }
 
-#[tina_runtime::isolate(event = ServiceEvent, request = ServiceRequest, reply = u32)]
+#[tina_runtime::isolate(
+    event = ServiceEvent,
+    request = ServiceRequest,
+    reply = u32,
+    spawn_observed = tina::SpawnObserved<
+        tina::ChildDefinition<Probe>,
+        tina::ServiceMessage<ServiceEvent, ServiceRequest>,
+        ProbeMessage,
+        u32
+    >,
+)]
 impl Service {
     fn handle_event(
         &mut self,
@@ -110,6 +133,17 @@ impl Service {
                     .then_service_event(ServiceEvent::CancelableCalled);
                 let cancel = cancel_call(handle).then_service_event(ServiceEvent::Cancelled);
                 Effect::Batch(vec![pending, cancel])
+            }
+            ServiceEvent::StartSpawn => tina::spawn_observed(tina::ChildDefinition::new(Probe, 4))
+                .then_service_event(ServiceEvent::Spawned),
+            ServiceEvent::CancelPending => {
+                let Some(ticket) = self.pending.ticket(&2) else {
+                    return noop();
+                };
+                let token = self.pending.remove(&2, ticket).expect("pending key exists");
+                token.cancel_service_event(|_key, request, outcome| {
+                    ServiceEvent::PendingCancelled(request, outcome)
+                })
             }
             ServiceEvent::Slept(result) => {
                 result.expect("sleep succeeds");
@@ -150,6 +184,31 @@ impl Service {
             ServiceEvent::DeferredCall(_, other) | ServiceEvent::FlowCall(_, other) => {
                 panic!("unexpected deferred call outcome: {other:?}")
             }
+            ServiceEvent::Spawned(Ok(_child)) => {
+                self.observed.lock().unwrap().push("spawned");
+                noop()
+            }
+            ServiceEvent::Spawned(Err(error)) => panic!("observed spawn failed: {error:?}"),
+            ServiceEvent::PendingReturned {
+                key,
+                ticket,
+                outcome,
+            } => {
+                let token = self
+                    .pending
+                    .remove(&key, ticket)
+                    .expect("completion ticket removes exact token");
+                let CallOutcome::Replied(value) = outcome else {
+                    panic!("pending child call failed: {outcome:?}");
+                };
+                reply_to(token.into_request_context(), value + 30)
+            }
+            ServiceEvent::PendingCancelled(request, tina::CancelOutcome::Cancelled) => {
+                reply_to(request, 99)
+            }
+            ServiceEvent::PendingCancelled(_, other) => {
+                panic!("pending cancellation failed: {other:?}")
+            }
         }
     }
 
@@ -169,6 +228,26 @@ impl Service {
                 call(self.probe, ProbeMessage::Value, TIMEOUT)
                     .then_service_event_with_request(request, ServiceEvent::FlowCall)
             }),
+            ServiceRequest::PendingComplete => request_call
+                .defer_cancelable(call_cancelable(self.probe, ProbeMessage::Value, TIMEOUT))
+                .try_admit_service_event(&mut self.pending, 1, |key, ticket, outcome| {
+                    ServiceEvent::PendingReturned {
+                        key,
+                        ticket,
+                        outcome,
+                    }
+                })
+                .unwrap_or_else(|error| error.reply(0)),
+            ServiceRequest::PendingCancel => request_call
+                .defer_cancelable(call_cancelable(self.probe, ProbeMessage::Hold, TIMEOUT))
+                .try_admit_service_event(&mut self.pending, 2, |key, ticket, outcome| {
+                    ServiceEvent::PendingReturned {
+                        key,
+                        ticket,
+                        outcome,
+                    }
+                })
+                .unwrap_or_else(|error| error.reply(0)),
         }
     }
 }
@@ -185,6 +264,7 @@ fn service_event_helpers_wrap_envelopes_and_preserve_request_authority() {
             Service {
                 probe,
                 observed: observed.clone(),
+                pending: PendingCancelableCallSet::with_capacity(2),
             },
             16,
         )
@@ -196,11 +276,15 @@ fn service_event_helpers_wrap_envelopes_and_preserve_request_authority() {
     runtime
         .send_event_and_observe(service.events, ServiceEvent::StartCancellation)
         .expect("start cancellation continuation");
+    runtime
+        .send_event_and_observe(service.events, ServiceEvent::StartSpawn)
+        .expect("start observed spawn continuation");
 
     for (request, expected) in [
         (ServiceRequest::DeferredSleep, 11),
         (ServiceRequest::DeferredCall, 17),
         (ServiceRequest::FlowCall, 27),
+        (ServiceRequest::PendingComplete, 37),
     ] {
         assert_eq!(
             runtime
@@ -210,11 +294,40 @@ fn service_event_helpers_wrap_envelopes_and_preserve_request_authority() {
         );
     }
 
+    let runtime_for_cancel = &runtime;
+    let cancel_request = std::thread::scope(|scope| {
+        let pending = scope.spawn(|| {
+            runtime_for_cancel.call_blocking_request(
+                service.requests,
+                ServiceRequest::PendingCancel,
+                TIMEOUT,
+            )
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        runtime_for_cancel
+            .send_event_and_observe(service.events, ServiceEvent::CancelPending)
+            .expect("cancel pending child call");
+        pending.join().expect("pending caller thread")
+    });
+    assert_eq!(
+        cancel_request.expect("pending cancel host call"),
+        CallOutcome::Replied(99)
+    );
+
     let deadline = Instant::now() + TIMEOUT;
     loop {
         let mut values = observed.lock().unwrap().clone();
         values.sort_unstable();
-        if values == ["call", "cancelable", "cancelled", "sleep", "typed_call"] {
+        if values
+            == [
+                "call",
+                "cancelable",
+                "cancelled",
+                "sleep",
+                "spawned",
+                "typed_call",
+            ]
+        {
             break;
         }
         assert!(
