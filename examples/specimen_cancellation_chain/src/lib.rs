@@ -102,13 +102,3 @@ pub fn assert_tokio_report_invariants(report: &Report) {
         "tokio: replies_before + replies_after must not exceed FANOUT, got {report:?}",
     );
 }
-
-/// Backwards-compatible aggregate invariant. Calls the appropriate
-/// per-side check based on `side`.
-pub fn assert_report_invariants(side: &str, report: &Report) {
-    match side {
-        "tina" => assert_tina_report_invariants(report),
-        "tokio" => assert_tokio_report_invariants(report),
-        other => panic!("unknown side {other:?}; expected \"tina\" or \"tokio\""),
-    }
-}

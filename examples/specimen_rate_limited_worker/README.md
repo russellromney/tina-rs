@@ -13,8 +13,9 @@ timing-sensitive (the worker may have drained one slot by the time
 the producer pushes the next job), so the smoke tests assert
 structural invariants:
 
-- `admitted + full == BURST_JOBS`
+- `admitted + full + terminal == BURST_JOBS`
 - `full > 0` (overload was visible)
+- `terminal == 0` (the worker remained live for the burst)
 - `processed == admitted`
 - `exit_clean`
 
@@ -107,7 +108,7 @@ let snap = outcomes.snapshot();
 ```
 
 After every observer fires, the host sends `BurstClosed(admitted)`
-through the observed-send retry helper's `send_observed_until` retry helper. If the
+through `send_observed_until`. If the
 mailbox is full of admitted `Submit`s, the helper retries until a slot
 opens or the deadline elapses; the typed `Closed` / `Timeout` /
 `WorkerStopped` outcomes stay distinct. That is deliberate: "done
@@ -127,10 +128,11 @@ What feels better:
 - **Rate window is in the trace.** Every processed job is one
   `Sleep` + one `Tick`. Reading the trace tells you the rate the
   worker actually achieved without any extra instrumentation.
-- **Producer learns the truth.** `send_and_observe` distinguishes
+- **Producer learns the truth.** `try_send_outcome` distinguishes
   `MailboxFull` (the queue is at cap) from `IngressFull` (the worker
-  thread can't even pick up the command). Tokio's `try_send` only
-  has the former.
+  thread can't even pick up the command), while also retaining
+  `MailboxClosed` and `WorkerStopped` as terminal buckets. Tokio's
+  `try_send` has `Full` and `Closed` only.
 - **Final value via `stop_with`.** The host reads the worker's
   `Report` through `observe_result`. No mpsc plumbing, no `Arc<Mutex>`
   for the answer.

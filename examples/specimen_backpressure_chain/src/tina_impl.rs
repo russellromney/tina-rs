@@ -45,12 +45,18 @@ enum CRequest {
 /// Internal event: the sleep continuation for a call in flight.
 #[derive(Debug)]
 enum CEvent {
-    Done(RequestContext<()>, SleepReply),
+    Done(RequestContext<CReply>, SleepReply),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CReply {
+    Ok,
+    DomainFailure,
 }
 
 struct ServiceC;
 
-#[tina_runtime::isolate(event = CEvent, request = CRequest, reply = ())]
+#[tina_runtime::isolate(event = CEvent, request = CRequest, reply = CReply)]
 impl ServiceC {
     fn handle_event(
         &mut self,
@@ -58,8 +64,8 @@ impl ServiceC {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match event {
-            CEvent::Done(req, Ok(())) => reply_to(req, ()),
-            CEvent::Done(req, Err(_)) => reply_to(req, ()),
+            CEvent::Done(req, Ok(())) => reply_to(req, CReply::Ok),
+            CEvent::Done(req, Err(_)) => reply_to(req, CReply::DomainFailure),
         }
     }
 
@@ -96,18 +102,21 @@ enum BRequest {
 /// Internal event: the call-to-C continuation for a request in flight.
 #[derive(Debug)]
 enum BEvent {
-    CDone(RequestContext<BReply>, CallOutcome<()>),
+    CDone(RequestContext<BReply>, CallOutcome<CReply>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BReply {
     Ok,
     CTimedOut,
-    Error,
+    Full,
+    Closed,
+    Rejected,
+    DomainFailure,
 }
 
 struct ServiceB {
-    c_addr: tina::ServiceRequestAddress<CEvent, CRequest, ()>,
+    c_addr: tina::ServiceRequestAddress<CEvent, CRequest, CReply>,
 }
 
 #[tina_runtime::isolate(event = BEvent, request = BRequest, reply = BReply)]
@@ -118,13 +127,7 @@ impl ServiceB {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match event {
-            BEvent::CDone(req, outcome) => match outcome {
-                CallOutcome::Replied(()) => reply_to(req, BReply::Ok),
-                CallOutcome::Timeout => reply_to(req, BReply::CTimedOut),
-                CallOutcome::Full | CallOutcome::Closed | CallOutcome::Rejected(_) => {
-                    reply_to(req, BReply::Error)
-                }
-            },
+            BEvent::CDone(req, outcome) => reply_to(req, map_c_outcome(outcome)),
         }
     }
 
@@ -155,6 +158,17 @@ impl ServiceB {
     }
 }
 
+fn map_c_outcome(outcome: CallOutcome<CReply>) -> BReply {
+    match outcome {
+        CallOutcome::Replied(CReply::Ok) => BReply::Ok,
+        CallOutcome::Replied(CReply::DomainFailure) => BReply::DomainFailure,
+        CallOutcome::Timeout => BReply::CTimedOut,
+        CallOutcome::Full => BReply::Full,
+        CallOutcome::Closed => BReply::Closed,
+        CallOutcome::Rejected(_) => BReply::Rejected,
+    }
+}
+
 // ---------- Service A: entry point ----------
 //
 // Same split-service shape as B: `call.now()` anchors the deadline before
@@ -176,8 +190,11 @@ enum AEvent {
 enum AReply {
     Success,
     CTimedOut,
-    ATimedOut,
-    Error,
+    Timeout,
+    Full,
+    Closed,
+    Rejected,
+    DomainFailure,
 }
 
 struct ServiceA {
@@ -193,15 +210,7 @@ impl ServiceA {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match event {
-            AEvent::BDone(req, outcome) => match outcome {
-                CallOutcome::Replied(BReply::Ok) => reply_to(req, AReply::Success),
-                CallOutcome::Replied(BReply::CTimedOut) => reply_to(req, AReply::CTimedOut),
-                CallOutcome::Replied(BReply::Error) => reply_to(req, AReply::Error),
-                CallOutcome::Timeout => reply_to(req, AReply::ATimedOut),
-                CallOutcome::Full | CallOutcome::Closed | CallOutcome::Rejected(_) => {
-                    reply_to(req, AReply::Error)
-                }
-            },
+            AEvent::BDone(req, outcome) => reply_to(req, map_b_outcome(outcome)),
         }
     }
 
@@ -237,6 +246,18 @@ impl ServiceA {
     }
 }
 
+fn map_b_outcome(outcome: CallOutcome<BReply>) -> AReply {
+    match outcome {
+        CallOutcome::Replied(BReply::Ok) => AReply::Success,
+        CallOutcome::Replied(BReply::CTimedOut) => AReply::CTimedOut,
+        CallOutcome::Replied(BReply::Full) | CallOutcome::Full => AReply::Full,
+        CallOutcome::Replied(BReply::Closed) | CallOutcome::Closed => AReply::Closed,
+        CallOutcome::Replied(BReply::Rejected) | CallOutcome::Rejected(_) => AReply::Rejected,
+        CallOutcome::Replied(BReply::DomainFailure) => AReply::DomainFailure,
+        CallOutcome::Timeout => AReply::Timeout,
+    }
+}
+
 // ---------- Driver: walks the script ----------
 
 #[derive(Debug, Clone)]
@@ -258,20 +279,23 @@ impl Driver {
         match msg {
             DriverMsg::Begin => self.next_step(),
             DriverMsg::ADone(outcome) => {
-                match outcome {
-                    CallOutcome::Replied(AReply::Success) => self.report.successful += 1,
-                    CallOutcome::Replied(AReply::CTimedOut) => self.report.c_timed_out += 1,
-                    CallOutcome::Replied(AReply::ATimedOut) => self.report.chain_dropped += 1,
-                    CallOutcome::Replied(AReply::Error) => self.report.chain_dropped += 1,
-                    CallOutcome::Timeout
-                    | CallOutcome::Full
-                    | CallOutcome::Closed
-                    | CallOutcome::Rejected(_) => self.report.chain_dropped += 1,
-                }
+                record_a_outcome(&mut self.report, outcome);
                 self.next_iteration += 1;
                 self.next_step()
             }
         }
+    }
+}
+
+fn record_a_outcome(report: &mut Report, outcome: CallOutcome<AReply>) {
+    match outcome {
+        CallOutcome::Replied(AReply::Success) => report.successful += 1,
+        CallOutcome::Replied(AReply::CTimedOut) => report.c_timed_out += 1,
+        CallOutcome::Replied(AReply::Timeout) | CallOutcome::Timeout => report.caller_timeout += 1,
+        CallOutcome::Replied(AReply::Full) | CallOutcome::Full => report.full += 1,
+        CallOutcome::Replied(AReply::Closed) | CallOutcome::Closed => report.closed += 1,
+        CallOutcome::Replied(AReply::Rejected) | CallOutcome::Rejected(_) => report.rejected += 1,
+        CallOutcome::Replied(AReply::DomainFailure) => report.domain_failure += 1,
     }
 }
 
@@ -298,7 +322,7 @@ impl Driver {
 
 pub fn run() -> anyhow::Result<Report> {
     let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
-    Ok(app.run_to_shutdown(Duration::from_secs(5), run_application)?)
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), run_application)?)
 }
 
 fn run_application(
@@ -346,4 +370,90 @@ fn run_application(
         .map_err(|e| anyhow::anyhow!("driver did not finish: {e:?}"))?;
 
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tina::CallRejectedReason;
+
+    const REJECTED: CallRejectedReason = CallRejectedReason::UnsupportedMessage;
+
+    #[test]
+    fn c_outcomes_remain_distinct_at_b() {
+        assert_eq!(map_c_outcome(CallOutcome::Replied(CReply::Ok)), BReply::Ok);
+        assert_eq!(
+            map_c_outcome(CallOutcome::Replied(CReply::DomainFailure)),
+            BReply::DomainFailure
+        );
+        assert_eq!(map_c_outcome(CallOutcome::Timeout), BReply::CTimedOut);
+        assert_eq!(map_c_outcome(CallOutcome::Full), BReply::Full);
+        assert_eq!(map_c_outcome(CallOutcome::Closed), BReply::Closed);
+        assert_eq!(map_c_outcome(CallOutcome::Rejected(REJECTED)), BReply::Rejected);
+    }
+
+    #[test]
+    fn b_and_runtime_outcomes_remain_distinct_at_a() {
+        let cases = [
+            (CallOutcome::Replied(BReply::Ok), AReply::Success),
+            (CallOutcome::Replied(BReply::CTimedOut), AReply::CTimedOut),
+            (CallOutcome::Replied(BReply::Full), AReply::Full),
+            (CallOutcome::Replied(BReply::Closed), AReply::Closed),
+            (CallOutcome::Replied(BReply::Rejected), AReply::Rejected),
+            (
+                CallOutcome::Replied(BReply::DomainFailure),
+                AReply::DomainFailure,
+            ),
+            (CallOutcome::Timeout, AReply::Timeout),
+            (CallOutcome::Full, AReply::Full),
+            (CallOutcome::Closed, AReply::Closed),
+            (CallOutcome::Rejected(REJECTED), AReply::Rejected),
+        ];
+        for (outcome, expected) in cases {
+            assert_eq!(map_b_outcome(outcome), expected);
+        }
+    }
+
+    #[test]
+    fn driver_accounts_every_terminal_bucket_independently() {
+        let mut report = Report::default();
+        for outcome in [
+            CallOutcome::Replied(AReply::Success),
+            CallOutcome::Replied(AReply::CTimedOut),
+            CallOutcome::Replied(AReply::Timeout),
+            CallOutcome::Replied(AReply::Full),
+            CallOutcome::Replied(AReply::Closed),
+            CallOutcome::Replied(AReply::Rejected),
+            CallOutcome::Replied(AReply::DomainFailure),
+        ] {
+            record_a_outcome(&mut report, outcome);
+        }
+        assert_eq!(
+            report,
+            Report {
+                successful: 1,
+                c_timed_out: 1,
+                caller_timeout: 1,
+                full: 1,
+                closed: 1,
+                rejected: 1,
+                domain_failure: 1,
+                exit_clean: false,
+            }
+        );
+
+        let mut outer = Report::default();
+        for outcome in [
+            CallOutcome::Timeout,
+            CallOutcome::Full,
+            CallOutcome::Closed,
+            CallOutcome::Rejected(REJECTED),
+        ] {
+            record_a_outcome(&mut outer, outcome);
+        }
+        assert_eq!(outer.caller_timeout, 1);
+        assert_eq!(outer.full, 1);
+        assert_eq!(outer.closed, 1);
+        assert_eq!(outer.rejected, 1);
+    }
 }

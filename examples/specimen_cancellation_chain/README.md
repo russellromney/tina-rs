@@ -32,8 +32,8 @@ cargo test --manifest-path examples/specimen_cancellation_chain/Cargo.toml
 
 - Cancellation is bookkeeping: each pending call has a `CallHandle`
   stored by a bounded `CallGroup` keyed by worker index. The driver
-  drains the group on cancel and fans the cancels back out as a
-  `Batch`, one cancel per stored handle. There is no one-shot
+  drains the group on cancel and fans the cancels back out through
+  `BoundedItems` / `bounded_batch`, one cancel per stored handle. There is no one-shot
   `JoinSet::abort_all()` analogue — and there will not be: explicit
   drain-and-cancel keeps each per-call outcome typed.
 
@@ -45,7 +45,10 @@ returns the typed continuation effect. `record_reply` and
 `record_cancel` settle exactly that generation; stale or duplicate
 continuations are errors rather than accidental cleanup of a reused
 slot. `drain_pending_for_cancel` transfers each move-only handle to
-one explicit `cancel_call` effect without growing past `FANOUT`.
+one explicit `cancel_call` effect without growing past `FANOUT`. The
+driver emits its report only after `CallGroup::report_ready()` says every
+reply and cancel fact is recorded; no host delay or finish message stands
+in for settlement.
 
 ## What feels better
 

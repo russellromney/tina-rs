@@ -16,8 +16,8 @@ cargo test --manifest-path examples/specimen_backpressure_chain/Cargo.toml
 ```
 
 ```
-side=tokio successful=3 c_timed_out=3 chain_dropped=0 exit_clean=true
-side=tina  successful=3 c_timed_out=3 chain_dropped=0 exit_clean=true
+side=tokio successful=3 c_timed_out=0 caller_timeout=3 full=0 closed=0 rejected=0 domain_failure=0 exit_clean=true
+side=tina  successful=3 c_timed_out=3 caller_timeout=0 full=0 closed=0 rejected=0 domain_failure=0 exit_clean=true
 ```
 
 ## Read
@@ -39,9 +39,9 @@ match tokio::time::timeout(total, service_b(i)).await {
 }
 ```
 
-The README counts `c_timed_out` only because *the test scripts which
-hop is slow* (`c_is_slow(i)`). In real Tokio code, the runtime tells
-you nothing more than "the chain timed out."
+The Tokio report therefore increments `caller_timeout`; it does not infer a
+C timeout from the test script. In real Tokio code, the runtime tells you
+nothing more than "the chain timed out."
 
 ## Tina shape
 
@@ -76,12 +76,15 @@ When C is too slow, B's `IsolateCall` to C resolves as
 and replies fast. A receives `CallOutcome::Replied(CTimedOut)` and
 knows *exactly* which hop ran out. No invisible drops:
 
-| Outcome at A                          | Hop responsible        |
-|---------------------------------------|------------------------|
-| `Replied(Success)`                    | (chain finished ok)    |
-| `Replied(CTimedOut)`                  | C ran past `budget`    |
-| `Timeout`                             | A's own outer deadline |
-| `Replied(Error)` / `Full` / `Closed`  | B ingress / lifecycle  |
+| Outcome at A             | Report bucket / truth       |
+|--------------------------|-----------------------------|
+| `Replied(Success)`       | chain finished              |
+| `Replied(CTimedOut)`     | C ran past `budget`         |
+| `Timeout`                | caller wait expired         |
+| `Full`                   | bounded admission was full  |
+| `Closed`                 | destination was closed      |
+| `Rejected(_)`            | typed runtime rejection     |
+| `Replied(DomainFailure)` | service-domain failure      |
 
 ## Discussion
 
@@ -102,10 +105,10 @@ What feels better:
   `Context::now()`; the simulator stamps the same field from its
   virtual clock anchor, so DST/replay tests see deterministic
   deadline math.
-- **The reply translator is tiny.** B's `match outcome { Replied(())
-  => reply(Ok), Timeout => reply(CTimedOut), Full | Closed =>
-  reply(Error) }` is the entire propagation layer. No second tower
-  middleware, no `tracing::Span` plumbing.
+- **The reply translator is exhaustive.** B and A preserve `Full`,
+  `Closed`, `Rejected`, caller `Timeout`, and domain failure as distinct
+  typed replies. The driver counts those buckets independently instead of
+  collapsing them into a generic error.
 
 What feels worse:
 

@@ -27,8 +27,9 @@
 //! - `c_timed_out` — Tina: B observed `CallOutcome::Timeout` from C
 //!   (or Tokio: outer timeout fired while we believe C was the slow
 //!   hop). Counted from each side's own visible state;
-//! - `chain_dropped` — Tokio-only flavor: outer timeout fired but we
-//!   cannot say which hop was responsible. Tina runs always know.
+//! - `caller_timeout` — a caller's own wait expired;
+//! - `full`, `closed`, `rejected`, and `domain_failure` — distinct
+//!   terminal truths preserved through every hop.
 
 pub mod tina_impl;
 pub mod tokio_impl;
@@ -65,27 +66,45 @@ pub struct Report {
     /// scripts that side so we can pretend); Tina reports this when
     /// B observes `CallOutcome::Timeout` from its `call(C, ..., budget)`.
     pub c_timed_out: u32,
-    /// Tokio-only: outer timeout fired and the runtime cannot tell us
-    /// which hop ran out of time. Tina always names the hop, so this
-    /// is `0` on the Tina side.
-    pub chain_dropped: u32,
+    /// A caller's own wait expired before a typed downstream reply arrived.
+    pub caller_timeout: u32,
+    /// A bounded call admission was full.
+    pub full: u32,
+    /// The destination was closed.
+    pub closed: u32,
+    /// The runtime rejected the call for another typed reason.
+    pub rejected: u32,
+    /// The service completed with a domain failure.
+    pub domain_failure: u32,
     /// Whether each side reached the end of `run` cleanly.
     pub exit_clean: bool,
 }
 
-/// Expected counts under the constants above. Both sides should see
-/// 3 fast (successful) and 3 slow (timed-out at C). The
-/// `chain_dropped` distinction does not show up in the report counts
-/// because the test scripts which requests are slow; the *kind* of
-/// information available to each runtime is what differs (and the
-/// README documents).
-pub fn expected_report() -> Report {
+/// Expected Tina counts under the constants above: three successful
+/// requests and three typed C-hop timeouts.
+pub fn expected_tina_report() -> Report {
     let slow_count = (0..REQUEST_COUNT).filter(|i| c_is_slow(*i)).count() as u32;
     let fast_count = REQUEST_COUNT - slow_count;
     Report {
         successful: fast_count,
         c_timed_out: slow_count,
-        chain_dropped: 0,
+        caller_timeout: 0,
+        full: 0,
+        closed: 0,
+        rejected: 0,
+        domain_failure: 0,
         exit_clean: true,
+    }
+}
+
+/// Tokio can only name its outer caller timeout, not the C hop.
+pub fn expected_tokio_report() -> Report {
+    let slow_count = (0..REQUEST_COUNT).filter(|i| c_is_slow(*i)).count() as u32;
+    let fast_count = REQUEST_COUNT - slow_count;
+    Report {
+        successful: fast_count,
+        caller_timeout: slow_count,
+        exit_clean: true,
+        ..Report::default()
     }
 }

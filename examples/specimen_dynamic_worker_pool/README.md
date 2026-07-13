@@ -127,7 +127,7 @@ What got better:
   `CoordMsg::Start` that carries no address. (FINDINGS finding 3,
   self-address at registration.)
 - **Application-shaped lifetime.** The host uses `LocalSystem` and its
-  consuming `run_to_shutdown` path, so early workload errors cannot bypass
+  consuming `run_to_shutdown_reported` path, so early workload errors cannot bypass
   typed terminal validation.
 
 ## Partial-failure flavor
@@ -138,12 +138,12 @@ report from the earlier scatter/gather specimens cover the typed partial-aggrega
 future variant of this specimen could:
 
 - give one worker a slice that triggers a panic;
-- have the coord observe the missing partial via
-  `observe_isolate_complete(child_addr)` (if the spawn API surfaced
-  the address) or via a deadline-fired tick that scans which
-  partials are missing;
+- have the coordinator join child completion and result publication as
+  one parent-owned typed outcome, rather than relying on the result message
+  alone;
 - emit a `Report` with `results_collected < expected`.
 
-That requires FINDINGS finding 14 (spawn API surfaces child's
-address); the self-address half of finding 3 is handled by
-the `register_root_using` constructor used here.
+Spawn addresses are already surfaced by the runtime. The remaining gap is a
+parent-side child join/completion primitive that combines child termination
+with expected result publication; `register_root_using` already resolves the
+coordinator self-address side.

@@ -105,7 +105,7 @@ pub fn run() -> anyhow::Result<Report> {
         .map(|i| WORK_VALUES[i * chunk_size..(i + 1) * chunk_size].to_vec())
         .collect();
 
-    Ok(app.run_to_shutdown(Duration::from_secs(5), move |app| {
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), move |app| {
         let coord_addr = app
             .register_root_using(
             // Mailbox sized for `Start` + every worker's `WorkerDone`.

@@ -1,5 +1,5 @@
 //! Tina side. The driver fans out one IsolateCall per worker via
-//! [`tina_runtime::call_cancelable`], stores each named wait in a bounded
+//! [`tina_runtime::call_cancelable_request`], stores each named wait in a bounded
 //! [`CallGroup`], and on the host's `Cancel` signal drains the group
 //! and cancels each entry explicitly with [`cancel_call`]. Worker
 //! replies that arrive after cancellation are
@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallGroup, CallGroupToken, CallOutcome, CallReplyRejectedReason, DefaultThreadedMailboxFactory,
-    DeferredReplyRejectedReason, LocalSystem, RuntimeEventKind, SleepReply,
-    call_cancelable_request, cancel_call, sleep,
+    BoundedItems, CallGroup, CallGroupToken, CallOutcome, CallReplyRejectedReason,
+    DefaultThreadedMailboxFactory, DeferredReplyRejectedReason, LocalSystem, RuntimeEventKind,
+    SleepReply, bounded_batch, call_cancelable_request, cancel_call, sleep,
 };
 
 use crate::{CANCEL_AFTER_MS, FANOUT, Report, WORK_MS};
@@ -95,9 +95,6 @@ enum DriverMsg {
         token: CallGroupToken,
         outcome: CancelOutcome,
     },
-    /// Stop the driver and emit the final report. Sent after the host
-    /// has waited long enough for the cancellation chain to settle.
-    Finish,
 }
 
 struct Driver {
@@ -120,24 +117,25 @@ impl Driver {
     ) -> Effect<Self> {
         match msg {
             DriverMsg::Begin => {
-                let mut effects = Vec::with_capacity(self.workers.len());
-                for (idx, worker) in self.workers.iter().enumerate() {
-                    let key = idx as u32;
-                    let effect = self
+                let workers = BoundedItems::try_from_iter(
+                    FANOUT as usize,
+                    self.workers.iter().copied().enumerate(),
+                )
+                .expect("worker fan-out is capped by FANOUT");
+                bounded_batch(workers.map_effects(|(idx, worker)| {
+                    self
                         .group
                         .start_cancelable(
-                            key,
-                            call_cancelable_request(*worker, WorkerRequest::Do, CALL_TIMEOUT),
+                            idx as u32,
+                            call_cancelable_request(worker, WorkerRequest::Do, CALL_TIMEOUT),
                             |worker, token, outcome| DriverMsg::Returned {
                                 worker,
                                 token,
                                 outcome,
                             },
                         )
-                        .expect("group sized to FANOUT");
-                    effects.push(effect);
-                }
-                Effect::Batch(effects)
+                        .expect("call group is capped by FANOUT")
+                }))
             }
             DriverMsg::Returned {
                 worker,
@@ -158,25 +156,25 @@ impl Driver {
                 if replied {
                     self.replies_before_cancel += 1;
                 }
-                noop()
+                self.finish_if_settled()
             }
             DriverMsg::Cancel => {
                 self.cancel_observed = true;
                 let cancel_requests = self.group.drain_pending_for_cancel();
-                let mut effects = Vec::with_capacity(cancel_requests.len());
-                // Drain the group; `cancel_call` is still explicit
-                // user code, one named wait at a time.
-                for request in cancel_requests {
-                    let (worker, token, handle) = request.into_parts();
-                    effects.push(
-                        cancel_call(handle).then(move |outcome| DriverMsg::Cancelled {
-                            worker,
-                            token,
-                            outcome,
-                        }),
-                    );
+                if cancel_requests.is_empty() {
+                    return self.finish_if_settled();
                 }
-                Effect::Batch(effects)
+                let cancel_requests =
+                    BoundedItems::try_from_iter(FANOUT as usize, cancel_requests)
+                        .expect("cancel fan-out is capped by FANOUT");
+                bounded_batch(cancel_requests.map_effects(|request| {
+                    let (worker, token, handle) = request.into_parts();
+                    cancel_call(handle).then(move |outcome| DriverMsg::Cancelled {
+                        worker,
+                        token,
+                        outcome,
+                    })
+                }))
             }
             DriverMsg::Cancelled {
                 worker,
@@ -186,14 +184,23 @@ impl Driver {
                 if self.group.record_cancel(worker, token, outcome).is_err() {
                     self.group_error = true;
                 }
-                noop()
+                self.finish_if_settled()
             }
-            DriverMsg::Finish => stop_with(Report {
+        }
+    }
+}
+
+impl Driver {
+    fn finish_if_settled(&self) -> Effect<Self> {
+        if self.cancel_observed && self.group.report_ready() {
+            stop_with(Report {
                 replies_before_cancel: self.replies_before_cancel,
                 replies_after_cancel: 0,
-                cancel_observed: self.cancel_observed,
+                cancel_observed: true,
                 exit_clean: !self.group_error,
-            }),
+            })
+        } else {
+            noop()
         }
     }
 }
@@ -202,7 +209,7 @@ impl Driver {
 
 pub fn run() -> anyhow::Result<Report> {
     let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
-    Ok(app.run_to_shutdown(Duration::from_secs(5), run_application)?)
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), run_application)?)
 }
 
 fn run_application(
@@ -246,16 +253,6 @@ fn run_application(
 
     app.try_send(driver, DriverMsg::Cancel)
         .map_err(|e| anyhow::anyhow!("send Cancel: {e:?}"))?;
-
-    // Give the worker sleep timers a chance to elapse so any "late"
-    // worker replies fire while the driver is alive but its
-    // pending-call slots have been cancelled. Those replies surface
-    // as `CallReplyRejected { CallerCancelled }` events — not
-    // delivered messages — which is the visible-truth invariant.
-    std::thread::sleep(Duration::from_millis(WORK_MS + 50));
-
-    app.try_send(driver, DriverMsg::Finish)
-        .map_err(|e| anyhow::anyhow!("send Finish: {e:?}"))?;
 
     let mut report = result
         .wait(Duration::from_secs(5))

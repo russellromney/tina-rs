@@ -4,13 +4,13 @@
 //! Both sides:
 //!
 //! - bound the worker's queue at [`QUEUE_CAPACITY`];
-//! - submit [`BURST_JOBS`] jobs as fast as the host can `try_send`;
+//! - submit [`BURST_JOBS`] jobs with non-blocking observed sends;
 //! - process one job per [`RATE_WINDOW_MS`].
 //!
 //! What we are looking at: how does overload show up at the
 //! producer? In Tokio, a bounded `mpsc` returns
-//! `TrySendError::Full`. In Tina, `LocalSystem::try_send` returns
-//! `IngressFull` once the worker mailbox is at capacity. Both sides
+//! `TrySendError::Full`. In Tina, `LocalSystem::try_send_outcome` records
+//! `MailboxFull` or `IngressFull` without collapsing terminal outcomes. Both sides
 //! count admitted vs full and report structurally identical numbers.
 //!
 //! The exact split between `admitted` and `full` is timing-sensitive
@@ -52,6 +52,8 @@ pub struct Report {
     /// Submissions rejected at the producer because the worker queue
     /// was full.
     pub jobs_full: u32,
+    /// Submissions rejected because the mailbox closed or worker stopped.
+    pub jobs_terminal: u32,
     /// Jobs the worker actually processed.
     pub jobs_processed: u32,
     /// Whether each side reached the end of `run` cleanly.
@@ -62,9 +64,13 @@ pub struct Report {
 /// from smoke tests so the assertion lives in one place.
 pub fn assert_report_invariants(side: &str, report: &Report) {
     assert_eq!(
-        report.jobs_admitted + report.jobs_full,
+        report.jobs_admitted + report.jobs_full + report.jobs_terminal,
         BURST_JOBS,
-        "{side}: admitted + full should account for every burst job, got {report:?}",
+        "{side}: admitted + full + terminal should account for every burst job, got {report:?}",
+    );
+    assert_eq!(
+        report.jobs_terminal, 0,
+        "{side}: worker must remain live for the whole burst, got {report:?}",
     );
     assert!(
         report.jobs_full > 0,
@@ -78,4 +84,24 @@ pub fn assert_report_invariants(side: &str, report: &Report) {
         report.exit_clean,
         "{side}: expected exit_clean, got {report:?}"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "worker must remain live for the whole burst")]
+    fn invariants_reject_terminal_submission() {
+        assert_report_invariants(
+            "tina",
+            &Report {
+                jobs_admitted: QUEUE_CAPACITY as u32,
+                jobs_full: BURST_JOBS - QUEUE_CAPACITY as u32 - 1,
+                jobs_terminal: 1,
+                jobs_processed: QUEUE_CAPACITY as u32,
+                exit_clean: true,
+            },
+        );
+    }
 }

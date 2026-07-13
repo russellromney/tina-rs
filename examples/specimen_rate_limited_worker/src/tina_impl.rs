@@ -180,7 +180,7 @@ fn rate_per_sec() -> u64 {
 
 pub fn run() -> anyhow::Result<Report> {
     let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
-    Ok(app.run_to_shutdown(Duration::from_secs(5), run_application)?)
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), run_application)?)
 }
 
 fn run_application(
@@ -253,6 +253,7 @@ fn run_application(
         // the message. `mailbox_closed` and `worker_stopped` would
         // surface here too if the worker had stopped mid-burst.
         jobs_full: burst.mailbox_full + burst.ingress_full,
+        jobs_terminal: burst.mailbox_closed + burst.worker_stopped,
         jobs_processed: report.jobs_processed,
         exit_clean: report.exit_clean,
     };

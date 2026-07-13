@@ -78,7 +78,7 @@ impl Store {
 
 pub fn run() -> anyhow::Result<Report> {
     let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
-    Ok(app.run_to_shutdown(Duration::from_secs(5), run_application)?)
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), run_application)?)
 }
 
 fn run_application(
@@ -140,12 +140,15 @@ fn run_application(
     let hot_snap = outcomes[0].snapshot();
     let hot_admitted = hot_snap.admitted;
     let hot_rejected = hot_snap.mailbox_full + hot_snap.ingress_full;
+    let hot_terminal = hot_snap.mailbox_closed + hot_snap.worker_stopped;
     let mut cold_admitted = 0u32;
     let mut cold_rejected = 0u32;
+    let mut cold_terminal = 0u32;
     for o in &outcomes[1..] {
         let s = o.snapshot();
         cold_admitted += s.admitted;
         cold_rejected += s.mailbox_full + s.ingress_full;
+        cold_terminal += s.mailbox_closed + s.worker_stopped;
     }
 
     let trace = app.trace();
@@ -191,8 +194,10 @@ fn run_application(
     Ok(Report {
         hot_admitted,
         hot_rejected,
+        hot_terminal,
         cold_admitted,
         cold_rejected,
+        cold_terminal,
         hot_turns,
         cold_min_turns,
         cold_min_expected_turns,

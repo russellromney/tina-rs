@@ -27,8 +27,9 @@ error source to the report's `AsRef<dyn Error + Send + Sync>` contract. The
 existing typed-error runner remains unchanged. Framework tests cover actual
 downstream `anyhow` use with outer `?`, clean, workload-only, shutdown-only,
 and dual results, exact report settlement, source-chain preservation, and a
-non-`anyhow` report container. The motivating specimen migrations remain in
-their dependent example cohort.
+non-`anyhow` report container. The five motivating specimens now use the
+reported runner directly, preserving their `anyhow` source chains without
+local terminal-result combiners.
 
 ### 2026-07-12 LocalSystem atomic root bootstrap parity
 
@@ -122,19 +123,23 @@ not this framework prerequisite.
 ### 2026-07-12 Pure bounded-workload LocalSystem migration
 
 Five bounded-workload specimens were reviewed as one host-authoring cohort.
-All five now use the fallible `LocalSystem` application facade and its typed
-consuming terminal runner. The dynamic worker pool also uses address-aware root
-construction directly on the facade. No example-local shutdown combiner or raw
-threaded owner remains; isolate state machines and Tokio comparisons are
-unchanged.
+All five now use the fallible `LocalSystem` application facade and
+`run_to_shutdown_reported`. The dynamic worker pool also uses address-aware
+root construction directly on the facade. Cancellation now bounds both effect
+producers and reports only after `CallGroup::report_ready()`. Backpressure
+preserves Full, Closed, Rejected, caller Timeout, and domain failure through
+the complete chain. Hot-key and rate-limit reports account for every
+`HostBurstSnapshot` terminal bucket. No example-local shutdown combiner, raw
+threaded owner, fake settlement delay, raw request-sized batch, or outcome
+collapse remains.
 
 | Example | Current friction | Desired user-facing form | Current API sufficient | Framework prerequisite | Example PR | Tests | Status |
 |---|---|---|---|---|---|---|---|
-| `specimen_backpressure_chain` | none | typed services inside `run_to_shutdown` | yes | terminal runner merged | this cohort | Tokio/Tina smoke and exact report; Tina 20x | migrated |
-| `specimen_cancellation_chain` | none | typed cancel and late-reply trace truth inside `run_to_shutdown` | yes | terminal runner merged | this cohort | Tokio/Tina smoke, exact cancel/rejection invariants; Tina 20x | migrated |
-| `specimen_dynamic_worker_pool` | none | `register_root_using` plus `run_to_shutdown` | yes | address-aware root parity merged | this cohort | exact fanout/sum smoke and owner-parity framework tests | migrated |
-| `specimen_hot_key_fairness` | none | bounded observed bursts and trace truth inside `run_to_shutdown` | yes | terminal runner merged | this cohort | Tokio/Tina invariant smoke, negative invariant tests; Tina 20x | migrated |
-| `specimen_rate_limited_worker` | none | observed burst/control/result inside `run_to_shutdown` | yes | terminal runner merged | this cohort | Tokio/Tina boundedness/refill invariants; Tina 20x | migrated |
+| `specimen_backpressure_chain` | none | exhaustive typed chain outcomes inside `run_to_shutdown_reported` | yes | reported runner merged | this cohort | Tokio/Tina smoke; direct mapping tests for every terminal bucket; Tina 20x | migrated |
+| `specimen_cancellation_chain` | none | bounded cancel fan-out and exact `CallGroup` settlement inside `run_to_shutdown_reported` | yes | reported runner merged | this cohort | Tokio/Tina smoke, exact cancel/rejection invariants; Tina 20x | migrated |
+| `specimen_dynamic_worker_pool` | parent-side child completion/result join remains a product probe, not local glue | `register_root_using` plus `run_to_shutdown_reported` | yes | address-aware root and reported runner merged | this cohort | exact fanout/sum smoke and owner-parity framework tests | migrated |
+| `specimen_hot_key_fairness` | none | exhaustive bounded observed bursts inside `run_to_shutdown_reported` | yes | reported runner merged | this cohort | Tokio/Tina invariant smoke, terminal-bucket negative tests; Tina 20x | migrated |
+| `specimen_rate_limited_worker` | none | exhaustive observed burst/control/result inside `run_to_shutdown_reported` | yes | reported runner merged | this cohort | Tokio/Tina boundedness/refill and terminal-bucket invariants; Tina 20x | migrated |
 
 ### 2026-07-12 Copied service path flow migration
 

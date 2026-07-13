@@ -25,7 +25,15 @@ fn main() -> anyhow::Result<()> {
 fn print_side(side: &str, report: Report) {
     println!(
         "comparison=specimen_backpressure_chain side={} successful={} \
-         c_timed_out={} chain_dropped={} exit_clean={}",
-        side, report.successful, report.c_timed_out, report.chain_dropped, report.exit_clean,
+         c_timed_out={} caller_timeout={} full={} closed={} rejected={} domain_failure={} exit_clean={}",
+        side,
+        report.successful,
+        report.c_timed_out,
+        report.caller_timeout,
+        report.full,
+        report.closed,
+        report.rejected,
+        report.domain_failure,
+        report.exit_clean,
     );
 }

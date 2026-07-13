@@ -21,15 +21,8 @@ pub fn run() -> anyhow::Result<Report> {
             match outcome {
                 AOutcome::Success => report.successful += 1,
                 AOutcome::Timeout => {
-                    // Tokio's outer timeout cannot tell us which hop
-                    // ran out of time. The test scripts that c_is_slow
-                    // is the only reason we know; in real Tokio code
-                    // this is just `chain_dropped`.
-                    if c_is_slow(i) {
-                        report.c_timed_out += 1;
-                    } else {
-                        report.chain_dropped += 1;
-                    }
+                    // Tokio's outer timeout names only the caller wait.
+                    report.caller_timeout += 1;
                 }
             }
         }
