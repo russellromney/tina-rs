@@ -11,6 +11,25 @@ valid; the long-form history lives in
 
 ## Active
 
+### 2026-07-12 Report-preserving LocalSystem terminal runner prerequisite
+
+Five application-shaped specimens use `anyhow::Result` for their host
+workloads. `anyhow::Error` intentionally does not implement
+`std::error::Error`, so the otherwise canonical `run_to_shutdown(...)?` form
+cannot participate in an outer standard-error conversion. Stringifying the
+report or restoring a local four-way result merge would erase either source
+truth or the terminal-runner ergonomics.
+
+`LocalSystem::run_to_shutdown_reported` and its multi-shard parity method wrap
+only the workload report in `ReportedWorkloadError<E>`. The adapter retains the
+owned report, exposes `get_ref` and `into_inner`, and delegates the standard
+error source to the report's `AsRef<dyn Error + Send + Sync>` contract. The
+existing typed-error runner remains unchanged. Framework tests cover actual
+downstream `anyhow` use with outer `?`, clean, workload-only, shutdown-only,
+and dual results, exact report settlement, source-chain preservation, and a
+non-`anyhow` report container. The motivating specimen migrations remain in
+their dependent example cohort.
+
 ### 2026-07-12 LocalSystem atomic root bootstrap parity
 
 `system_job_queue` exposed a facade gap during its `LocalSystem` migration:
