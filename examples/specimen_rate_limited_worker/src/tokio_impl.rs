@@ -35,7 +35,7 @@ pub fn run() -> anyhow::Result<Report> {
                 Ok(()) => report.jobs_admitted += 1,
                 Err(mpsc::error::TrySendError::Full(_)) => report.jobs_full += 1,
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    return Err(anyhow::anyhow!("consumer closed unexpectedly"));
+                    report.jobs_terminal += 1;
                 }
             }
         }

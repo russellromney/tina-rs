@@ -25,7 +25,23 @@ fn main() -> anyhow::Result<()> {
 fn print_side(side: &str, report: Report) {
     println!(
         "comparison=specimen_dynamic_worker_pool side={} results_collected={} \
-         total_sum={} exit_clean={}",
-        side, report.results_collected, report.total_sum, report.exit_clean,
+         total_sum={} spawn_zero_capacity={} spawn_destination_unavailable={} spawn_other={} \
+         call_full={} call_closed={} call_timeout={} \
+         rejected_foreign_system={} rejected_reply_abandoned={} \
+         rejected_handler_panicked={} rejected_unsupported_message={} exit_clean={}",
+        side,
+        report.results_collected,
+        report.total_sum,
+        report.spawn_zero_capacity,
+        report.spawn_destination_unavailable,
+        report.spawn_other,
+        report.call_full,
+        report.call_closed,
+        report.call_timeout,
+        report.rejected_foreign_system,
+        report.rejected_reply_abandoned,
+        report.rejected_handler_panicked,
+        report.rejected_unsupported_message,
+        report.exit_clean,
     );
 }

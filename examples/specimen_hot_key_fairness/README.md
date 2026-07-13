@@ -18,13 +18,15 @@ Both sides:
   `try_send`.
 - Tina: `Store` isolate per shard, mailbox cap = `SHARD_MAILBOX`,
   rate-limited via `sleep().then(Tick)`. Producer uses one
-  `HostBurstOutcomes` per shard plus `runtime.try_send_outcome` —
+  `HostBurstOutcomes` per shard plus `app.try_send_outcome` —
   the typed snapshot reports `admitted` / `mailbox_full` /
-  `ingress_full` per shard with no observer closure.
+  `ingress_full` / `mailbox_closed` / `worker_stopped` per shard with
+  no observer closure.
 
 The smoke test asserts:
 
 - every burst write is accounted for;
+- terminal rejection buckets are zero while the stores are live;
 - the hot shard rejected at least one write (overload was visible);
 - the cold shards admitted everything (fairness held).
 - Tina's trace-derived `FairnessReport` says every cold isolate made

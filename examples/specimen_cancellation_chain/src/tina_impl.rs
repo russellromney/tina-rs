@@ -1,5 +1,5 @@
 //! Tina side. The driver fans out one IsolateCall per worker via
-//! [`tina_runtime::call_cancelable`], stores each named wait in a bounded
+//! [`tina_runtime::call_cancelable_request`], stores each named wait in a bounded
 //! [`CallGroup`], and on the host's `Cancel` signal drains the group
 //! and cancels each entry explicitly with [`cancel_call`]. Worker
 //! replies that arrive after cancellation are
@@ -8,14 +8,13 @@
 //! handler.
 
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallGroup, CallGroupToken, CallOutcome, CallReplyRejectedReason, DefaultThreadedMailboxFactory,
-    DeferredReplyRejectedReason, RuntimeEventKind, SleepReply, ThreadedRuntime,
-    call_cancelable_request, cancel_call, sleep,
+    BoundedItems, CallGroup, CallGroupReport, CallGroupToken, CallOutcome, CallReplyRejectedReason,
+    DefaultThreadedMailboxFactory, DeferredReplyRejectedReason, LocalSystem, RuntimeEventKind,
+    SleepReply, bounded_batch, call_cancelable_request, cancel_call, sleep,
 };
 
 use crate::{CANCEL_AFTER_MS, FANOUT, Report, WORK_MS};
@@ -96,9 +95,6 @@ enum DriverMsg {
         token: CallGroupToken,
         outcome: CancelOutcome,
     },
-    /// Stop the driver and emit the final report. Sent after the host
-    /// has waited long enough for the cancellation chain to settle.
-    Finish,
 }
 
 struct Driver {
@@ -106,10 +102,9 @@ struct Driver {
     /// Bounded named wait group: one entry per worker, keyed by worker
     /// index. `with_capacity(FANOUT)` rejects extra inserts as `Full`
     /// rather than growing — a known-size fan-out fits exactly.
-    group: CallGroup<u32, WorkerReply>,
-    replies_before_cancel: u32,
+    group: Option<CallGroup<u32, WorkerReply>>,
     cancel_observed: bool,
-    group_error: bool,
+    settlement_protocol_errors: u32,
 }
 
 #[tina_runtime::isolate(message = DriverMsg)]
@@ -121,24 +116,26 @@ impl Driver {
     ) -> Effect<Self> {
         match msg {
             DriverMsg::Begin => {
-                let mut effects = Vec::with_capacity(self.workers.len());
-                for (idx, worker) in self.workers.iter().enumerate() {
-                    let key = idx as u32;
-                    let effect = self
-                        .group
+                let workers = BoundedItems::try_from_iter(
+                    FANOUT as usize,
+                    self.workers.iter().copied().enumerate(),
+                )
+                .expect("worker fan-out is capped by FANOUT");
+                bounded_batch(workers.map_effects(|(idx, worker)| {
+                    self.group
+                        .as_mut()
+                        .expect("group exists until the driver stops")
                         .start_cancelable(
-                            key,
-                            call_cancelable_request(*worker, WorkerRequest::Do, CALL_TIMEOUT),
+                            idx as u32,
+                            call_cancelable_request(worker, WorkerRequest::Do, CALL_TIMEOUT),
                             |worker, token, outcome| DriverMsg::Returned {
                                 worker,
                                 token,
                                 outcome,
                             },
                         )
-                        .expect("group sized to FANOUT");
-                    effects.push(effect);
-                }
-                Effect::Batch(effects)
+                        .expect("call group is capped by FANOUT")
+                }))
             }
             DriverMsg::Returned {
                 worker,
@@ -148,118 +145,163 @@ impl Driver {
                 // Explicit slot cleanup on completion — Tina's
                 // CallGroup has no Drop magic. A normal reply settled
                 // the call; the slot is reusable.
-                let replied = matches!(outcome, CallOutcome::Replied(_));
                 if self
                     .group
+                    .as_mut()
+                    .expect("group exists until the driver stops")
                     .record_reply(worker, token, outcome, |_| false)
                     .is_err()
                 {
-                    self.group_error = true;
+                    self.settlement_protocol_errors += 1;
                 }
-                if replied {
-                    self.replies_before_cancel += 1;
-                }
-                noop()
+                self.finish_if_settled()
             }
             DriverMsg::Cancel => {
                 self.cancel_observed = true;
-                let cancel_requests = self.group.drain_pending_for_cancel();
-                let mut effects = Vec::with_capacity(cancel_requests.len());
-                // Drain the group; `cancel_call` is still explicit
-                // user code, one named wait at a time.
-                for request in cancel_requests {
-                    let (worker, token, handle) = request.into_parts();
-                    effects.push(
-                        cancel_call(handle).then(move |outcome| DriverMsg::Cancelled {
-                            worker,
-                            token,
-                            outcome,
-                        }),
-                    );
+                let cancel_requests = self
+                    .group
+                    .as_mut()
+                    .expect("group exists until the driver stops")
+                    .drain_pending_for_cancel();
+                if cancel_requests.is_empty() {
+                    return self.finish_if_settled();
                 }
-                Effect::Batch(effects)
+                let cancel_requests = BoundedItems::try_from_iter(FANOUT as usize, cancel_requests)
+                    .expect("cancel fan-out is capped by FANOUT");
+                bounded_batch(cancel_requests.map_effects(|request| {
+                    let (worker, token, handle) = request.into_parts();
+                    cancel_call(handle).then(move |outcome| DriverMsg::Cancelled {
+                        worker,
+                        token,
+                        outcome,
+                    })
+                }))
             }
             DriverMsg::Cancelled {
                 worker,
                 token,
                 outcome,
             } => {
-                if self.group.record_cancel(worker, token, outcome).is_err() {
-                    self.group_error = true;
+                if self
+                    .group
+                    .as_mut()
+                    .expect("group exists until the driver stops")
+                    .record_cancel(worker, token, outcome)
+                    .is_err()
+                {
+                    self.settlement_protocol_errors += 1;
                 }
-                noop()
+                self.finish_if_settled()
             }
-            DriverMsg::Finish => stop_with(Report {
-                replies_before_cancel: self.replies_before_cancel,
-                replies_after_cancel: 0,
-                cancel_observed: self.cancel_observed,
-                exit_clean: !self.group_error,
-            }),
         }
+    }
+}
+
+impl Driver {
+    fn finish_if_settled(&mut self) -> Effect<Self> {
+        let ready = self.group.as_ref().is_some_and(CallGroup::report_ready);
+        if self.cancel_observed && ready {
+            let group = self
+                .group
+                .take()
+                .expect("a ready group exists until its report is consumed")
+                .into_report();
+            stop_with(report_from_group(group, self.settlement_protocol_errors))
+        } else {
+            noop()
+        }
+    }
+}
+
+fn report_from_group(
+    group: CallGroupReport<u32, WorkerReply>,
+    settlement_protocol_errors: u32,
+) -> Report {
+    let mut report = Report {
+        cancel_observed: true,
+        pending: u32::try_from(group.pending).expect("group capacity fits u32"),
+        settlement_complete: group.complete,
+        settlement_protocol_errors,
+        ..Report::default()
+    };
+    for branch in group.branch_outcomes {
+        record_branch_outcome(&mut report, branch.outcome);
+    }
+    for cancel in group.cancel_outcomes {
+        record_cancel_outcome(&mut report, cancel.outcome);
+    }
+    report.exit_clean =
+        report.settlement_complete && report.pending == 0 && report.settlement_protocol_errors == 0;
+    report
+}
+
+fn record_branch_outcome(report: &mut Report, outcome: CallOutcome<WorkerReply>) {
+    match outcome {
+        CallOutcome::Replied(_) => report.replies_before_cancel += 1,
+        CallOutcome::Full => report.call_full += 1,
+        CallOutcome::Closed => report.call_closed += 1,
+        CallOutcome::Timeout => report.call_timeout += 1,
+        CallOutcome::Rejected(_) => report.call_rejected += 1,
+    }
+}
+
+fn record_cancel_outcome(report: &mut Report, outcome: CancelOutcome) {
+    match outcome {
+        CancelOutcome::Cancelled => report.cancel_cancelled += 1,
+        CancelOutcome::NotAdmitted => report.cancel_not_admitted += 1,
+        CancelOutcome::AlreadyCompleted => report.cancel_already_completed += 1,
+        CancelOutcome::AlreadyCancelled => report.cancel_already_cancelled += 1,
+        CancelOutcome::WrongShard => report.cancel_wrong_shard += 1,
     }
 }
 
 // --- Run ------------------------------------------------------------------
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
-    let shutdown = runtime.shutdown_handle();
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), run_application)?)
+}
 
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+) -> anyhow::Result<Report> {
     let mut workers = Vec::with_capacity(FANOUT as usize);
     for _ in 0..FANOUT {
         workers.push(
-            runtime
-                .register_split_service::<Worker, WorkerEvent, WorkerRequest, Infallible>(
-                    Worker {
-                        work: Duration::from_millis(WORK_MS),
-                    },
-                    8,
-                )
-                .map_err(|e| anyhow::anyhow!("register worker: {e:?}"))?
-                .requests,
+            app.register_split_service::<Worker, WorkerEvent, WorkerRequest, Infallible>(
+                Worker {
+                    work: Duration::from_millis(WORK_MS),
+                },
+                8,
+            )
+            .map_err(|e| anyhow::anyhow!("register worker: {e:?}"))?
+            .requests,
         );
     }
 
-    let driver = runtime
-        .register_with_capacity::<_, Infallible>(
+    let driver = app
+        .register_root::<_, Infallible>(
             Driver {
                 workers,
-                group: CallGroup::with_capacity(FANOUT as usize),
-                replies_before_cancel: 0,
+                group: Some(CallGroup::with_capacity(FANOUT as usize)),
                 cancel_observed: false,
-                group_error: false,
+                settlement_protocol_errors: 0,
             },
             32,
         )
         .map_err(|e| anyhow::anyhow!("register driver: {e:?}"))?;
 
-    let result = runtime
+    let result = app
         .observe_result::<Report, _, _>(driver)
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
 
-    runtime
-        .try_send(driver, DriverMsg::Begin)
+    app.try_send(driver, DriverMsg::Begin)
         .map_err(|e| anyhow::anyhow!("send Begin: {e:?}"))?;
 
     std::thread::sleep(Duration::from_millis(CANCEL_AFTER_MS));
 
-    runtime
-        .try_send(driver, DriverMsg::Cancel)
+    app.try_send(driver, DriverMsg::Cancel)
         .map_err(|e| anyhow::anyhow!("send Cancel: {e:?}"))?;
-
-    // Give the worker sleep timers a chance to elapse so any "late"
-    // worker replies fire while the driver is alive but its
-    // pending-call slots have been cancelled. Those replies surface
-    // as `CallReplyRejected { CallerCancelled }` events — not
-    // delivered messages — which is the visible-truth invariant.
-    std::thread::sleep(Duration::from_millis(WORK_MS + 50));
-
-    runtime
-        .try_send(driver, DriverMsg::Finish)
-        .map_err(|e| anyhow::anyhow!("send Finish: {e:?}"))?;
 
     let mut report = result
         .wait(Duration::from_secs(5))
@@ -295,15 +337,74 @@ pub fn run() -> anyhow::Result<Report> {
     let target = FANOUT.saturating_sub(report.replies_before_cancel);
     let drain_deadline = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < drain_deadline {
-        if count_rejected(&runtime.trace()) >= target {
+        if count_rejected(&app.trace()) >= target {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    report.replies_after_cancel = count_rejected(&runtime.trace());
+    report.replies_after_cancel = count_rejected(&app.trace());
 
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tina::CallRejectedReason;
+
+    #[test]
+    fn branch_terminal_outcomes_have_independent_buckets() {
+        let mut report = Report::default();
+        for outcome in [
+            CallOutcome::Replied(WorkerReply),
+            CallOutcome::Full,
+            CallOutcome::Closed,
+            CallOutcome::Timeout,
+            CallOutcome::Rejected(CallRejectedReason::UnsupportedMessage),
+        ] {
+            record_branch_outcome(&mut report, outcome);
+        }
+        assert_eq!(report.replies_before_cancel, 1);
+        assert_eq!(report.call_full, 1);
+        assert_eq!(report.call_closed, 1);
+        assert_eq!(report.call_timeout, 1);
+        assert_eq!(report.call_rejected, 1);
+    }
+
+    #[test]
+    fn cancel_terminal_outcomes_have_independent_buckets() {
+        let mut report = Report::default();
+        for outcome in [
+            CancelOutcome::Cancelled,
+            CancelOutcome::NotAdmitted,
+            CancelOutcome::AlreadyCompleted,
+            CancelOutcome::AlreadyCancelled,
+            CancelOutcome::WrongShard,
+        ] {
+            record_cancel_outcome(&mut report, outcome);
+        }
+        assert_eq!(report.cancel_cancelled, 1);
+        assert_eq!(report.cancel_not_admitted, 1);
+        assert_eq!(report.cancel_already_completed, 1);
+        assert_eq!(report.cancel_already_cancelled, 1);
+        assert_eq!(report.cancel_wrong_shard, 1);
+    }
+
+    #[test]
+    fn incomplete_or_invalid_group_cannot_report_clean_exit() {
+        let report = report_from_group(
+            CallGroupReport {
+                winner: None,
+                branch_outcomes: Vec::new(),
+                cancel_outcomes: Vec::new(),
+                pending: 1,
+                complete: false,
+            },
+            2,
+        );
+        assert_eq!(report.pending, 1);
+        assert!(!report.settlement_complete);
+        assert_eq!(report.settlement_protocol_errors, 2);
+        assert!(!report.exit_clean);
+    }
 }

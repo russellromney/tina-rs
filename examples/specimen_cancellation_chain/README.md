@@ -6,8 +6,8 @@ the host asks for cancellation before any worker has finished.
 
 ## What this teaches
 
-Tina's first-form external cancellation primitive is
-`call_cancelable(addr, msg, t).then(...)` which returns a
+Tina's first-form typed-service cancellation primitive is
+`call_cancelable_request(addr, request, t).then(...)`, which returns a
 caller-owned `CallHandle`, plus `cancel_call(handle).then(...)`
 which closes the wait. The handle is move-only and not `Clone`: one
 handle, one cancel.
@@ -31,23 +31,27 @@ cargo test --manifest-path examples/specimen_cancellation_chain/Cargo.toml
 ## What feels worse than Tokio
 
 - Cancellation is bookkeeping: each pending call has a `CallHandle`
-  the driver stores in a `PendingCallSet` keyed by worker index. The
-  driver drains the set on cancel and fans the cancels back out as a
-  `Batch`, one cancel per stored handle. There is no one-shot
+  stored by a bounded `CallGroup` keyed by worker index. The driver
+  drains the group on cancel and fans the cancels back out through
+  `BoundedItems` / `bounded_batch`, one cancel per stored handle. There is no one-shot
   `JoinSet::abort_all()` analogue — and there will not be: explicit
   drain-and-cancel keeps each per-call outcome typed.
 
 ## Bounded cancel storage
 
-The driver used to keep a `Vec<CallHandle<WorkerReply>>` and
-`drain(..)` it on cancel. It now uses
-`PendingCallSet<u32, WorkerReply>::with_capacity(FANOUT)` — bounded
-storage, typed `Full` / `DuplicateKey` errors on insert, explicit
-`remove(&key)` on each completion. The cancel-all pattern is the
-same drain-and-cancel that the old shape did by hand; the difference
-is that the slot table cannot grow past `FANOUT`, and the cleanup
-contract is now spelled out in the type rather than buried in a
-`Vec` convention.
+The driver uses `CallGroup<u32, WorkerReply>::with_capacity(FANOUT)`.
+`start_cancelable` allocates a bounded, generation-stamped slot and
+returns the typed continuation effect. `record_reply` and
+`record_cancel` settle exactly that generation; stale or duplicate
+continuations are errors rather than accidental cleanup of a reused
+slot. `drain_pending_for_cancel` transfers each move-only handle to
+one explicit `cancel_call` effect without growing past `FANOUT`. The
+driver emits its report only after `CallGroup::report_ready()` says every
+reply and cancel fact is recorded; no host delay or finish message stands
+in for settlement. It then consumes `CallGroup::into_report()` and exposes
+independent buckets for `Replied`, `Full`, `Closed`, `Timeout`, `Rejected`,
+and every `CancelOutcome`; stale or duplicate continuations increment a
+separate protocol-error bucket instead of disappearing.
 
 ## What feels better
 
@@ -63,4 +67,4 @@ contract is now spelled out in the type rather than buried in a
 ## Findings touched
 
 - See FINDINGS finding 8 (external cancellation API) — Tina now ships
-  the first-form primitive (`call_cancelable` + `cancel_call`).
+  the first-form primitives (`call_cancelable_request` + `cancel_call`).

@@ -29,26 +29,23 @@
 //!   bounded mailbox) so the worker stops the moment its `processed`
 //!   count catches up — no `Arc<AtomicU32>` side channel.
 //! - **Final value via `stop_with`.** The host reads the worker's
-//!   processed count through `runtime.observe_result::<Report>`.
+//!   processed count through `app.observe_result::<Report>`.
 
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tina::prelude::*;
 use tina_runtime::{
-    AdmissionDecision, DefaultThreadedMailboxFactory, HostBurstOutcomes, RateLimit, SleepReply,
-    ThreadedRuntime, sleep,
+    AdmissionDecision, DefaultThreadedMailboxFactory, HostBurstOutcomes, LocalSystem, RateLimit,
+    SleepReply, sleep,
 };
 
 use crate::{BURST_JOBS, QUEUE_CAPACITY, RATE_WINDOW_MS, Report};
 
 #[derive(Debug)]
 enum WorkerMsg {
-    /// One job submission from the host. The `u32` is the job index;
-    /// the worker only logs it (and we deliberately bind it in the
-    /// handler so the payload stays a real lesson, not a unit hole).
-    Submit(u32),
+    /// One job submission from the host.
+    Submit,
     /// Backoff continuation marking "the rate window elapsed, try the next
     /// job." Carries `SleepReply` so a cancelled timer (shutdown) is
     /// visible at the reply site.
@@ -74,9 +71,6 @@ struct Worker {
     /// `Some(n)` after [`WorkerMsg::BurstClosed`] arrives, naming the
     /// final admitted count the worker should stop at.
     expected: Option<u32>,
-    /// Last job index the worker processed. Tracked so `Submit(u32)`
-    /// is bound and read deliberately rather than ignored.
-    last_index: Option<u32>,
 }
 
 #[tina_runtime::isolate(message = WorkerMsg)]
@@ -87,9 +81,8 @@ impl Worker {
         ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            WorkerMsg::Submit(index) => {
+            WorkerMsg::Submit => {
                 self.report.jobs_admitted += 1;
-                self.last_index = Some(index);
                 self.pending += 1;
                 // Kick the pace loop only if no timer is already in flight.
                 if self.pacing { noop() } else { self.drive(ctx) }
@@ -180,12 +173,13 @@ fn rate_per_sec() -> u64 {
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
-    let shutdown = runtime.shutdown_handle();
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), run_application)?)
+}
 
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+) -> anyhow::Result<Report> {
     let worker = Worker {
         // burst 1 → one job, then pace at one per refill window.
         limiter: RateLimit::new("rate_limited_worker.pace", 1, rate_per_sec(), 1),
@@ -194,13 +188,12 @@ pub fn run() -> anyhow::Result<Report> {
         pending: 0,
         pacing: false,
         expected: None,
-        last_index: None,
     };
-    let worker_addr = runtime
-        .register_with_capacity::<_, Infallible>(worker, QUEUE_CAPACITY)
+    let worker_addr = app
+        .register_root::<_, Infallible>(worker, QUEUE_CAPACITY)
         .map_err(|e| anyhow::anyhow!("register worker: {e:?}"))?;
 
-    let waiter = runtime
+    let waiter = app
         .observe_result::<Report, _, _>(worker_addr)
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
 
@@ -215,8 +208,8 @@ pub fn run() -> anyhow::Result<Report> {
     // (admitted, mailbox_full, mailbox_closed, ingress_full,
     // worker_stopped); none of them are collapsed.
     let outcomes = HostBurstOutcomes::new();
-    for n in 0..BURST_JOBS {
-        let _ = runtime.try_send_outcome(worker_addr, WorkerMsg::Submit(n), &outcomes);
+    for _ in 0..BURST_JOBS {
+        let _ = app.try_send_outcome(worker_addr, WorkerMsg::Submit, &outcomes);
     }
     outcomes
         .wait_complete(Duration::from_secs(2))
@@ -233,14 +226,13 @@ pub fn run() -> anyhow::Result<Report> {
     // helper. It retries on Full/IngressFull until the deadline and
     // returns typed Closed / WorkerStopped / Timeout. No hidden queue;
     // the control message rides the same bounded data mailbox.
-    runtime
-        .send_observed_until(
-            worker_addr,
-            Instant::now() + Duration::from_secs(2),
-            Duration::from_millis(2),
-            || WorkerMsg::BurstClosed(admitted_n),
-        )
-        .map_err(|e| anyhow::anyhow!("could not deliver BurstClosed: {e}"))?;
+    app.send_observed_until(
+        worker_addr,
+        Instant::now() + Duration::from_secs(2),
+        Duration::from_millis(2),
+        || WorkerMsg::BurstClosed(admitted_n),
+    )
+    .map_err(|e| anyhow::anyhow!("could not deliver BurstClosed: {e}"))?;
 
     let report = waiter
         .wait(Duration::from_secs(5))
@@ -254,12 +246,10 @@ pub fn run() -> anyhow::Result<Report> {
         // the message. `mailbox_closed` and `worker_stopped` would
         // surface here too if the worker had stopped mid-burst.
         jobs_full: burst.mailbox_full + burst.ingress_full,
+        jobs_terminal: burst.mailbox_closed + burst.worker_stopped,
         jobs_processed: report.jobs_processed,
         exit_clean: report.exit_clean,
     };
 
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
     Ok(final_report)
 }

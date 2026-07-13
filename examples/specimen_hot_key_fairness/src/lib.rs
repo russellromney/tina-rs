@@ -24,8 +24,12 @@ pub const PER_WRITE_MS: u64 = 5;
 pub struct Report {
     pub hot_admitted: u32,
     pub hot_rejected: u32,
+    /// Hot submissions rejected because the mailbox closed or the worker stopped.
+    pub hot_terminal: u32,
     pub cold_admitted: u32,
     pub cold_rejected: u32,
+    /// Cold submissions rejected because the mailbox closed or the worker stopped.
+    pub cold_terminal: u32,
     pub hot_turns: u64,
     pub cold_min_turns: u64,
     pub cold_min_expected_turns: u64,
@@ -37,11 +41,19 @@ pub struct Report {
 }
 
 pub fn assert_report_invariants(side: &str, r: &Report) {
-    let hot_total = r.hot_admitted + r.hot_rejected;
-    let cold_total = r.cold_admitted + r.cold_rejected;
+    let hot_total = r.hot_admitted + r.hot_rejected + r.hot_terminal;
+    let cold_total = r.cold_admitted + r.cold_rejected + r.cold_terminal;
     assert_eq!(hot_total, HOT_WRITES, "{side}: {r:?}");
     let cold_expected = (SHARDS - 1) * COLD_WRITES_PER_SHARD;
     assert_eq!(cold_total, cold_expected, "{side}: {r:?}");
+    assert_eq!(
+        r.hot_terminal, 0,
+        "{side}: hot worker stopped during burst: {r:?}"
+    );
+    assert_eq!(
+        r.cold_terminal, 0,
+        "{side}: cold worker stopped during burst: {r:?}"
+    );
     assert!(
         r.hot_rejected > 0,
         "{side}: hot shard should overflow under skew, got {r:?}",
@@ -79,8 +91,10 @@ mod tests {
         Report {
             hot_admitted: SHARD_MAILBOX as u32,
             hot_rejected: HOT_WRITES - SHARD_MAILBOX as u32,
+            hot_terminal: 0,
             cold_admitted: (SHARDS - 1) * COLD_WRITES_PER_SHARD,
             cold_rejected: 0,
+            cold_terminal: 0,
             hot_turns: 9,
             cold_min_turns: 9,
             cold_min_expected_turns: 9,
@@ -126,6 +140,24 @@ mod tests {
     fn tina_invariants_reject_unnamed_lag_unit() {
         let mut report = good_tina_report();
         report.fairness_line = "latency_ms=0".to_string();
+        assert_report_invariants("tina", &report);
+    }
+
+    #[test]
+    #[should_panic(expected = "hot worker stopped during burst")]
+    fn tina_invariants_reject_terminal_hot_submission() {
+        let mut report = good_tina_report();
+        report.hot_rejected -= 1;
+        report.hot_terminal = 1;
+        assert_report_invariants("tina", &report);
+    }
+
+    #[test]
+    #[should_panic(expected = "cold worker stopped during burst")]
+    fn tina_invariants_reject_terminal_cold_submission() {
+        let mut report = good_tina_report();
+        report.cold_admitted -= 1;
+        report.cold_terminal = 1;
         assert_report_invariants("tina", &report);
     }
 }

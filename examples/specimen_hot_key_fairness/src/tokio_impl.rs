@@ -29,7 +29,8 @@ pub fn run() -> anyhow::Result<Report> {
         for _ in 0..HOT_WRITES {
             match txs[0].try_send(()) {
                 Ok(()) => report.hot_admitted += 1,
-                Err(_) => report.hot_rejected += 1,
+                Err(mpsc::error::TrySendError::Full(_)) => report.hot_rejected += 1,
+                Err(mpsc::error::TrySendError::Closed(_)) => report.hot_terminal += 1,
             }
         }
         // Cold keys: round-robin across the remaining shards.
@@ -38,7 +39,8 @@ pub fn run() -> anyhow::Result<Report> {
             let shard = 1 + (i % cold_shards);
             match txs[shard].try_send(()) {
                 Ok(()) => report.cold_admitted += 1,
-                Err(_) => report.cold_rejected += 1,
+                Err(mpsc::error::TrySendError::Full(_)) => report.cold_rejected += 1,
+                Err(mpsc::error::TrySendError::Closed(_)) => report.cold_terminal += 1,
             }
         }
         drop(txs);
