@@ -211,7 +211,10 @@ fn full_gateway_mailbox_remains_a_distinct_call_outcome() {
     .expect("mailbox pressure remains typed and shuts down cleanly");
 
     assert!(report.call_full > 0, "expected call Full: {report:?}");
-    assert_eq!(report.call_timeout, 0, "mailbox Full must not become timeout");
+    assert_eq!(
+        report.call_timeout, 0,
+        "mailbox Full must not become timeout"
+    );
     assert_eq!(
         report.slow_events_accepted, report.ok as u64,
         "only completed slow requests should emit events"

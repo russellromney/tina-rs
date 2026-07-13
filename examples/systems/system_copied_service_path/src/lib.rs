@@ -24,11 +24,10 @@
 //! capabilities but they do not belong in the first thing a user copies.
 
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(test)]
-use std::{thread, time::Instant};
+use std::{sync::Arc, thread, time::Instant};
 
 use tina::CallRejectedReason;
 use tina::capacity::CapacityMode;
@@ -245,12 +244,9 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         timer_capacity: config.timer_capacity,
         ..LocalSystemConfig::default()
     };
-    let runtime = Arc::new(
-        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
-            .config(local_config)
-            .try_build()?,
-    );
-    let shutdown = runtime.shutdown_handle();
+    let runtime = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+        .config(local_config)
+        .try_build()?;
     let scope =
         SharedCapacityScope::new("copied_service_path.in_flight", "requests", config.capacity);
     // "Recovered" state seeded before the isolate accepts traffic — the
@@ -258,73 +254,63 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     let seed_ledger: Vec<u64> = vec![0];
     let ledger_seed_len = seed_ledger.len();
 
-    let gateway_result: Result<SplitServiceHandle<GatewayEvent, GatewayRequest, GatewayReply>, _> =
-        runtime.register_split_service::<Gateway, GatewayEvent, GatewayRequest, Infallible>(
-            Gateway::new(
-                scope.clone(),
-                seed_ledger,
-                Duration::from_millis(config.work_ms),
-            ),
-            config.mailbox,
+    let workload = runtime.run_to_shutdown_reported(Duration::from_secs(5), |runtime| {
+        let gateway: SplitServiceHandle<GatewayEvent, GatewayRequest, GatewayReply> = runtime
+            .register_split_service::<Gateway, GatewayEvent, GatewayRequest, Infallible>(
+                Gateway::new(
+                    scope.clone(),
+                    seed_ledger,
+                    Duration::from_millis(config.work_ms),
+                ),
+                config.mailbox,
+            )
+            .map_err(|error| anyhow::anyhow!("register gateway: {error:?}"))?;
+        let requests = gateway.requests;
+
+        let call_timeout = Duration::from_millis(config.call_timeout_ms);
+
+        let load = tina_proof_harness::load::run_with_observation(
+            LoadRun {
+                workers: config.callers,
+                stop: LoadStop::ops(config.callers as u64),
+                label: "copied_service_path",
+            },
+            move |worker_id| match runtime.call_blocking_request(
+                requests,
+                GatewayRequest::Submit(worker_id as u32),
+                call_timeout,
+            ) {
+                Ok(CallOutcome::Replied(GatewayReply::Accepted { .. })) => OpOutcome::Ok,
+                Ok(CallOutcome::Replied(GatewayReply::Full { .. })) => {
+                    OpOutcome::Err { kind: "full" }
+                }
+                Ok(CallOutcome::Replied(GatewayReply::WorkFailed(error))) => OpOutcome::Err {
+                    kind: call_error_kind(error),
+                },
+                Ok(CallOutcome::Replied(GatewayReply::Stats { .. })) => OpOutcome::Err {
+                    kind: "unexpected_reply",
+                },
+                Ok(CallOutcome::Full) => OpOutcome::Err {
+                    kind: "mailbox_full",
+                },
+                Ok(CallOutcome::Closed) => OpOutcome::Err { kind: "closed" },
+                Ok(CallOutcome::Timeout) => OpOutcome::Timeout,
+                Ok(CallOutcome::Rejected(reason)) => OpOutcome::Err {
+                    kind: rejected_kind(reason),
+                },
+                Err(error) => OpOutcome::Err {
+                    kind: host_error_kind(error),
+                },
+            },
+            None::<fn() -> LoadObservation>,
         );
-    let gateway = match gateway_result {
-        Ok(gateway) => gateway,
-        Err(error) => {
-            let shutdown_result = shutdown_runtime(shutdown, runtime);
-            return match shutdown_result {
-                Ok(()) => Err(anyhow::anyhow!("register gateway: {error:?}")),
-                Err(shutdown_error) => Err(anyhow::anyhow!(
-                    "register gateway: {error:?}; shutdown also failed: {shutdown_error}"
-                )),
-            };
-        }
-    };
-    let requests = gateway.requests;
 
-    let call_timeout = Duration::from_millis(config.call_timeout_ms);
-    let rt_for_ops = Arc::clone(&runtime);
-
-    let mut load = tina_proof_harness::load::run_with_observation(
-        LoadRun {
-            workers: config.callers,
-            stop: LoadStop::ops(config.callers as u64),
-            label: "copied_service_path",
-        },
-        move |worker_id| match rt_for_ops.call_blocking_request(
-            requests,
-            GatewayRequest::Submit(worker_id as u32),
-            call_timeout,
-        ) {
-            Ok(CallOutcome::Replied(GatewayReply::Accepted { .. })) => OpOutcome::Ok,
-            Ok(CallOutcome::Replied(GatewayReply::Full { .. })) => OpOutcome::Err { kind: "full" },
-            Ok(CallOutcome::Replied(GatewayReply::WorkFailed(error))) => OpOutcome::Err {
-                kind: call_error_kind(error),
-            },
-            Ok(CallOutcome::Replied(GatewayReply::Stats { .. })) => OpOutcome::Err {
-                kind: "unexpected_reply",
-            },
-            Ok(CallOutcome::Full) => OpOutcome::Err {
-                kind: "mailbox_full",
-            },
-            Ok(CallOutcome::Closed) => OpOutcome::Err { kind: "closed" },
-            Ok(CallOutcome::Timeout) => OpOutcome::Timeout,
-            Ok(CallOutcome::Rejected(reason)) => OpOutcome::Err {
-                kind: rejected_kind(reason),
-            },
-            Err(error) => OpOutcome::Err {
-                kind: host_error_kind(error),
-            },
-        },
-        None::<fn() -> LoadObservation>,
-    );
-
-    let stats_timeout = Duration::from_millis(
-        config
-            .work_ms
-            .saturating_add(1_000)
-            .max(config.call_timeout_ms),
-    );
-    let report_result = (|| -> anyhow::Result<_> {
+        let stats_timeout = Duration::from_millis(
+            config
+                .work_ms
+                .saturating_add(1_000)
+                .max(config.call_timeout_ms),
+        );
         let ledger_final_len =
             match runtime.call_blocking_request(requests, GatewayRequest::Stats, stats_timeout) {
                 Ok(CallOutcome::Replied(GatewayReply::Stats { ledger_len })) => ledger_len,
@@ -353,18 +339,17 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
             .find(|(kind, _)| kind.as_str() == "full")
             .map(|(_, count)| *count as usize)
             .unwrap_or(0);
-        Ok((
+        Ok::<_, anyhow::Error>((
+            load,
             admitted,
             full,
             ledger_final_len,
             discovery_line,
             pre_shutdown_snap,
         ))
-    })();
+    });
 
-    // Graceful shutdown: owner stop must release every held charge. The
-    // post-shutdown snapshot is the load-bearing proof of that claim.
-    let shutdown_result = shutdown_runtime(shutdown, runtime);
+    // The terminal runner consumed the owner before this load-bearing proof.
     let post_shutdown_snap = scope.snapshot();
     let settlement_result = if post_shutdown_snap.current == 0
         && post_shutdown_snap.admitted == post_shutdown_snap.released
@@ -379,9 +364,12 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         ))
     };
 
-    shutdown_result?;
+    let workload = match workload {
+        Err(error) if error.shutdown().is_some() => return Err(error.into()),
+        result => result,
+    };
     settlement_result?;
-    let (admitted, full, ledger_final_len, discovery_line, pre_shutdown_snap) = report_result?;
+    let (mut load, admitted, full, ledger_final_len, discovery_line, pre_shutdown_snap) = workload?;
 
     let mut pressure = ServicePressureReport::new("system_copied_service_path");
     pressure.add_measured("scope", scope.surface_report(CapacityMode::Fixed));
@@ -493,44 +481,44 @@ fn host_error_kind(error: ThreadedRuntimeError) -> &'static str {
     }
 }
 
-fn shutdown_runtime(
-    shutdown: tina_runtime::ThreadedShutdownHandle,
-    runtime: Arc<LocalSystem<SingleShard, DefaultThreadedMailboxFactory>>,
-) -> anyhow::Result<()> {
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod adversarial_tests {
     use super::*;
 
-    type TestSystem = Arc<LocalSystem<SingleShard, DefaultThreadedMailboxFactory>>;
+    type TestSystem = LocalSystem<SingleShard, DefaultThreadedMailboxFactory>;
     type TestGateway = SplitServiceHandle<GatewayEvent, GatewayRequest, GatewayReply>;
 
-    fn test_system(
+    fn test_system() -> TestSystem {
+        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+            .try_build()
+            .expect("test local system")
+    }
+
+    fn test_gateway(
+        runtime: &TestSystem,
         scope: SharedCapacityScope,
         hold: Duration,
-    ) -> (
-        TestSystem,
-        tina_runtime::ThreadedShutdownHandle,
-        TestGateway,
-    ) {
-        let runtime = Arc::new(
-            LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
-                .try_build()
-                .expect("test local system"),
-        );
-        let shutdown = runtime.shutdown_handle();
-        let gateway = runtime
+    ) -> TestGateway {
+        runtime
             .register_split_service::<Gateway, GatewayEvent, GatewayRequest, Infallible>(
                 Gateway::new(scope, vec![0], hold),
                 256,
             )
-            .expect("register test gateway");
-        (runtime, shutdown, gateway)
+            .expect("register test gateway")
+    }
+
+    // This test helper initiates shutdown while a caller is still parked, so it
+    // intentionally exercises the lower-level shutdown handle rather than the
+    // application runner, whose workload closure must return before shutdown.
+    fn shutdown_during_in_flight_call(
+        shutdown: tina_runtime::ThreadedShutdownHandle,
+        runtime: Arc<TestSystem>,
+    ) {
+        let terminal = shutdown
+            .request_and_wait_report(Duration::from_secs(5))
+            .expect("observe shutdown");
+        drop(runtime);
+        terminal.ensure_clean().expect("clean shutdown");
     }
 
     #[test]
@@ -561,62 +549,67 @@ mod adversarial_tests {
     #[test]
     fn calls_closed_while_queued_never_cross_durable_admission_boundary() {
         let scope = SharedCapacityScope::new("queued", "requests", 256);
-        let (runtime, shutdown, gateway) = test_system(scope.clone(), Duration::from_millis(1));
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        test_system()
+            .run_to_shutdown(Duration::from_secs(5), |runtime| {
+                let gateway = test_gateway(runtime, scope.clone(), Duration::from_millis(1));
+                let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
 
-        runtime
-            .try_send_event(
-                gateway.events,
-                GatewayEvent::BlockWorker {
-                    entered: entered_tx,
-                    release: release_rx,
-                },
-            )
-            .expect("queue worker blocker");
-        entered_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("worker must enter blocker");
+                runtime
+                    .try_send_event(
+                        gateway.events,
+                        GatewayEvent::BlockWorker {
+                            entered: entered_tx,
+                            release: release_rx,
+                        },
+                    )
+                    .expect("queue worker blocker");
+                entered_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("worker must enter blocker");
 
-        for payload in 0..8 {
-            let outcome = runtime.call_blocking_request(
-                gateway.requests,
-                GatewayRequest::Submit(payload),
-                Duration::ZERO,
-            );
-            assert!(
-                matches!(
-                    outcome,
-                    Ok(CallOutcome::Timeout) | Err(ThreadedRuntimeError::HostWaitTimeout)
-                ),
-                "zero-deadline queued call must time out: {outcome:?}"
-            );
-        }
-        release_tx.send(()).expect("release worker");
+                for payload in 0..8 {
+                    let outcome = runtime.call_blocking_request(
+                        gateway.requests,
+                        GatewayRequest::Submit(payload),
+                        Duration::ZERO,
+                    );
+                    assert!(
+                        matches!(
+                            outcome,
+                            Ok(CallOutcome::Timeout) | Err(ThreadedRuntimeError::HostWaitTimeout)
+                        ),
+                        "zero-deadline queued call must time out: {outcome:?}"
+                    );
+                }
+                release_tx.send(()).expect("release worker");
 
-        let ledger_len = match runtime
-            .call_blocking_request(
-                gateway.requests,
-                GatewayRequest::Stats,
-                Duration::from_secs(2),
-            )
-            .expect("stats host call")
-        {
-            CallOutcome::Replied(GatewayReply::Stats { ledger_len }) => ledger_len,
-            other => panic!("unexpected stats outcome: {other:?}"),
-        };
-        let snapshot = scope.snapshot();
-        assert_eq!(snapshot.admitted, 0, "closed calls reached admission");
-        assert_eq!(snapshot.released, 0, "closed calls created leases");
-        assert_eq!(ledger_len, 1, "closed calls committed durable records");
-
-        shutdown_runtime(shutdown, runtime).expect("clean queued-call shutdown");
+                let ledger_len = match runtime
+                    .call_blocking_request(
+                        gateway.requests,
+                        GatewayRequest::Stats,
+                        Duration::from_secs(2),
+                    )
+                    .expect("stats host call")
+                {
+                    CallOutcome::Replied(GatewayReply::Stats { ledger_len }) => ledger_len,
+                    other => panic!("unexpected stats outcome: {other:?}"),
+                };
+                let snapshot = scope.snapshot();
+                assert_eq!(snapshot.admitted, 0, "closed calls reached admission");
+                assert_eq!(snapshot.released, 0, "closed calls created leases");
+                assert_eq!(ledger_len, 1, "closed calls committed durable records");
+                Ok::<_, Infallible>(())
+            })
+            .expect("clean queued-call shutdown");
     }
 
     #[test]
     fn owner_shutdown_drops_in_flight_request_and_lease_exactly_once() {
         let scope = SharedCapacityScope::new("owner_stop", "requests", 1);
-        let (runtime, shutdown, gateway) = test_system(scope.clone(), Duration::from_secs(30));
+        let runtime = Arc::new(test_system());
+        let shutdown = runtime.shutdown_handle();
+        let gateway = test_gateway(&runtime, scope.clone(), Duration::from_secs(30));
         let caller_runtime = Arc::clone(&runtime);
         let caller = thread::spawn(move || {
             caller_runtime.call_blocking_request(
@@ -648,7 +641,7 @@ mod adversarial_tests {
             "held sleep never reached driver admission"
         );
 
-        shutdown_runtime(shutdown, runtime).expect("owner shutdown must be clean");
+        shutdown_during_in_flight_call(shutdown, runtime);
         let outcome = caller.join().expect("caller thread must not panic");
         assert!(
             matches!(

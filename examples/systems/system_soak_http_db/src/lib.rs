@@ -18,7 +18,7 @@
 //! the same grep + parser works.
 
 use std::convert::Infallible;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -307,126 +307,109 @@ fn classify_outcomes(
     Ok(counts)
 }
 
-type SoakSystem = LocalSystem<SingleShard, DefaultThreadedMailboxFactory>;
-
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     let local_config = LocalSystemConfig {
         timer_capacity: config.timer_capacity,
         ..LocalSystemConfig::default()
     };
-    let runtime = Arc::new(
-        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
-            .config(local_config)
-            .try_build()?,
-    );
-    let shutdown = runtime.shutdown_handle();
+    let runtime = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+        .config(local_config)
+        .try_build()?;
     let soak = Soak::new(&config);
     let http_scope = soak.http_scope.clone();
     let db_scope = soak.db_scope.clone();
     let events = soak.events.clone();
-    let svc_result: Result<SplitServiceHandle<SoakEvent, SoakRequest, SoakReply>, _> = runtime
-        .register_split_service::<Soak, SoakEvent, SoakRequest, Infallible>(
-            soak,
-            config.gateway_mailbox,
-        );
-    let svc = match svc_result {
-        Ok(service) => service,
-        Err(error) => {
-            let shutdown_result = shutdown_runtime(shutdown, runtime);
-            return match shutdown_result {
-                Ok(()) => Err(anyhow::anyhow!("register soak gateway: {error:?}")),
-                Err(shutdown_error) => Err(anyhow::anyhow!(
-                    "register soak gateway: {error:?}; shutdown also failed: {shutdown_error}"
-                )),
-            };
-        }
-    };
+    let report_result = runtime.run_to_shutdown_reported(Duration::from_secs(5), |runtime| {
+        let svc: SplitServiceHandle<SoakEvent, SoakRequest, SoakReply> = runtime
+            .register_split_service::<Soak, SoakEvent, SoakRequest, Infallible>(
+                soak,
+                config.gateway_mailbox,
+            )
+            .map_err(|error| anyhow::anyhow!("register soak gateway: {error:?}"))?;
 
-    let timeout = Duration::from_millis(config.call_timeout_ms);
-    let total = config.workers * config.requests_per_worker;
-    let outcomes = Arc::new(Mutex::new(Vec::with_capacity(total)));
-    let barrier = Arc::new(Barrier::new(config.workers + 1));
-    let mut threads = Vec::with_capacity(config.workers);
-
-    for worker_id in 0..config.workers {
-        let rt = Arc::clone(&runtime);
-        let gate = Arc::clone(&barrier);
-        let out = Arc::clone(&outcomes);
-        let requests = svc.requests;
-        let per = config.requests_per_worker;
-        threads.push(thread::spawn(move || {
-            gate.wait();
-            for request_id in 0..per {
-                let r = rt.call_blocking_request(
-                    requests,
-                    SoakRequest::Request {
-                        worker_id,
-                        request_id,
-                    },
-                    timeout,
-                );
-                out.lock().expect("outcomes").push(r);
+        let timeout = Duration::from_millis(config.call_timeout_ms);
+        let total = config.workers * config.requests_per_worker;
+        let outcomes = Mutex::new(Vec::with_capacity(total));
+        let barrier = Barrier::new(config.workers + 1);
+        let worker_panicked = thread::scope(|scope| {
+            let mut threads = Vec::with_capacity(config.workers);
+            for worker_id in 0..config.workers {
+                let requests = svc.requests;
+                let per = config.requests_per_worker;
+                let barrier = &barrier;
+                let outcomes = &outcomes;
+                threads.push(scope.spawn(move || {
+                    barrier.wait();
+                    for request_id in 0..per {
+                        let result = runtime.call_blocking_request(
+                            requests,
+                            SoakRequest::Request {
+                                worker_id,
+                                request_id,
+                            },
+                            timeout,
+                        );
+                        outcomes.lock().expect("outcomes").push(result);
+                    }
+                }));
             }
-        }));
-    }
-    barrier.wait();
-    let mut worker_panicked = false;
-    for worker in threads {
-        worker_panicked |= worker.join().is_err();
-    }
+            barrier.wait();
+            threads
+                .into_iter()
+                .fold(false, |panicked, worker| panicked | worker.join().is_err())
+        });
 
-    let report_result = (|| -> anyhow::Result<RunReport> {
         if worker_panicked {
             anyhow::bail!("one or more soak worker threads panicked");
         }
         let outcomes = outcomes.lock().expect("outcomes");
         let counts = classify_outcomes(&outcomes)?;
 
-    // Aggregate everything into a ServicePressureReport .
+        // Aggregate everything into a ServicePressureReport .
         let mut summary = ServicePressureReport::new("soak_http_db");
         summary.add_surface(ServicePressureSurface::measured(
             "soak.http.in_flight",
             "scope",
             http_scope.surface_report(CapacityMode::Fixed),
         ));
-    summary.add_surface(ServicePressureSurface::measured(
-        "soak.db.in_flight",
-        "scope",
-        db_scope.surface_report(CapacityMode::Fixed),
-    ));
-    summary.add_surface(ServicePressureSurface::measured(
-        "soak.slow_requests",
-        "events",
-        events.surface_report(CapacityMode::Fixed),
-    ));
-    summary.add_unavailable(
-        "soak.outbound.pool",
-        "pool_waiters",
-        "no outbound pool installed in this soak",
-    );
+        summary.add_surface(ServicePressureSurface::measured(
+            "soak.db.in_flight",
+            "scope",
+            db_scope.surface_report(CapacityMode::Fixed),
+        ));
+        summary.add_surface(ServicePressureSurface::measured(
+            "soak.slow_requests",
+            "events",
+            events.surface_report(CapacityMode::Fixed),
+        ));
+        summary.add_unavailable(
+            "soak.outbound.pool",
+            "pool_waiters",
+            "no outbound pool installed in this soak",
+        );
 
         let mut discovery_lines: Vec<String> = Vec::new();
         discovery_lines.push(http_scope.discovery_line());
-    discovery_lines.push(db_scope.discovery_line());
-    discovery_lines.push(events.discovery_line());
-    for surface in &summary.surfaces {
-        discovery_lines.push(surface.discovery_line());
-    }
+        discovery_lines.push(db_scope.discovery_line());
+        discovery_lines.push(events.discovery_line());
+        for surface in &summary.surfaces {
+            discovery_lines.push(surface.discovery_line());
+        }
 
         let mut copyable_assertion_failures = Vec::new();
         let capacity_summary: CapacitySummary = summary
             .capacity_summary()
             .map_err(|e| anyhow::anyhow!("capacity summary: {e:?}"))?;
-    if let Err(errors) = capacity_summary.assert_no_full() {
-        for err in &errors {
-            copyable_assertion_failures.push(format_assertion_failure(err));
+        if let Err(errors) = capacity_summary.assert_no_full() {
+            for err in &errors {
+                copyable_assertion_failures.push(format_assertion_failure(err));
+            }
         }
-    }
 
         let event_snap = events.snapshot();
         let service_summary_line = summary.summary_line();
 
-        Ok(RunReport {
+        Ok::<_, anyhow::Error>(RunReport {
             total_requests: total,
             ok: counts.ok,
             http_full: counts.http_full,
@@ -442,9 +425,8 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
             service_summary_line,
             copyable_assertion_failures,
         })
-    })();
+    });
 
-    let shutdown_result = shutdown_runtime(shutdown, runtime);
     let http_after_shutdown = http_scope.snapshot();
     let db_after_shutdown = db_scope.snapshot();
     let settlement_result = if http_after_shutdown.current != 0 || db_after_shutdown.current != 0 {
@@ -457,7 +439,10 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         Ok(())
     };
 
-    shutdown_result?;
+    let report_result = match report_result {
+        Err(error) if error.shutdown().is_some() => return Err(error.into()),
+        result => result,
+    };
     settlement_result?;
     let report = report_result?;
 
@@ -468,16 +453,6 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     println!("{}", report.service_summary_line);
 
     Ok(report)
-}
-
-fn shutdown_runtime(
-    shutdown: tina_runtime::ThreadedShutdownHandle,
-    runtime: Arc<SoakSystem>,
-) -> anyhow::Result<()> {
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
-    Ok(())
 }
 
 #[cfg(test)]

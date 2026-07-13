@@ -72,12 +72,13 @@ What felt good:
 - Caller timeout and shutdown both release the parked lease exactly;
   the smoke suite asserts a timed-out request leaves both shared scopes
   at zero after clean terminal shutdown.
-- The live host is a fallible `LocalSystem`. Timer capacity is explicit,
+- The live host is a fallible `LocalSystem`. Scoped workers borrow that single
+  application owner, timer capacity is explicit,
   and a saturated timer lane returns `TimerFailed(TimerFull)` while
   releasing the HTTP lease instead of becoming a host timeout.
 - Gateway `Full`, caller timeout at either HTTP or DB, and every outer
   host error remain distinct. Host-side failures still run bounded
-  terminal shutdown before `run` returns the error.
+  `run_to_shutdown_reported` terminal shutdown before `run` returns the error.
 
 What remains policy-specific:
 

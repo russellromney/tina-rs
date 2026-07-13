@@ -1,7 +1,9 @@
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+#[cfg(test)]
+use std::sync::Arc;
 
 use tina::prelude::*;
 use tina_runtime::{
@@ -176,72 +178,79 @@ impl Batcher {
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let app = Arc::new(
-        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
-    );
-    let shutdown = app.shutdown_handle();
-    let batcher = app
-        .register_split_service::<Batcher, BatcherEvent, BatcherRequest, Infallible>(
-            Batcher::new(
-                BATCH_SIZE,
-                Duration::from_millis(BATCH_TIMEOUT_MS),
-                MAX_PENDING,
-            ),
-            SUBMISSION_CAPACITY,
-        )
-        .map_err(|error| anyhow::anyhow!("register batcher: {error:?}"))?;
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    let mut report = app.run_to_shutdown_reported(SHUTDOWN_TIMEOUT, |app| {
+        let batcher = app
+            .register_split_service::<Batcher, BatcherEvent, BatcherRequest, Infallible>(
+                Batcher::new(
+                    BATCH_SIZE,
+                    Duration::from_millis(BATCH_TIMEOUT_MS),
+                    MAX_PENDING,
+                ),
+                SUBMISSION_CAPACITY,
+            )
+            .map_err(|error| anyhow::anyhow!("register batcher: {error:?}"))?;
 
-    let mut callers = Vec::with_capacity(CALLERS);
-    for item in 1..=CALLERS as u64 {
-        let app = Arc::clone(&app);
-        let requests = batcher.requests;
-        callers.push(thread::spawn(move || {
-            app.call_blocking_request(requests, BatcherRequest::Submit(item), CALL_TIMEOUT)
-        }));
-    }
+        let outcomes = thread::scope(|scope| {
+            let mut callers = Vec::with_capacity(CALLERS);
+            for item in 1..=CALLERS as u64 {
+                let requests = batcher.requests;
+                callers.push(scope.spawn(move || {
+                    app.call_blocking_request(requests, BatcherRequest::Submit(item), CALL_TIMEOUT)
+                }));
+            }
+            callers
+                .into_iter()
+                .map(|caller| {
+                    caller
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("batcher caller thread panicked"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+        })?;
 
-    let mut report = Report {
-        callers: CALLERS,
-        ..Report::default()
-    };
-    for caller in callers {
-        match caller
-            .join()
-            .map_err(|_| anyhow::anyhow!("batcher caller thread panicked"))?
-        {
-            Ok(outcome) => match outcome {
-                CallOutcome::Replied(BatcherReply::Batched(_)) => report.successes += 1,
-                CallOutcome::Replied(BatcherReply::Full) => report.full_rejects += 1,
-                CallOutcome::Replied(BatcherReply::TimerFailed(_)) => {
-                    report.timer_failures += 1;
+        let mut report = Report {
+            callers: CALLERS,
+            ..Report::default()
+        };
+        for outcome in outcomes {
+            match outcome {
+                Ok(outcome) => match outcome {
+                    CallOutcome::Replied(BatcherReply::Batched(_)) => report.successes += 1,
+                    CallOutcome::Replied(BatcherReply::Full) => report.full_rejects += 1,
+                    CallOutcome::Replied(BatcherReply::TimerFailed(_)) => {
+                        report.timer_failures += 1;
+                        report.failed += 1;
+                    }
+                    CallOutcome::Replied(BatcherReply::Stats(_)) => report.failed += 1,
+                    CallOutcome::Full => {
+                        report.transport_full += 1;
+                        report.failed += 1;
+                    }
+                    CallOutcome::Closed => {
+                        report.closed += 1;
+                        report.failed += 1;
+                    }
+                    CallOutcome::Timeout => {
+                        report.timeouts += 1;
+                        report.failed += 1;
+                    }
+                    CallOutcome::Rejected(_) => {
+                        report.rejected += 1;
+                        report.failed += 1;
+                    }
+                },
+                Err(error) => {
+                    record_host_error(&mut report, error);
                     report.failed += 1;
                 }
-                CallOutcome::Replied(BatcherReply::Stats(_)) => report.failed += 1,
-                CallOutcome::Full => {
-                    report.transport_full += 1;
-                    report.failed += 1;
-                }
-                CallOutcome::Closed => {
-                    report.closed += 1;
-                    report.failed += 1;
-                }
-                CallOutcome::Timeout => {
-                    report.timeouts += 1;
-                    report.failed += 1;
-                }
-                CallOutcome::Rejected(_) => {
-                    report.rejected += 1;
-                    report.failed += 1;
-                }
-            },
-            Err(error) => {
-                record_host_error(&mut report, error);
-                report.failed += 1;
             }
         }
-    }
-    let stats =
-        match app.call_blocking_request(batcher.requests, BatcherRequest::Stats, CALL_TIMEOUT)? {
+        let stats = match app.call_blocking_request(
+            batcher.requests,
+            BatcherRequest::Stats,
+            CALL_TIMEOUT,
+        )? {
             CallOutcome::Replied(BatcherReply::Stats(stats)) => stats,
             CallOutcome::Replied(other) => anyhow::bail!("stats returned wrong reply: {other:?}"),
             CallOutcome::Full => anyhow::bail!("stats call mailbox was full"),
@@ -249,12 +258,10 @@ pub fn run() -> anyhow::Result<Report> {
             CallOutcome::Timeout => anyhow::bail!("stats call timed out"),
             CallOutcome::Rejected(reason) => anyhow::bail!("stats call rejected: {reason:?}"),
         };
-    report.batches_size_flushed = stats.size_flushes;
-    report.batches_timer_flushed = stats.timer_flushes;
-
-    let terminal = shutdown.request_and_wait_report(SHUTDOWN_TIMEOUT)?;
-    drop(app);
-    terminal.ensure_clean()?;
+        report.batches_size_flushed = stats.size_flushes;
+        report.batches_timer_flushed = stats.timer_flushes;
+        Ok::<_, anyhow::Error>(report)
+    })?;
     report.exit_clean = true;
     Ok(report)
 }
@@ -285,7 +292,6 @@ mod tests {
 
     struct Harness {
         app: Arc<App>,
-        shutdown: tina_runtime::ThreadedShutdownHandle,
         service: tina_runtime::SplitServiceHandle<BatcherEvent, BatcherRequest, BatcherReply>,
     }
 
@@ -296,18 +302,13 @@ mod tests {
                     .try_build()
                     .expect("start local system"),
             );
-            let shutdown = app.shutdown_handle();
             let service = app
                 .register_split_service::<Batcher, BatcherEvent, BatcherRequest, Infallible>(
                     Batcher::new(batch_size, interval, max_pending),
                     32,
                 )
                 .expect("register batcher");
-            Self {
-                app,
-                shutdown,
-                service,
-            }
+            Self { app, service }
         }
 
         fn stats(&self) -> BatcherStats {
@@ -347,12 +348,10 @@ mod tests {
         }
 
         fn shutdown(self) {
-            let terminal = self
-                .shutdown
-                .request_and_wait_report(SHUTDOWN_TIMEOUT)
-                .expect("observe shutdown");
-            drop(self.app);
-            terminal.ensure_clean().expect("clean shutdown");
+            Arc::try_unwrap(self.app)
+                .unwrap_or_else(|_| panic!("all caller owners returned"))
+                .run_to_shutdown(SHUTDOWN_TIMEOUT, |_| Ok::<_, Infallible>(()))
+                .expect("clean shutdown");
         }
     }
 
@@ -530,17 +529,16 @@ mod tests {
     fn shutdown_observation_is_bounded() {
         let harness = Harness::new(2, Duration::from_secs(5), 2);
         let (sent, received) = mpsc::channel();
-        let shutdown = harness.shutdown.clone();
+        let app =
+            Arc::try_unwrap(harness.app).unwrap_or_else(|_| panic!("no caller owners escaped"));
         thread::spawn(move || {
-            sent.send(shutdown.request_and_wait_report(SHUTDOWN_TIMEOUT))
+            sent.send(app.run_to_shutdown(SHUTDOWN_TIMEOUT, |_| Ok::<_, Infallible>(())))
                 .expect("send shutdown outcome");
         });
-        let terminal = received
+        received
             .recv_timeout(SHUTDOWN_TIMEOUT)
             .expect("bounded shutdown observation")
             .expect("shutdown succeeds");
-        drop(harness.app);
-        terminal.ensure_clean().expect("clean shutdown");
     }
 
     #[test]

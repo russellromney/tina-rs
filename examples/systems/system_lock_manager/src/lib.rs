@@ -28,9 +28,12 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Barrier, Mutex};
 use std::thread;
 use std::time::Duration;
+
+#[cfg(test)]
+use std::sync::Arc;
 
 use tina::prelude::*;
 use tina_runtime::{
@@ -470,85 +473,63 @@ pub fn run_fifo(config: RunConfig) -> anyhow::Result<FifoReport> {
         lease_ms: 5_000,
         ..config
     };
-    let runtime = start(cfg)?;
-    let shutdown = runtime.shutdown_handle();
-    let lockmgr = register(&runtime, cfg)?;
-    let timeout = Duration::from_millis(cfg.call_timeout_ms);
+    run_local(cfg, |runtime| {
+        let admitted_order: Vec<u32> = (1..=4).collect();
+        let grant_order = Mutex::new(Vec::new());
+        thread::scope(|scope| {
+            let lockmgr = register(runtime, cfg)?;
+            let timeout = Duration::from_millis(cfg.call_timeout_ms);
 
-    let key = "fifo-key".to_string();
-    let admitted_order: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
-    let grant_order: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+            let key = "fifo-key".to_string();
 
-    // Hold the lock from the host first so every contender parks before
-    // any of them can be granted.
-    let holder = acquire_handle(&runtime, lockmgr, &key, timeout)?;
+            // Hold the lock from the host first so every contender parks before
+            // any of them can be granted.
+            let holder = acquire_handle(runtime, lockmgr, &key, timeout)?;
 
-    let contenders = 4u32;
-    // Each contender admits itself in a fixed order via a sequential
-    // gate. That keeps Acquire admission order matching the worker id
-    // and lets us assert FIFO grant order against the same sequence.
-    let admit_gate = Arc::new(Mutex::new(1u32));
-    let mut threads = Vec::with_capacity(contenders as usize);
-    for id in 1..=contenders {
-        let rt = Arc::clone(&runtime);
-        let key_for_thread = key.clone();
-        let gate = Arc::clone(&admit_gate);
-        let admitted = Arc::clone(&admitted_order);
-        let granted = Arc::clone(&grant_order);
-        threads.push(thread::spawn(move || -> anyhow::Result<()> {
-            // Wait until it is this contender's turn to enter Acquire.
-            loop {
-                {
-                    let g = gate.lock().expect("gate");
-                    if *g == id {
-                        admitted.lock().expect("admitted").push(id);
-                        break;
-                    }
-                }
-                thread::sleep(Duration::from_millis(2));
+            let contenders = 4u32;
+            let mut threads = Vec::with_capacity(contenders as usize);
+            for id in 1..=contenders {
+                let key_for_thread = key.clone();
+                let granted = &grant_order;
+                threads.push(scope.spawn(move || -> anyhow::Result<()> {
+                    let handle = expect_granted(runtime.call_blocking_request(
+                        lockmgr,
+                        LockRequest::Acquire {
+                            key: key_for_thread.clone(),
+                        },
+                        timeout,
+                    )?)?;
+                    granted.lock().expect("granted").push(id);
+                    expect_released(runtime.call_blocking_request(
+                        lockmgr,
+                        LockRequest::Release { handle },
+                        timeout,
+                    )?)
+                }));
+                // Observe this request parked before admitting the next one.
+                // The server-side waiter count is the FIFO admission proof;
+                // host scheduling delays cannot reorder the cohort.
+                wait_for_waiters(runtime, lockmgr, id as usize, timeout)?;
             }
-            // Hand the gate to the next contender once admission is in
-            // flight. A short pause makes sure the queue receives our
-            // Acquire message before the next thread races us.
-            thread::sleep(Duration::from_millis(20));
-            *gate.lock().expect("gate") = id + 1;
 
-            let handle = expect_granted(rt.call_blocking_request(
+            expect_released(runtime.call_blocking_request(
                 lockmgr,
-                LockRequest::Acquire {
-                    key: key_for_thread.clone(),
-                },
+                LockRequest::Release { handle: holder },
                 timeout,
             )?)?;
-            granted.lock().expect("granted").push(id);
-            expect_released(rt.call_blocking_request(
-                lockmgr,
-                LockRequest::Release { handle },
-                timeout,
-            )?)
-        }));
-    }
 
-    // Wait for all four contenders to be parked before releasing the
-    // primary holder. Otherwise the first releaser's grant could race
-    // the slowest contender's Acquire.
-    wait_for_waiters(&runtime, lockmgr, contenders as usize, timeout)?;
-    expect_released(runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Release { handle: holder },
-        timeout,
-    )?)?;
+            for t in threads {
+                t.join()
+                    .map_err(|_| anyhow::anyhow!("contender thread panicked"))??;
+            }
 
-    for t in threads {
-        t.join().expect("contender thread")?;
-    }
-
-    let stats = stats(&runtime, lockmgr, timeout)?;
-    shutdown_runtime(shutdown, runtime)?;
-    Ok(FifoReport {
-        admitted_order: admitted_order.lock().expect("admitted").clone(),
-        grant_order: grant_order.lock().expect("granted").clone(),
-        stats,
+            let stats = stats(runtime, lockmgr, timeout)?;
+            Ok(FifoReport {
+                admitted_order,
+                grant_order: grant_order.lock().expect("granted").clone(),
+                stats,
+            })
+        })
     })
 }
 
@@ -561,62 +542,66 @@ pub fn run_expiry_handoff(config: RunConfig) -> anyhow::Result<ExpiryHandoffRepo
         lease_ms: 100,
         ..config
     };
-    let runtime = start(cfg)?;
-    let shutdown = runtime.shutdown_handle();
-    let lockmgr = register(&runtime, cfg)?;
-    let timeout = Duration::from_millis(cfg.call_timeout_ms);
-    let key = "expire-key".to_string();
+    run_local(cfg, |runtime| {
+        thread::scope(|scope| {
+            let lockmgr = register(runtime, cfg)?;
+            let timeout = Duration::from_millis(cfg.call_timeout_ms);
+            let key = "expire-key".to_string();
 
-    let original = acquire_handle(&runtime, lockmgr, &key, timeout)?;
+            let original = acquire_handle(runtime, lockmgr, &key, timeout)?;
 
-    let rt2 = Arc::clone(&runtime);
-    let key_for_waiter = key.clone();
-    let waiter = thread::spawn(move || {
-        rt2.call_blocking_request(
-            lockmgr,
-            LockRequest::Acquire {
-                key: key_for_waiter,
-            },
-            timeout,
-        )
-    });
+            let key_for_waiter = key.clone();
+            let waiter = scope.spawn(move || {
+                runtime.call_blocking_request(
+                    lockmgr,
+                    LockRequest::Acquire {
+                        key: key_for_waiter,
+                    },
+                    timeout,
+                )
+            });
 
-    wait_for_waiters(&runtime, lockmgr, 1, timeout)?;
+            wait_for_waiters(runtime, lockmgr, 1, timeout)?;
 
-    // Wait through the lease so the timer fires and the queued caller
-    // gets handed the lock without us doing anything.
-    thread::sleep(Duration::from_millis(cfg.lease_ms + 80));
+            // Wait through the lease so the timer fires and the queued caller
+            // gets handed the lock without us doing anything.
+            thread::sleep(Duration::from_millis(cfg.lease_ms + 80));
 
-    let waiter_handle = expect_granted(waiter.join().expect("waiter thread")?)?;
-    let waiter_received_grant = waiter_handle.key == key;
+            let waiter_handle = expect_granted(
+                waiter
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("waiter thread panicked"))??,
+            )?;
+            let waiter_received_grant = waiter_handle.key == key;
 
-    // Original release should now be stale.
-    let stale_reply = expect_reply(
-        runtime.call_blocking_request(
-            lockmgr,
-            LockRequest::Release { handle: original },
-            timeout,
-        )?,
-        "stale release",
-    )?;
-    let original_release_was_stale = matches!(stale_reply, LockReply::StaleHandle);
+            // Original release should now be stale.
+            let stale_reply = expect_reply(
+                runtime.call_blocking_request(
+                    lockmgr,
+                    LockRequest::Release { handle: original },
+                    timeout,
+                )?,
+                "stale release",
+            )?;
+            let original_release_was_stale = matches!(stale_reply, LockReply::StaleHandle);
 
-    // Tidy up: release the new holder. We still want to confirm normal
-    // release works after a hand-off chain.
-    expect_released(runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Release {
-            handle: waiter_handle,
-        },
-        timeout,
-    )?)?;
+            // Tidy up: release the new holder. We still want to confirm normal
+            // release works after a hand-off chain.
+            expect_released(runtime.call_blocking_request(
+                lockmgr,
+                LockRequest::Release {
+                    handle: waiter_handle,
+                },
+                timeout,
+            )?)?;
 
-    let stats = stats(&runtime, lockmgr, timeout)?;
-    shutdown_runtime(shutdown, runtime)?;
-    Ok(ExpiryHandoffReport {
-        waiter_received_grant,
-        original_release_was_stale,
-        stats,
+            let stats = stats(runtime, lockmgr, timeout)?;
+            Ok(ExpiryHandoffReport {
+                waiter_received_grant,
+                original_release_was_stale,
+                stats,
+            })
+        })
     })
 }
 
@@ -628,89 +613,93 @@ pub fn run_renewal(config: RunConfig) -> anyhow::Result<RenewalReport> {
         lease_ms: 120,
         ..config
     };
-    let runtime = start(cfg)?;
-    let shutdown = runtime.shutdown_handle();
-    let lockmgr = register(&runtime, cfg)?;
-    let timeout = Duration::from_millis(cfg.call_timeout_ms);
-    let key = "renew-key".to_string();
+    run_local(cfg, |runtime| {
+        let waiter_done = Mutex::new(false);
+        thread::scope(|scope| {
+            let lockmgr = register(runtime, cfg)?;
+            let timeout = Duration::from_millis(cfg.call_timeout_ms);
+            let key = "renew-key".to_string();
 
-    let handle = acquire_handle(&runtime, lockmgr, &key, timeout)?;
+            let handle = acquire_handle(runtime, lockmgr, &key, timeout)?;
 
-    let waiter_done = Arc::new(Mutex::new(false));
-    let waiter_done_for_thread = Arc::clone(&waiter_done);
-    let rt2 = Arc::clone(&runtime);
-    let key_for_waiter = key.clone();
-    let waiter = thread::spawn(move || {
-        let outcome = rt2.call_blocking_request(
-            lockmgr,
-            LockRequest::Acquire {
-                key: key_for_waiter,
-            },
-            timeout,
-        );
-        *waiter_done_for_thread.lock().expect("waiter done") = true;
-        outcome
-    });
+            let waiter_done_for_thread = &waiter_done;
+            let key_for_waiter = key.clone();
+            let waiter = scope.spawn(move || {
+                let outcome = runtime.call_blocking_request(
+                    lockmgr,
+                    LockRequest::Acquire {
+                        key: key_for_waiter,
+                    },
+                    timeout,
+                );
+                *waiter_done_for_thread.lock().expect("waiter done") = true;
+                outcome
+            });
 
-    wait_for_waiters(&runtime, lockmgr, 1, timeout)?;
+            wait_for_waiters(runtime, lockmgr, 1, timeout)?;
 
-    // Renew at half-lease; waiter must remain parked.
-    thread::sleep(Duration::from_millis(cfg.lease_ms / 2));
-    match expect_reply(
-        runtime.call_blocking_request(
-            lockmgr,
-            LockRequest::Renew {
-                handle: handle.clone(),
-            },
-            timeout,
-        )?,
-        "renew",
-    )? {
-        LockReply::Renewed { .. } => {}
-        other => anyhow::bail!("renew did not return Renewed: {other:?}"),
-    }
+            // Renew at half-lease; waiter must remain parked.
+            thread::sleep(Duration::from_millis(cfg.lease_ms / 2));
+            match expect_reply(
+                runtime.call_blocking_request(
+                    lockmgr,
+                    LockRequest::Renew {
+                        handle: handle.clone(),
+                    },
+                    timeout,
+                )?,
+                "renew",
+            )? {
+                LockReply::Renewed { .. } => {}
+                other => anyhow::bail!("renew did not return Renewed: {other:?}"),
+            }
 
-    // Sleep past where the original (un-renewed) lease would have fired.
-    thread::sleep(Duration::from_millis(cfg.lease_ms / 2 + 30));
-    let still_held_after_original_lease = !*waiter_done.lock().expect("waiter done");
+            // Sleep past where the original (un-renewed) lease would have fired.
+            thread::sleep(Duration::from_millis(cfg.lease_ms / 2 + 30));
+            let still_held_after_original_lease = !*waiter_done.lock().expect("waiter done");
 
-    // Final release should drain the waiter.
-    let saved = handle.clone();
-    expect_released(runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Release { handle },
-        timeout,
-    )?)?;
-    let final_release_ok = true;
-
-    let old_handle_renew_was_stale = matches!(
-        expect_reply(
-            runtime.call_blocking_request(
+            // Final release should drain the waiter.
+            let saved = handle.clone();
+            expect_released(runtime.call_blocking_request(
                 lockmgr,
-                LockRequest::Renew { handle: saved },
-                timeout
-            )?,
-            "stale renew",
-        )?,
-        LockReply::StaleHandle
-    );
+                LockRequest::Release { handle },
+                timeout,
+            )?)?;
+            let final_release_ok = true;
 
-    let waiter_handle = expect_granted(waiter.join().expect("waiter thread")?)?;
-    expect_released(runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Release {
-            handle: waiter_handle,
-        },
-        timeout,
-    )?)?;
+            let old_handle_renew_was_stale = matches!(
+                expect_reply(
+                    runtime.call_blocking_request(
+                        lockmgr,
+                        LockRequest::Renew { handle: saved },
+                        timeout
+                    )?,
+                    "stale renew",
+                )?,
+                LockReply::StaleHandle
+            );
 
-    let stats = stats(&runtime, lockmgr, timeout)?;
-    shutdown_runtime(shutdown, runtime)?;
-    Ok(RenewalReport {
-        still_held_after_original_lease,
-        final_release_ok,
-        old_handle_renew_was_stale,
-        stats,
+            let waiter_handle = expect_granted(
+                waiter
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("waiter thread panicked"))??,
+            )?;
+            expect_released(runtime.call_blocking_request(
+                lockmgr,
+                LockRequest::Release {
+                    handle: waiter_handle,
+                },
+                timeout,
+            )?)?;
+
+            let stats = stats(runtime, lockmgr, timeout)?;
+            Ok(RenewalReport {
+                still_held_after_original_lease,
+                final_release_ok,
+                old_handle_renew_was_stale,
+                stats,
+            })
+        })
     })
 }
 
@@ -722,30 +711,33 @@ pub fn run_stale_release(config: RunConfig) -> anyhow::Result<StaleReleaseReport
         lease_ms: 5_000,
         ..config
     };
-    let runtime = start(cfg)?;
-    let shutdown = runtime.shutdown_handle();
-    let lockmgr = register(&runtime, cfg)?;
-    let timeout = Duration::from_millis(cfg.call_timeout_ms);
-    let key = "stale-key".to_string();
+    run_local(cfg, |runtime| {
+        let lockmgr = register(runtime, cfg)?;
+        let timeout = Duration::from_millis(cfg.call_timeout_ms);
+        let key = "stale-key".to_string();
 
-    let handle = acquire_handle(&runtime, lockmgr, &key, timeout)?;
-    let saved = handle.clone();
-    expect_released(runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Release { handle },
-        timeout,
-    )?)?;
-    let second = expect_reply(
-        runtime.call_blocking_request(lockmgr, LockRequest::Release { handle: saved }, timeout)?,
-        "second release",
-    )?;
-    let second_release_was_stale = matches!(second, LockReply::StaleHandle);
+        let handle = acquire_handle(runtime, lockmgr, &key, timeout)?;
+        let saved = handle.clone();
+        expect_released(runtime.call_blocking_request(
+            lockmgr,
+            LockRequest::Release { handle },
+            timeout,
+        )?)?;
+        let second = expect_reply(
+            runtime.call_blocking_request(
+                lockmgr,
+                LockRequest::Release { handle: saved },
+                timeout,
+            )?,
+            "second release",
+        )?;
+        let second_release_was_stale = matches!(second, LockReply::StaleHandle);
 
-    let stats = stats(&runtime, lockmgr, timeout)?;
-    shutdown_runtime(shutdown, runtime)?;
-    Ok(StaleReleaseReport {
-        second_release_was_stale,
-        stats,
+        let stats = stats(runtime, lockmgr, timeout)?;
+        Ok(StaleReleaseReport {
+            second_release_was_stale,
+            stats,
+        })
     })
 }
 
@@ -758,91 +750,99 @@ pub fn run_per_key_overflow(config: RunConfig) -> anyhow::Result<PerKeyOverflowR
         max_waiters_per_key: 2,
         ..config
     };
-    let runtime = start(cfg)?;
-    let shutdown = runtime.shutdown_handle();
-    let lockmgr = register(&runtime, cfg)?;
-    let timeout = Duration::from_millis(cfg.call_timeout_ms);
-    let key = "busy-key".to_string();
+    run_local(cfg, |runtime| {
+        let overflow = 3;
+        let contenders = (cfg.max_waiters_per_key + overflow) as u32;
+        let barrier = Barrier::new(contenders as usize + 1);
+        thread::scope(|scope| {
+            let lockmgr = register(runtime, cfg)?;
+            let timeout = Duration::from_millis(cfg.call_timeout_ms);
+            let key = "busy-key".to_string();
 
-    let holder = acquire_handle(&runtime, lockmgr, &key, timeout)?;
+            let holder = acquire_handle(runtime, lockmgr, &key, timeout)?;
 
-    // 2 admitted to the queue + 3 overflow callers that must see Busy.
-    let overflow = 3;
-    let contenders = (cfg.max_waiters_per_key + overflow) as u32;
-    let barrier = Arc::new(Barrier::new(contenders as usize + 1));
-    let mut threads = Vec::with_capacity(contenders as usize);
-    for _ in 0..contenders {
-        let rt = Arc::clone(&runtime);
-        let gate = Arc::clone(&barrier);
-        let key_for_thread = key.clone();
-        threads.push(thread::spawn(
-            move || -> anyhow::Result<CallOutcome<LockReply>> {
-                gate.wait();
-                let outcome = rt.call_blocking_request(
-                    lockmgr,
-                    LockRequest::Acquire {
-                        key: key_for_thread,
-                    },
-                    timeout,
-                )?;
-                // Granted callers release immediately so the per-key
-                // hand-off chain drains within the call timeout.
-                if let CallOutcome::Replied(LockReply::Granted { handle }) = &outcome {
-                    expect_released(rt.call_blocking_request(
-                        lockmgr,
-                        LockRequest::Release {
-                            handle: handle.clone(),
-                        },
-                        timeout,
-                    )?)?;
+            // 2 admitted to the queue + 3 overflow callers that must see Busy.
+            let mut threads = Vec::with_capacity(contenders as usize);
+            for _ in 0..contenders {
+                let gate = &barrier;
+                let key_for_thread = key.clone();
+                threads.push(
+                    scope.spawn(move || -> anyhow::Result<CallOutcome<LockReply>> {
+                        gate.wait();
+                        let outcome = runtime.call_blocking_request(
+                            lockmgr,
+                            LockRequest::Acquire {
+                                key: key_for_thread,
+                            },
+                            timeout,
+                        )?;
+                        // Granted callers release immediately so the per-key
+                        // hand-off chain drains within the call timeout.
+                        if let CallOutcome::Replied(LockReply::Granted { handle }) = &outcome {
+                            expect_released(runtime.call_blocking_request(
+                                lockmgr,
+                                LockRequest::Release {
+                                    handle: handle.clone(),
+                                },
+                                timeout,
+                            )?)?;
+                        }
+                        Ok(outcome)
+                    }),
+                );
+            }
+            barrier.wait();
+
+            // Wait until both the queue is full AND every overflow caller has
+            // been counted as a per-key full reject. Counting on the server side
+            // happens before the Busy reply lands, so this is the cleanest way
+            // to know the burst has fully landed before we release the holder.
+            wait_for_busy_settlement(
+                runtime,
+                lockmgr,
+                cfg.max_waiters_per_key,
+                overflow as u64,
+                timeout,
+            )?;
+
+            // Release the holder so admitted waiters can drain.
+            expect_released(runtime.call_blocking_request(
+                lockmgr,
+                LockRequest::Release { handle: holder },
+                timeout,
+            )?)?;
+
+            let mut busy = 0;
+            for contender in threads {
+                match contender
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("overflow contender panicked"))??
+                {
+                    CallOutcome::Replied(LockReply::Busy(WaitBusyReason::KeyFull)) => busy += 1,
+                    CallOutcome::Replied(LockReply::Busy(WaitBusyReason::GlobalFull)) => {
+                        anyhow::bail!("per-key overflow unexpectedly hit the global cap")
+                    }
+                    CallOutcome::Replied(LockReply::Granted { .. }) => {
+                        // Already released inside the worker thread.
+                    }
+                    CallOutcome::Replied(reply) => {
+                        anyhow::bail!("unexpected per-key overflow reply: {reply:?}")
+                    }
+                    CallOutcome::Full => anyhow::bail!("per-key overflow acquire mailbox was full"),
+                    CallOutcome::Closed => {
+                        anyhow::bail!("lock manager closed during per-key overflow")
+                    }
+                    CallOutcome::Timeout => anyhow::bail!("per-key overflow acquire timed out"),
+                    CallOutcome::Rejected(reason) => {
+                        anyhow::bail!("per-key overflow acquire rejected: {reason:?}")
+                    }
                 }
-                Ok(outcome)
-            },
-        ));
-    }
-    barrier.wait();
-
-    // Wait until both the queue is full AND every overflow caller has
-    // been counted as a per-key full reject. Counting on the server side
-    // happens before the Busy reply lands, so this is the cleanest way
-    // to know the burst has fully landed before we release the holder.
-    wait_for_busy_settlement(
-        &runtime,
-        lockmgr,
-        cfg.max_waiters_per_key,
-        overflow as u64,
-        timeout,
-    )?;
-
-    // Release the holder so admitted waiters can drain.
-    let _ =
-        runtime.call_blocking_request(lockmgr, LockRequest::Release { handle: holder }, timeout)?;
-
-    let mut busy = 0;
-    for contender in threads {
-        match contender.join().expect("contender")? {
-            CallOutcome::Replied(LockReply::Busy(WaitBusyReason::KeyFull)) => busy += 1,
-            CallOutcome::Replied(LockReply::Busy(WaitBusyReason::GlobalFull)) => {
-                anyhow::bail!("per-key overflow unexpectedly hit the global cap")
             }
-            CallOutcome::Replied(LockReply::Granted { .. }) => {
-                // Already released inside the worker thread.
-            }
-            CallOutcome::Replied(reply) => {
-                anyhow::bail!("unexpected per-key overflow reply: {reply:?}")
-            }
-            CallOutcome::Full => anyhow::bail!("per-key overflow acquire mailbox was full"),
-            CallOutcome::Closed => anyhow::bail!("lock manager closed during per-key overflow"),
-            CallOutcome::Timeout => anyhow::bail!("per-key overflow acquire timed out"),
-            CallOutcome::Rejected(reason) => {
-                anyhow::bail!("per-key overflow acquire rejected: {reason:?}")
-            }
-        }
-    }
 
-    let stats = stats(&runtime, lockmgr, timeout)?;
-    shutdown_runtime(shutdown, runtime)?;
-    Ok(PerKeyOverflowReport { busy, stats })
+            let stats = stats(runtime, lockmgr, timeout)?;
+            Ok(PerKeyOverflowReport { busy, stats })
+        })
+    })
 }
 
 /// Saturate the global waiter table across two held keys. The second key is
@@ -855,58 +855,62 @@ pub fn run_global_overflow(config: RunConfig) -> anyhow::Result<GlobalOverflowRe
         max_waiters_per_key: 2,
         ..config
     };
-    let runtime = start(cfg)?;
-    let shutdown = runtime.shutdown_handle();
-    let lockmgr = register(&runtime, cfg)?;
-    let timeout = Duration::from_millis(cfg.call_timeout_ms);
+    run_local(cfg, |runtime| {
+        thread::scope(|scope| {
+            let lockmgr = register(runtime, cfg)?;
+            let timeout = Duration::from_millis(cfg.call_timeout_ms);
 
-    let first = acquire_handle(&runtime, lockmgr, "global-a", timeout)?;
-    let second = acquire_handle(&runtime, lockmgr, "global-b", timeout)?;
-    let rt = Arc::clone(&runtime);
-    let waiter = thread::spawn(move || {
-        rt.call_blocking_request(
-            lockmgr,
-            LockRequest::Acquire {
-                key: "global-a".into(),
-            },
-            timeout,
-        )
-    });
-    wait_for_waiters(&runtime, lockmgr, 1, timeout)?;
+            let first = acquire_handle(runtime, lockmgr, "global-a", timeout)?;
+            let second = acquire_handle(runtime, lockmgr, "global-b", timeout)?;
+            let waiter = scope.spawn(move || {
+                runtime.call_blocking_request(
+                    lockmgr,
+                    LockRequest::Acquire {
+                        key: "global-a".into(),
+                    },
+                    timeout,
+                )
+            });
+            wait_for_waiters(runtime, lockmgr, 1, timeout)?;
 
-    let global_full = matches!(
-        expect_reply(
-            runtime.call_blocking_request(
+            let global_full = matches!(
+                expect_reply(
+                    runtime.call_blocking_request(
+                        lockmgr,
+                        LockRequest::Acquire {
+                            key: "global-b".into(),
+                        },
+                        timeout,
+                    )?,
+                    "global overflow acquire",
+                )?,
+                LockReply::Busy(WaitBusyReason::GlobalFull)
+            );
+            expect_released(runtime.call_blocking_request(
                 lockmgr,
-                LockRequest::Acquire {
-                    key: "global-b".into(),
-                },
+                LockRequest::Release { handle: first },
                 timeout,
-            )?,
-            "global overflow acquire",
-        )?,
-        LockReply::Busy(WaitBusyReason::GlobalFull)
-    );
-    expect_released(runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Release { handle: first },
-        timeout,
-    )?)?;
-    let granted = expect_granted(waiter.join().expect("global waiter")?)?;
-    expect_released(runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Release { handle: granted },
-        timeout,
-    )?)?;
-    expect_released(runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Release { handle: second },
-        timeout,
-    )?)?;
+            )?)?;
+            let granted = expect_granted(
+                waiter
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("global waiter panicked"))??,
+            )?;
+            expect_released(runtime.call_blocking_request(
+                lockmgr,
+                LockRequest::Release { handle: granted },
+                timeout,
+            )?)?;
+            expect_released(runtime.call_blocking_request(
+                lockmgr,
+                LockRequest::Release { handle: second },
+                timeout,
+            )?)?;
 
-    let stats = stats(&runtime, lockmgr, timeout)?;
-    shutdown_runtime(shutdown, runtime)?;
-    Ok(GlobalOverflowReport { global_full, stats })
+            let stats = stats(runtime, lockmgr, timeout)?;
+            Ok(GlobalOverflowReport { global_full, stats })
+        })
+    })
 }
 
 /// A timed-out FIFO head is reclaimed on refill. With capacity one, admitting
@@ -919,67 +923,75 @@ pub fn run_caller_gone_refill(config: RunConfig) -> anyhow::Result<CallerGoneRef
         max_waiters_per_key: 1,
         ..config
     };
-    let runtime = start(cfg)?;
-    let shutdown = runtime.shutdown_handle();
-    let lockmgr = register(&runtime, cfg)?;
-    let timeout = Duration::from_millis(cfg.call_timeout_ms);
-    let holder = acquire_handle(&runtime, lockmgr, "refill", timeout)?;
+    run_local(cfg, |runtime| {
+        thread::scope(|scope| {
+            let lockmgr = register(runtime, cfg)?;
+            let timeout = Duration::from_millis(cfg.call_timeout_ms);
+            let holder = acquire_handle(runtime, lockmgr, "refill", timeout)?;
 
-    let rt = Arc::clone(&runtime);
-    let gone = thread::spawn(move || {
-        rt.call_blocking_request(
-            lockmgr,
-            LockRequest::Acquire {
-                key: "refill".into(),
-            },
-            Duration::from_millis(40),
-        )
-    });
-    wait_for_waiters(&runtime, lockmgr, 1, timeout)?;
-    let first_timed_out = match gone.join().expect("timed-out waiter")? {
-        CallOutcome::Timeout => true,
-        CallOutcome::Replied(reply) => {
-            anyhow::bail!("caller-gone probe unexpectedly replied: {reply:?}")
-        }
-        CallOutcome::Full => anyhow::bail!("caller-gone probe mailbox was full"),
-        CallOutcome::Closed => anyhow::bail!("lock manager closed during caller-gone probe"),
-        CallOutcome::Rejected(reason) => {
-            anyhow::bail!("caller-gone probe rejected: {reason:?}")
-        }
-    };
+            let gone = scope.spawn(move || {
+                runtime.call_blocking_request(
+                    lockmgr,
+                    LockRequest::Acquire {
+                        key: "refill".into(),
+                    },
+                    Duration::from_millis(40),
+                )
+            });
+            wait_for_waiters(runtime, lockmgr, 1, timeout)?;
+            let first_timed_out = match gone
+                .join()
+                .map_err(|_| anyhow::anyhow!("timed-out waiter panicked"))??
+            {
+                CallOutcome::Timeout => true,
+                CallOutcome::Replied(reply) => {
+                    anyhow::bail!("caller-gone probe unexpectedly replied: {reply:?}")
+                }
+                CallOutcome::Full => anyhow::bail!("caller-gone probe mailbox was full"),
+                CallOutcome::Closed => {
+                    anyhow::bail!("lock manager closed during caller-gone probe")
+                }
+                CallOutcome::Rejected(reason) => {
+                    anyhow::bail!("caller-gone probe rejected: {reason:?}")
+                }
+            };
 
-    let rt = Arc::clone(&runtime);
-    let replacement = thread::spawn(move || {
-        rt.call_blocking_request(
-            lockmgr,
-            LockRequest::Acquire {
-                key: "refill".into(),
-            },
-            timeout,
-        )
-    });
-    wait_for_reclaimed(&runtime, lockmgr, 1, timeout)?;
-    expect_released(runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Release { handle: holder },
-        timeout,
-    )?)?;
-    let replacement_handle = expect_granted(replacement.join().expect("replacement waiter")?)?;
-    let next_waiter_granted = replacement_handle.key == "refill";
-    expect_released(runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Release {
-            handle: replacement_handle,
-        },
-        timeout,
-    )?)?;
+            let replacement = scope.spawn(move || {
+                runtime.call_blocking_request(
+                    lockmgr,
+                    LockRequest::Acquire {
+                        key: "refill".into(),
+                    },
+                    timeout,
+                )
+            });
+            wait_for_reclaimed(runtime, lockmgr, 1, timeout)?;
+            expect_released(runtime.call_blocking_request(
+                lockmgr,
+                LockRequest::Release { handle: holder },
+                timeout,
+            )?)?;
+            let replacement_handle = expect_granted(
+                replacement
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("replacement waiter panicked"))??,
+            )?;
+            let next_waiter_granted = replacement_handle.key == "refill";
+            expect_released(runtime.call_blocking_request(
+                lockmgr,
+                LockRequest::Release {
+                    handle: replacement_handle,
+                },
+                timeout,
+            )?)?;
 
-    let stats = stats(&runtime, lockmgr, timeout)?;
-    shutdown_runtime(shutdown, runtime)?;
-    Ok(CallerGoneRefillReport {
-        first_timed_out,
-        next_waiter_granted,
-        stats,
+            let stats = stats(runtime, lockmgr, timeout)?;
+            Ok(CallerGoneRefillReport {
+                first_timed_out,
+                next_waiter_granted,
+                stats,
+            })
+        })
     })
 }
 
@@ -990,34 +1002,33 @@ pub fn run_keyspace_overflow(config: RunConfig) -> anyhow::Result<KeyspaceOverfl
         max_keys: 1,
         ..config
     };
-    let runtime = start(cfg)?;
-    let shutdown = runtime.shutdown_handle();
-    let lockmgr = register(&runtime, cfg)?;
-    let timeout = Duration::from_millis(cfg.call_timeout_ms);
-    let holder = acquire_handle(&runtime, lockmgr, "only-key", timeout)?;
-    let keyspace_full = matches!(
-        expect_reply(
-            runtime.call_blocking_request(
-                lockmgr,
-                LockRequest::Acquire {
-                    key: "second-key".into(),
-                },
-                timeout,
+    run_local(cfg, |runtime| {
+        let lockmgr = register(runtime, cfg)?;
+        let timeout = Duration::from_millis(cfg.call_timeout_ms);
+        let holder = acquire_handle(runtime, lockmgr, "only-key", timeout)?;
+        let keyspace_full = matches!(
+            expect_reply(
+                runtime.call_blocking_request(
+                    lockmgr,
+                    LockRequest::Acquire {
+                        key: "second-key".into(),
+                    },
+                    timeout,
+                )?,
+                "keyspace overflow acquire",
             )?,
-            "keyspace overflow acquire",
-        )?,
-        LockReply::KeyspaceFull
-    );
-    expect_released(runtime.call_blocking_request(
-        lockmgr,
-        LockRequest::Release { handle: holder },
-        timeout,
-    )?)?;
-    let stats = stats(&runtime, lockmgr, timeout)?;
-    shutdown_runtime(shutdown, runtime)?;
-    Ok(KeyspaceOverflowReport {
-        keyspace_full,
-        stats,
+            LockReply::KeyspaceFull
+        );
+        expect_released(runtime.call_blocking_request(
+            lockmgr,
+            LockRequest::Release { handle: holder },
+            timeout,
+        )?)?;
+        let stats = stats(runtime, lockmgr, timeout)?;
+        Ok(KeyspaceOverflowReport {
+            keyspace_full,
+            stats,
+        })
     })
 }
 
@@ -1178,21 +1189,16 @@ fn wait_for_reclaimed(
     }
 }
 
-fn shutdown_runtime(
-    shutdown: tina_runtime::ThreadedShutdownHandle,
-    runtime: Arc<App>,
-) -> anyhow::Result<()> {
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
-    Ok(())
+fn start(config: RunConfig) -> anyhow::Result<App> {
+    validate_config(config)?;
+    Ok(LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?)
 }
 
-fn start(config: RunConfig) -> anyhow::Result<Arc<App>> {
-    validate_config(config)?;
-    Ok(Arc::new(
-        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
-    ))
+fn run_local<T>(
+    config: RunConfig,
+    workload: impl FnOnce(&App) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    Ok(start(config)?.run_to_shutdown_reported(Duration::from_secs(5), workload)?)
 }
 
 #[cfg(test)]
@@ -1279,11 +1285,13 @@ mod unit_tests {
 
     #[test]
     fn shutdown_closes_a_parked_caller_and_reports_clean() {
+        // The test must initiate shutdown before the caller returns, which is
+        // the lower-level control-flow case outside run_to_shutdown's contract.
         let cfg = RunConfig {
             lease_ms: 5_000,
             ..RunConfig::default()
         };
-        let runtime = start(cfg).expect("start");
+        let runtime = Arc::new(start(cfg).expect("start"));
         let shutdown = runtime.shutdown_handle();
         let lockmgr = register(&runtime, cfg).expect("register");
         let timeout = Duration::from_secs(2);

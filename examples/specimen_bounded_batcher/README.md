@@ -19,8 +19,10 @@ replies to every caller with the batch total when either the batch reaches
   current timer failure settles the batch with typed `TimerFailed(CallError)`
   replies instead of abandoning callers.
 - The live host uses fallible `LocalSystem` startup, typed
-  `call_blocking_request`, exhaustive inner call and outer host-control
-  outcomes, and bounded truthful shutdown observation.
+  `call_blocking_request`, scoped callers borrowing the application facade,
+  exhaustive inner call and outer host-control outcomes, and
+  `run_to_shutdown_reported` for bounded truthful shutdown even when the
+  workload returns an error.
 
 Caller timeout does not retract submitted work. `SharedWork` reclaims the
 closed reply slot at the next admission, while the accepted item remains in
