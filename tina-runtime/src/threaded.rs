@@ -1101,6 +1101,69 @@ where
             .map(crate::SplitServiceHandle::from_address)
     }
 
+    /// Registers one split service and atomically prefills its first event.
+    #[allow(private_bounds, clippy::type_complexity)]
+    pub fn register_split_service_with_bootstrap<I, Event, Request, Outbound>(
+        &self,
+        isolate: I,
+        mailbox_capacity: usize,
+        bootstrap: Event,
+    ) -> Result<
+        crate::SplitServiceHandle<Event, Request, I::Reply>,
+        ThreadedRegisterBootstrapError<Event>,
+    >
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<Event, Request>,
+                Send = TinaOutbound<Outbound>,
+            > + tina::CallableIsolate
+            + Send
+            + 'static,
+        Event: Send + 'static,
+        Request: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: 'static,
+    {
+        match self.call_with_input(
+            (isolate, bootstrap),
+            move |runtime, (isolate, bootstrap)| {
+                runtime.register_split_service_with_bootstrap::<I, Event, Request, Outbound>(
+                    isolate,
+                    mailbox_capacity,
+                    bootstrap,
+                )
+            },
+        ) {
+            Ok(result) => result.map_err(ThreadedRegisterBootstrapError::from_register),
+            Err(RecoverableControlCallError::NotAdmitted {
+                error: ThreadedRuntimeError::CommandFull,
+                input: (_, bootstrap),
+            }) => Err(ThreadedRegisterBootstrapError::CommandFull(bootstrap)),
+            Err(RecoverableControlCallError::NotAdmitted {
+                error: ThreadedRuntimeError::WorkerStopped,
+                input: (_, bootstrap),
+            }) => Err(ThreadedRegisterBootstrapError::CommandClosed(bootstrap)),
+            Err(RecoverableControlCallError::Accepted(ThreadedRuntimeError::WorkerStopped)) => {
+                Err(ThreadedRegisterBootstrapError::WorkerStopped)
+            }
+            Err(RecoverableControlCallError::Accepted(
+                ThreadedRuntimeError::WorkerUnresponsive,
+            )) => Err(ThreadedRegisterBootstrapError::WorkerUnresponsive),
+            Err(RecoverableControlCallError::Accepted(_)) => {
+                unreachable!("control transport returned an impossible accepted error")
+            }
+            Err(RecoverableControlCallError::NotAdmitted { .. }) => {
+                unreachable!("control transport returned an impossible pre-admission error")
+            }
+        }
+    }
+
     /// Threaded mirror of [`crate::Runtime::register_event_service`].
     #[allow(private_bounds)]
     pub fn register_event_service<I, Event, Outbound>(

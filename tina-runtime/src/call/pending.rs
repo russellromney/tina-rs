@@ -491,6 +491,29 @@ where
         let (token, effect) = self.reply_with_ticket(key, translator);
         pending.try_insert(token).map(|_| effect)
     }
+
+    /// Split-service event form of [`Self::try_admit`].
+    pub fn try_admit_service_event<I, F, Event, Request, K>(
+        self,
+        pending: &mut PendingCancelableCallSet<K, Q, R>,
+        key: K,
+        translator: F,
+    ) -> Result<tina::Effect<I>, PendingCancelableInsertError<K, Q, R>>
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Reply = Q,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        F: FnOnce(K, PendingCancelableTicket, CallOutcome<R>) -> Event + 'static,
+        K: Clone + PartialEq + 'static,
+        Event: 'static,
+        Request: 'static,
+    {
+        self.try_admit(pending, key, move |key, ticket, outcome| {
+            tina::ServiceMessage::Event(translator(key, ticket, outcome))
+        })
+    }
 }
 
 impl<'request, T, R, I> RequestDeferredCancelableCall<'request, T, R, I>
@@ -551,6 +574,28 @@ where
                 })
             }
         }
+    }
+
+    /// Split-service event form of [`Self::try_admit`].
+    pub fn try_admit_service_event<F, Event, Request, K>(
+        self,
+        pending: &mut PendingCancelableCallSet<K, I::Reply, R>,
+        key: K,
+        translator: F,
+    ) -> Result<tina::RequestEffect<I>, RequestPendingCancelableInsertError<'request, K, R, I>>
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        F: FnOnce(K, PendingCancelableTicket, CallOutcome<R>) -> Event + 'static,
+        K: Clone + PartialEq + 'static,
+        Event: 'static,
+        Request: 'static,
+    {
+        self.try_admit(pending, key, move |key, ticket, outcome| {
+            tina::ServiceMessage::Event(translator(key, ticket, outcome))
+        })
     }
 }
 
@@ -635,5 +680,21 @@ where
         M: 'static,
     {
         cancel_call(self.handle).then(move |outcome| translator(self.key, self.request, outcome))
+    }
+
+    /// Split-service event form of [`Self::cancel`].
+    pub fn cancel_service_event<I, F, Event, Request>(self, translator: F) -> tina::Effect<I>
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        F: FnOnce(K, tina::RequestContext<Q>, CancelOutcome) -> Event + 'static,
+        Event: 'static,
+        Request: 'static,
+    {
+        self.cancel(move |key, request, outcome| {
+            tina::ServiceMessage::Event(translator(key, request, outcome))
+        })
     }
 }

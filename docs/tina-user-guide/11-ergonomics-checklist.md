@@ -246,6 +246,14 @@ Threaded owners also distinguish `WorkerStopped` from
 accepted, but an unresponsive worker may still complete registration after
 the host-side timeout.
 
+For a split event/request service, use
+`register_split_service_with_bootstrap[_on](..., first_event)`. It returns the
+same typed `SplitServiceHandle` as ordinary split registration and accepts or
+returns the domain event directly; application code never constructs a
+`ServiceMessage::Event` envelope. Threaded owners require the bootstrap event
+to be `Send`, but do not require a shard-local request type to be `Send` merely
+because the first mailbox item is an event.
+
 ### Construct with the root address
 
 When root state genuinely needs its own typed address, construct it through the

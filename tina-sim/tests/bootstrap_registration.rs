@@ -74,6 +74,85 @@ fn fresh_service() -> (Service, Rc<Cell<u32>>, Rc<Cell<u32>>) {
     )
 }
 
+#[derive(Debug)]
+enum SplitEvent {
+    Bootstrap(DropProbe),
+}
+
+#[derive(Debug)]
+enum SplitRequest {
+    Inspect,
+}
+
+struct SplitService {
+    booted: bool,
+}
+
+#[tina_runtime::isolate(
+    event = SplitEvent,
+    request = SplitRequest,
+    shard = TestShard
+)]
+impl SplitService {
+    fn handle_event(
+        &mut self,
+        event: SplitEvent,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match event {
+            SplitEvent::Bootstrap(_authority) => self.booted = true,
+        }
+        noop()
+    }
+
+    fn handle_request(
+        &mut self,
+        request: SplitRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            SplitRequest::Inspect => call.reply(()),
+        }
+    }
+}
+
+#[test]
+fn simulator_split_bootstrap_hides_envelope_and_preserves_authority() {
+    let _ = SplitRequest::Inspect;
+    let mut simulator = Simulator::new(TestShard(9), SimulatorConfig::default());
+    let drops = Rc::new(Cell::new(0));
+    let service = simulator
+        .register_split_service_with_bootstrap::<SplitService, _, _, Infallible>(
+            SplitService { booted: false },
+            1,
+            SplitEvent::Bootstrap(DropProbe(Rc::clone(&drops))),
+        )
+        .expect("typed split bootstrap");
+    let extra_drops = Rc::new(Cell::new(0));
+    assert!(matches!(
+        simulator.try_send_event(
+            service.events,
+            SplitEvent::Bootstrap(DropProbe(Rc::clone(&extra_drops))),
+        ),
+        Err(IngressSendError::Full(_))
+    ));
+    simulator.run_until_quiescent();
+    assert_eq!(drops.get(), 1);
+
+    let refused_drops = Rc::new(Cell::new(0));
+    let refused = simulator
+        .register_split_service_with_bootstrap::<SplitService, _, _, Infallible>(
+            SplitService { booted: false },
+            0,
+            SplitEvent::Bootstrap(DropProbe(Rc::clone(&refused_drops))),
+        )
+        .expect_err("zero-capacity split bootstrap");
+    assert!(matches!(refused, RegisterBootstrapError::Full(_)));
+    assert_eq!(refused_drops.get(), 0);
+    drop(refused);
+    assert_eq!(refused_drops.get(), 1);
+}
+
 #[test]
 fn simulator_bootstrap_is_admitted_before_address_publication() {
     let mut simulator = Simulator::new(TestShard(1), SimulatorConfig::default());
@@ -185,6 +264,24 @@ fn multi_shard_simulator_has_the_same_bootstrap_shape() {
     simulator.run_until_quiescent();
     assert_eq!(delivered.get(), 1);
     assert_eq!(message_drops.get(), 1);
+}
+
+#[test]
+fn multi_shard_simulator_split_bootstrap_uses_domain_event() {
+    let mut simulator =
+        MultiShardSimulator::new([TestShard(10), TestShard(20)], SimulatorConfig::default());
+    let drops = Rc::new(Cell::new(0));
+    let service = simulator
+        .register_split_service_with_bootstrap_on::<SplitService, _, _, Infallible>(
+            ShardId::new(20),
+            SplitService { booted: false },
+            1,
+            SplitEvent::Bootstrap(DropProbe(Rc::clone(&drops))),
+        )
+        .expect("typed split bootstrap on owned shard");
+    assert_eq!(service.events.address().shard(), ShardId::new(20));
+    simulator.run_until_quiescent();
+    assert_eq!(drops.get(), 1);
 }
 
 #[test]

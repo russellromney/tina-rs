@@ -4,6 +4,16 @@ This file records completed work.
 
 ## Unreleased
 
+### Envelope-free split-service bootstrap
+
+- Add `register_split_service_with_bootstrap[_on]` across explicit,
+  threaded, `LocalSystem`, and simulator owners. Callers provide and recover a
+  domain event while the private `ServiceMessage` envelope remains internal.
+- Add split-service event continuations for observed spawn,
+  `PendingCancelableCallSet` admission, and pending-call cancellation. These
+  preserve child results, tickets, request authority, and cancel outcomes
+  without application-side envelope adapters.
+
 ### AWS LocalSystem installation
 
 - Add `LocalSystem` installation parity for all five `tina-aws-bridge`

@@ -309,6 +309,53 @@ where
         ))
     }
 
+    /// Registers one split service on `shard` and atomically prefills its
+    /// first event.
+    #[allow(private_bounds, clippy::type_complexity)]
+    pub fn register_split_service_with_bootstrap_on<I, Event, Request, Outbound>(
+        &mut self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+        bootstrap: Event,
+    ) -> Result<
+        crate::SplitServiceHandle<Event, Request, I::Reply>,
+        crate::RegisterBootstrapError<Event>,
+    >
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<Event, Request>,
+                Send = TinaOutbound<Outbound>,
+            > + tina::CallableIsolate
+            + 'static,
+        Event: 'static,
+        Request: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: 'static,
+    {
+        self.register_with_capacity_and_bootstrap_on::<I, Outbound>(
+            shard,
+            isolate,
+            mailbox_capacity,
+            tina::ServiceMessage::Event(bootstrap),
+        )
+        .map(crate::SplitServiceHandle::from_address)
+        .map_err(|error| {
+            error.map_message(|message| match message {
+                tina::ServiceMessage::Event(event) => event,
+                tina::ServiceMessage::Request(_) => {
+                    unreachable!("split-service bootstrap was constructed as an event")
+                }
+            })
+        })
+    }
+
     /// Registers one event-only service on the requested shard.
     ///
     /// # Panics
