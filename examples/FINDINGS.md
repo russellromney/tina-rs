@@ -103,8 +103,38 @@ The simulator now has matching single- and multi-shard
 `register_with_capacity_and_bootstrap[_on]` vocabulary, with prefill before
 entry/address publication. Focused tests prove first delivery, typed host-call
 visibility, exact authority settlement, rollback, bounded refusal, closed
-startup lanes, and owner parity. Migrating `system_job_queue` remains a
-separate dependent example cohort.
+startup lanes, and owner parity. `system_job_queue` now consumes this facade
+through the dependent migration described below.
+
+### 2026-07-13 Job-queue LocalSystem migration (closed)
+
+`system_job_queue` now uses `LocalSystem` as its only live application owner.
+Each scenario atomically registers and bootstraps the queue, retains a typed
+split-service handle, uses `call_blocking_request`, and delegates unconditional
+terminal observation to `run_to_shutdown_reported`. The four former
+`Arc<ThreadedRuntime>` shells and local shutdown combiner are gone.
+
+The old cancellation-ordering note was stale: `RequestCall::reply_and`
+explicitly puts the current caller's reply before its follow-up effects. The
+migration's refill probe did find a separate application bug. The queue marked
+a worker idle before the worker released its deferred process reply, and a
+stale wake could then take and drop a newer job. Cancellation now uses a typed
+worker request and acknowledgement; the queue retains the worker's in-flight
+charge until acknowledgement, and stale wakes preserve newer worker state.
+Repeated tests prove exact cancel settlement followed by immediate refill,
+while a caller-timeout probe proves both the worker charge and parked token
+drain after the caller disappears. Cancel reconciliation is exhaustive:
+bounded Tina-time retries handle `Full` and `Timeout`, `Closed` retires and
+respawns the worker, and
+`Rejected`, malformed acknowledgements, timer failure, or retry exhaustion
+stop the queue instead of silently leaking admission capacity.
+
+`RunConfig::validate` rejects zero or excessive worker, mailbox, sleep, and
+timeout values before startup. Overflow burst size, barrier participants, and
+worker dispatch deadlines use checked arithmetic before any corresponding
+thread, barrier, vector, or batch allocation. The host report preserves
+`Full`, `Closed`, `Timeout`, and `Rejected` terminals instead of folding them
+into `Busy`.
 
 ### 2026-07-12 Guaranteed LocalSystem terminal runner prerequisite
 

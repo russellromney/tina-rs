@@ -3,7 +3,7 @@
 //!
 //! v2 collapses two parallel pending structures (`PendingReplies` for parked
 //! callers + `PendingCallSet` for in-flight call handles) into one
-//! [`PendingCancelableCallSet`], using `CallContext::defer_cancelable(...)
+//! [`PendingCancelableCallSet`], using `RequestCall::defer_cancelable(...)
 //! .try_admit(...)` as the admission gate. Total admission cap is `workers`;
 //! there is no separate queue layer. A queued layer would just delay the
 //! `Busy` reply and was buying nothing real.
@@ -12,7 +12,7 @@
 //!
 //! - [`PendingCancelableCallSet`] for caller authority + cancel handle as
 //!   one token.
-//! - `CallContext::defer_cancelable(call_cancelable(...)).try_admit(...)`
+//! - `RequestCall::defer_cancelable(call_cancelable_request(...)).try_admit(...)`
 //!   for "admit first, then dispatch" with a typed `Full` recovery path.
 //! - `PendingCancelableCall::cancel(translator)` for cancel-while-running:
 //!   one effect closes the wait AND routes the parked request context into
@@ -20,27 +20,36 @@
 //! - `spawn_observed(ChildDefinition::new(...))` for typed child refs.
 //! - Runtime-owned `sleep` as the worker's only async surface.
 //! - The `Worker` isolate uses the `event = .. request = ..` split-service
-//!   macro form: `WorkerEvent` (`Cancel`, `Wake`) is fire-and-forget,
-//!   `WorkerRequest` (`Process`) is the one caller-authority message. The
+//!   macro form: `WorkerEvent::Wake` is fire-and-forget, while
+//!   `WorkerRequest` carries typed `Process` and `Cancel` calls. The
 //!   macro generates both rejection arms, so neither `handle_event` nor
 //!   `handle_request` writes one by hand.
-//! - `register_with_capacity_and_bootstrap` registers the `Queue` isolate
-//!   with its startup `Bootstrap` message prefilled atomically, instead of
-//!   a separate post-register `try_send`.
+//! - `LocalSystem::register_split_service_with_bootstrap` registers the `Queue`
+//!   isolate with its startup `Bootstrap` event prefilled atomically.
 
+use std::fmt;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use tina::{ChildDefinition, prelude::*};
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, PendingCancelableCallSet,
+    CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, PendingCancelableCallSet,
     PendingCancelableRemoveError, PendingCancelableTicket, RequestPendingCancelableInsertError,
-    SleepReply, ThreadedRuntime, ThreadedShutdownHandle, call_cancelable_request, sleep,
+    SleepReply, SplitServiceHandle, call_cancelable_request, call_request, sleep,
 };
 
+const MAX_WORKERS: usize = 256;
+const MAX_MAILBOX_CAPACITY: usize = 65_536;
+const MAX_JOB_SLEEP_MS: u64 = 60_000;
+const MAX_CALL_TIMEOUT_MS: u64 = 120_000;
+const OVERFLOW_EXTRA_CALLERS: usize = 3;
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const WORKER_CANCEL_RETRY_DELAY: Duration = Duration::from_millis(1);
+const MAX_WORKER_CANCEL_RETRIES: u8 = 3;
+
 /// Tunables for one specimen run.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunConfig {
     pub workers: usize,
     pub queue_mailbox: usize,
@@ -60,6 +69,116 @@ impl Default for RunConfig {
         }
     }
 }
+
+impl RunConfig {
+    /// Validates every value that controls an allocation, caller thread, or
+    /// wait before the runtime is constructed.
+    pub fn validate(self) -> Result<Self, RunConfigError> {
+        nonzero_bounded("workers", self.workers, MAX_WORKERS)?;
+        nonzero_bounded("queue_mailbox", self.queue_mailbox, MAX_MAILBOX_CAPACITY)?;
+        nonzero_bounded("worker_mailbox", self.worker_mailbox, MAX_MAILBOX_CAPACITY)?;
+        nonzero_bounded_u64("job_sleep_ms", self.job_sleep_ms, MAX_JOB_SLEEP_MS)?;
+        nonzero_bounded_u64("call_timeout_ms", self.call_timeout_ms, MAX_CALL_TIMEOUT_MS)?;
+
+        let burst = self
+            .workers
+            .checked_add(OVERFLOW_EXTRA_CALLERS)
+            .ok_or(RunConfigError::DerivedCountOverflow("overflow burst"))?;
+        burst
+            .checked_add(1)
+            .ok_or(RunConfigError::DerivedCountOverflow(
+                "overflow barrier participants",
+            ))?;
+        self.job_sleep_ms
+            .checked_mul(4)
+            .and_then(|value| value.checked_add(1_000))
+            .ok_or(RunConfigError::DerivedDurationOverflow(
+                "worker dispatch timeout",
+            ))?;
+        Ok(self)
+    }
+
+    fn overflow_shape(self) -> Result<(usize, usize), RunConfigError> {
+        let burst = self
+            .workers
+            .checked_add(OVERFLOW_EXTRA_CALLERS)
+            .ok_or(RunConfigError::DerivedCountOverflow("overflow burst"))?;
+        let participants = burst
+            .checked_add(1)
+            .ok_or(RunConfigError::DerivedCountOverflow(
+                "overflow barrier participants",
+            ))?;
+        Ok((burst, participants))
+    }
+
+    fn dispatch_timeout(self) -> Duration {
+        let millis = self
+            .job_sleep_ms
+            .checked_mul(4)
+            .and_then(|value| value.checked_add(1_000))
+            .expect("RunConfig::validate checked the dispatch timeout");
+        Duration::from_millis(millis)
+    }
+}
+
+fn nonzero_bounded(field: &'static str, value: usize, max: usize) -> Result<(), RunConfigError> {
+    if value == 0 {
+        return Err(RunConfigError::Zero(field));
+    }
+    if value > max {
+        return Err(RunConfigError::TooLarge { field, value, max });
+    }
+    Ok(())
+}
+
+fn nonzero_bounded_u64(field: &'static str, value: u64, max: u64) -> Result<(), RunConfigError> {
+    if value == 0 {
+        return Err(RunConfigError::Zero(field));
+    }
+    if value > max {
+        return Err(RunConfigError::DurationTooLarge { field, value, max });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunConfigError {
+    Zero(&'static str),
+    TooLarge {
+        field: &'static str,
+        value: usize,
+        max: usize,
+    },
+    DurationTooLarge {
+        field: &'static str,
+        value: u64,
+        max: u64,
+    },
+    DerivedCountOverflow(&'static str),
+    DerivedDurationOverflow(&'static str),
+}
+
+impl fmt::Display for RunConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zero(field) => write!(formatter, "{field} must be greater than zero"),
+            Self::TooLarge { field, value, max } => {
+                write!(formatter, "{field}={value} exceeds maximum {max}")
+            }
+            Self::DurationTooLarge { field, value, max } => {
+                write!(formatter, "{field}={value}ms exceeds maximum {max}ms")
+            }
+            Self::DerivedCountOverflow(field) => {
+                write!(formatter, "{field} overflowed usize")
+            }
+            Self::DerivedDurationOverflow(field) => {
+                write!(formatter, "{field} overflowed u64 milliseconds")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RunConfigError {}
 
 /// Job identity. Monotonic per queue; never reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -87,6 +206,7 @@ pub struct QueueStats {
     pub workers: usize,
     pub workers_alive: usize,
     pub in_flight: usize,
+    pub pending_callers: usize,
     pub jobs_admitted: u64,
     pub jobs_busy_rejected: u64,
     pub jobs_completed: u64,
@@ -94,6 +214,7 @@ pub struct QueueStats {
     pub jobs_failed: u64,
     pub worker_crashes: u64,
     pub worker_respawns: u64,
+    pub cancel_reconciliation_failures: u64,
 }
 
 /// Replies the queue produces to host callers.
@@ -122,11 +243,24 @@ pub enum QueueEvent {
         ticket: PendingCancelableTicket,
         outcome: CallOutcome<WorkerReply>,
     },
+    WorkerCancelReturned {
+        slot: usize,
+        id: JobId,
+        attempt: u8,
+        outcome: CallOutcome<WorkerReply>,
+    },
+    RetryWorkerCancel {
+        slot: usize,
+        id: JobId,
+        attempt: u8,
+        result: SleepReply,
+    },
     /// Continuation from `PendingCancelableCall::cancel`. Carries the parked
     /// caller's request context so we can answer them after the cancel lands.
     ParkedCallerCancelled {
         id: JobId,
         req: tina::RequestContext<QueueReply>,
+        outcome: tina::CancelOutcome,
     },
 }
 
@@ -148,18 +282,15 @@ pub type QueueMsg = tina::ServiceMessage<QueueEvent, QueueRequest>;
 pub enum WorkerReply {
     Completed(u32),
     Cancelled,
+    Failed(String),
+    CancelAcknowledged { id: JobId, released: bool },
 }
 
-/// Fire-and-forget facts a worker accepts: cancel-while-running and the
-/// runtime-owned sleep wake-up. Neither carries caller authority.
+/// Fire-and-forget facts a worker accepts.
 #[derive(Debug, Clone)]
 pub enum WorkerEvent {
-    Cancel(JobId),
     /// Internal: the runtime-owned sleep finished.
-    Wake {
-        id: JobId,
-        result: SleepReply,
-    },
+    Wake { id: JobId, result: SleepReply },
 }
 
 /// The one caller-authority request a worker accepts.
@@ -170,6 +301,7 @@ pub enum WorkerRequest {
         payload: Payload,
         sleep_ms: u64,
     },
+    Cancel(JobId),
 }
 
 /// Split-service envelope for `Worker`. The `event = .. request = ..`
@@ -186,7 +318,6 @@ struct Worker {
 struct WorkerCurrent {
     id: JobId,
     payload: Payload,
-    cancelled: bool,
     slot: tina::DeferredReply<WorkerReply>,
 }
 
@@ -198,23 +329,19 @@ impl Worker {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match event {
-            WorkerEvent::Cancel(id) => {
-                if let Some(current) = self.current.as_mut() {
-                    if current.id == id {
-                        current.cancelled = true;
-                    }
-                }
-                noop()
-            }
-            WorkerEvent::Wake { id, result: _ } => {
+            WorkerEvent::Wake { id, result } => {
                 let Some(current) = self.current.take() else {
                     return noop();
                 };
                 if current.id != id {
+                    self.current = Some(current);
                     return noop();
                 }
-                if current.cancelled {
-                    return reply_to::<Self>(current.slot, WorkerReply::Cancelled);
+                if let Err(error) = result {
+                    return reply_to::<Self>(
+                        current.slot,
+                        WorkerReply::Failed(format!("worker sleep failed: {error:?}")),
+                    );
                 }
                 match current.payload {
                     Payload::Poison => panic!("worker poisoned by job {id:?}"),
@@ -242,16 +369,28 @@ impl Worker {
                 }
                 call.capture(move |req| {
                     let slot = req.into_deferred();
-                    self.current = Some(WorkerCurrent {
-                        id,
-                        payload,
-                        cancelled: false,
-                        slot,
-                    });
+                    self.current = Some(WorkerCurrent { id, payload, slot });
                     sleep(Duration::from_millis(sleep_ms))
                         .then_service_event(move |result| WorkerEvent::Wake { id, result })
                 })
             }
+            WorkerRequest::Cancel(id) => match self.current.take() {
+                Some(current) if current.id == id => call.reply_and(
+                    WorkerReply::CancelAcknowledged { id, released: true },
+                    vec![reply_to::<Self>(current.slot, WorkerReply::Cancelled)],
+                ),
+                Some(current) => {
+                    self.current = Some(current);
+                    call.reply(WorkerReply::CancelAcknowledged {
+                        id,
+                        released: false,
+                    })
+                }
+                None => call.reply(WorkerReply::CancelAcknowledged {
+                    id,
+                    released: false,
+                }),
+            },
         }
     }
 }
@@ -273,7 +412,6 @@ struct Queue {
     event = QueueEvent,
     request = QueueRequest,
     reply = QueueReply,
-    send = tina::Outbound<WorkerMsg>,
     io = tina_runtime::RuntimeCall<QueueMsg>,
     spawn_observed = tina::SpawnObserved<ChildDefinition<Worker>, QueueMsg, WorkerMsg, WorkerReply>,
 )]
@@ -292,9 +430,20 @@ impl Queue {
                 ticket,
                 outcome,
             } => self.on_worker_call_returned(slot, id, ticket, outcome),
-            QueueEvent::ParkedCallerCancelled { id, req } => {
-                self.stats.jobs_cancelled += 1;
-                reply_to::<Self>(req, QueueReply::Done(JobOutcome::Cancelled { id }))
+            QueueEvent::WorkerCancelReturned {
+                slot,
+                id,
+                attempt,
+                outcome,
+            } => self.on_worker_cancel_returned(slot, id, attempt, outcome),
+            QueueEvent::RetryWorkerCancel {
+                slot,
+                id,
+                attempt,
+                result,
+            } => self.retry_worker_cancel(slot, id, attempt, result),
+            QueueEvent::ParkedCallerCancelled { id, req, outcome } => {
+                self.on_parked_caller_cancelled(id, req, outcome)
             }
         }
     }
@@ -316,7 +465,7 @@ impl Queue {
     fn new(config: RunConfig, ready: Arc<ReadyGate>) -> Self {
         Self {
             config,
-            pending: PendingCancelableCallSet::with_capacity(config.workers.max(1)),
+            pending: PendingCancelableCallSet::with_capacity(config.workers),
             workers: vec![None; config.workers],
             worker_busy: vec![None; config.workers],
             next_id: 1,
@@ -324,6 +473,7 @@ impl Queue {
                 workers: config.workers,
                 workers_alive: 0,
                 in_flight: 0,
+                pending_callers: 0,
                 jobs_admitted: 0,
                 jobs_busy_rejected: 0,
                 jobs_completed: 0,
@@ -331,6 +481,7 @@ impl Queue {
                 jobs_failed: 0,
                 worker_crashes: 0,
                 worker_respawns: 0,
+                cancel_reconciliation_failures: 0,
             },
             spawned_workers: 0,
             ready_signal: ready,
@@ -348,7 +499,7 @@ impl Queue {
     fn spawn_worker(&self, slot: usize) -> Effect<Self> {
         let cap = self.config.worker_mailbox;
         spawn_observed(ChildDefinition::new(Worker { current: None }, cap))
-            .then(move |result| QueueMsg::Event(QueueEvent::WorkerStarted { slot, result }))
+            .then_service_event(move |result| QueueEvent::WorkerStarted { slot, result })
     }
 
     fn on_worker_started(
@@ -385,9 +536,12 @@ impl Queue {
             return call.reply(QueueReply::Busy);
         };
         let id = JobId(self.next_id);
-        self.next_id += 1;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("monotonic job id space exhausted");
         let sleep_ms = self.config.job_sleep_ms;
-        let dispatch_timeout = Duration::from_millis(sleep_ms.saturating_mul(4) + 1_000);
+        let dispatch_timeout = self.config.dispatch_timeout();
 
         let admission = call
             .defer_cancelable(call_cancelable_request(
@@ -399,13 +553,13 @@ impl Queue {
                 },
                 dispatch_timeout,
             ))
-            .try_admit(&mut self.pending, id, move |key, ticket, outcome| {
-                QueueMsg::Event(QueueEvent::WorkerCallReturned {
+            .try_admit_service_event(&mut self.pending, id, move |key, ticket, outcome| {
+                QueueEvent::WorkerCallReturned {
                     slot,
                     id: key,
                     ticket,
                     outcome,
-                })
+                }
             });
         match admission {
             Ok(effect) => {
@@ -442,38 +596,161 @@ impl Queue {
             }
         };
 
-        // Free the worker slot. The late `WorkerCallReturned` will see the
-        // missing pending entry and only tick the late-reply counter.
-        let mut worker_addr = None;
+        // Keep the worker slot charged until the worker acknowledges that it
+        // released the cancelled process's deferred reply authority.
+        let mut worker = None;
         for (slot, busy) in self.worker_busy.iter_mut().enumerate() {
             if *busy == Some(id) {
-                *busy = None;
-                worker_addr = self.workers[slot];
+                worker = self.workers[slot].map(|worker| (slot, worker));
                 break;
             }
         }
-        self.stats.in_flight = self.in_flight_count();
 
-        // Order in this batch matters. Replying the cancel API caller
-        // first appears to keep the cancel-call translator's later message
-        // delivery clean; with the cancel-ack effect last, the
-        // `ParkedCallerCancelled` continuation never lands and the parked
-        // submit caller gets `Closed` (reply-abandoned). Worth reporting as
-        // a Finding — the user shouldn't have to discover this empirically.
+        // `reply_and` guarantees that the cancel caller is settled before
+        // these follow-up effects run. The cancel continuation still owns and
+        // explicitly settles the parked submit caller.
         let mut follow_up: Vec<Effect<Self>> = Vec::with_capacity(2);
-        follow_up.push(token.cancel(|key, req, _outcome| {
-            QueueMsg::Event(QueueEvent::ParkedCallerCancelled { id: key, req })
+        follow_up.push(token.cancel_service_event(|key, req, outcome| {
+            QueueEvent::ParkedCallerCancelled {
+                id: key,
+                req,
+                outcome,
+            }
         }));
-        if let Some(worker) = worker_addr {
-            // Wake the worker early so it stops sleeping; the worker's reply
-            // will be rejected by the runtime since `cancel_call` already
-            // closed our wait. This send is opportunistic.
-            follow_up.push(tina::send_event::<Self, _, _>(
-                worker.events,
-                WorkerEvent::Cancel(id),
-            ));
+        if let Some((slot, worker)) = worker {
+            follow_up.push(self.cancel_worker(slot, id, 0, worker));
+        } else {
+            self.stats.cancel_reconciliation_failures += 1;
+            follow_up.push(stop());
         }
         call.reply_and(QueueReply::Cancelled(id), follow_up)
+    }
+
+    fn on_parked_caller_cancelled(
+        &mut self,
+        id: JobId,
+        req: tina::RequestContext<QueueReply>,
+        outcome: tina::CancelOutcome,
+    ) -> Effect<Self> {
+        match outcome {
+            tina::CancelOutcome::Cancelled | tina::CancelOutcome::AlreadyCancelled => {
+                self.stats.jobs_cancelled += 1;
+                reply_to::<Self>(req, QueueReply::Done(JobOutcome::Cancelled { id }))
+            }
+            tina::CancelOutcome::AlreadyCompleted => {
+                self.stats.jobs_failed += 1;
+                reply_to::<Self>(
+                    req,
+                    QueueReply::Done(JobOutcome::Failed {
+                        id,
+                        reason: "cancel raced with an already completed worker call".into(),
+                    }),
+                )
+            }
+            tina::CancelOutcome::NotAdmitted | tina::CancelOutcome::WrongShard => {
+                self.stats.jobs_failed += 1;
+                self.stats.cancel_reconciliation_failures += 1;
+                batch(vec![
+                    reply_to::<Self>(
+                        req,
+                        QueueReply::Done(JobOutcome::Failed {
+                            id,
+                            reason: format!("worker-call cancellation returned {outcome:?}"),
+                        }),
+                    ),
+                    stop(),
+                ])
+            }
+        }
+    }
+
+    fn cancel_worker(
+        &self,
+        slot: usize,
+        id: JobId,
+        attempt: u8,
+        worker: SplitServiceHandle<WorkerEvent, WorkerRequest, WorkerReply>,
+    ) -> Effect<Self> {
+        call_request(
+            worker.requests,
+            WorkerRequest::Cancel(id),
+            self.config.dispatch_timeout(),
+        )
+        .then_service_event(move |outcome| QueueEvent::WorkerCancelReturned {
+            slot,
+            id,
+            attempt,
+            outcome,
+        })
+    }
+
+    fn on_worker_cancel_returned(
+        &mut self,
+        slot: usize,
+        id: JobId,
+        attempt: u8,
+        outcome: CallOutcome<WorkerReply>,
+    ) -> Effect<Self> {
+        if self.worker_busy[slot] != Some(id) {
+            return noop();
+        }
+
+        match classify_worker_cancel_outcome(id, &outcome) {
+            WorkerCancelDisposition::Released => {
+                self.worker_busy[slot] = None;
+                self.stats.in_flight = self.in_flight_count();
+                noop()
+            }
+            WorkerCancelDisposition::Retry if attempt < MAX_WORKER_CANCEL_RETRIES => {
+                let next_attempt = attempt + 1;
+                sleep(WORKER_CANCEL_RETRY_DELAY).then_service_event(move |result| {
+                    QueueEvent::RetryWorkerCancel {
+                        slot,
+                        id,
+                        attempt: next_attempt,
+                        result,
+                    }
+                })
+            }
+            WorkerCancelDisposition::Retry => self.fail_cancel_reconciliation(),
+            WorkerCancelDisposition::Closed => {
+                self.worker_busy[slot] = None;
+                if self.workers[slot].take().is_some() {
+                    self.stats.workers_alive = self.stats.workers_alive.saturating_sub(1);
+                }
+                self.stats.in_flight = self.in_flight_count();
+                self.stats.worker_crashes += 1;
+                self.stats.worker_respawns += 1;
+                self.spawn_worker(slot)
+            }
+            WorkerCancelDisposition::Fatal => self.fail_cancel_reconciliation(),
+        }
+    }
+
+    fn retry_worker_cancel(
+        &mut self,
+        slot: usize,
+        id: JobId,
+        attempt: u8,
+        result: SleepReply,
+    ) -> Effect<Self> {
+        if result.is_err() {
+            return self.fail_cancel_reconciliation();
+        }
+        if self.worker_busy[slot] != Some(id) {
+            return noop();
+        }
+        let Some(worker) = self.workers[slot] else {
+            return self.fail_cancel_reconciliation();
+        };
+        self.cancel_worker(slot, id, attempt, worker)
+    }
+
+    fn fail_cancel_reconciliation(&mut self) -> Effect<Self> {
+        self.stats.cancel_reconciliation_failures += 1;
+        // Stopping the owner also stops its children, so no uncertain worker
+        // can be reused and no replacement can make the topology unbounded.
+        stop()
     }
 
     fn on_worker_call_returned(
@@ -494,53 +771,96 @@ impl Queue {
             }
         };
 
-        if self.worker_busy[slot] == Some(id) {
-            self.worker_busy[slot] = None;
-            self.stats.in_flight = self.in_flight_count();
-        }
-
+        let disposition = classify_worker_call_outcome(&outcome);
         let req = pending.into_request_context();
         let final_outcome = match outcome {
             CallOutcome::Replied(WorkerReply::Completed(value)) => {
+                self.release_worker_slot(slot, id);
                 self.stats.jobs_completed += 1;
                 JobOutcome::Completed { id, value }
             }
             CallOutcome::Replied(WorkerReply::Cancelled) => {
+                self.release_worker_slot(slot, id);
                 self.stats.jobs_cancelled += 1;
                 JobOutcome::Cancelled { id }
             }
-            CallOutcome::Closed | CallOutcome::Rejected(_) => {
+            CallOutcome::Replied(WorkerReply::Failed(reason)) => {
+                self.release_worker_slot(slot, id);
                 self.stats.jobs_failed += 1;
-                self.stats.worker_crashes += 1;
-                if self.workers[slot].is_some() {
-                    self.stats.workers_alive = self.stats.workers_alive.saturating_sub(1);
-                }
-                self.workers[slot] = None;
+                JobOutcome::Failed { id, reason }
+            }
+            CallOutcome::Full => {
+                self.release_worker_slot(slot, id);
+                self.stats.jobs_failed += 1;
                 JobOutcome::Failed {
                     id,
-                    reason: format!("worker call returned {outcome:?}"),
+                    reason: "worker process call was not admitted: Full".into(),
                 }
             }
-            CallOutcome::Timeout | CallOutcome::Full => {
+            CallOutcome::Closed => {
+                self.stats.worker_crashes += 1;
                 self.stats.jobs_failed += 1;
                 JobOutcome::Failed {
                     id,
-                    reason: format!("worker call returned {outcome:?}"),
+                    reason: "worker process call returned Closed".into(),
+                }
+            }
+            CallOutcome::Timeout => {
+                self.stats.jobs_failed += 1;
+                JobOutcome::Failed {
+                    id,
+                    reason: "worker process call timed out; cancellation reconciliation started"
+                        .into(),
+                }
+            }
+            CallOutcome::Rejected(reason) => {
+                self.stats.jobs_failed += 1;
+                JobOutcome::Failed {
+                    id,
+                    reason: format!("worker process call was rejected: {reason:?}"),
+                }
+            }
+            CallOutcome::Replied(WorkerReply::CancelAcknowledged { .. }) => {
+                self.stats.jobs_failed += 1;
+                JobOutcome::Failed {
+                    id,
+                    reason: "process call returned a cancel acknowledgement".into(),
                 }
             }
         };
 
-        let respawn_effect = if self.workers[slot].is_none() {
-            self.stats.worker_respawns += 1;
-            Some(self.spawn_worker(slot))
-        } else {
-            None
+        let follow_up = match disposition {
+            WorkerCallDisposition::Released => None,
+            WorkerCallDisposition::Reconcile => match self.workers[slot] {
+                Some(worker) => Some(self.cancel_worker(slot, id, 0, worker)),
+                None => Some(stop()),
+            },
+            WorkerCallDisposition::Replace => {
+                self.worker_busy[slot] = None;
+                if self.workers[slot].take().is_some() {
+                    self.stats.workers_alive = self.stats.workers_alive.saturating_sub(1);
+                }
+                self.stats.in_flight = self.in_flight_count();
+                self.stats.worker_respawns += 1;
+                Some(self.spawn_worker(slot))
+            }
+            WorkerCallDisposition::Fatal => {
+                self.stats.cancel_reconciliation_failures += 1;
+                Some(stop())
+            }
         };
 
         let reply = reply_to::<Self>(req, QueueReply::Done(final_outcome));
-        match respawn_effect {
-            Some(spawn) => batch(vec![reply, spawn]),
+        match follow_up {
+            Some(effect) => batch(vec![reply, effect]),
             None => reply,
+        }
+    }
+
+    fn release_worker_slot(&mut self, slot: usize, id: JobId) {
+        if self.worker_busy[slot] == Some(id) {
+            self.worker_busy[slot] = None;
+            self.stats.in_flight = self.in_flight_count();
         }
     }
 
@@ -559,8 +879,234 @@ impl Queue {
     fn snapshot(&self) -> QueueStats {
         let mut s = self.stats.clone();
         s.in_flight = self.in_flight_count();
+        s.pending_callers = self.pending.len();
         s.workers_alive = self.workers.iter().filter(|w| w.is_some()).count();
         s
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerCancelDisposition {
+    Released,
+    Retry,
+    Closed,
+    Fatal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerCallDisposition {
+    Released,
+    Reconcile,
+    Replace,
+    Fatal,
+}
+
+fn classify_worker_call_outcome(outcome: &CallOutcome<WorkerReply>) -> WorkerCallDisposition {
+    match outcome {
+        CallOutcome::Replied(WorkerReply::Completed(_))
+        | CallOutcome::Replied(WorkerReply::Cancelled)
+        | CallOutcome::Replied(WorkerReply::Failed(_))
+        | CallOutcome::Full => WorkerCallDisposition::Released,
+        CallOutcome::Timeout => WorkerCallDisposition::Reconcile,
+        CallOutcome::Closed => WorkerCallDisposition::Replace,
+        CallOutcome::Rejected(_) | CallOutcome::Replied(WorkerReply::CancelAcknowledged { .. }) => {
+            WorkerCallDisposition::Fatal
+        }
+    }
+}
+
+fn classify_worker_cancel_outcome(
+    id: JobId,
+    outcome: &CallOutcome<WorkerReply>,
+) -> WorkerCancelDisposition {
+    match outcome {
+        CallOutcome::Replied(WorkerReply::CancelAcknowledged {
+            id: acknowledged, ..
+        }) if *acknowledged == id => WorkerCancelDisposition::Released,
+        CallOutcome::Full | CallOutcome::Timeout => WorkerCancelDisposition::Retry,
+        CallOutcome::Closed => WorkerCancelDisposition::Closed,
+        CallOutcome::Rejected(_)
+        | CallOutcome::Replied(WorkerReply::Completed(_))
+        | CallOutcome::Replied(WorkerReply::Cancelled)
+        | CallOutcome::Replied(WorkerReply::Failed(_))
+        | CallOutcome::Replied(WorkerReply::CancelAcknowledged { .. }) => {
+            WorkerCancelDisposition::Fatal
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_cancel_classification_is_exhaustive_and_id_sensitive() {
+        let id = JobId(7);
+        for released in [false, true] {
+            assert_eq!(
+                classify_worker_cancel_outcome(
+                    id,
+                    &CallOutcome::Replied(WorkerReply::CancelAcknowledged { id, released }),
+                ),
+                WorkerCancelDisposition::Released,
+            );
+        }
+        for outcome in [CallOutcome::Full, CallOutcome::Timeout] {
+            assert_eq!(
+                classify_worker_cancel_outcome(id, &outcome),
+                WorkerCancelDisposition::Retry,
+            );
+        }
+        assert_eq!(
+            classify_worker_cancel_outcome(id, &CallOutcome::Closed),
+            WorkerCancelDisposition::Closed,
+        );
+        for outcome in [
+            CallOutcome::Rejected(tina::CallRejectedReason::UnsupportedMessage),
+            CallOutcome::Replied(WorkerReply::Completed(14)),
+            CallOutcome::Replied(WorkerReply::Cancelled),
+            CallOutcome::Replied(WorkerReply::Failed("sleep".into())),
+            CallOutcome::Replied(WorkerReply::CancelAcknowledged {
+                id: JobId(8),
+                released: true,
+            }),
+        ] {
+            assert_eq!(
+                classify_worker_cancel_outcome(id, &outcome),
+                WorkerCancelDisposition::Fatal,
+            );
+        }
+    }
+
+    #[test]
+    fn worker_process_classification_never_reuses_an_uncertain_worker() {
+        for outcome in [
+            CallOutcome::Replied(WorkerReply::Completed(14)),
+            CallOutcome::Replied(WorkerReply::Cancelled),
+            CallOutcome::Replied(WorkerReply::Failed("sleep".into())),
+            CallOutcome::Full,
+        ] {
+            assert_eq!(
+                classify_worker_call_outcome(&outcome),
+                WorkerCallDisposition::Released,
+            );
+        }
+        assert_eq!(
+            classify_worker_call_outcome(&CallOutcome::Timeout),
+            WorkerCallDisposition::Reconcile,
+        );
+        assert_eq!(
+            classify_worker_call_outcome(&CallOutcome::Closed),
+            WorkerCallDisposition::Replace,
+        );
+        for outcome in [
+            CallOutcome::Rejected(tina::CallRejectedReason::UnsupportedMessage),
+            CallOutcome::Replied(WorkerReply::CancelAcknowledged {
+                id: JobId(7),
+                released: true,
+            }),
+        ] {
+            assert_eq!(
+                classify_worker_call_outcome(&outcome),
+                WorkerCallDisposition::Fatal,
+            );
+        }
+    }
+
+    fn cancel_queue(id: JobId) -> Queue {
+        let config = RunConfig {
+            workers: 1,
+            queue_mailbox: 4,
+            worker_mailbox: 4,
+            job_sleep_ms: 10,
+            call_timeout_ms: 100,
+        };
+        let mut queue = Queue::new(config, Arc::new(ReadyGate::default()));
+        queue.worker_busy[0] = Some(id);
+        queue.stats.in_flight = 1;
+        queue
+    }
+
+    #[test]
+    fn worker_cancel_state_machine_retries_replaces_and_fails_closed() {
+        let id = JobId(7);
+
+        let mut retry = cancel_queue(id);
+        assert!(matches!(
+            retry.on_worker_cancel_returned(0, id, 0, CallOutcome::Full),
+            Effect::Io(_)
+        ));
+        assert_eq!(retry.worker_busy[0], Some(id));
+        assert_eq!(retry.stats.cancel_reconciliation_failures, 0);
+
+        let mut exhausted = cancel_queue(id);
+        assert!(matches!(
+            exhausted.on_worker_cancel_returned(
+                0,
+                id,
+                MAX_WORKER_CANCEL_RETRIES,
+                CallOutcome::Timeout,
+            ),
+            Effect::Stop
+        ));
+        assert_eq!(exhausted.worker_busy[0], Some(id));
+        assert_eq!(exhausted.stats.cancel_reconciliation_failures, 1);
+
+        let mut closed = cancel_queue(id);
+        assert!(matches!(
+            closed.on_worker_cancel_returned(0, id, 0, CallOutcome::Closed),
+            Effect::SpawnObserved(_)
+        ));
+        assert_eq!(closed.worker_busy[0], None);
+        assert_eq!(closed.stats.in_flight, 0);
+        assert_eq!(closed.stats.worker_crashes, 1);
+        assert_eq!(closed.stats.worker_respawns, 1);
+
+        let mut rejected = cancel_queue(id);
+        assert!(matches!(
+            rejected.on_worker_cancel_returned(
+                0,
+                id,
+                0,
+                CallOutcome::Rejected(tina::CallRejectedReason::UnsupportedMessage),
+            ),
+            Effect::Stop
+        ));
+        assert_eq!(rejected.stats.cancel_reconciliation_failures, 1);
+    }
+
+    #[test]
+    fn worker_cancel_state_machine_releases_only_the_matching_job() {
+        let id = JobId(7);
+        let mut queue = cancel_queue(id);
+        assert!(matches!(
+            queue.on_worker_cancel_returned(
+                0,
+                JobId(8),
+                0,
+                CallOutcome::Replied(WorkerReply::CancelAcknowledged {
+                    id: JobId(8),
+                    released: true,
+                }),
+            ),
+            Effect::Noop
+        ));
+        assert_eq!(queue.worker_busy[0], Some(id));
+
+        assert!(matches!(
+            queue.on_worker_cancel_returned(
+                0,
+                id,
+                0,
+                CallOutcome::Replied(WorkerReply::CancelAcknowledged {
+                    id,
+                    released: false,
+                }),
+            ),
+            Effect::Noop
+        ));
+        assert_eq!(queue.worker_busy[0], None);
+        assert_eq!(queue.stats.in_flight, 0);
     }
 }
 
@@ -587,6 +1133,7 @@ impl ReadyGate {
 pub struct RunReport {
     pub overflow: OverflowReport,
     pub cancel_in_flight: CancelInFlightReport,
+    pub caller_gone: CallerGoneReport,
     pub poison_crash: PoisonCrashReport,
     pub respawn_then_admit: RespawnThenAdmitReport,
 }
@@ -595,6 +1142,11 @@ pub struct RunReport {
 pub struct OverflowReport {
     pub completed: usize,
     pub busy: usize,
+    pub full: usize,
+    pub closed: usize,
+    pub timeout: usize,
+    pub rejected: usize,
+    pub rejection_reasons: Vec<tina::CallRejectedReason>,
     pub stats: QueueStats,
 }
 
@@ -602,6 +1154,13 @@ pub struct OverflowReport {
 pub struct CancelInFlightReport {
     pub submit_outcome: JobOutcome,
     pub cancel_reply: QueueReply,
+    pub refill_outcome: JobOutcome,
+    pub stats: QueueStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerGoneReport {
+    pub submit_outcome: CallOutcome<QueueReply>,
     pub stats: QueueStats,
 }
 
@@ -619,218 +1178,281 @@ pub struct RespawnThenAdmitReport {
 }
 
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
+    let config = config.validate()?;
     Ok(RunReport {
         overflow: run_overflow(config)?,
         cancel_in_flight: run_cancel_in_flight(config)?,
+        caller_gone: run_caller_gone(config)?,
         poison_crash: run_poison_crash(config)?,
         respawn_then_admit: run_respawn_then_admit(config)?,
     })
 }
 
 pub fn run_overflow(config: RunConfig) -> anyhow::Result<OverflowReport> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
-    let shutdown = runtime.shutdown_handle();
-    let queue = register_queue(&runtime, config)?;
-    // Admission cap is `workers`. Burst beyond it.
-    let cap = config.workers;
-    let burst = cap + 3;
-    let timeout = Duration::from_millis(config.call_timeout_ms);
-
-    let barrier = Arc::new(Barrier::new(burst + 1));
-    let outcomes = Arc::new(Mutex::new(Vec::with_capacity(burst)));
-    let mut threads = Vec::with_capacity(burst);
-    for _ in 0..burst {
-        let rt = Arc::clone(&runtime);
-        let gate = Arc::clone(&barrier);
-        let out = Arc::clone(&outcomes);
-        threads.push(thread::spawn(move || {
-            gate.wait();
-            let outcome = rt.call_blocking(
-                queue,
-                QueueMsg::Request(QueueRequest::Submit(Payload::Work(7))),
-                timeout,
-            );
-            out.lock().expect("outcomes lock").push(outcome);
-        }));
-    }
-    barrier.wait();
-    for t in threads {
-        t.join().expect("submit thread panicked");
-    }
-
-    let mut completed = 0;
-    let mut busy = 0;
-    for outcome in outcomes.lock().expect("outcomes lock").iter() {
-        match outcome {
-            Ok(CallOutcome::Replied(QueueReply::Done(JobOutcome::Completed { .. }))) => {
-                completed += 1
+    let config = config.validate()?;
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    app.run_to_shutdown_reported(SHUTDOWN_TIMEOUT, |app| -> anyhow::Result<OverflowReport> {
+        let queue = register_queue(app, config)?;
+        let (burst, barrier_participants) = config.overflow_shape()?;
+        let timeout = Duration::from_millis(config.call_timeout_ms);
+        let barrier = Barrier::new(barrier_participants);
+        let outcomes = thread::scope(|scope| {
+            let mut threads = Vec::with_capacity(burst);
+            for _ in 0..burst {
+                threads.push(scope.spawn(|| {
+                    barrier.wait();
+                    app.call_blocking_request(
+                        queue.requests,
+                        QueueRequest::Submit(Payload::Work(7)),
+                        timeout,
+                    )
+                }));
             }
-            Ok(CallOutcome::Replied(QueueReply::Busy)) => busy += 1,
-            other => anyhow::bail!("unexpected submit outcome: {other:?}"),
-        }
-    }
+            barrier.wait();
+            threads
+                .into_iter()
+                .map(|thread| {
+                    thread
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("submit thread panicked"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+        })?;
 
-    let stats = stats(&runtime, queue)?;
-    shutdown_runtime(shutdown, runtime)?;
-    Ok(OverflowReport {
-        completed,
-        busy,
-        stats,
+        let mut completed = 0;
+        let mut busy = 0;
+        let mut full = 0;
+        let mut closed = 0;
+        let mut timeout_count = 0;
+        let mut rejected = 0;
+        let mut rejection_reasons = Vec::new();
+        for outcome in outcomes {
+            match outcome? {
+                CallOutcome::Replied(QueueReply::Done(JobOutcome::Completed { .. })) => {
+                    completed += 1;
+                }
+                CallOutcome::Replied(QueueReply::Busy) => busy += 1,
+                CallOutcome::Full => full += 1,
+                CallOutcome::Closed => closed += 1,
+                CallOutcome::Timeout => timeout_count += 1,
+                CallOutcome::Rejected(reason) => {
+                    rejected += 1;
+                    rejection_reasons.push(reason);
+                }
+                CallOutcome::Replied(other) => {
+                    anyhow::bail!("unexpected submit reply: {other:?}");
+                }
+            }
+        }
+
+        Ok(OverflowReport {
+            completed,
+            busy,
+            full,
+            closed,
+            timeout: timeout_count,
+            rejected,
+            rejection_reasons,
+            stats: stats(app, queue.requests)?,
+        })
     })
+    .map_err(anyhow::Error::from)
 }
 
 pub fn run_cancel_in_flight(config: RunConfig) -> anyhow::Result<CancelInFlightReport> {
     // Long-running job so cancel reliably lands first.
-    let mut config = config;
+    let mut config = config.validate()?;
     config.job_sleep_ms = config.job_sleep_ms.max(150);
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
-    let shutdown = runtime.shutdown_handle();
-    let queue = register_queue(&runtime, config)?;
-    let timeout = Duration::from_millis(config.call_timeout_ms);
+    let config = config.validate()?;
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    app.run_to_shutdown_reported(
+        SHUTDOWN_TIMEOUT,
+        |app| -> anyhow::Result<CancelInFlightReport> {
+            let queue = register_queue(app, config)?;
+            let timeout = Duration::from_millis(config.call_timeout_ms);
+            let (submit_outcome, cancel_reply) = thread::scope(|scope| -> anyhow::Result<_> {
+                let submit = scope.spawn(|| {
+                    app.call_blocking_request(
+                        queue.requests,
+                        QueueRequest::Submit(Payload::Work(99)),
+                        timeout,
+                    )
+                });
 
-    let rt = Arc::clone(&runtime);
-    let submit = thread::spawn(move || {
-        rt.call_blocking(
-            queue,
-            QueueMsg::Request(QueueRequest::Submit(Payload::Work(99))),
-            timeout,
-        )
-    });
+                thread::sleep(Duration::from_millis(config.job_sleep_ms / 4 + 5));
+                let cancel_reply = match app.call_blocking_request(
+                    queue.requests,
+                    QueueRequest::Cancel(JobId(1)),
+                    timeout,
+                )? {
+                    CallOutcome::Replied(reply) => reply,
+                    other => anyhow::bail!("unexpected cancel outcome: {other:?}"),
+                };
+                let submit_outcome = match submit
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("submit thread panicked"))??
+                {
+                    CallOutcome::Replied(QueueReply::Done(outcome)) => outcome,
+                    other => anyhow::bail!("unexpected submit outcome: {other:?}"),
+                };
+                Ok((submit_outcome, cancel_reply))
+            })?;
 
-    // Let the submit reach the worker before we cancel.
-    thread::sleep(Duration::from_millis(config.job_sleep_ms / 4 + 5));
-    let cancel_outcome = runtime.call_blocking(
-        queue,
-        QueueMsg::Request(QueueRequest::Cancel(JobId(1))),
-        timeout,
-    )?;
-    let cancel_reply = match cancel_outcome {
-        CallOutcome::Replied(reply) => reply,
-        other => anyhow::bail!("unexpected cancel outcome: {other:?}"),
-    };
+            wait_until(
+                Duration::from_secs(2),
+                "worker cancel acknowledgement",
+                || {
+                    stats(app, queue.requests)
+                        .map(|snapshot| snapshot.in_flight == 0)
+                        .unwrap_or(false)
+                },
+            )?;
+            let refill_outcome = match app.call_blocking_request(
+                queue.requests,
+                QueueRequest::Submit(Payload::Work(21)),
+                timeout,
+            )? {
+                CallOutcome::Replied(QueueReply::Done(outcome)) => outcome,
+                other => anyhow::bail!("unexpected refill outcome: {other:?}"),
+            };
 
-    let submit_outcome = match submit.join().expect("submit thread panicked")? {
-        CallOutcome::Replied(QueueReply::Done(o)) => o,
-        other => anyhow::bail!("unexpected submit outcome: {other:?}"),
-    };
+            thread::sleep(Duration::from_millis(config.job_sleep_ms + 30));
+            Ok(CancelInFlightReport {
+                submit_outcome,
+                cancel_reply,
+                refill_outcome,
+                stats: stats(app, queue.requests)?,
+            })
+        },
+    )
+    .map_err(anyhow::Error::from)
+}
 
-    // Give the late worker reply time to land so the late-reply counter
-    // ticks before we read stats.
-    thread::sleep(Duration::from_millis(config.job_sleep_ms + 30));
-    let stats = stats(&runtime, queue)?;
-    shutdown_runtime(shutdown, runtime)?;
+pub fn run_caller_gone(config: RunConfig) -> anyhow::Result<CallerGoneReport> {
+    let mut config = config.validate()?;
+    config.job_sleep_ms = config.job_sleep_ms.max(100);
+    let config = config.validate()?;
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    app.run_to_shutdown_reported(
+        SHUTDOWN_TIMEOUT,
+        |app| -> anyhow::Result<CallerGoneReport> {
+            let queue = register_queue(app, config)?;
+            let submit_outcome = app.call_blocking_request(
+                queue.requests,
+                QueueRequest::Submit(Payload::Work(11)),
+                Duration::from_millis(10),
+            )?;
+            if !matches!(submit_outcome, CallOutcome::Timeout) {
+                anyhow::bail!("caller-gone probe expected Timeout, got {submit_outcome:?}");
+            }
 
-    Ok(CancelInFlightReport {
-        submit_outcome,
-        cancel_reply,
-        stats,
-    })
+            wait_until(Duration::from_secs(2), "caller-gone settlement", || {
+                stats(app, queue.requests)
+                    .map(|snapshot| snapshot.jobs_completed == 1 && snapshot.in_flight == 0)
+                    .unwrap_or(false)
+            })?;
+            Ok(CallerGoneReport {
+                submit_outcome,
+                stats: stats(app, queue.requests)?,
+            })
+        },
+    )
+    .map_err(anyhow::Error::from)
 }
 
 pub fn run_poison_crash(config: RunConfig) -> anyhow::Result<PoisonCrashReport> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
-    let shutdown = runtime.shutdown_handle();
-    let queue = register_queue(&runtime, config)?;
-    let timeout = Duration::from_millis(config.call_timeout_ms);
+    let config = config.validate()?;
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    app.run_to_shutdown_reported(SHUTDOWN_TIMEOUT, |app| {
+        let queue = register_queue(app, config)?;
+        let timeout = Duration::from_millis(config.call_timeout_ms);
+        let failed_outcome = match app.call_blocking_request(
+            queue.requests,
+            QueueRequest::Submit(Payload::Poison),
+            timeout,
+        )? {
+            CallOutcome::Replied(QueueReply::Done(outcome)) => outcome,
+            other => anyhow::bail!("unexpected poison outcome: {other:?}"),
+        };
 
-    let outcome = runtime.call_blocking(
-        queue,
-        QueueMsg::Request(QueueRequest::Submit(Payload::Poison)),
-        timeout,
-    )?;
-    let failed_outcome = match outcome {
-        CallOutcome::Replied(QueueReply::Done(o)) => o,
-        other => anyhow::bail!("unexpected poison outcome: {other:?}"),
-    };
+        wait_until(Duration::from_secs(2), "respawn", || {
+            stats(app, queue.requests)
+                .map(|snapshot| snapshot.workers_alive == config.workers)
+                .unwrap_or(false)
+        })?;
 
-    // Poll briefly so the respawn finishes before we read stats.
-    wait_until(Duration::from_secs(2), "respawn", || {
-        let s = stats(&runtime, queue).unwrap_or_else(|_| panic!("stats failed"));
-        s.workers_alive == config.workers
-    })?;
-
-    let stats = stats(&runtime, queue)?;
-    shutdown_runtime(shutdown, runtime)?;
-    Ok(PoisonCrashReport {
-        failed_outcome,
-        stats,
+        Ok(PoisonCrashReport {
+            failed_outcome,
+            stats: stats(app, queue.requests)?,
+        })
     })
+    .map_err(anyhow::Error::from)
 }
 
 pub fn run_respawn_then_admit(config: RunConfig) -> anyhow::Result<RespawnThenAdmitReport> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
-    let shutdown = runtime.shutdown_handle();
-    let queue = register_queue(&runtime, config)?;
-    let timeout = Duration::from_millis(config.call_timeout_ms);
+    let config = config.validate()?;
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    app.run_to_shutdown_reported(SHUTDOWN_TIMEOUT, |app| {
+        let queue = register_queue(app, config)?;
+        let timeout = Duration::from_millis(config.call_timeout_ms);
+        let poison_outcome = match app.call_blocking_request(
+            queue.requests,
+            QueueRequest::Submit(Payload::Poison),
+            timeout,
+        )? {
+            CallOutcome::Replied(QueueReply::Done(outcome)) => outcome,
+            other => anyhow::bail!("unexpected poison outcome: {other:?}"),
+        };
 
-    let poison = runtime.call_blocking(
-        queue,
-        QueueMsg::Request(QueueRequest::Submit(Payload::Poison)),
-        timeout,
-    )?;
-    let poison_outcome = match poison {
-        CallOutcome::Replied(QueueReply::Done(o)) => o,
-        other => anyhow::bail!("unexpected poison outcome: {other:?}"),
-    };
+        wait_until(Duration::from_secs(2), "respawn", || {
+            stats(app, queue.requests)
+                .map(|snapshot| snapshot.workers_alive == config.workers)
+                .unwrap_or(false)
+        })?;
 
-    // Wait for the respawn to land before sending the follow-up.
-    wait_until(Duration::from_secs(2), "respawn", || {
-        stats(&runtime, queue)
-            .map(|s| s.workers_alive == config.workers)
-            .unwrap_or(false)
-    })?;
+        let follow_up_outcome = match app.call_blocking_request(
+            queue.requests,
+            QueueRequest::Submit(Payload::Work(21)),
+            timeout,
+        )? {
+            CallOutcome::Replied(QueueReply::Done(outcome)) => outcome,
+            other => anyhow::bail!("unexpected follow-up outcome: {other:?}"),
+        };
 
-    let follow_up = runtime.call_blocking(
-        queue,
-        QueueMsg::Request(QueueRequest::Submit(Payload::Work(21))),
-        timeout,
-    )?;
-    let follow_up_outcome = match follow_up {
-        CallOutcome::Replied(QueueReply::Done(o)) => o,
-        other => anyhow::bail!("unexpected follow-up outcome: {other:?}"),
-    };
-
-    let stats = stats(&runtime, queue)?;
-    shutdown_runtime(shutdown, runtime)?;
-    Ok(RespawnThenAdmitReport {
-        poison_outcome,
-        follow_up_outcome,
-        stats,
+        Ok(RespawnThenAdmitReport {
+            poison_outcome,
+            follow_up_outcome,
+            stats: stats(app, queue.requests)?,
+        })
     })
+    .map_err(anyhow::Error::from)
 }
 
 // ---------- Helpers ----------
 
 fn register_queue(
-    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
     config: RunConfig,
-) -> anyhow::Result<Address<QueueMsg, QueueReply>> {
+) -> anyhow::Result<SplitServiceHandle<QueueEvent, QueueRequest, QueueReply>> {
     let ready = Arc::new(ReadyGate::default());
 
-    let address = runtime
-        .register_with_capacity_and_bootstrap::<Queue, WorkerMsg>(
+    let service = app
+        .register_split_service_with_bootstrap::<
+            Queue,
+            QueueEvent,
+            QueueRequest,
+            std::convert::Infallible,
+        >(
             Queue::new(config, Arc::clone(&ready)),
             config.queue_mailbox,
-            QueueMsg::Event(QueueEvent::Bootstrap),
+            QueueEvent::Bootstrap,
         )
         .map_err(|e| anyhow::anyhow!("register queue: {e:?}"))?;
 
     wait_until(Duration::from_secs(2), "all workers ready", || {
         ready.ready()
     })?;
-    Ok(address)
+    Ok(service)
 }
 
 fn wait_until<F>(timeout: Duration, label: &str, mut predicate: F) -> anyhow::Result<()>
@@ -848,25 +1470,11 @@ where
 }
 
 fn stats(
-    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
-    queue: Address<QueueMsg, QueueReply>,
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    queue: tina::ServiceRequestAddress<QueueEvent, QueueRequest, QueueReply>,
 ) -> anyhow::Result<QueueStats> {
-    match runtime.call_blocking(
-        queue,
-        QueueMsg::Request(QueueRequest::Stats),
-        Duration::from_secs(2),
-    )? {
+    match app.call_blocking_request(queue, QueueRequest::Stats, Duration::from_secs(2))? {
         CallOutcome::Replied(QueueReply::Stats(s)) => Ok(s),
         other => anyhow::bail!("stats call failed: {other:?}"),
     }
-}
-
-fn shutdown_runtime(
-    shutdown: ThreadedShutdownHandle,
-    runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
-) -> anyhow::Result<()> {
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
-    Ok(())
 }
