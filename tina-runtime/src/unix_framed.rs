@@ -77,12 +77,21 @@ impl UnixFramedWriter {
     }
 
     /// Builds a length-delimited writer with body and whole-batch caps.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max_body_len == 0`, matching
+    /// [`tina_codec::LengthDelimitedFramer::new`].
     pub fn length_delimited(
         stream: UnixStreamId,
         prefix: LengthPrefix,
         max_body_len: usize,
         max_encoded_len: usize,
     ) -> Self {
+        assert!(
+            max_body_len > 0,
+            "UnixFramedWriter requires max_body_len > 0"
+        );
         Self::new(
             stream,
             FrameFormat::LengthDelimited {
@@ -282,6 +291,8 @@ mod tests {
     use super::*;
     use tina::{Context, Effect, Outbound, SingleShard};
 
+    use crate::{CallInput, WriteOwnedError, WriteOwnedReply};
+
     #[derive(Debug)]
     struct Dummy;
 
@@ -310,8 +321,51 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct DummyService;
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    enum ServiceEvent {
+        Wrote(UnixWriteOwnedReply),
+    }
+
+    impl Isolate for DummyService {
+        type Message = tina::ServiceMessage<ServiceEvent, std::convert::Infallible>;
+        type Reply = ();
+        type Send = Outbound<std::convert::Infallible>;
+        type Spawn = std::convert::Infallible;
+        type SpawnObserved = std::convert::Infallible;
+        type Io = RuntimeCall<Self::Message>;
+        type Fact = std::convert::Infallible;
+        type Shard = SingleShard;
+
+        fn handle(
+            &mut self,
+            _msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            tina::noop()
+        }
+    }
+
     fn stream() -> UnixStreamId {
         UnixStreamId::new(1)
+    }
+
+    fn take_write<I, M>(effect: Effect<I>) -> (Vec<u8>, usize)
+    where
+        I: Isolate<Message = M, Io = RuntimeCall<M>>,
+        M: 'static,
+    {
+        let Effect::Io(call) = effect else {
+            panic!("expected Unix write effect");
+        };
+        let (request, _translator) = call.into_parts();
+        let CallInput::UnixWriteOwned { bytes, start, .. } = request else {
+            panic!("expected owned Unix write, got {request:?}");
+        };
+        (bytes, start)
     }
 
     #[test]
@@ -392,6 +446,33 @@ mod tests {
     }
 
     #[test]
+    fn zero_batch_cap_refuses_without_mutation() {
+        let mut line = UnixFramedWriter::lines(stream(), 8, 0);
+        assert_eq!(
+            line.push_frame(b""),
+            Err(FramedWriteError::BatchFull {
+                encoded_len: 0,
+                frame_len: 1,
+                max_encoded_len: 0,
+            })
+        );
+        assert_eq!(line.frame_count(), 0);
+        assert_eq!(line.encoded_len(), 0);
+
+        let mut length = UnixFramedWriter::length_delimited(stream(), LengthPrefix::U16, 8, 0);
+        assert_eq!(
+            length.push_frame(b""),
+            Err(FramedWriteError::BatchFull {
+                encoded_len: 0,
+                frame_len: 2,
+                max_encoded_len: 0,
+            })
+        );
+        assert_eq!(length.frame_count(), 0);
+        assert_eq!(length.encoded_len(), 0);
+    }
+
+    #[test]
     fn empty_batch_stays_appendable_and_started_batch_is_frozen() {
         let mut writer = UnixFramedWriter::lines(stream(), 8, 16);
         assert!(writer.next_effect::<Dummy, _, _>(Msg::Wrote).is_none());
@@ -421,8 +502,98 @@ mod tests {
     }
 
     #[test]
+    fn raw_partial_writes_preserve_the_exact_allocation_and_offset() {
+        let mut writer = UnixFramedWriter::lines(stream(), 8, 16);
+        writer.push_frame(b"ping").unwrap();
+        writer.push_frame(b"ok").unwrap();
+
+        let effect = writer
+            .next_effect::<Dummy, _, _>(Msg::Wrote)
+            .expect("non-empty batch arms");
+        let (bytes, start) = take_write(effect);
+        let allocation = bytes.as_ptr();
+        assert_eq!(start, 0);
+        assert_eq!(bytes, b"ping\nok\n");
+
+        let step: LoopStep<Dummy, usize> =
+            writer.advance(Ok(WriteOwnedReply { bytes, written: 2 }), Msg::Wrote);
+        let LoopStep::Pending(effect) = step else {
+            panic!("partial write must continue, got {step:?}");
+        };
+        let (bytes, start) = take_write(effect);
+        assert_eq!(bytes.as_ptr(), allocation);
+        assert_eq!(start, 2);
+
+        let step: LoopStep<Dummy, usize> =
+            writer.advance(Ok(WriteOwnedReply { bytes, written: 6 }), Msg::Wrote);
+        assert!(matches!(step, LoopStep::Done(8)));
+        assert_eq!(writer.encoded_len(), 8);
+        assert!(writer.next_effect::<Dummy, _, _>(Msg::Wrote).is_none());
+    }
+
+    #[test]
+    fn split_service_partial_writes_match_raw_authoring() {
+        let mut writer = UnixFramedWriter::length_delimited(stream(), LengthPrefix::U8, 8, 16);
+        writer.push_frame(b"ping").unwrap();
+
+        let effect = writer
+            .next_service_event::<DummyService, _, _, _>(ServiceEvent::Wrote)
+            .expect("non-empty batch arms");
+        let (bytes, start) = take_write(effect);
+        let allocation = bytes.as_ptr();
+        assert_eq!(start, 0);
+        assert_eq!(bytes, &[4, b'p', b'i', b'n', b'g']);
+
+        let step: LoopStep<DummyService, usize> = writer.advance_service_event(
+            Ok(WriteOwnedReply { bytes, written: 2 }),
+            ServiceEvent::Wrote,
+        );
+        let LoopStep::Pending(effect) = step else {
+            panic!("partial service write must continue, got {step:?}");
+        };
+        let (bytes, start) = take_write(effect);
+        assert_eq!(bytes.as_ptr(), allocation);
+        assert_eq!(start, 2);
+
+        let step: LoopStep<DummyService, usize> = writer.advance_service_event(
+            Ok(WriteOwnedReply { bytes, written: 3 }),
+            ServiceEvent::Wrote,
+        );
+        assert!(matches!(step, LoopStep::Done(5)));
+    }
+
+    #[test]
+    fn write_failure_surfaces_exact_error_after_returning_the_allocation() {
+        let mut writer = UnixFramedWriter::lines(stream(), 8, 16);
+        writer.push_frame(b"ping").unwrap();
+        let effect = writer
+            .next_effect::<Dummy, _, _>(Msg::Wrote)
+            .expect("non-empty batch arms");
+        let (bytes, _) = take_write(effect);
+        let allocation = bytes.as_ptr();
+        let reply = Err(WriteOwnedError {
+            error: CallError::Io,
+            bytes,
+        });
+        assert_eq!(
+            reply.as_ref().unwrap_err().bytes.as_ptr(),
+            allocation,
+            "the runtime returns the exact caller-owned allocation"
+        );
+
+        let step: LoopStep<Dummy, usize> = writer.advance(reply, Msg::Wrote);
+        assert!(matches!(step, LoopStep::Failed(CallError::Io)));
+    }
+
+    #[test]
     #[should_panic(expected = "max_line_len > 0")]
     fn zero_line_cap_is_rejected_like_the_decoder() {
         let _ = UnixFramedWriter::lines(stream(), 0, 16);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_body_len > 0")]
+    fn zero_length_body_cap_is_rejected_like_the_decoder() {
+        let _ = UnixFramedWriter::length_delimited(stream(), LengthPrefix::U8, 0, 16);
     }
 }

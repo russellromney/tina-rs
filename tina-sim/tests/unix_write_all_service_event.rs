@@ -234,6 +234,7 @@ enum FramedWriterEvent {
     Connected(Result<UnixStreamId, CallError>),
     Wrote(UnixWriteOwnedReply),
     Closed(UnixStreamCloseReply),
+    Stop,
 }
 
 struct FramedWriter {
@@ -241,9 +242,13 @@ struct FramedWriter {
     stream: Option<UnixStreamId>,
     writer: Option<UnixFramedWriter>,
     report: FramedWriterReport,
+    allocation: Option<usize>,
+    allocation_preserved: bool,
+    write_completions: usize,
+    write_armed: Arc<AtomicBool>,
 }
 
-type FramedWriterReport = Arc<Mutex<Option<Result<usize, CallError>>>>;
+type FramedWriterReport = Arc<Mutex<Option<WriterReport>>>;
 
 #[tina_runtime::isolate(event = FramedWriterEvent, shard = UnixServiceShard)]
 impl FramedWriter {
@@ -273,14 +278,25 @@ impl FramedWriter {
             }
             FramedWriterEvent::Connected(Err(error)) => self.finish(Err(error)),
             FramedWriterEvent::Wrote(reply) => {
+                self.write_completions += 1;
+                let returned = match &reply {
+                    Ok(reply) => reply.bytes.as_ptr() as usize,
+                    Err(error) => error.bytes.as_ptr() as usize,
+                };
+                let allocation = *self.allocation.get_or_insert(returned);
+                self.allocation_preserved &= allocation == returned;
                 let writer = self.writer.as_mut().expect("framed writer armed");
                 match writer.advance_service_event(reply, FramedWriterEvent::Wrote) {
-                    LoopStep::Pending(effect) => effect,
+                    LoopStep::Pending(effect) => {
+                        self.write_armed.store(true, Ordering::Release);
+                        effect
+                    }
                     LoopStep::Done(written) => self.finish(Ok(written)),
                     LoopStep::Failed(error) => self.finish(Err(error)),
                 }
             }
             FramedWriterEvent::Closed(Ok(())) => stop(),
+            FramedWriterEvent::Stop => stop(),
             FramedWriterEvent::Closed(Err(error)) => {
                 panic!("framed writer close failed: {error:?}")
             }
@@ -290,7 +306,11 @@ impl FramedWriter {
 
 impl FramedWriter {
     fn finish(&mut self, result: Result<usize, CallError>) -> Effect<Self> {
-        *self.report.lock().unwrap() = Some(result);
+        *self.report.lock().unwrap() = Some(WriterReport {
+            outcome: result,
+            allocation_preserved: self.allocation_preserved,
+            write_completions: self.write_completions,
+        });
         self.writer = None;
         let Some(stream) = self.stream.take() else {
             return stop();
@@ -299,16 +319,22 @@ impl FramedWriter {
     }
 }
 
-fn framed_writer(path: PathBuf) -> (FramedWriter, FramedWriterReport) {
+fn framed_writer(path: PathBuf) -> (FramedWriter, FramedWriterReport, Arc<AtomicBool>) {
     let report = Arc::new(Mutex::new(None));
+    let write_armed = Arc::new(AtomicBool::new(false));
     (
         FramedWriter {
             path,
             stream: None,
             writer: None,
             report: Arc::clone(&report),
+            allocation: None,
+            allocation_preserved: true,
+            write_completions: 0,
+            write_armed: Arc::clone(&write_armed),
         },
         report,
+        write_armed,
     )
 }
 
@@ -383,7 +409,7 @@ fn live_runtime_and_simulator_share_bounded_framed_writer_authoring() {
 
     let live_path = socket_path("framed-live");
     let live_received = Arc::new(Mutex::new(Vec::new()));
-    let (live_writer, live_report) = framed_writer(live_path.clone());
+    let (live_writer, live_report, _) = framed_writer(live_path.clone());
     let mut runtime = Runtime::new(UnixServiceShard, DefaultMailboxFactory);
     let server = runtime.register_event_service::<Server, ServerEvent, Infallible>(
         Server {
@@ -410,14 +436,17 @@ fn live_runtime_and_simulator_share_bounded_framed_writer_authoring() {
         std::thread::sleep(Duration::from_millis(1));
     }
     while runtime.step() > 0 {}
-    assert_eq!(*live_report.lock().unwrap(), Some(Ok(expected.len())));
+    let live_report = live_report.lock().unwrap().clone().expect("live report");
+    assert_eq!(live_report.outcome, Ok(expected.len()));
+    assert!(live_report.allocation_preserved);
+    assert!(live_report.write_completions >= 1);
     assert_eq!(*live_received.lock().unwrap(), expected);
     drop(runtime);
     let _ = std::fs::remove_file(live_path);
 
     let sim_path = socket_path("framed-sim");
     let sim_received = Arc::new(Mutex::new(Vec::new()));
-    let (sim_writer, sim_report) = framed_writer(sim_path.clone());
+    let (sim_writer, sim_report, _) = framed_writer(sim_path.clone());
     let mut config = SimulatorConfig::default();
     config.unix.default_inbound_capacity = 2;
     config.unix.default_write_cap = 2;
@@ -437,8 +466,95 @@ fn live_runtime_and_simulator_share_bounded_framed_writer_authoring() {
     assert!(sim.try_send_event(server, ServerEvent::Start).is_ok());
     assert!(sim.try_send_event(client, FramedWriterEvent::Start).is_ok());
     sim.run_until_quiescent();
-    assert_eq!(*sim_report.lock().unwrap(), Some(Ok(expected.len())));
+    assert_eq!(
+        sim_report.lock().unwrap().as_ref(),
+        Some(&WriterReport {
+            outcome: Ok(expected.len()),
+            allocation_preserved: true,
+            write_completions: expected.len().div_ceil(2),
+        })
+    );
     assert_eq!(*sim_received.lock().unwrap(), expected);
+}
+
+#[test]
+fn framed_writer_peer_close_returns_typed_error_and_original_allocation() {
+    let path = socket_path("framed-closed");
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let (writer, report, _) = framed_writer(path.clone());
+    let mut sim = Simulator::new(UnixServiceShard, SimulatorConfig::default());
+    let server = sim.register_event_service(
+        Server {
+            path,
+            listener: None,
+            stream: None,
+            received,
+            close_on_accept: true,
+            read: false,
+        },
+        8,
+    );
+    let client = sim.register_event_service(writer, 8);
+    assert!(sim.try_send_event(server, ServerEvent::Start).is_ok());
+    assert!(sim.try_send_event(client, FramedWriterEvent::Start).is_ok());
+    sim.run_until_quiescent();
+
+    assert_eq!(
+        report.lock().unwrap().as_ref(),
+        Some(&WriterReport {
+            outcome: Err(CallError::Io),
+            allocation_preserved: true,
+            write_completions: 1,
+        })
+    );
+    assert!(!sim.has_in_flight_calls());
+}
+
+#[test]
+fn framed_writer_owner_stop_settles_pending_write_authority() {
+    let path = socket_path("framed-owner-stop");
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let (writer, report, armed) = framed_writer(path.clone());
+    let mut config = SimulatorConfig::default();
+    config.unix.default_inbound_capacity = 1;
+    config.unix.default_write_cap = 1;
+    let mut sim = Simulator::new(UnixServiceShard, config);
+    let server = sim.register_event_service(
+        Server {
+            path,
+            listener: None,
+            stream: None,
+            received,
+            close_on_accept: false,
+            read: false,
+        },
+        8,
+    );
+    let client = sim.register_event_service(writer, 8);
+    assert!(sim.try_send_event(server, ServerEvent::Start).is_ok());
+    assert!(sim.try_send_event(client, FramedWriterEvent::Start).is_ok());
+    while !armed.load(Ordering::Acquire) {
+        assert!(sim.step() > 0, "framed writer must park after progress");
+    }
+    assert!(sim.try_send_event(client, FramedWriterEvent::Stop).is_ok());
+    sim.run_until_quiescent();
+
+    assert!(report.lock().unwrap().is_none());
+    assert!(!sim.has_in_flight_calls());
+    assert!(
+        sim.trace().iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::CallCompletionRejected {
+                    call_kind: CallKind::UnixWrite,
+                    reason: CallCompletionRejectedReason::RequesterClosed,
+                    ..
+                }
+            )
+        }),
+        "trace: {:#?}",
+        sim.trace()
+    );
 }
 
 #[test]
