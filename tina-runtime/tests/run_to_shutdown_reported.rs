@@ -298,6 +298,33 @@ fn generic_as_ref_report_is_preserved_without_anyhow_specific_behavior() {
 }
 
 #[test]
+fn multi_shard_reported_workload_failure_preserves_owned_source() {
+    let result = LocalSystem::<TestShard, DefaultThreadedMailboxFactory>::multi_shard(
+        DefaultThreadedMailboxFactory,
+    )
+    .shard(TestShard(10))
+    .shard(TestShard(11))
+    .build()
+    .run_to_shutdown_reported(Duration::from_secs(2), |_app| {
+        Err::<(), _>(GenericReport::new(
+            "multi report context",
+            "multi report source",
+        ))
+    });
+
+    let Err(RunToShutdownError::Workload(error)) = result else {
+        panic!("expected multi-shard reported workload failure");
+    };
+    assert_eq!(error.get_ref().context, "multi report context");
+    assert!(matches!(
+        error.source(),
+        Some(source) if source.downcast_ref::<LeafError>()
+            == Some(&LeafError("multi report source"))
+    ));
+    assert_eq!(error.into_inner().source, LeafError("multi report source"));
+}
+
+#[test]
 fn reported_workload_value_is_dropped_exactly_once() {
     let drops = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&drops);
