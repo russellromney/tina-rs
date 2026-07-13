@@ -171,4 +171,11 @@ fn run_config_rejects_all_unbounded_allocation_and_wait_inputs() {
             ..
         })
     ));
+
+    let zero_sleep = RunConfig {
+        job_sleep_ms: 0,
+        ..base
+    };
+    assert!(run_cancel_in_flight(zero_sleep).is_err());
+    assert!(run_caller_gone(zero_sleep).is_err());
 }

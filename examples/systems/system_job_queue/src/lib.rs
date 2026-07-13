@@ -438,7 +438,7 @@ impl Queue {
     fn new(config: RunConfig, ready: Arc<ReadyGate>) -> Self {
         Self {
             config,
-            pending: PendingCancelableCallSet::with_capacity(config.workers.max(1)),
+            pending: PendingCancelableCallSet::with_capacity(config.workers),
             workers: vec![None; config.workers],
             worker_busy: vec![None; config.workers],
             next_id: 1,
@@ -862,7 +862,7 @@ pub fn run_overflow(config: RunConfig) -> anyhow::Result<OverflowReport> {
 
 pub fn run_cancel_in_flight(config: RunConfig) -> anyhow::Result<CancelInFlightReport> {
     // Long-running job so cancel reliably lands first.
-    let mut config = config;
+    let mut config = config.validate()?;
     config.job_sleep_ms = config.job_sleep_ms.max(150);
     let config = config.validate()?;
     let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
@@ -930,7 +930,7 @@ pub fn run_cancel_in_flight(config: RunConfig) -> anyhow::Result<CancelInFlightR
 }
 
 pub fn run_caller_gone(config: RunConfig) -> anyhow::Result<CallerGoneReport> {
-    let mut config = config;
+    let mut config = config.validate()?;
     config.job_sleep_ms = config.job_sleep_ms.max(100);
     let config = config.validate()?;
     let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
