@@ -1214,6 +1214,8 @@ where
     /// matching the way [`Self::try_send`] routes ingress. Same vocabulary
     /// as [`crate::ThreadedRuntime::observe_result`]:
     ///
+    /// - routing errors: `ForeignSystem`, `UnknownShard`, before observation
+    ///   capacity is claimed;
     /// - eager errors: `AlreadyStopped`, `AlreadyClaimed`, `ObservationFull`;
     /// - `wait` outcomes: `Timeout`, `RuntimeStopped`, `StoppedWithoutResult`,
     ///   `TypeMismatch`.
@@ -1407,14 +1409,13 @@ where
     /// phase: a future host-to-shard variant is only worth shipping with
     /// a real caller and a cross-shard remote-path proof.
     ///
-    /// # Panics
-    ///
-    /// Panics if `address.shard()` is not owned by this runtime — same
-    /// programmer-error convention as [`Self::try_send`] and
-    /// [`Self::observe_result`].
-    ///
     /// # Errors
     ///
+    /// - [`ThreadedRuntimeError::ForeignSystem`] — the address belongs to a
+    ///   different system incarnation. No host-call driver or command is
+    ///   created.
+    /// - [`ThreadedRuntimeError::UnknownShard`] — the address targets a shard
+    ///   this runtime does not own. No host-call driver or command is created.
     /// - [`ThreadedRuntimeError::CommandFull`] — the bounded worker
     ///   command queue could not accept the host-control admission
     ///   command immediately.
@@ -1524,7 +1525,7 @@ where
     /// [`crate::ThreadedRuntime::call_blocking_request`]: it wraps the
     /// request in [`tina::ServiceMessage::Request`] and keeps host code
     /// from reaching for the raw split envelope address. See
-    /// [`Self::call_blocking`] for the shard-routing and panic contract.
+    /// [`Self::call_blocking`] for the shard-routing and error contract.
     pub fn call_blocking_request<Event, Request, Reply>(
         &self,
         address: tina::ServiceRequestAddress<Event, Request, Reply>,

@@ -237,8 +237,7 @@ pub enum ThreadedRuntimeError {
     WorkerStopped,
     /// The addressed lifecycle parent is stopped, unknown, or stale.
     ParentStopped,
-    /// A multi-shard owner operation targeted a shard this local system does
-    /// not own.
+    /// An owner operation targeted a shard this runtime/system does not own.
     UnknownShard(ShardId),
     /// The worker could not prove backend completion-slot ownership was
     /// released during shutdown.

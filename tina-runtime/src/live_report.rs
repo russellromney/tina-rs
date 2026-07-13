@@ -198,6 +198,10 @@ impl LiveShardMetrics {
         }
     }
 
+    pub(crate) const fn shard(&self) -> ShardId {
+        self.shard
+    }
+
     /// Records one return from a bounded worker park.
     pub(crate) fn record_park_wakeup(&self) {
         self.park_wakeups.fetch_add(1, Ordering::Relaxed);

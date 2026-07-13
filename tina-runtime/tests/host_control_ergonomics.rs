@@ -846,6 +846,94 @@ fn multi_shard_call_blocking_rejects_foreign_system_before_unknown_shard() {
     let _ = runtime.shutdown();
 }
 
+#[test]
+fn routing_failures_win_over_saturated_command_queues() {
+    let single = single_runtime(1);
+    let single_release = Arc::new(AtomicBool::new(false));
+    let single_entered = Arc::new(AtomicBool::new(false));
+    let single_spinner = single
+        .register_with_capacity::<SpinnerSimple, Infallible>(
+            SpinnerSimple {
+                flag: Arc::clone(&single_release),
+                entered: Arc::clone(&single_entered),
+            },
+            4,
+        )
+        .expect("register single spinner");
+    single
+        .try_send(single_spinner, SpinnerSimpleMsg::Tick)
+        .expect("occupy single worker");
+    while !single_entered.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
+    single
+        .try_send(single_spinner, SpinnerSimpleMsg::Tick)
+        .expect("fill single command queue");
+    let single_unowned = Address::<EchoSimpleMsg, u32>::new_with_generation_in(
+        single.system_incarnation(),
+        ShardId::new(99),
+        single_spinner.isolate(),
+        single_spinner.generation(),
+    );
+    assert!(matches!(
+        single.call_blocking(
+            single_unowned,
+            EchoSimpleMsg::AddOne(1),
+            Duration::ZERO,
+        ),
+        Err(ThreadedRuntimeError::UnknownShard(shard)) if shard == ShardId::new(99)
+    ));
+    assert_eq!(
+        single.observe_result::<u32, _, _>(single_unowned).err(),
+        Some(tina_runtime::ResultWaitError::UnknownShard(ShardId::new(
+            99
+        )))
+    );
+    single_release.store(true, Ordering::Release);
+    single.shutdown().expect("single runtime shuts down");
+
+    let multi = multi_runtime(1);
+    let multi_release = Arc::new(AtomicBool::new(false));
+    let multi_entered = Arc::new(AtomicBool::new(false));
+    let multi_spinner = multi
+        .register_with_capacity_on::<SpinnerMS, Infallible>(
+            ShardId::new(1),
+            SpinnerMS {
+                flag: Arc::clone(&multi_release),
+                entered: Arc::clone(&multi_entered),
+            },
+            4,
+        )
+        .expect("register multi spinner");
+    multi
+        .try_send(multi_spinner, SpinnerMsg::Tick)
+        .expect("occupy multi worker");
+    while !multi_entered.load(Ordering::Acquire) {
+        thread::yield_now();
+    }
+    multi
+        .try_send(multi_spinner, SpinnerMsg::Tick)
+        .expect("fill multi command queue");
+    let multi_unowned = Address::<EchoMsg, u32>::new_with_generation_in(
+        multi.system_incarnation(),
+        ShardId::new(99),
+        multi_spinner.isolate(),
+        multi_spinner.generation(),
+    );
+    assert!(matches!(
+        multi.call_blocking(multi_unowned, EchoMsg::AddOne(1), Duration::ZERO),
+        Err(ThreadedRuntimeError::UnknownShard(shard)) if shard == ShardId::new(99)
+    ));
+    assert_eq!(
+        multi.observe_result::<u32, _, _>(multi_unowned).err(),
+        Some(tina_runtime::ResultWaitError::UnknownShard(ShardId::new(
+            99
+        )))
+    );
+    multi_release.store(true, Ordering::Release);
+    multi.shutdown().expect("multi runtime shuts down");
+}
+
 // ------------------------- Rock 2: ThreadedShutdownHandle -------------------
 
 #[test]

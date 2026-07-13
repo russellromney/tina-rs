@@ -59,10 +59,11 @@ pub enum WaitError {
 
 /// Outcome of registering or waiting on an [`IsolateResultWaiter`].
 ///
-/// `CommandFull`, `ObservationFull`, `AlreadyClaimed`, and `AlreadyStopped`
-/// only fire at register time. `RuntimeStopped` can fire either while
-/// registering or from [`IsolateResultWaiter::wait`]; the remaining outcomes
-/// only fire while waiting.
+/// `ForeignSystem`, `UnknownShard`, `CommandFull`, `ObservationFull`,
+/// `AlreadyClaimed`, and `AlreadyStopped` only fire at register time.
+/// `RuntimeStopped` can fire either while registering or from
+/// [`IsolateResultWaiter::wait`]; the remaining outcomes only fire while
+/// waiting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultWaitError {
     /// The address belongs to another runtime/system incarnation.
@@ -72,7 +73,8 @@ pub enum ResultWaitError {
         /// Incarnation carried by the address.
         actual: tina::SystemIncarnation,
     },
-    /// The address targets a shard this multi-shard runtime does not own.
+    /// The address targets a shard this runtime/system does not own.
+    /// No result authority or observation capacity was claimed.
     UnknownShard(ShardId),
     /// `wait` timed out before the isolate stopped.
     Timeout,

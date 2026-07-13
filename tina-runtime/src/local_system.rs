@@ -1231,6 +1231,8 @@ where
     /// This is the host-call companion to [`Self::register_root`]. The timeout
     /// is the target call deadline; backend admission and worker failures are
     /// returned as [`ThreadedRuntimeError`].
+    /// A foreign system or unowned shard is rejected before host work is
+    /// admitted.
     pub fn call_blocking<M, R>(
         &self,
         address: Address<M, R>,
@@ -1242,6 +1244,30 @@ where
         R: Send + 'static,
     {
         self.runtime().call_blocking(address, message, timeout)
+    }
+
+    /// Like [`call_blocking`](Self::call_blocking), but separates the target
+    /// call deadline from the host-side wait budget.
+    ///
+    /// Foreign-system rejection and all backend admission, worker, and host
+    /// wait failures remain typed as [`ThreadedRuntimeError`].
+    pub fn call_blocking_with_host_timeout<M, R>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        target_timeout: Duration,
+        host_wait_timeout: Duration,
+    ) -> Result<crate::CallOutcome<R>, ThreadedRuntimeError>
+    where
+        M: Send + 'static,
+        R: Send + 'static,
+    {
+        self.runtime().call_blocking_with_host_timeout(
+            address,
+            message,
+            target_timeout,
+            host_wait_timeout,
+        )
     }
 
     /// Performs one blocking host call through a split-service request
@@ -1354,7 +1380,8 @@ where
     /// Register the waiter before triggering the isolate. Eager registration
     /// failures and waiter outcomes match [`ThreadedRuntime::observe_result`]
     /// exactly; the local-system facade does not flatten result authority or
-    /// terminal failure reasons.
+    /// terminal failure reasons. A foreign system or unowned shard is rejected
+    /// before result authority or observation capacity is claimed.
     pub fn observe_result<T: Send + 'static, M: 'static, R: 'static>(
         &self,
         address: Address<M, R>,
@@ -2219,10 +2246,8 @@ where
     /// This is the host-call companion to [`Self::register_root_on`]. It
     /// preserves the backend's [`crate::CallOutcome`] terminal vocabulary.
     ///
-    /// # Panics
-    ///
-    /// Panics when the address targets a shard not owned by this local system,
-    /// matching [`Self::try_send`] and the lower-level threaded owner.
+    /// A foreign system or unowned shard is returned as a typed error before
+    /// host work is admitted.
     pub fn call_blocking<M, R>(
         &self,
         address: Address<M, R>,
@@ -2236,13 +2261,36 @@ where
         self.runtime().call_blocking(address, message, timeout)
     }
 
+    /// Like [`call_blocking`](Self::call_blocking), but separates the target
+    /// call deadline from the host-side wait budget.
+    ///
+    /// Returns [`ThreadedRuntimeError::ForeignSystem`] or
+    /// [`ThreadedRuntimeError::UnknownShard`] before admitting host work when
+    /// the address does not belong to this local topology.
+    pub fn call_blocking_with_host_timeout<M, R>(
+        &self,
+        address: Address<M, R>,
+        message: M,
+        target_timeout: Duration,
+        host_wait_timeout: Duration,
+    ) -> Result<crate::CallOutcome<R>, ThreadedRuntimeError>
+    where
+        M: Send + 'static,
+        R: Send + 'static,
+    {
+        self.runtime().call_blocking_with_host_timeout(
+            address,
+            message,
+            target_timeout,
+            host_wait_timeout,
+        )
+    }
+
     /// Performs one blocking host call through a split-service request
     /// capability, routed by the shard carried in `address`.
     ///
-    /// # Panics
-    ///
-    /// Panics when the address targets a shard not owned by this local system,
-    /// matching [`Self::call_blocking`].
+    /// A foreign system or unowned shard is returned as a typed error before
+    /// host work is admitted.
     pub fn call_blocking_request<Event, Request, Reply>(
         &self,
         address: tina::ServiceRequestAddress<Event, Request, Reply>,
@@ -2262,8 +2310,9 @@ where
     /// [`tina::stop_with`] on the shard carried by `address`.
     ///
     /// Routing, eager errors, and waiter outcomes match
-    /// [`ThreadedMultiShardRuntime::observe_result`]. An address for a shard
-    /// outside this local system returns [`crate::ResultWaitError::UnknownShard`].
+    /// [`ThreadedMultiShardRuntime::observe_result`]. A foreign system or
+    /// unowned shard is returned as a typed error before result authority or
+    /// observation capacity is claimed.
     pub fn observe_result<T: Send + 'static, M: 'static, R: 'static>(
         &self,
         address: Address<M, R>,
