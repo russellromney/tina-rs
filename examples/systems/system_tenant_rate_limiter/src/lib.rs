@@ -9,8 +9,8 @@
 //! Two truths the specimen proves:
 //!
 //! 1. `retry_after` is a deterministic function of `(rate, burst, now,
-//!    key history)`. Two runs with the same script produce byte-identical
-//!    `retry_after` values.
+//!    key history)`. The gateway owns `now` through `call.now()`; simulator
+//!    tests provide virtual time through the same policy method.
 //! 2. Cold tenants make progress while a hot tenant is rate-limited.
 //!
 //! The service itself is plain Tina: bounded mailbox, request/reply with
@@ -19,13 +19,12 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use tina::CallRejectedReason;
 use tina::prelude::*;
 use tina_runtime::{
-    AdmissionDecision, CallOutcome, CapacitySummary, DefaultThreadedMailboxFactory, RateLimit,
-    ServiceHandle, ThreadedRuntime, format_discovery_line,
+    CallOutcome, CapacitySummary, DefaultThreadedMailboxFactory, RateLimit, RateLimitConfig,
+    RateLimitDecision, ServiceHandle, ThreadedRuntime, format_discovery_line,
 };
 
 /// Tenant identifier. Static strings keep the specimen allocation-free
@@ -35,14 +34,11 @@ pub type TenantId = &'static str;
 /// One request from a caller to the gateway.
 #[derive(Debug)]
 pub enum GatewayMsg {
-    /// `now` is the caller-supplied admission timestamp. In production
-    /// services this is `ctx.now()` on the caller side; the specimen
-    /// drives it explicitly so the replay determinism is visible.
+    /// Attempt one admission for `tenant`. The gateway owner supplies the
+    /// logical timestamp from `call.now()`.
     Request {
         /// Tenant to charge against.
         tenant: TenantId,
-        /// Admission timestamp.
-        now: Instant,
     },
     /// Read the limiter's current capacity surface. Equivalent to a
     /// `GET /debug/capacity` probe in a real edge service.
@@ -65,8 +61,13 @@ pub enum GatewayReply {
         /// Earliest moment the caller could retry.
         retry_after: Duration,
     },
-    /// Key table full — no slot for a fresh tenant.
-    TenantTableFull {
+    /// No tracked-key capacity remained for a fresh tenant.
+    TenantCapacityFull {
+        /// Tenant that could not be admitted.
+        tenant: TenantId,
+    },
+    /// The limiter has been explicitly closed.
+    Closed {
         /// Tenant that could not be admitted.
         tenant: TenantId,
     },
@@ -81,7 +82,7 @@ pub struct SnapshotReport {
     pub live_tenants: usize,
     /// Cumulative `RateLimited` decisions.
     pub rate_limited_count: u64,
-    /// Cumulative `Full` (table full) decisions.
+    /// Cumulative tracked-key-capacity decisions.
     pub full_count: u64,
     /// One-line discovery summary for the capacity surface.
     pub discovery_line: String,
@@ -111,24 +112,18 @@ impl Gateway {
 
     fn handle_call(&mut self, msg: GatewayMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
         match msg {
-            GatewayMsg::Request { tenant, now } => match self.rate.try_admit(&tenant, now) {
-                AdmissionDecision::Admitted(_grant) => call.reply(GatewayReply::Ok { tenant }),
-                AdmissionDecision::RateLimited { retry_after, .. } => {
+            GatewayMsg::Request { tenant } => match self.rate.try_admit_at(&tenant, call.now()) {
+                RateLimitDecision::Admitted => call.reply(GatewayReply::Ok { tenant }),
+                RateLimitDecision::RateLimited { retry_after, .. } => {
                     call.reply(GatewayReply::Limited {
                         tenant,
                         retry_after,
                     })
                 }
-                AdmissionDecision::Full(_) => call.reply(GatewayReply::TenantTableFull { tenant }),
-                AdmissionDecision::Closed(_)
-                | AdmissionDecision::Wait { .. }
-                | AdmissionDecision::Degrade { .. }
-                | AdmissionDecision::TimedOut(_) => {
-                    // The policy is configured as Shed; these arms are
-                    // unreachable in the default first form. Reject loudly
-                    // if a future change rewires the policy.
-                    call.reject(CallRejectedReason::UnsupportedMessage)
+                RateLimitDecision::KeyCapacityFull(_) => {
+                    call.reply(GatewayReply::TenantCapacityFull { tenant })
                 }
+                RateLimitDecision::Closed(_) => call.reply(GatewayReply::Closed { tenant }),
             },
             GatewayMsg::Snapshot => {
                 let report = self.rate.report();
@@ -212,9 +207,11 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
 
     let rate = RateLimit::<TenantId>::new(
         "tenant.rate",
-        config.max_tenants,
-        config.rate_per_sec,
-        config.burst,
+        RateLimitConfig {
+            max_keys: config.max_tenants,
+            rate_per_sec: config.rate_per_sec,
+            burst: config.burst,
+        },
     );
 
     let gateway: ServiceHandle<GatewayMsg, GatewayReply> = runtime
@@ -222,8 +219,6 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         .map_err(|e| anyhow::anyhow!("register gateway: {e:?}"))?;
 
     let timeout = Duration::from_millis(config.call_timeout_ms);
-    let base = Instant::now();
-
     let mut hot_admitted = 0usize;
     let mut hot_limited = 0usize;
     let mut hot_retry_afters_ms: Vec<u128> = Vec::with_capacity(config.hot_requests);
@@ -233,7 +228,6 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
                 gateway.call,
                 GatewayMsg::Request {
                     tenant: "tenant.hot",
-                    now: base,
                 },
                 timeout,
             )
@@ -257,7 +251,6 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
                 gateway.call,
                 GatewayMsg::Request {
                     tenant: "tenant.cold",
-                    now: base,
                 },
                 timeout,
             )

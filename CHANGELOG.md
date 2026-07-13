@@ -4,16 +4,22 @@ This file records completed work.
 
 ## Unreleased
 
-### Narrow rate-limit decisions
+### Rate-limit API ergonomics
 
-- `RateLimit::try_admit` now returns
-  `RateLimitDecision::{Admitted, RateLimited, TableFull, Closed}` directly.
+- `RateLimit::try_admit_at` now returns the payload-free
+  `RateLimitDecision::{Admitted, RateLimited, KeyCapacityFull, Closed}`
+  directly. The `_at` suffix names the logical-time boundary, and
+  `Admitted` reflects that its token is already consumed with nothing to
+  release.
   The unused speculative rate-specific table-pressure builders were removed;
   generic `ServicePolicy::decide` remains the explicit widening boundary to
   `AdmissionDecision`. This is a nightly pre-0.1 API correction.
-- Direct callers should import `RateLimitDecision` and rename the former
-  `AdmissionDecision::Full` arm to `TableFull`; generic `ServicePolicy`
-  callers retain the broad decision shape unchanged.
+- `RateLimitConfig` replaces three positional numeric constructor arguments
+  with named `max_keys`, `rate_per_sec`, and `burst` fields.
+- Direct callers should import `RateLimitDecision`, use owner time from
+  `ctx.now()` or `call.now()`, and handle `KeyCapacityFull`; generic
+  `ServicePolicy` callers retain the broad decision shape with `()` on rate
+  admission.
 
 ### Report-preserving application shutdown
 
@@ -1634,9 +1640,9 @@ Closed the remaining gaps against the phase plan's proof/specimen list:
 
 - `KeyedLimit` and `RateLimit` track `live_keys` as an `O(1)` field
   instead of scanning all slots on every `report()`.
-- `KeyedLimit::try_admit` and `RateLimit::try_admit` take `&K` instead
-  of `K`. The hot path (existing key) is allocation-free even for
-  `K = String`; the key is only cloned on the new-slot allocation path.
+- `KeyedLimit::try_admit` and `RateLimit::try_admit_at` take `&K` instead of
+  `K`. The hot path (existing key) is allocation-free even for `K = String`;
+  the key is only cloned on the new-slot allocation path.
 - `RateLimit::forget_key` renamed to `evict_key_for_capacity` with an
   explicit doc that it is a policy-owned lever, not a request-path
   helper, plus an `evicted_count` telemetry counter.
@@ -1669,8 +1675,8 @@ Closed the remaining gaps against the phase plan's proof/specimen list:
   sequences across runs. Per-key storage is a fixed-capacity `Vec<Option<...>>`;
   the first form does not silently evict a key to make room for a new
   one. The `examples/systems/system_tenant_rate_limiter` specimen drives
-  the cold-tenant-progresses-while-hot-tenant-is-limited proof and
-  asserts byte-identical `retry_after` across two runs.
+  the cold-tenant-progresses-while-hot-tenant-is-limited proof. Exact replay
+  timing is asserted under simulator-owned virtual time.
 - Compile-fail proofs cover `KeyedPermit` move-only release (no double
   release) and the private-field invariant that user code cannot forge a
   permit via a struct literal.

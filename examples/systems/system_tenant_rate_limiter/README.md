@@ -4,9 +4,9 @@ Edge-service rate limiter where every tenant owns its own token bucket.
 
 The specimen proves two truths the admission policy layer cares about:
 
-1. **Replay determinism.** `retry_after` is a pure function of `(rate,
-   burst, now, key history)`. Two runs over the same script produce
-   byte-identical `retry_after` values; sim and live make the same call.
+1. **Replayable policy time.** `retry_after` is a pure function of `(rate,
+   burst, now, key history)`. The live gateway supplies owner time from
+   `call.now()`; simulator tests use the same API with virtual time.
 2. **Hot tenant cannot starve cold tenants.** A tenant that exhausts its
    bucket sees `Limited { retry_after }`; a different tenant arriving at
    the same moment still gets `Ok`. Pressure stays per-key.
@@ -17,7 +17,7 @@ What it does not do:
   decides whether to sleep and try again; the gateway never retries.
 - No growing key map. The tenant table is fixed-capacity; the third
   distinct tenant on a `max_tenants=2` configuration is rejected with a
-  typed `TenantTableFull` reply.
+  typed `TenantCapacityFull` reply.
 - No background sweeper. State drops with the runtime.
 
 Run it:
@@ -28,12 +28,12 @@ cargo test --manifest-path examples/systems/system_tenant_rate_limiter/Cargo.tom
 
 ## Findings
 
-What felt good: `try_admit(&tenant, ctx.now())` borrows the key (alloc-free
-hot path) and threads time explicitly, so the same code is deterministic
-under sim replay; `RateLimited { retry_after }` is exact, not approximate.
+What felt good: `try_admit_at(&tenant, call.now())` borrows the key
+(allocation-free hot path), names the explicit logical-time boundary, and
+keeps timestamp authority with the gateway owner. The same call is
+deterministic under simulator virtual time.
 
-What felt rough: a policy that only ever yields `Ok` / `RateLimited` /
-`TenantTableFull` still forces an exhaustive match over all
-`AdmissionDecision` variants (the rest are `unreachable!()`). See the
-cross-specimen "Admission and rate policy ergonomics" entry in
-[`examples/FINDINGS.md`](../../FINDINGS.md).
+The narrow `RateLimitDecision::{Admitted, RateLimited, KeyCapacityFull,
+Closed}` match contains only outcomes this policy can produce. `Admitted`
+has no payload because the token is already consumed and nothing remains to
+release.

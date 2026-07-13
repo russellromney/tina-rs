@@ -19,7 +19,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina_runtime::{RateLimit, RateLimitDecision, RuntimeEvent, stable_trace_hash};
+use tina_runtime::{
+    RateLimit, RateLimitConfig, RateLimitDecision, RuntimeEvent, stable_trace_hash,
+};
 use tina_sim::{Simulator, SimulatorConfig};
 
 type DecisionLog = Rc<RefCell<Vec<String>>>;
@@ -47,12 +49,14 @@ impl Gate {
                 // The load-bearing line: `now` comes from the simulator's
                 // virtual clock, not the wall clock.
                 let now = ctx.now();
-                let decision = match self.limiter.try_admit(&key, now) {
-                    RateLimitDecision::Admitted(_) => format!("{key}=ok"),
+                let decision = match self.limiter.try_admit_at(&key, now) {
+                    RateLimitDecision::Admitted => format!("{key}=ok"),
                     RateLimitDecision::RateLimited { retry_after, .. } => {
                         format!("{key}=rate({}ms)", retry_after.as_millis())
                     }
-                    RateLimitDecision::TableFull(_) => format!("{key}=table_full"),
+                    RateLimitDecision::KeyCapacityFull(_) => {
+                        format!("{key}=key_capacity_full")
+                    }
                     RateLimitDecision::Closed(_) => format!("{key}=closed"),
                 };
                 self.log.borrow_mut().push(decision);
@@ -71,7 +75,7 @@ const SCRIPT: &[(&str, u64)] = &[
     ("a", 50),  // 50ms < refill window → still limited
     ("a", 120), // enough time for one token → ok
     ("b", 200),
-    ("c", 200), // a third distinct key (max_keys = 2) → table full
+    ("c", 200), // a third distinct key (max_keys = 2) -> key capacity full
     ("a", 260),
 ];
 
@@ -89,7 +93,14 @@ fn run(seed: u64) -> (Vec<String>, Vec<RuntimeEvent>) {
     );
     let gate = sim.register::<_, _, Infallible>(Gate {
         // 10 tokens/sec, burst 2, up to 2 keys.
-        limiter: RateLimit::new("sim.rate", 2, 10, 2),
+        limiter: RateLimit::new(
+            "sim.rate",
+            RateLimitConfig {
+                max_keys: 2,
+                rate_per_sec: 10,
+                burst: 2,
+            },
+        ),
         log: Rc::clone(&log),
     });
 
@@ -130,8 +141,10 @@ fn rate_limit_decisions_replay_byte_identical_under_sim_time() {
         "script did not hit the rate-limit path: {decisions_a:?}",
     );
     assert!(
-        decisions_a.iter().any(|d| d.ends_with("=table_full")),
-        "script did not hit key-table pressure: {decisions_a:?}",
+        decisions_a
+            .iter()
+            .any(|d| d.ends_with("=key_capacity_full")),
+        "script did not hit tracked-key capacity: {decisions_a:?}",
     );
     assert!(
         decisions_a.iter().filter(|d| d.ends_with("=ok")).count() >= 3,
@@ -166,7 +179,14 @@ fn retry_after_under_sim_is_the_exact_token_window() {
     let log: DecisionLog = Rc::new(RefCell::new(Vec::new()));
     let mut sim = Simulator::new(SingleShard, SimulatorConfig::default());
     let gate = sim.register::<_, _, Infallible>(Gate {
-        limiter: RateLimit::new("sim.exact", 2, 10, 1),
+        limiter: RateLimit::new(
+            "sim.exact",
+            RateLimitConfig {
+                max_keys: 2,
+                rate_per_sec: 10,
+                burst: 1,
+            },
+        ),
         log: Rc::clone(&log),
     });
     // Burst 1: first admit OK, second at the same instant is rate-limited

@@ -365,7 +365,7 @@ three small policy types that compose with everything above.
 ```rust
 use tina_runtime::{
     AdmissionDecision, ConcurrencyLimit, KeyedLimit, PressureAction, RateLimit,
-    RateLimitDecision, ServicePolicy,
+    RateLimitConfig, RateLimitDecision, ServicePolicy,
 };
 ```
 
@@ -394,24 +394,36 @@ match policy.decide(key, now) {
 }
 ```
 
-`RateLimit::try_admit` uses a narrower decision so handlers only match outcomes
-the token bucket can produce:
+`RateLimit::try_admit_at` uses a narrower decision so handlers only match
+outcomes the token bucket can produce. The `_at` suffix makes the explicit
+logical-time authority visible:
 
 ```rust
-match rate.try_admit(tenant, call.now()) {
-    RateLimitDecision::Admitted(grant) => serve(tenant, grant),
+let mut rate = RateLimit::new(
+    "gateway.rate",
+    RateLimitConfig {
+        max_keys: 1_000,
+        rate_per_sec: 10,
+        burst: 20,
+    },
+);
+
+match rate.try_admit_at(&tenant, call.now()) {
+    RateLimitDecision::Admitted => serve(tenant),
     RateLimitDecision::RateLimited { retry_after, .. } => {
         reply_limited(retry_after)
     }
-    RateLimitDecision::TableFull(_) => reply_full(),
+    RateLimitDecision::KeyCapacityFull(_) => reply_full(),
     RateLimitDecision::Closed(_) => reply_closed(),
 }
 ```
 
-`RateLimit` sheds key-table pressure as `TableFull`; it has no hidden wait,
-degrade, or pressure-triggered close configuration. Explicit `close()` still
-produces `Closed`. Generic code can drive it through `ServicePolicy::decide`,
-which deliberately widens these four outcomes into `AdmissionDecision`.
+`Admitted` carries no permit because its token has already been consumed;
+there is no authority or capacity to release. `RateLimit` reports tracked-key
+pressure as `KeyCapacityFull`; it has no hidden wait, degrade, or
+pressure-triggered close configuration. Explicit `close()` still produces
+`Closed`. Generic code can drive it through `ServicePolicy::decide`, which
+deliberately widens these four outcomes into `AdmissionDecision<()>`.
 
 Rules the layer keeps:
 
@@ -425,14 +437,14 @@ Rules the layer keeps:
   `CapacitySurfaceReport`; rejection counts roll into `full_count` so
   `summary.any_full()` stays honest for admission surfaces.
 - **Fixed-capacity per-key storage.** No growing `HashMap`. A new rate-limit
-  key finds a free slot or sees `TableFull(report)`; broad admission policies
-  use `Full(report)`. Neither path silently evicts.
+  key finds a free slot or sees `KeyCapacityFull(report)`; broad admission
+  policies use `Full(report)`. Neither path silently evicts.
 - **Move-only proofs.** `ConcurrencyPermit` / `KeyedPermit` cannot be released
   twice. The compile-fail tests prove it.
 
 `examples/systems/system_tenant_rate_limiter` is the motivating R&D proof. Its
-dependent migration will adopt `RateLimitDecision` and move timestamp
-authority from the request to the gateway's `call.now()`.
+gateway owns timestamp authority through `call.now()`; callers cannot mint
+refill credit by supplying an admission timestamp.
 
 ## Shared Weighted Budgets
 
