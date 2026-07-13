@@ -61,4 +61,18 @@ fn invalid_config_returns_without_allocating_or_panicking() {
     })
     .expect_err("oversized mailbox is unsafe configuration");
     assert!(format!("{error:#}").contains("lane_mailbox=100001"));
+
+    let error = run(RunConfig {
+        work_ms: 60_001,
+        ..RunConfig::default()
+    })
+    .expect_err("oversized work duration is unsafe configuration");
+    assert!(format!("{error:#}").contains("work_ms=60001ms exceeds maximum 60000ms"));
+
+    let error = run(RunConfig {
+        call_timeout_ms: 60_001,
+        ..RunConfig::default()
+    })
+    .expect_err("oversized caller timeout is unsafe configuration");
+    assert!(format!("{error:#}").contains("call_timeout_ms=60001ms exceeds maximum 60000ms"));
 }

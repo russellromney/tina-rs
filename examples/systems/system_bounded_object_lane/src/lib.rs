@@ -15,6 +15,8 @@ use tina_runtime::{
 const MAX_CALLERS: usize = 10_000;
 const MAX_LANE_IN_FLIGHT: usize = 10_000;
 const MAX_LANE_MAILBOX: usize = 100_000;
+const MAX_WORK_MS: u64 = 60_000;
+const MAX_CALL_TIMEOUT_MS: u64 = 60_000;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy)]
@@ -57,9 +59,13 @@ impl RunConfig {
         validate_cap("lane_in_flight", self.lane_in_flight, 1, MAX_LANE_IN_FLIGHT)?;
         // Zero is useful for deterministic mailbox-full tests.
         validate_cap("lane_mailbox", self.lane_mailbox, 0, MAX_LANE_MAILBOX)?;
-        if self.call_timeout_ms == 0 {
-            return Err(RunConfigError::ZeroDuration("call_timeout_ms"));
-        }
+        validate_duration("work_ms", self.work_ms, false, MAX_WORK_MS)?;
+        validate_duration(
+            "call_timeout_ms",
+            self.call_timeout_ms,
+            true,
+            MAX_CALL_TIMEOUT_MS,
+        )?;
         Ok(self)
     }
 }
@@ -77,6 +83,11 @@ pub enum RunConfigError {
         max: usize,
     },
     ZeroDuration(&'static str),
+    DurationTooLarge {
+        field: &'static str,
+        value_ms: u64,
+        max_ms: u64,
+    },
 }
 
 impl fmt::Display for RunConfigError {
@@ -92,6 +103,11 @@ impl fmt::Display for RunConfigError {
                 max,
             } => write!(f, "{field}={value} is outside {min}..={max}"),
             Self::ZeroDuration(field) => write!(f, "{field} must be non-zero"),
+            Self::DurationTooLarge {
+                field,
+                value_ms,
+                max_ms,
+            } => write!(f, "{field}={value_ms}ms exceeds maximum {max_ms}ms"),
         }
     }
 }
@@ -566,6 +582,25 @@ fn validate_cap(
     }
 }
 
+fn validate_duration(
+    field: &'static str,
+    value_ms: u64,
+    require_nonzero: bool,
+    max_ms: u64,
+) -> Result<(), RunConfigError> {
+    if require_nonzero && value_ms == 0 {
+        Err(RunConfigError::ZeroDuration(field))
+    } else if value_ms > max_ms {
+        Err(RunConfigError::DurationTooLarge {
+            field,
+            value_ms,
+            max_ms,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 fn env_usize(name: &'static str) -> Result<Option<usize>, RunConfigError> {
     env_parse(name)
 }
@@ -679,6 +714,28 @@ mod tests {
             .validate()
             .is_ok()
         );
+        assert!(matches!(
+            RunConfig {
+                work_ms: MAX_WORK_MS + 1,
+                ..RunConfig::default()
+            }
+            .validate(),
+            Err(RunConfigError::DurationTooLarge {
+                field: "work_ms",
+                ..
+            })
+        ));
+        assert!(matches!(
+            RunConfig {
+                call_timeout_ms: MAX_CALL_TIMEOUT_MS + 1,
+                ..RunConfig::default()
+            }
+            .validate(),
+            Err(RunConfigError::DurationTooLarge {
+                field: "call_timeout_ms",
+                ..
+            })
+        ));
     }
 
     #[test]
