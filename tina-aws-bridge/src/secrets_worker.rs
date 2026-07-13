@@ -14,7 +14,9 @@ use aws_sdk_secretsmanager::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_secretsmanager::operation::get_secret_value::GetSecretValueError;
 use tina::CallContext;
 use tina::prelude::*;
-use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeError, sleep};
+use tina_runtime::{
+    LocalSystem, MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeError, sleep,
+};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 #[cfg(feature = "tracing")]
@@ -53,7 +55,7 @@ struct SecretsInFlight {
     request_kind: &'static str,
 }
 
-/// Result of [`SecretsWorker::install`].
+/// Result of [`SecretsWorker::install`] or [`SecretsWorker::install_local`].
 pub struct InstalledSecretsBridge<S: Shard + 'static> {
     /// Tina address callers use with `call(...)`.
     pub address: Address<SecretsMsg, SecretsResult>,
@@ -182,6 +184,12 @@ pub struct SecretsWorker<S: Shard + 'static> {
     metrics: Arc<SecretsMetricsInner>,
     _owned_runtime: Option<OwnedRuntime>,
     _shard: PhantomData<S>,
+}
+
+impl<S: Shard + 'static> Drop for SecretsWorker<S> {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+    }
 }
 
 impl<S: Shard + 'static> SecretsWorker<S> {
@@ -444,6 +452,27 @@ impl<S: Shard + 'static> SecretsWorker<S> {
 }
 
 impl<S: Shard + Send + 'static> SecretsWorker<S> {
+    fn install_via(
+        config: SecretsConfig,
+        register: impl FnOnce(
+            Self,
+            usize,
+        )
+            -> Result<Address<SecretsMsg, SecretsResult>, ThreadedRuntimeError>,
+    ) -> Result<InstalledSecretsBridge<S>, SecretsInstallError> {
+        config.validate()?;
+        let cap = config.mailbox_capacity;
+        let (worker, metrics) = Self::new(config).map_err(SecretsInstallError::Build)?;
+        let closer = worker.closer();
+        let address = register(worker, cap).map_err(SecretsInstallError::Register)?;
+        Ok(InstalledSecretsBridge {
+            address,
+            closer,
+            metrics,
+            _shard: PhantomData,
+        })
+    }
+
     /// Validate config, build the worker, register it, and return the
     /// address, closer, and metrics handle.
     pub fn install<F>(
@@ -453,18 +482,21 @@ impl<S: Shard + Send + 'static> SecretsWorker<S> {
     where
         F: MailboxFactory + Send + 'static,
     {
-        config.validate()?;
-        let cap = config.mailbox_capacity;
-        let (worker, metrics) = Self::new(config).map_err(SecretsInstallError::Build)?;
-        let closer = worker.closer();
-        let address = runtime
-            .register_with_capacity::<_, Infallible>(worker, cap)
-            .map_err(SecretsInstallError::Register)?;
-        Ok(InstalledSecretsBridge {
-            address,
-            closer,
-            metrics,
-            _shard: PhantomData,
+        Self::install_via(config, |worker, cap| {
+            runtime.register_with_capacity::<_, Infallible>(worker, cap)
+        })
+    }
+
+    /// Local-system first form of [`Self::install`].
+    pub fn install_local<F>(
+        system: &LocalSystem<S, F>,
+        config: SecretsConfig,
+    ) -> Result<InstalledSecretsBridge<S>, SecretsInstallError>
+    where
+        F: MailboxFactory + Send + 'static,
+    {
+        Self::install_via(config, |worker, cap| {
+            system.register_root::<_, Infallible>(worker, cap)
         })
     }
 }
@@ -480,6 +512,18 @@ where
     F: MailboxFactory + Send + 'static,
 {
     SecretsWorker::<S>::install(runtime, config)
+}
+
+/// Local-system first form of [`install_secrets`].
+pub fn install_secrets_local<S, F>(
+    system: &LocalSystem<S, F>,
+    config: SecretsConfig,
+) -> Result<InstalledSecretsBridge<S>, SecretsInstallError>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+{
+    SecretsWorker::<S>::install_local(system, config)
 }
 
 impl<S: Shard + 'static> Isolate for SecretsWorker<S> {
@@ -677,5 +721,40 @@ fn tally_terminal(metrics: &SecretsMetricsInner, result: &SecretsResult) {
             metrics.sdk_errors.fetch_add(1, Ordering::Relaxed);
         }
         Err(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod install_tests {
+    use super::*;
+    use tina::SingleShard;
+
+    #[test]
+    fn rejected_install_drops_the_fully_built_worker() {
+        for expected in [
+            ThreadedRuntimeError::CommandFull,
+            ThreadedRuntimeError::WorkerStopped,
+        ] {
+            let retained = Arc::new(std::sync::Mutex::new(None));
+            let retained_for_register = Arc::clone(&retained);
+            let result = SecretsWorker::<SingleShard>::install_via(
+                SecretsConfig::default(),
+                move |worker, _| {
+                    *retained_for_register.lock().expect("retained closer") = Some(worker.closer());
+                    Err(expected)
+                },
+            );
+            assert!(
+                matches!(result, Err(SecretsInstallError::Register(error)) if error == expected)
+            );
+            let closer = retained
+                .lock()
+                .expect("retained closer")
+                .take()
+                .expect("closer captured before registration");
+            assert!(closer.is_closed());
+            assert_eq!(Arc::strong_count(&closer.closed), 1);
+            assert_eq!(Arc::strong_count(&closer.metrics), 1);
+        }
     }
 }

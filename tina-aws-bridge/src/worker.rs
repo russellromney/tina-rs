@@ -18,7 +18,9 @@ use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use tina::CallContext;
 use tina::prelude::*;
-use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeError, sleep};
+use tina_runtime::{
+    LocalSystem, MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeError, sleep,
+};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 #[cfg(feature = "tracing")]
@@ -58,7 +60,7 @@ struct InFlight {
     request_kind: &'static str,
 }
 
-/// Result of [`S3Worker::install`].
+/// Result of [`S3Worker::install`] or [`S3Worker::install_local`].
 pub struct InstalledS3Bridge<S: Shard + 'static> {
     /// Tina address callers use with `call(...)`.
     pub address: Address<S3Msg, S3Result>,
@@ -189,6 +191,12 @@ pub struct S3Worker<S: Shard + 'static> {
     metrics: Arc<MetricsInner>,
     _owned_runtime: Option<OwnedRuntime>,
     _shard: PhantomData<S>,
+}
+
+impl<S: Shard + 'static> Drop for S3Worker<S> {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+    }
 }
 
 impl<S: Shard + 'static> S3Worker<S> {
@@ -455,6 +463,23 @@ impl<S: Shard + 'static> S3Worker<S> {
 }
 
 impl<S: Shard + Send + 'static> S3Worker<S> {
+    fn install_via(
+        config: S3Config,
+        register: impl FnOnce(Self, usize) -> Result<Address<S3Msg, S3Result>, ThreadedRuntimeError>,
+    ) -> Result<InstalledS3Bridge<S>, InstallError> {
+        config.validate()?;
+        let cap = config.mailbox_capacity;
+        let (worker, metrics) = Self::new(config).map_err(InstallError::Build)?;
+        let closer = worker.closer();
+        let address = register(worker, cap).map_err(InstallError::Register)?;
+        Ok(InstalledS3Bridge {
+            address,
+            closer,
+            metrics,
+            _shard: PhantomData,
+        })
+    }
+
     /// Validate config, build the worker, register it, and return the
     /// address, closer, and metrics handle.
     pub fn install<F>(
@@ -464,18 +489,21 @@ impl<S: Shard + Send + 'static> S3Worker<S> {
     where
         F: MailboxFactory + Send + 'static,
     {
-        config.validate()?;
-        let cap = config.mailbox_capacity;
-        let (worker, metrics) = Self::new(config).map_err(InstallError::Build)?;
-        let closer = worker.closer();
-        let address = runtime
-            .register_with_capacity::<_, Infallible>(worker, cap)
-            .map_err(InstallError::Register)?;
-        Ok(InstalledS3Bridge {
-            address,
-            closer,
-            metrics,
-            _shard: PhantomData,
+        Self::install_via(config, |worker, cap| {
+            runtime.register_with_capacity::<_, Infallible>(worker, cap)
+        })
+    }
+
+    /// Local-system first form of [`Self::install`].
+    pub fn install_local<F>(
+        system: &LocalSystem<S, F>,
+        config: S3Config,
+    ) -> Result<InstalledS3Bridge<S>, InstallError>
+    where
+        F: MailboxFactory + Send + 'static,
+    {
+        Self::install_via(config, |worker, cap| {
+            system.register_root::<_, Infallible>(worker, cap)
         })
     }
 }
@@ -491,6 +519,18 @@ where
     F: MailboxFactory + Send + 'static,
 {
     S3Worker::<S>::install(runtime, config)
+}
+
+/// Local-system first form of [`install_s3`].
+pub fn install_s3_local<S, F>(
+    system: &LocalSystem<S, F>,
+    config: S3Config,
+) -> Result<InstalledS3Bridge<S>, InstallError>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+{
+    S3Worker::<S>::install_local(system, config)
 }
 
 impl<S: Shard + 'static> Isolate for S3Worker<S> {
@@ -778,5 +818,36 @@ fn tally_terminal(metrics: &MetricsInner, result: &S3Result) {
             metrics.response_too_large.fetch_add(1, Ordering::Relaxed);
         }
         Err(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod install_tests {
+    use super::*;
+    use tina::SingleShard;
+
+    #[test]
+    fn rejected_install_drops_the_fully_built_worker() {
+        for expected in [
+            ThreadedRuntimeError::CommandFull,
+            ThreadedRuntimeError::WorkerStopped,
+        ] {
+            let retained = Arc::new(std::sync::Mutex::new(None));
+            let retained_for_register = Arc::clone(&retained);
+            let result =
+                S3Worker::<SingleShard>::install_via(S3Config::default(), move |worker, _| {
+                    *retained_for_register.lock().expect("retained closer") = Some(worker.closer());
+                    Err(expected)
+                });
+            assert!(matches!(result, Err(InstallError::Register(error)) if error == expected));
+            let closer = retained
+                .lock()
+                .expect("retained closer")
+                .take()
+                .expect("closer captured before registration");
+            assert!(closer.is_closed());
+            assert_eq!(Arc::strong_count(&closer.closed), 1);
+            assert_eq!(Arc::strong_count(&closer.metrics), 1);
+        }
     }
 }

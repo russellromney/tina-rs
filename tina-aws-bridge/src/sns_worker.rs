@@ -16,7 +16,9 @@ use aws_sdk_sns::primitives::Blob;
 use aws_sdk_sns::types::MessageAttributeValue;
 use tina::CallContext;
 use tina::prelude::*;
-use tina_runtime::{MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeError, sleep};
+use tina_runtime::{
+    LocalSystem, MailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeError, sleep,
+};
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 #[cfg(feature = "tracing")]
@@ -56,7 +58,7 @@ struct SnsInFlight {
     request_kind: &'static str,
 }
 
-/// Result of [`SnsWorker::install`].
+/// Result of [`SnsWorker::install`] or [`SnsWorker::install_local`].
 pub struct InstalledSnsBridge<S: Shard + 'static> {
     /// Tina address callers use with `call(...)`.
     pub address: Address<SnsMsg, SnsResult>,
@@ -185,6 +187,12 @@ pub struct SnsWorker<S: Shard + 'static> {
     metrics: Arc<SnsMetricsInner>,
     _owned_runtime: Option<OwnedRuntime>,
     _shard: PhantomData<S>,
+}
+
+impl<S: Shard + 'static> Drop for SnsWorker<S> {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::Release);
+    }
 }
 
 impl<S: Shard + 'static> SnsWorker<S> {
@@ -443,6 +451,23 @@ impl<S: Shard + 'static> SnsWorker<S> {
 }
 
 impl<S: Shard + Send + 'static> SnsWorker<S> {
+    fn install_via(
+        config: SnsConfig,
+        register: impl FnOnce(Self, usize) -> Result<Address<SnsMsg, SnsResult>, ThreadedRuntimeError>,
+    ) -> Result<InstalledSnsBridge<S>, SnsInstallError> {
+        config.validate()?;
+        let cap = config.mailbox_capacity;
+        let (worker, metrics) = Self::new(config).map_err(SnsInstallError::Build)?;
+        let closer = worker.closer();
+        let address = register(worker, cap).map_err(SnsInstallError::Register)?;
+        Ok(InstalledSnsBridge {
+            address,
+            closer,
+            metrics,
+            _shard: PhantomData,
+        })
+    }
+
     /// Validate config, build the worker, register it, and return the
     /// address, closer, and metrics handle.
     pub fn install<F>(
@@ -452,18 +477,21 @@ impl<S: Shard + Send + 'static> SnsWorker<S> {
     where
         F: MailboxFactory + Send + 'static,
     {
-        config.validate()?;
-        let cap = config.mailbox_capacity;
-        let (worker, metrics) = Self::new(config).map_err(SnsInstallError::Build)?;
-        let closer = worker.closer();
-        let address = runtime
-            .register_with_capacity::<_, Infallible>(worker, cap)
-            .map_err(SnsInstallError::Register)?;
-        Ok(InstalledSnsBridge {
-            address,
-            closer,
-            metrics,
-            _shard: PhantomData,
+        Self::install_via(config, |worker, cap| {
+            runtime.register_with_capacity::<_, Infallible>(worker, cap)
+        })
+    }
+
+    /// Local-system first form of [`Self::install`].
+    pub fn install_local<F>(
+        system: &LocalSystem<S, F>,
+        config: SnsConfig,
+    ) -> Result<InstalledSnsBridge<S>, SnsInstallError>
+    where
+        F: MailboxFactory + Send + 'static,
+    {
+        Self::install_via(config, |worker, cap| {
+            system.register_root::<_, Infallible>(worker, cap)
         })
     }
 }
@@ -479,6 +507,18 @@ where
     F: MailboxFactory + Send + 'static,
 {
     SnsWorker::<S>::install(runtime, config)
+}
+
+/// Local-system first form of [`install_sns`].
+pub fn install_sns_local<S, F>(
+    system: &LocalSystem<S, F>,
+    config: SnsConfig,
+) -> Result<InstalledSnsBridge<S>, SnsInstallError>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+{
+    SnsWorker::<S>::install_local(system, config)
 }
 
 impl<S: Shard + 'static> Isolate for SnsWorker<S> {
@@ -714,5 +754,36 @@ fn tally_terminal(metrics: &SnsMetricsInner, result: &SnsResult) {
             metrics.sdk_errors.fetch_add(1, Ordering::Relaxed);
         }
         Err(_) => {}
+    }
+}
+
+#[cfg(test)]
+mod install_tests {
+    use super::*;
+    use tina::SingleShard;
+
+    #[test]
+    fn rejected_install_drops_the_fully_built_worker() {
+        for expected in [
+            ThreadedRuntimeError::CommandFull,
+            ThreadedRuntimeError::WorkerStopped,
+        ] {
+            let retained = Arc::new(std::sync::Mutex::new(None));
+            let retained_for_register = Arc::clone(&retained);
+            let result =
+                SnsWorker::<SingleShard>::install_via(SnsConfig::default(), move |worker, _| {
+                    *retained_for_register.lock().expect("retained closer") = Some(worker.closer());
+                    Err(expected)
+                });
+            assert!(matches!(result, Err(SnsInstallError::Register(error)) if error == expected));
+            let closer = retained
+                .lock()
+                .expect("retained closer")
+                .take()
+                .expect("closer captured before registration");
+            assert!(closer.is_closed());
+            assert_eq!(Arc::strong_count(&closer.closed), 1);
+            assert_eq!(Arc::strong_count(&closer.metrics), 1);
+        }
     }
 }
