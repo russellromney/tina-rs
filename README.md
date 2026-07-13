@@ -44,10 +44,8 @@ retry Run(3) after one step -> Accepted
 send Run(4) after stop -> Closed(Run(4)); host retains the job
 ```
 
-The complete program is below. Its checked-in source is
-[`tina-runtime/examples/bounded_mailbox.rs`](tina-runtime/examples/bounded_mailbox.rs),
-which the normal all-target workspace checks compile. A test also requires this
-README block to remain byte-for-byte synchronized with that source.
+The complete program is below and in 
+[`tina-runtime/examples/bounded_mailbox.rs`](tina-runtime/examples/bounded_mailbox.rs).
 
 <!-- bounded-mailbox-source -->
 ```rust
