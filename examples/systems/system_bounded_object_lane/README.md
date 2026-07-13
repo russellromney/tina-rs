@@ -48,11 +48,14 @@ Tina capability pulled:
 - Host-side concurrent calls.
 - Typed AWS bridge outcome shape.
 
-Remaining integration limitation:
-- `tina-aws-bridge` installation currently requires the lower threaded owner.
-  Until bridge installation has `LocalSystem` parity, `run_against_s3` is an
-  integration-shape probe rather than a self-contained live application
-  entry point. The hermetic fake path is fully runnable and tested.
+The real S3 path:
+- `run_against_s3` accepts `S3Config`, installs the bridge through the same
+  `LocalSystem` as the lane, and never accepts a foreign runtime address.
+- Typed install, application, bridge-drain, combined application-plus-drain,
+  startup, and facade-shutdown failures remain distinct.
+- The bridge is closed and drained while its facade is still alive;
+  `S3RunReport` makes both `workload` and successful `drain` mandatory.
+- A hermetic HTTP endpoint test exercises this full path without AWS access.
 
 Verdict:
 - keep

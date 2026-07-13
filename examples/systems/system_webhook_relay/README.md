@@ -46,10 +46,14 @@ cargo test --manifest-path examples/systems/system_webhook_relay/Cargo.toml
 
 - The `Retry` reply does not include a backoff suggestion; budget and timing
   remain caller-owned.
-- `tina-aws-bridge` installation currently requires the lower threaded owner.
-  Until bridge installation has `LocalSystem` parity, `run_against_sqs` is an
-  integration-shape probe rather than a self-contained live application
-  entry point. No simulator parity is claimed for real bridge IO.
+- `run_against_sqs` accepts `SqsConfig`, installs into the relay's
+  `LocalSystem`, closes and drains the bridge before facade shutdown, and
+  returns `SqsRunReport` with mandatory `workload` and successful `drain`.
+- Typed install, relay workload, drain, combined workload-plus-drain, startup,
+  and facade-shutdown failures remain distinct. No simulator parity is claimed
+  for real bridge IO.
+- A hermetic HTTP endpoint test exercises the full real bridge lifecycle
+  without an AWS account.
 
 ## Tina capability pulled
 

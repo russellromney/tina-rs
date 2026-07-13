@@ -27,7 +27,7 @@ use tina::CallRejectedReason;
 use tina::prelude::*;
 use tina_aws_bridge::{
     BridgeFatal, BridgeOutcomeClass, BridgeRetryable, BridgeUnavailable, SqsAddress, SqsError,
-    SqsRequest, SqsResponse, SqsSendMessage, send_sqs,
+    SqsConfig, SqsDrainReport, SqsInstallError, SqsRequest, SqsResponse, SqsSendMessage, send_sqs,
 };
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, ReportedWorkloadError,
@@ -568,6 +568,15 @@ pub struct RunReport {
     pub stats: RelayStats,
 }
 
+/// Successful real-SQS run with mandatory relay and bridge-drain truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqsRunReport {
+    /// Relay workload outcomes.
+    pub workload: RunReport,
+    /// Successful bridge close-and-drain result captured before facade shutdown.
+    pub drain: SqsDrainReport,
+}
+
 /// A non-reply terminal outcome from the final stats request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatsTerminalOutcome {
@@ -584,6 +593,8 @@ pub enum StatsTerminalOutcome {
 /// Typed workload failure retained by [`run_to_shutdown_reported`](LocalSystem::run_to_shutdown_reported).
 #[derive(Debug)]
 pub enum RelayWorkloadError {
+    /// The SQS bridge config, client, runtime, or Tina registration failed.
+    BridgeInstall(SqsInstallError),
     /// A root service could not be registered.
     Registration {
         service: &'static str,
@@ -595,11 +606,19 @@ pub enum RelayWorkloadError {
     StatsTerminal(StatsTerminalOutcome),
     /// The relay answered the stats request with the wrong reply variant.
     UnexpectedStatsReply(Box<RelayReply>),
+    /// Application work succeeded but accepted SQS work did not drain.
+    BridgeDrain(SqsDrainReport),
+    /// Application work and SQS drain both failed; neither is discarded.
+    WorkloadAndBridgeDrain {
+        workload: Box<RelayWorkloadError>,
+        drain: SqsDrainReport,
+    },
 }
 
 impl fmt::Display for RelayWorkloadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::BridgeInstall(source) => write!(f, "install SQS bridge: {source}"),
             Self::Registration { service, source } => {
                 write!(f, "register {service}: {source}")
             }
@@ -610,6 +629,17 @@ impl fmt::Display for RelayWorkloadError {
             Self::UnexpectedStatsReply(reply) => {
                 write!(f, "stats call returned unexpected reply: {reply:?}")
             }
+            Self::BridgeDrain(report) => write!(
+                f,
+                "SQS bridge did not drain: remaining={} kinds={:?}",
+                report.in_flight_remaining, report.in_flight_kinds
+            ),
+            Self::WorkloadAndBridgeDrain { workload, drain } => write!(
+                f,
+                "relay workload failed ({workload}) and SQS bridge did not drain: \
+                 remaining={} kinds={:?}",
+                drain.in_flight_remaining, drain.in_flight_kinds
+            ),
         }
     }
 }
@@ -617,8 +647,10 @@ impl fmt::Display for RelayWorkloadError {
 impl Error for RelayWorkloadError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::BridgeInstall(source) => Some(source),
             Self::Registration { source, .. } | Self::StatsHost(source) => Some(source),
-            Self::StatsTerminal(_) | Self::UnexpectedStatsReply(_) => None,
+            Self::WorkloadAndBridgeDrain { workload, .. } => Some(workload.as_ref()),
+            Self::StatsTerminal(_) | Self::UnexpectedStatsReply(_) | Self::BridgeDrain(_) => None,
         }
     }
 }
@@ -707,9 +739,9 @@ pub fn run(config: RunConfig) -> Result<RunReport, RunError> {
         .map_err(|error| RunError::Terminal(Box::new(error)))
 }
 
-/// Run the relay against a `tina-aws-bridge` SQS worker. The caller
-/// supplies an already-installed bridge address, the queue URL, and
-/// the per-call timeout. The relay forwards `events` events
+/// Run the relay against an SQS worker installed into the same `LocalSystem`.
+/// The caller supplies bridge configuration, the queue URL, and the per-call
+/// timeout. The relay forwards `events` events
 /// sequentially through the bridge and returns each typed outcome
 /// plus the final stats.
 ///
@@ -719,20 +751,19 @@ pub fn run(config: RunConfig) -> Result<RunReport, RunError> {
 pub fn run_against_sqs(
     events: usize,
     call_timeout_ms: u64,
-    sqs_address: tina_aws_bridge::SqsAddress,
+    sqs_config: SqsConfig,
     queue_url: String,
     bridge_timeout: Duration,
-) -> Result<RunReport, RunError> {
+) -> Result<SqsRunReport, RunError> {
     validate_event_count(events).map_err(RunError::InvalidConfig)?;
     validate_timeout_ms("call timeout", call_timeout_ms).map_err(RunError::InvalidConfig)?;
     if queue_url.trim().is_empty() {
         return Err(RunError::InvalidConfig(RunConfigError::EmptyQueueUrl));
     }
-    let bridge_timeout_ms = bridge_timeout.as_millis();
-    if bridge_timeout_ms > u128::from(MAX_CALL_TIMEOUT_MS) {
+    if bridge_timeout > Duration::from_millis(MAX_CALL_TIMEOUT_MS) {
         return Err(RunError::InvalidConfig(RunConfigError::DurationTooLarge {
             field: "bridge timeout",
-            requested_ms: bridge_timeout_ms,
+            requested_ms: duration_millis_ceil(bridge_timeout),
             max_ms: MAX_CALL_TIMEOUT_MS,
         }));
     }
@@ -742,11 +773,13 @@ pub fn run_against_sqs(
         .map_err(RunError::Startup)?;
     runtime
         .run_to_shutdown_reported(SHUTDOWN_TIMEOUT, |runtime| {
-            let relay = runtime
+            let bridge = tina_aws_bridge::install_sqs_local(runtime, sqs_config)
+                .map_err(RelayWorkloadError::BridgeInstall)?;
+            let workload = runtime
                 .register_split_service::<Relay, RelayEvent, RelayRequest, Infallible>(
                     Relay::new(
                         OutboundPort::Sqs(SqsOutbound {
-                            address: sqs_address,
+                            address: bridge.address,
                             queue_url,
                             timeout: bridge_timeout,
                         }),
@@ -757,11 +790,31 @@ pub fn run_against_sqs(
                 .map_err(|source| RelayWorkloadError::Registration {
                     service: "relay",
                     source,
-                })?;
-
-            drive_relay(runtime, relay.requests, events, call_timeout_ms)
+                })
+                .and_then(|relay| drive_relay(runtime, relay.requests, events, call_timeout_ms));
+            let drain = bridge.closer.close_and_drain(SHUTDOWN_TIMEOUT);
+            finish_sqs_workload(workload, drain)
         })
         .map_err(|error| RunError::Terminal(Box::new(error)))
+}
+
+fn duration_millis_ceil(duration: Duration) -> u128 {
+    duration.as_nanos().div_ceil(1_000_000)
+}
+
+fn finish_sqs_workload(
+    workload: Result<RunReport, RelayWorkloadError>,
+    drain: SqsDrainReport,
+) -> Result<SqsRunReport, RelayWorkloadError> {
+    match (workload, drain.drained) {
+        (Ok(workload), true) => Ok(SqsRunReport { workload, drain }),
+        (Err(error), true) => Err(error),
+        (Ok(_), false) => Err(RelayWorkloadError::BridgeDrain(drain)),
+        (Err(workload), false) => Err(RelayWorkloadError::WorkloadAndBridgeDrain {
+            workload: Box::new(workload),
+            drain,
+        }),
+    }
 }
 
 fn drive_relay(
@@ -820,7 +873,10 @@ fn drive_relay(
         Err(error) => return Err(RelayWorkloadError::StatsHost(error)),
     };
 
-    Ok(RunReport { replies, stats })
+    Ok(RunReport {
+        replies,
+        stats,
+    })
 }
 
 fn classify_driver_outcome(
@@ -967,6 +1023,37 @@ mod tests {
             classify_driver_outcome(Err(ThreadedRuntimeError::HostWaitTimeout)),
             DriverReply::RuntimeError(ThreadedRuntimeError::HostWaitTimeout)
         );
+    }
+
+    #[test]
+    fn sqs_lifecycle_retains_workload_and_drain_failures_together() {
+        let drain = SqsDrainReport {
+            closed: true,
+            drained: false,
+            in_flight_remaining: 1,
+            in_flight_kinds: vec![("send_message", 1)],
+        };
+        let error = finish_sqs_workload(
+            Err(RelayWorkloadError::StatsTerminal(
+                StatsTerminalOutcome::Timeout,
+            )),
+            drain,
+        )
+        .expect_err("both failures must remain visible");
+        assert!(matches!(
+            error,
+            RelayWorkloadError::WorkloadAndBridgeDrain {
+                workload,
+                drain: SqsDrainReport {
+                    drained: false,
+                    in_flight_remaining: 1,
+                    ..
+                },
+            } if matches!(
+                workload.as_ref(),
+                RelayWorkloadError::StatsTerminal(StatsTerminalOutcome::Timeout)
+            )
+        ));
     }
 
     #[test]

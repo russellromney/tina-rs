@@ -286,20 +286,21 @@ authority exactly. The cache uses `SharedWork` for bounded single-flight
 callers and generation-stamps invalidation. The request-only tenant limiter
 stamps `RateLimit` admission with `RequestCall::now()` and preserves the narrow
 four-way decision vocabulary on live and simulator owners. `Admitted` consumes
-the token in place, so the example carries no permit-shaped cleanup. The request-only
-webhook fake removes its dummy event lane and preserves every outer call,
-bridge, rejection, and worker-domain outcome. A final audit also stopped the
-gateway from treating a failed runtime timer as successful held work.
+the token in place, so the example carries no permit-shaped cleanup. The
+request-only webhook fake removes its dummy event lane and preserves every
+outer call, bridge, rejection, and worker-domain outcome. A final audit also
+stopped the gateway from treating a failed runtime timer as successful held
+work.
 
-The real AWS paths expose one remaining framework prerequisite: bridge workers
-can only be installed through `ThreadedRuntime`, while these application
-runners own a `LocalSystem`. Passing an already-installed S3/SQS address into a
-new facade does not establish that the address belongs to the new runtime.
-`tina-aws-bridge` needs LocalSystem installation parity (including typed
-install failure, close/drain, metrics, and shutdown ownership) before
-`run_against_s3` and `run_against_sqs` can be canonical live application
-entry points. The hermetic fake paths are complete; the real bridge runners
-remain integration-shape probes and are not claimed as runnable closures.
+The real AWS paths exposed one final framework prerequisite: an installed
+S3/SQS address could belong to a different threaded owner than the new
+`LocalSystem` created by the runner. AWS bridge installation now has
+`LocalSystem` parity across S3, SQS, SNS, DynamoDB, and Secrets Manager.
+`run_against_s3` and `run_against_sqs` accept bridge config, install into the
+same facade as the application service, retain typed install and application
+failures, close and drain while the facade remains live, preserve a combined
+workload-plus-drain failure, and only then consume facade shutdown. Hermetic
+real bridge tests prove the complete lifecycle without an AWS account.
 
 ### 2026-07-12 Request-aware raw flow prerequisite
 

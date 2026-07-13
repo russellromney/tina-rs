@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::fmt;
 use std::thread;
 use std::time::Duration;
@@ -8,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use tina::prelude::*;
 use tina_runtime::{
     CallError, CallOutcome, ConcurrencyParkError, ConcurrencyParkTicket, ConcurrencyPendingReplies,
-    DefaultThreadedMailboxFactory, LocalSystem, SleepReply, request_effect_after_concurrency_park,
-    sleep,
+    DefaultThreadedMailboxFactory, LocalSystem, ReportedWorkloadError, RunToShutdownError,
+    SleepReply, StartupError, request_effect_after_concurrency_park, sleep,
 };
 
 const MAX_CALLERS: usize = 10_000;
@@ -85,9 +86,10 @@ pub enum RunConfigError {
     ZeroDuration(&'static str),
     DurationTooLarge {
         field: &'static str,
-        value_ms: u64,
+        value_ms: u128,
         max_ms: u64,
     },
+    EmptyS3Bucket,
 }
 
 impl fmt::Display for RunConfigError {
@@ -108,6 +110,7 @@ impl fmt::Display for RunConfigError {
                 value_ms,
                 max_ms,
             } => write!(f, "{field}={value_ms}ms exceeds maximum {max_ms}ms"),
+            Self::EmptyS3Bucket => f.write_str("S3 bucket must not be empty"),
         }
     }
 }
@@ -127,6 +130,103 @@ pub struct RunReport {
     pub rejection_reasons: Vec<tina::CallRejectedReason>,
     pub stats: LaneStats,
     pub dropped_permits: u64,
+}
+
+/// Successful real-S3 run with mandatory application and bridge-drain truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3RunReport {
+    /// Object-lane workload outcomes.
+    pub workload: RunReport,
+    /// Successful bridge close-and-drain result captured before facade shutdown.
+    pub drain: tina_aws_bridge::S3DrainReport,
+}
+
+/// Workload-side failures for [`run_against_s3`].
+#[derive(Debug)]
+pub enum S3WorkloadError {
+    /// The bridge config, client, runtime, or Tina registration failed.
+    Install(tina_aws_bridge::InstallError),
+    /// The object-lane application failed after bridge installation.
+    Application(anyhow::Error),
+    /// The application succeeded but accepted SDK work did not drain.
+    Drain(tina_aws_bridge::S3DrainReport),
+    /// Both application work and bridge drain failed; neither is discarded.
+    ApplicationAndDrain {
+        application: anyhow::Error,
+        drain: tina_aws_bridge::S3DrainReport,
+    },
+}
+
+impl fmt::Display for S3WorkloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Install(error) => write!(f, "install S3 bridge: {error}"),
+            Self::Application(error) => write!(f, "object-lane workload failed: {error}"),
+            Self::Drain(report) => write!(
+                f,
+                "S3 bridge did not drain: remaining={} kinds={:?}",
+                report.in_flight_remaining, report.in_flight_kinds
+            ),
+            Self::ApplicationAndDrain { application, drain } => write!(
+                f,
+                "object-lane workload failed ({application}) and S3 bridge did not drain: \
+                 remaining={} kinds={:?}",
+                drain.in_flight_remaining, drain.in_flight_kinds
+            ),
+        }
+    }
+}
+
+impl Error for S3WorkloadError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Install(error) => Some(error),
+            Self::Application(error) | Self::ApplicationAndDrain { application: error, .. } => {
+                Some(error.as_ref())
+            }
+            Self::Drain(_) => None,
+        }
+    }
+}
+
+impl AsRef<dyn Error + Send + Sync + 'static> for S3WorkloadError {
+    fn as_ref(&self) -> &(dyn Error + Send + Sync + 'static) {
+        self
+    }
+}
+
+/// Terminal S3 runner failure preserving workload and facade shutdown truth.
+pub type S3TerminalError = RunToShutdownError<ReportedWorkloadError<S3WorkloadError>>;
+
+/// Complete failure surface for [`run_against_s3`].
+#[derive(Debug)]
+pub enum S3RunError {
+    /// Inputs were rejected before runtime construction.
+    InvalidConfig(RunConfigError),
+    /// The local runtime could not start.
+    Startup(StartupError),
+    /// Workload, bridge drain, facade shutdown, or a preserved combination failed.
+    Terminal(Box<S3TerminalError>),
+}
+
+impl fmt::Display for S3RunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfig(error) => write!(f, "invalid S3 lane configuration: {error}"),
+            Self::Startup(error) => write!(f, "S3 lane startup failed: {error}"),
+            Self::Terminal(error) => write!(f, "S3 lane run failed: {error}"),
+        }
+    }
+}
+
+impl Error for S3RunError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidConfig(error) => Some(error),
+            Self::Startup(error) => Some(error),
+            Self::Terminal(error) => Some(error.as_ref()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -360,38 +460,76 @@ impl ObjectLane {
     }
 }
 
-/// Runs the lane against an installed `tina-aws-bridge` S3 worker.
+/// Runs the lane against an S3 worker installed into the same `LocalSystem`.
 ///
 /// Lane admission remains local and bounded. Bridge admission, delivery,
 /// rejection, worker, and unexpected-response failures retain their typed
 /// variants in [`WorkFailure`].
 pub fn run_against_s3(
     config: RunConfig,
-    s3_address: tina_aws_bridge::S3Address,
+    s3_config: tina_aws_bridge::S3Config,
     bucket: String,
     key_prefix: String,
     bridge_timeout: Duration,
-) -> anyhow::Result<RunReport> {
-    let config = config.validate()?;
+) -> Result<S3RunReport, S3RunError> {
+    let config = config.validate().map_err(S3RunError::InvalidConfig)?;
+    if bucket.trim().is_empty() {
+        return Err(S3RunError::InvalidConfig(RunConfigError::EmptyS3Bucket));
+    }
+    if bridge_timeout > Duration::from_millis(MAX_CALL_TIMEOUT_MS) {
+        return Err(S3RunError::InvalidConfig(
+            RunConfigError::DurationTooLarge {
+                field: "bridge_timeout",
+                value_ms: duration_millis_ceil(bridge_timeout),
+                max_ms: MAX_CALL_TIMEOUT_MS,
+            },
+        ));
+    }
     let dropped_before = tina_runtime::dropped_permit_count();
-    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+        .try_build()
+        .map_err(S3RunError::Startup)?;
     let mut report = app
         .run_to_shutdown_reported(SHUTDOWN_TIMEOUT, |app| {
-            let lane = register_lane(
+            let bridge = tina_aws_bridge::install_s3_local(app, s3_config)
+                .map_err(S3WorkloadError::Install)?;
+            let workload = register_lane(
                 app,
                 config,
                 WorkBackend::AwsS3 {
-                    address: s3_address,
+                    address: bridge.address,
                     bucket,
                     key_prefix,
                     timeout: bridge_timeout,
                 },
-            )?;
-            drive_callers(app, lane.requests, config)
+            )
+            .and_then(|lane| drive_callers(app, lane.requests, config));
+            let drain = bridge.closer.close_and_drain(SHUTDOWN_TIMEOUT);
+            finish_s3_workload(workload, drain)
         })
-        .map_err(anyhow::Error::from)?;
-    report.dropped_permits = tina_runtime::dropped_permit_count().saturating_sub(dropped_before);
+        .map_err(|error| S3RunError::Terminal(Box::new(error)))?;
+    report.workload.dropped_permits =
+        tina_runtime::dropped_permit_count().saturating_sub(dropped_before);
     Ok(report)
+}
+
+fn duration_millis_ceil(duration: Duration) -> u128 {
+    duration.as_nanos().div_ceil(1_000_000)
+}
+
+fn finish_s3_workload(
+    workload: anyhow::Result<RunReport>,
+    drain: tina_aws_bridge::S3DrainReport,
+) -> Result<S3RunReport, S3WorkloadError> {
+    match (workload, drain.drained) {
+        (Ok(workload), true) => Ok(S3RunReport { workload, drain }),
+        (Err(error), true) => Err(S3WorkloadError::Application(error)),
+        (Ok(_), false) => Err(S3WorkloadError::Drain(drain)),
+        (Err(application), false) => Err(S3WorkloadError::ApplicationAndDrain {
+            application,
+            drain,
+        }),
+    }
 }
 
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
@@ -593,7 +731,7 @@ fn validate_duration(
     } else if value_ms > max_ms {
         Err(RunConfigError::DurationTooLarge {
             field,
-            value_ms,
+            value_ms: u128::from(value_ms),
             max_ms,
         })
     } else {
@@ -669,6 +807,29 @@ mod tests {
             s3_outcome_to_work_result(CallOutcome::Replied(Ok(unexpected.clone()))),
             Err(WorkFailure::UnexpectedS3Response(unexpected))
         );
+    }
+
+    #[test]
+    fn s3_lifecycle_retains_workload_and_drain_failures_together() {
+        let drain = tina_aws_bridge::S3DrainReport {
+            closed: true,
+            drained: false,
+            in_flight_remaining: 1,
+            in_flight_kinds: vec![("put_object", 1)],
+        };
+        let error = finish_s3_workload(Err(anyhow::anyhow!("workload")), drain)
+            .expect_err("both failures must remain visible");
+        assert!(matches!(
+            error,
+            S3WorkloadError::ApplicationAndDrain {
+                application,
+                drain: tina_aws_bridge::S3DrainReport {
+                    drained: false,
+                    in_flight_remaining: 1,
+                    ..
+                },
+            } if application.to_string() == "workload"
+        ));
     }
 
     #[test]
