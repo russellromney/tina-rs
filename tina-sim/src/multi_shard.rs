@@ -197,6 +197,29 @@ where
         self.simulators.iter().any(Simulator::has_in_flight_calls)
     }
 
+    /// Registers a typed waiter for a terminal `stop_with` value on the
+    /// address's owning simulated shard.
+    ///
+    /// Foreign-system and unknown-shard addresses are rejected before any
+    /// per-shard observation capacity is claimed. All other registration and
+    /// wait outcomes match [`Simulator::observe_result`].
+    pub fn observe_result<T: Send + 'static, M: 'static, R: 'static>(
+        &mut self,
+        address: Address<M, R>,
+    ) -> Result<tina_runtime::IsolateResultWaiter<T>, tina_runtime::ResultWaitError> {
+        let expected = self.system_incarnation();
+        if address.system() != expected {
+            return Err(tina_runtime::ResultWaitError::ForeignSystem {
+                expected,
+                actual: address.system(),
+            });
+        }
+        let Some(index) = self.shard_indexes.get(&address.shard()).copied() else {
+            return Err(tina_runtime::ResultWaitError::UnknownShard(address.shard()));
+        };
+        self.simulators[index].observe_result::<T, M, R>(address)
+    }
+
     /// Registers one root isolate on the requested owning shard.
     #[allow(private_bounds)]
     pub fn register_on<I, Msg, Outbound>(
