@@ -17,6 +17,7 @@ const MAX_CALLERS: usize = 4_096;
 const MAX_PENDING_CAPACITY: usize = 65_536;
 const MAX_ENTRY_CAPACITY: usize = 65_536;
 const MAX_CACHE_MAILBOX: usize = 65_536;
+const MAX_DURATION_MS: u64 = 60_000;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy)]
@@ -53,7 +54,9 @@ pub enum ConfigError {
     ZeroCacheMailbox,
     CacheMailboxTooLarge { requested: usize, max: usize },
     ZeroFillDelay,
+    FillDelayTooLarge { requested_ms: u64, max_ms: u64 },
     ZeroCallTimeout,
+    CallTimeoutTooLarge { requested_ms: u64, max_ms: u64 },
 }
 
 impl fmt::Display for ConfigError {
@@ -76,7 +79,18 @@ impl fmt::Display for ConfigError {
                 write!(f, "cache mailbox {requested} exceeds maximum {max}")
             }
             Self::ZeroFillDelay => write!(f, "fill delay must be positive"),
+            Self::FillDelayTooLarge {
+                requested_ms,
+                max_ms,
+            } => write!(f, "fill delay {requested_ms}ms exceeds maximum {max_ms}ms"),
             Self::ZeroCallTimeout => write!(f, "call timeout must be positive"),
+            Self::CallTimeoutTooLarge {
+                requested_ms,
+                max_ms,
+            } => write!(
+                f,
+                "call timeout {requested_ms}ms exceeds maximum {max_ms}ms"
+            ),
         }
     }
 }
@@ -818,8 +832,20 @@ fn validate_config(config: RunConfig) -> Result<(), ConfigError> {
     if config.fill_ms == 0 {
         return Err(ConfigError::ZeroFillDelay);
     }
+    if config.fill_ms > MAX_DURATION_MS {
+        return Err(ConfigError::FillDelayTooLarge {
+            requested_ms: config.fill_ms,
+            max_ms: MAX_DURATION_MS,
+        });
+    }
     if config.call_timeout_ms == 0 {
         return Err(ConfigError::ZeroCallTimeout);
+    }
+    if config.call_timeout_ms > MAX_DURATION_MS {
+        return Err(ConfigError::CallTimeoutTooLarge {
+            requested_ms: config.call_timeout_ms,
+            max_ms: MAX_DURATION_MS,
+        });
     }
     Ok(())
 }

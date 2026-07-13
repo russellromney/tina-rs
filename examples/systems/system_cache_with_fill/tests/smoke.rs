@@ -127,6 +127,26 @@ fn invalid_configuration_is_typed_and_rejected_before_startup() {
                 max: 65_536,
             },
         ),
+        (
+            RunConfig {
+                fill_ms: u64::MAX,
+                ..RunConfig::default()
+            },
+            ConfigError::FillDelayTooLarge {
+                requested_ms: u64::MAX,
+                max_ms: 60_000,
+            },
+        ),
+        (
+            RunConfig {
+                call_timeout_ms: u64::MAX,
+                ..RunConfig::default()
+            },
+            ConfigError::CallTimeoutTooLarge {
+                requested_ms: u64::MAX,
+                max_ms: 60_000,
+            },
+        ),
     ];
 
     for (config, expected) in cases {
