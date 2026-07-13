@@ -54,11 +54,11 @@
 //!   permits; evicting a key with outstanding permits would orphan them.
 //!   Slots free themselves when the last permit is released. There is no
 //!   meaningful eviction to expose.
-//! - **Per-key storage owns `K`.** Lookups borrow (`try_admit(&K)`), so the
-//!   hot path of an existing key is allocation-free. A new key is cloned
-//!   once when its slot is allocated, and the stored `K` is dropped when the
-//!   slot frees. For `K = String` that is one alloc per *slot allocation*,
-//!   not per request.
+//! - **Per-key storage owns `K`.** Lookups borrow (`KeyedLimit::try_admit(&K)`
+//!   and `RateLimit::try_admit_at(&K, Instant)`), so the hot path of an
+//!   existing key is allocation-free. A new key is cloned once when its slot
+//!   is allocated, and the stored `K` is dropped when the slot frees. For
+//!   `K = String` that is one alloc per *slot allocation*, not per request.
 //! - **[`AdmissionDecision`] is sized at its largest variant** (it carries an
 //!   [`AdmissionReport`]). It is meant to be matched and discarded at the
 //!   admission site, not stored. [`AdmissionDecision::into_admitted`] keeps
@@ -1644,10 +1644,8 @@ mod tests {
         let mut limit: RateLimit<()> = RateLimit::new("policy.trait", rate_config(1, 1, 1));
         let now = fixed_now();
         // First decision admits (burst = 1).
-        assert!(matches!(
-            admit_via_trait(&mut limit, &(), now),
-            AdmissionDecision::Admitted(_)
-        ));
+        let admitted: AdmissionDecision<()> = admit_via_trait(&mut limit, &(), now);
+        assert!(matches!(admitted, AdmissionDecision::Admitted(())));
         // Second decision in the same instant is rate-limited.
         assert!(matches!(
             admit_via_trait(&mut limit, &(), now),

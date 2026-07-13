@@ -408,7 +408,7 @@ let mut rate = RateLimit::new(
     },
 );
 
-match rate.try_admit_at(tenant, call.now()) {
+match rate.try_admit_at(&tenant, call.now()) {
     RateLimitDecision::Admitted => serve(tenant),
     RateLimitDecision::RateLimited { retry_after, .. } => {
         reply_limited(retry_after)

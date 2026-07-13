@@ -95,6 +95,18 @@ fn config(max_keys: usize, rate_per_sec: u64, burst: u32) -> RateLimitConfig {
 }
 
 #[test]
+fn every_zero_configuration_field_is_rejected() {
+    for (field, config) in [
+        ("max_keys", config(0, 1, 1)),
+        ("rate_per_sec", config(1, 0, 1)),
+        ("burst", config(1, 1, 0)),
+    ] {
+        let result = std::panic::catch_unwind(|| RateLimit::<()>::new("rate.invalid", config));
+        assert!(result.is_err(), "zero {field} must be rejected");
+    }
+}
+
+#[test]
 fn admit_consumes_immediately_and_refill_preserves_exact_truth() {
     let now = Instant::now();
     let mut limit = RateLimit::new("rate.refill", config(2, 10, 1));

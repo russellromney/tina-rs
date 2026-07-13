@@ -8,15 +8,21 @@ fn hot_tenant_is_limited_while_cold_tenant_progresses() {
     };
     let report = run(config).expect("run");
 
-    // Hot tenant: burst (3) admissions, the rest Limited.
+    // A live runtime owns wall-clock scheduling, so later requests may see
+    // refill credit. Assert accounting and visible pressure, not an exact
+    // admitted/limited split.
     assert_eq!(
-        report.hot_admitted, config.burst as usize,
-        "hot must admit exactly `burst` requests at t=0, got {report:?}"
+        report.hot_admitted + report.hot_limited,
+        config.hot_requests,
+        "every hot request must receive an admitted or limited reply, got {report:?}"
     );
-    assert_eq!(
-        report.hot_limited,
-        config.hot_requests - config.burst as usize,
-        "hot must rate-limit every request past burst, got {report:?}"
+    assert!(
+        report.hot_admitted >= config.burst as usize,
+        "the initial burst must admit, got {report:?}"
+    );
+    assert!(
+        report.hot_limited > 0,
+        "the tight live burst must expose rate pressure, got {report:?}"
     );
 
     // Cold tenant: every request admitted (cold_requests <= burst).

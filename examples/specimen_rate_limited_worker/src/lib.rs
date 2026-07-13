@@ -21,7 +21,7 @@
 //!
 //! Note on naming: the "rate" here is *throughput pacing*, not *admission
 //! rate limiting* (accept/reject at the door). The Tina side paces with a
-//! `tina_runtime::RateLimit<()>` token bucket — `try_admit((), ctx.now())`
+//! `tina_runtime::RateLimit<()>` token bucket — `try_admit_at(&(), ctx.now())`
 //! returns `Admitted` (process one) or `RateLimited { retry_after }` (sleep
 //! that long, then ask again) — so the rate window falls out of the
 //! limiter's deterministic `retry_after` instead of a hand-rolled sleep.
