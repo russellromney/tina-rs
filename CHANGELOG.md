@@ -4,6 +4,14 @@ This file records completed work.
 
 ## Unreleased
 
+### Shed-only rate-limit decisions
+
+- Added `ShedRateLimit<K>`, a construction-time shed policy whose
+  `ShedRateLimitDecision` exposes only `Admitted`, `RateLimited`, `TableFull`,
+  and explicit `Closed`. It shares `RateLimit`'s deterministic token bucket and
+  reporting while removing impossible wait, degrade, and timed-out handler
+  arms from immediate-shed services.
+
 ### Report-preserving application shutdown
 
 - `LocalSystem::run_to_shutdown_reported` and its multi-shard parity method

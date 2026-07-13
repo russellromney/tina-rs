@@ -365,6 +365,7 @@ three small policy types that compose with everything above.
 ```rust
 use tina_runtime::{
     AdmissionDecision, ConcurrencyLimit, KeyedLimit, PressureAction, RateLimit,
+    ShedRateLimit, ShedRateLimitDecision,
 };
 ```
 
@@ -378,8 +379,11 @@ Three policies, one decision shape:
 - `RateLimit<K>` — replayable per-key token bucket. Decisions are pure
   functions of `(rate, burst, now, key history)`. The caller supplies
   `now` from `ctx.now()` or sim-supplied time.
+- `ShedRateLimit<K>` — the same token bucket with key-table pressure fixed to
+  immediate shedding. Its narrower decision type cannot express wait,
+  degrade, or pressure-triggered close.
 
-Every `try_admit(...)` returns the same `AdmissionDecision<T>`:
+The three configurable policies return the same `AdmissionDecision<T>`:
 
 ```rust
 match limit.try_admit(tenant, ctx.now()) {
@@ -392,6 +396,24 @@ match limit.try_admit(tenant, ctx.now()) {
     AdmissionDecision::TimedOut(_) => reply_timeout(),
 }
 ```
+
+When immediate shedding is the configured policy, prefer the narrower form so
+the handler only matches outcomes the limiter can produce:
+
+```rust
+match shed_limit.try_admit(tenant, ctx.now()) {
+    ShedRateLimitDecision::Admitted(grant) => serve(tenant, grant),
+    ShedRateLimitDecision::RateLimited { retry_after, .. } => {
+        reply_limited(retry_after)
+    }
+    ShedRateLimitDecision::TableFull(_) => reply_full(),
+    ShedRateLimitDecision::Closed(_) => reply_closed(),
+}
+```
+
+`ShedRateLimit::new(...)` encodes that policy at construction; it does not
+expose `on_table_pressure`, so the returned decision vocabulary remains true
+after builder configuration. Explicit `close()` still produces `Closed`.
 
 Rules the layer keeps:
 

@@ -19,7 +19,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina_runtime::{AdmissionDecision, RateLimit, RuntimeEvent, stable_trace_hash};
+use tina_runtime::{
+    AdmissionDecision, RateLimit, RuntimeEvent, ShedRateLimit, ShedRateLimitDecision,
+    stable_trace_hash,
+};
 use tina_sim::{Simulator, SimulatorConfig};
 
 type DecisionLog = Rc<RefCell<Vec<String>>>;
@@ -146,6 +149,60 @@ fn rate_limit_decisions_are_independent_of_seed() {
     assert_eq!(
         decisions_1, decisions_2,
         "RateLimit decisions must not depend on the simulator seed",
+    );
+}
+
+#[test]
+fn shed_rate_limit_uses_the_same_narrow_vocabulary_under_sim_time() {
+    struct ShedGate {
+        limiter: ShedRateLimit<&'static str>,
+        log: DecisionLog,
+    }
+
+    #[tina_runtime::isolate(message = GateMsg)]
+    impl ShedGate {
+        fn handle(
+            &mut self,
+            msg: GateMsg,
+            ctx: &mut Context<'_, SingleShard, Self::Reply>,
+        ) -> Effect<Self> {
+            let GateMsg::Admit(key) = msg;
+            let decision = match self.limiter.try_admit(&key, ctx.now()) {
+                ShedRateLimitDecision::Admitted(_) => format!("{key}=ok"),
+                ShedRateLimitDecision::RateLimited { retry_after, .. } => {
+                    format!("{key}=rate({}ms)", retry_after.as_millis())
+                }
+                ShedRateLimitDecision::TableFull(_) => format!("{key}=table_full"),
+                ShedRateLimitDecision::Closed(_) => format!("{key}=closed"),
+            };
+            self.log.borrow_mut().push(decision);
+            noop()
+        }
+    }
+
+    let log: DecisionLog = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(SingleShard, SimulatorConfig::default());
+    let gate = sim.register::<_, _, Infallible>(ShedGate {
+        limiter: ShedRateLimit::new("sim.shed", 1, 10, 1),
+        log: Rc::clone(&log),
+    });
+    for key in ["alpha", "alpha", "beta"] {
+        sim.try_send(gate, GateMsg::Admit(key)).expect("send admit");
+        sim.step();
+    }
+    sim.advance_time(Duration::from_millis(100));
+    sim.try_send(gate, GateMsg::Admit("alpha"))
+        .expect("send refill admit");
+    sim.run_until_quiescent();
+
+    assert_eq!(
+        *log.borrow(),
+        [
+            "alpha=ok",
+            "alpha=rate(100ms)",
+            "beta=table_full",
+            "alpha=ok"
+        ]
     );
 }
 

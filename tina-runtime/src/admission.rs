@@ -19,10 +19,16 @@
 //! - [`KeyedLimit`] — fixed-cap per-key concurrency with explicit slot reuse.
 //! - [`RateLimit`] — replayable token-bucket per key, decisions are pure
 //!   functions of `(config, now, key history)`.
+//! - [`ShedRateLimit`] — the same token bucket with table pressure fixed to
+//!   immediate shedding and a four-variant [`ShedRateLimitDecision`].
 //!
-//! All three return [`AdmissionDecision`]. Successful admission carries a
-//! move-only proof object the caller must release explicitly. There is no
-//! hidden retry, no hidden queue, no growing per-key map.
+//! The configurable policies return [`AdmissionDecision`]. `ShedRateLimit`
+//! returns its smaller decision vocabulary because wait, degrade, and
+//! pressure-triggered close are unrepresentable in its configuration.
+//! Successful concurrency admission carries a move-only proof object the
+//! caller must release explicitly; a rate grant instead proves that one token
+//! was consumed. There is no hidden retry, hidden queue, or growing per-key
+//! map.
 //!
 //! Retry remains caller-owned. Pair these policies with [`crate::FullHandling`]
 //! when retry-with-backoff is the right answer, or treat each rejection as
@@ -1280,6 +1286,17 @@ struct RateSlot<K> {
     last_seen: Instant,
 }
 
+#[derive(Debug)]
+enum RateLimitCoreDecision<T> {
+    Admitted(T),
+    RateLimited {
+        retry_after: Duration,
+        report: AdmissionReport,
+    },
+    TableFull,
+    Closed(AdmissionReport),
+}
+
 const ONE_TOKEN_NT: u128 = 1_000_000_000;
 
 impl<K: Eq + Clone> RateLimit<K> {
@@ -1385,9 +1402,24 @@ impl<K: Eq + Clone> RateLimit<K> {
     /// backwards is treated as "no new credit since last call" — the
     /// previous `last_seen` is preserved.
     pub fn try_admit(&mut self, key: &K, now: Instant) -> AdmissionDecision<RateGrant<K>> {
+        match self.try_admit_core(key, now) {
+            RateLimitCoreDecision::Admitted(grant) => AdmissionDecision::Admitted(grant),
+            RateLimitCoreDecision::RateLimited {
+                retry_after,
+                report,
+            } => AdmissionDecision::RateLimited {
+                retry_after,
+                report,
+            },
+            RateLimitCoreDecision::TableFull => self.refuse_table(),
+            RateLimitCoreDecision::Closed(report) => AdmissionDecision::Closed(report),
+        }
+    }
+
+    fn try_admit_core(&mut self, key: &K, now: Instant) -> RateLimitCoreDecision<RateGrant<K>> {
         if self.closed {
             self.closed_count = self.closed_count.saturating_add(1);
-            return AdmissionDecision::Closed(self.report());
+            return RateLimitCoreDecision::Closed(self.report());
         }
         // Find existing slot.
         if let Some(idx) = self.find_slot(key) {
@@ -1413,20 +1445,16 @@ impl<K: Eq + Clone> RateLimit<K> {
                 self.high_water_keys = self.live_keys;
             }
             // burst >= 1 (we panic in `new`), so first admit always succeeds.
-            return AdmissionDecision::Admitted(RateGrant { _key: PhantomData });
+            return RateLimitCoreDecision::Admitted(RateGrant { _key: PhantomData });
         }
-        // Table full of other keys — map onto the configured table action.
-        self.refuse_table()
+        RateLimitCoreDecision::TableFull
     }
 
     /// Map a table-full rejection onto the configured [`PressureAction`].
     /// `full_count` is bumped only when the decision surfaces as `Full`.
     fn refuse_table(&mut self) -> AdmissionDecision<RateGrant<K>> {
         match self.action {
-            PressureAction::Shed => {
-                self.full_count = self.full_count.saturating_add(1);
-                AdmissionDecision::Full(self.report())
-            }
+            PressureAction::Shed => AdmissionDecision::Full(self.refuse_table_shed()),
             PressureAction::Degrade => {
                 self.degrade_count = self.degrade_count.saturating_add(1);
                 AdmissionDecision::Degrade {
@@ -1448,7 +1476,12 @@ impl<K: Eq + Clone> RateLimit<K> {
         }
     }
 
-    fn admit_existing(&mut self, idx: usize, now: Instant) -> AdmissionDecision<RateGrant<K>> {
+    fn refuse_table_shed(&mut self) -> AdmissionReport {
+        self.full_count = self.full_count.saturating_add(1);
+        self.report()
+    }
+
+    fn admit_existing(&mut self, idx: usize, now: Instant) -> RateLimitCoreDecision<RateGrant<K>> {
         let burst_nt = self.burst_nano_tokens;
         let rate = self.rate_per_sec;
         let slot = self
@@ -1471,7 +1504,7 @@ impl<K: Eq + Clone> RateLimit<K> {
         if new_available >= ONE_TOKEN_NT {
             slot.available_nt = new_available - ONE_TOKEN_NT;
             slot.last_seen = next_last_seen;
-            AdmissionDecision::Admitted(RateGrant { _key: PhantomData })
+            RateLimitCoreDecision::Admitted(RateGrant { _key: PhantomData })
         } else {
             // Not enough credit. Compute `retry_after` deterministically.
             let needed_nt = ONE_TOKEN_NT - new_available;
@@ -1481,7 +1514,7 @@ impl<K: Eq + Clone> RateLimit<K> {
             slot.available_nt = new_available;
             slot.last_seen = next_last_seen;
             self.rate_limited_count = self.rate_limited_count.saturating_add(1);
-            AdmissionDecision::RateLimited {
+            RateLimitCoreDecision::RateLimited {
                 retry_after,
                 report: self.report_const(),
             }
@@ -1575,6 +1608,152 @@ impl<K: Eq + Clone> RateLimit<K> {
     /// Capacity surface projection.
     pub fn capacity_surface(&self) -> CapacitySurfaceReport {
         self.report().capacity_surface()
+    }
+}
+
+/// Per-key token-bucket rate limiter with shed-only table pressure.
+///
+/// Unlike [`RateLimit`], this policy does not expose configurable table
+/// pressure. Its decision vocabulary is therefore limited to the four
+/// outcomes it can actually produce: admitted, rate-limited, table full, and
+/// closed. Use this form when a service sheds new keys immediately rather than
+/// waiting, degrading, or closing on table pressure.
+#[derive(Debug)]
+#[must_use = "ShedRateLimit is state; store it on the isolate"]
+pub struct ShedRateLimit<K> {
+    inner: RateLimit<K>,
+}
+
+/// Decision returned by [`ShedRateLimit::try_admit`].
+#[derive(Debug)]
+#[must_use = "ShedRateLimitDecision must be matched; on failure the caller decides reply or retry"]
+pub enum ShedRateLimitDecision<T> {
+    /// Admitted. Consume the move-only grant on the admitted path.
+    Admitted(T),
+    /// Refused because the key's token bucket was empty.
+    RateLimited {
+        /// Earliest delay after which the caller could try again.
+        retry_after: Duration,
+        /// Snapshot at decision time.
+        report: AdmissionReport,
+    },
+    /// Refused because the fixed-capacity key table had no free slot.
+    TableFull(AdmissionReport),
+    /// Refused because the policy was explicitly closed.
+    Closed(AdmissionReport),
+}
+
+impl<T> ShedRateLimitDecision<T> {
+    /// Borrow the report carried by a rejection, if any.
+    pub const fn report(&self) -> Option<&AdmissionReport> {
+        match self {
+            Self::Admitted(_) => None,
+            Self::RateLimited { report, .. } | Self::TableFull(report) | Self::Closed(report) => {
+                Some(report)
+            }
+        }
+    }
+}
+
+impl<K: Eq + Clone> ShedRateLimit<K> {
+    /// Build a shed-only rate limit allowing `rate_per_sec` admissions per
+    /// second per key, with a token bucket up to `burst` and at most
+    /// `max_keys` tracked keys.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rate_per_sec == 0`, `burst == 0`, or `max_keys == 0`.
+    pub fn new(
+        surface: impl Into<SurfaceName>,
+        max_keys: usize,
+        rate_per_sec: u64,
+        burst: u32,
+    ) -> Self {
+        Self {
+            inner: RateLimit::new(surface, max_keys, rate_per_sec, burst),
+        }
+    }
+
+    /// Set the configured capacity mode.
+    pub fn with_mode(mut self, mode: CapacityMode) -> Self {
+        self.inner = self.inner.with_mode(mode);
+        self
+    }
+
+    /// Try to admit one request for `key` at logical time `now`.
+    pub fn try_admit(&mut self, key: &K, now: Instant) -> ShedRateLimitDecision<RateGrant<K>> {
+        match self.inner.try_admit_core(key, now) {
+            RateLimitCoreDecision::Admitted(grant) => ShedRateLimitDecision::Admitted(grant),
+            RateLimitCoreDecision::RateLimited {
+                retry_after,
+                report,
+            } => ShedRateLimitDecision::RateLimited {
+                retry_after,
+                report,
+            },
+            RateLimitCoreDecision::TableFull => {
+                ShedRateLimitDecision::TableFull(self.inner.refuse_table_shed())
+            }
+            RateLimitCoreDecision::Closed(report) => ShedRateLimitDecision::Closed(report),
+        }
+    }
+
+    /// Configured rate per second.
+    pub const fn rate_per_sec(&self) -> u64 {
+        self.inner.rate_per_sec()
+    }
+
+    /// Configured burst.
+    pub const fn burst(&self) -> u32 {
+        self.inner.burst()
+    }
+
+    /// Configured key-table capacity.
+    pub fn max_keys(&self) -> usize {
+        self.inner.max_keys()
+    }
+
+    /// Number of live key slots.
+    pub const fn live_keys(&self) -> usize {
+        self.inner.live_keys()
+    }
+
+    /// Cumulative count of explicit key-table evictions.
+    pub const fn evicted_count(&self) -> u64 {
+        self.inner.evicted_count()
+    }
+
+    /// Explicitly evict one key's bucket state to free table capacity.
+    ///
+    /// This is an administrative policy lever with the same caveats as
+    /// [`RateLimit::evict_key_for_capacity`].
+    pub fn evict_key_for_capacity(&mut self, key: &K) -> bool {
+        self.inner.evict_key_for_capacity(key)
+    }
+
+    /// Mark this policy closed.
+    pub fn close(&mut self) {
+        self.inner.close();
+    }
+
+    /// `true` if closed.
+    pub const fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+
+    /// Build the current report.
+    pub fn report(&self) -> AdmissionReport {
+        self.inner.report()
+    }
+
+    /// Inspect one key's bucket state, if any.
+    pub fn key_state(&self, key: &K) -> Option<RateKeyState> {
+        self.inner.key_state(key)
+    }
+
+    /// Project the current report onto a capacity surface.
+    pub fn capacity_surface(&self) -> CapacitySurfaceReport {
+        self.inner.capacity_surface()
     }
 }
 

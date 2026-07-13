@@ -11,6 +11,25 @@ valid; the long-form history lives in
 
 ## Active
 
+### 2026-07-12 Shed-only rate-limit decision prerequisite
+
+`system_tenant_rate_limiter` configured immediate shedding for key-table
+pressure but had to match the full seven-variant `AdmissionDecision`, then
+collapse `Wait`, `Degrade`, `TimedOut`, and pressure-triggered close into an
+unsupported-message rejection. Those outcomes were impossible for the chosen
+policy, so the exhaustive match made the example less truthful rather than
+more defensive.
+
+`ShedRateLimit<K>` now encodes immediate table-pressure shedding in its
+construction and returns `ShedRateLimitDecision::{Admitted, RateLimited,
+TableFull, Closed}`. The implementation shares the existing deterministic
+token-bucket state machine without asserting a runtime `PressureAction`.
+Reports retain exact rate-limited, table-full, and explicit-close counts; the
+move-only `RateGrant` still proves token consumption. Runtime and simulator
+tests cover admission, exact retry timing, refill, table-capacity eviction,
+closed state, grant settlement, and deterministic virtual-time replay.
+Migrating the motivating system remains a separate dependent example change.
+
 ### 2026-07-12 Report-preserving LocalSystem terminal runner prerequisite
 
 Five application-shaped specimens use `anyhow::Result` for their host
