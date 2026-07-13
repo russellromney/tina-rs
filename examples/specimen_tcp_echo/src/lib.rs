@@ -142,21 +142,23 @@ pub enum EchoListenerMsg {
 /// Parent that owns the bound listener and spawns one handler per
 /// accepted connection.
 ///
-/// A production server would accept forever; the demo bounds accepts by
-/// `target_accepts` so the runtime reaches a clean stop.
+/// `target_accepts` is `None` to accept forever like a production
+/// server; `Some(n)` bounds accepts so a test reaches a clean stop.
 #[derive(Debug)]
 pub struct EchoListener {
     bind_addr: SocketAddr,
     max_chunk: usize,
-    target_accepts: usize,
+    target_accepts: Option<usize>,
     accepted: usize,
     listener: Option<ListenerId>,
 }
 
 impl EchoListener {
-    /// A listener that binds `bind_addr` and accepts `target_accepts`
-    /// connections before closing.
-    pub fn new(bind_addr: SocketAddr, target_accepts: usize) -> Self {
+    /// A listener that binds `bind_addr` and accepts connections.
+    ///
+    /// `target_accepts` is `None` to accept forever like a production
+    /// server; `Some(n)` bounds accepts so a test reaches a clean stop.
+    pub fn new(bind_addr: SocketAddr, target_accepts: Option<usize>) -> Self {
         Self {
             bind_addr,
             max_chunk: MAX_CHUNK,
@@ -199,6 +201,12 @@ impl EchoListener {
             }
             EchoListenerMsg::Accepted { stream } => {
                 self.accepted += 1;
+                // Server-side liveness for the standing server only. A
+                // bounded (test/demo) run leaves this quiet so its output
+                // stays deterministic.
+                if self.target_accepts.is_none() {
+                    println!("accepted connection");
+                }
                 let child = spawn(
                     ChildDefinition::new(
                         EchoConnection::new(stream, self.max_chunk),
@@ -206,10 +214,9 @@ impl EchoListener {
                     )
                     .with_initial_message(EchoConnectionMsg::Begin),
                 );
-                let follow_up = if self.accepted < self.target_accepts {
-                    EchoListenerMsg::AcceptNext
-                } else {
-                    EchoListenerMsg::Close
+                let follow_up = match self.target_accepts {
+                    Some(target) if self.accepted >= target => EchoListenerMsg::Close,
+                    _ => EchoListenerMsg::AcceptNext,
                 };
                 batch([child, ctx.send_self(follow_up)])
             }
@@ -247,7 +254,7 @@ pub fn echo_round_trip(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
 
     let listener = runtime
         .register_with_capacity::<EchoListener, EchoListenerMsg>(
-            EchoListener::new(bind_addr, 1),
+            EchoListener::new(bind_addr, Some(1)),
             LISTENER_CAPACITY,
         )
         .map_err(|e| anyhow::anyhow!("register listener: {e:?}"))?;

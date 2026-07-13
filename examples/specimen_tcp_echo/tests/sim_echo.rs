@@ -71,7 +71,7 @@ fn run_echo_sim_with_write_cap(payload: &[u8], write_cap: usize) -> ReplayArtifa
         },
     );
 
-    let listener = sim.register(EchoListener::new(bind_addr(), 1));
+    let listener = sim.register(EchoListener::new(bind_addr(), Some(1)));
     sim.try_send(listener, EchoListenerMsg::Start)
         .expect("start listener");
     sim.run_until_quiescent();
