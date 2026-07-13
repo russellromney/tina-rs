@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::error::Error as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -77,6 +78,12 @@ fn local_installs_return_callable_handles_drain_while_alive_and_shutdown_cleanly
         .expect("install DynamoDB");
     let secrets = tina_aws_bridge::install_secrets_local(&app, SecretsConfig::default())
         .expect("install Secrets Manager");
+
+    assert!(!s3.closer.is_closed());
+    assert!(!sqs.closer.is_closed());
+    assert!(!sns.closer.is_closed());
+    assert!(!dynamo.closer.is_closed());
+    assert!(!secrets.closer.is_closed());
 
     assert!(s3.closer.close_and_drain(Duration::ZERO).drained);
     assert!(sqs.closer.close_and_drain(Duration::ZERO).drained);
@@ -214,6 +221,58 @@ fn local_installs_preserve_typed_config_and_stopped_worker_errors() {
     ));
 }
 
+#[test]
+fn install_errors_preserve_typed_sources_for_every_service() {
+    macro_rules! assert_source {
+        ($error:expr, $source:ty) => {
+            assert!(
+                $error
+                    .source()
+                    .and_then(|source| source.downcast_ref::<$source>())
+                    .is_some(),
+                "{} must retain a typed {} source",
+                $error,
+                stringify!($source),
+            );
+        };
+    }
+
+    let s3_config = InstallError::Config(S3ConfigError::ZeroMailboxCapacity);
+    let s3_build = InstallError::Build(S3Error::Internal("build failed".into()));
+    let s3_register = InstallError::Register(ThreadedRuntimeError::WorkerStopped);
+    assert_source!(s3_config, S3ConfigError);
+    assert_source!(s3_build, S3Error);
+    assert_source!(s3_register, ThreadedRuntimeError);
+
+    let sqs_config = SqsInstallError::Config(SqsConfigError::ZeroMailboxCapacity);
+    let sqs_build = SqsInstallError::Build(SqsError::Internal("build failed".into()));
+    let sqs_register = SqsInstallError::Register(ThreadedRuntimeError::WorkerStopped);
+    assert_source!(sqs_config, SqsConfigError);
+    assert_source!(sqs_build, SqsError);
+    assert_source!(sqs_register, ThreadedRuntimeError);
+
+    let sns_config = SnsInstallError::Config(SnsConfigError::ZeroMailboxCapacity);
+    let sns_build = SnsInstallError::Build(SnsError::Internal("build failed".into()));
+    let sns_register = SnsInstallError::Register(ThreadedRuntimeError::WorkerStopped);
+    assert_source!(sns_config, SnsConfigError);
+    assert_source!(sns_build, SnsError);
+    assert_source!(sns_register, ThreadedRuntimeError);
+
+    let dynamo_config = DynamoInstallError::Config(DynamoConfigError::ZeroMailboxCapacity);
+    let dynamo_build = DynamoInstallError::Build(DynamoError::Internal("build failed".into()));
+    let dynamo_register = DynamoInstallError::Register(ThreadedRuntimeError::WorkerStopped);
+    assert_source!(dynamo_config, DynamoConfigError);
+    assert_source!(dynamo_build, DynamoError);
+    assert_source!(dynamo_register, ThreadedRuntimeError);
+
+    let secrets_config = SecretsInstallError::Config(SecretsConfigError::ZeroMailboxCapacity);
+    let secrets_build = SecretsInstallError::Build(SecretsError::Internal("build failed".into()));
+    let secrets_register = SecretsInstallError::Register(ThreadedRuntimeError::WorkerStopped);
+    assert_source!(secrets_config, SecretsConfigError);
+    assert_source!(secrets_build, SecretsError);
+    assert_source!(secrets_register, ThreadedRuntimeError);
+}
+
 #[derive(Debug)]
 enum GateMsg {
     Hold,
@@ -222,6 +281,14 @@ enum GateMsg {
 struct Gate {
     entered: Arc<AtomicBool>,
     release: Arc<AtomicBool>,
+}
+
+struct ReleaseOnDrop(Arc<AtomicBool>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 #[tina_runtime::isolate(message = GateMsg)]
@@ -263,6 +330,7 @@ fn local_installs_report_command_full_then_refill_for_every_service() {
         .expect("start bounded local system");
     let entered = Arc::new(AtomicBool::new(false));
     let release = Arc::new(AtomicBool::new(false));
+    let release_on_drop = ReleaseOnDrop(Arc::clone(&release));
     let gate = app
         .register_root::<Gate, Infallible>(
             Gate {
@@ -273,9 +341,11 @@ fn local_installs_report_command_full_then_refill_for_every_service() {
         )
         .expect("register gate");
     app.try_send(gate, GateMsg::Hold).expect("occupy worker");
-    while !entered.load(Ordering::Acquire) {
+    let enter_deadline = Instant::now() + Duration::from_secs(2);
+    while !entered.load(Ordering::Acquire) && Instant::now() < enter_deadline {
         std::thread::yield_now();
     }
+    assert!(entered.load(Ordering::Acquire), "gate did not enter");
     app.try_send(gate, GateMsg::Hold)
         .expect("fill host-control queue");
 
@@ -305,6 +375,7 @@ fn local_installs_report_command_full_then_refill_for_every_service() {
     ));
 
     release.store(true, Ordering::Release);
+    drop(release_on_drop);
     let s3 = retry_command_full(
         || S3Worker::<SingleShard>::install_local(&app, S3Config::default()),
         |error| {
