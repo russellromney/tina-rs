@@ -489,11 +489,12 @@ pub fn assert_no_leaked_capacity_at_shutdown(report: &LoadReport) {
 /// Run `op` under load.
 ///
 /// `op` is invoked per worker, per iteration. It must be `Send + Sync`
-/// because all worker threads share it via `Arc`. `leak_check`, if
+/// because all worker threads share it via `Arc`. Workers are scoped and join
+/// before return, so `op` may borrow caller-owned host state. `leak_check`, if
 /// supplied, runs once after all workers join, on the calling thread.
 pub fn run<F, L>(run: LoadRun, op: F, leak_check: Option<L>) -> LoadReport
 where
-    F: Fn(usize) -> OpOutcome + Send + Sync + 'static,
+    F: Fn(usize) -> OpOutcome + Send + Sync,
     L: FnOnce() -> bool,
 {
     run_with_observation(
@@ -514,10 +515,11 @@ where
 /// Use this when a specimen can report capacity high-water/final-current
 /// counts, late results, and trace fingerprints. The harness records what
 /// the specimen returns; it does not retry, drain hidden queues, or turn
-/// `Full` into success.
+/// `Full` into success. Worker threads are scoped, so `op` may borrow state
+/// owned by the caller.
 pub fn run_with_observation<F, O>(run: LoadRun, op: F, observation: Option<O>) -> LoadReport
 where
-    F: Fn(usize) -> OpOutcome + Send + Sync + 'static,
+    F: Fn(usize) -> OpOutcome + Send + Sync,
     O: FnOnce() -> LoadObservation,
 {
     assert!(run.workers > 0, "LoadRun.workers must be > 0");
@@ -533,72 +535,75 @@ where
     let halted = Arc::new(AtomicBool::new(false));
     let start_gate = Arc::new(Barrier::new(run.workers + 1));
 
-    let mut handles = Vec::with_capacity(run.workers);
-    for worker_id in 0..run.workers {
-        let op = Arc::clone(&op);
-        let ops_dispatched = Arc::clone(&ops_dispatched);
-        let halted = Arc::clone(&halted);
-        let start_gate = Arc::clone(&start_gate);
-        let latency_capacity = latency_capacity_for_worker(op_cap, run.workers);
-        let handle = thread::spawn(move || -> WorkerObs {
-            start_gate.wait();
-            let stop_at = stop_after
-                .map(|duration| tina::Deadline::from_instant(Instant::now(), duration).instant());
-            let mut obs = WorkerObs::with_latency_capacity(latency_capacity);
-            let mut current_streak: u64 = 0;
-            loop {
-                if halted.load(Ordering::Acquire) {
-                    break;
-                }
-                if let Some(deadline) = stop_at
-                    && Instant::now() >= deadline
-                {
-                    halted.store(true, Ordering::Release);
-                    break;
-                }
-                let prior = ops_dispatched.fetch_add(1, Ordering::AcqRel);
-                if prior >= op_cap {
-                    halted.store(true, Ordering::Release);
-                    break;
-                }
-                let t0 = Instant::now();
-                let outcome = op(worker_id);
-                let dt = t0.elapsed();
-                obs.latencies_ns.push(duration_to_ns(dt));
-                let pressure = !matches!(outcome, OpOutcome::Ok);
-                match outcome {
-                    OpOutcome::Ok => obs.ok += 1,
-                    OpOutcome::Err { kind } => {
-                        obs.err += 1;
-                        *obs.err_kinds.entry(kind.to_string()).or_insert(0) += 1;
+    let (combined, elapsed) = thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(run.workers);
+        for worker_id in 0..run.workers {
+            let op = Arc::clone(&op);
+            let ops_dispatched = Arc::clone(&ops_dispatched);
+            let halted = Arc::clone(&halted);
+            let start_gate = Arc::clone(&start_gate);
+            let latency_capacity = latency_capacity_for_worker(op_cap, run.workers);
+            let handle = scope.spawn(move || -> WorkerObs {
+                start_gate.wait();
+                let stop_at = stop_after.map(|duration| {
+                    tina::Deadline::from_instant(Instant::now(), duration).instant()
+                });
+                let mut obs = WorkerObs::with_latency_capacity(latency_capacity);
+                let mut current_streak: u64 = 0;
+                loop {
+                    if halted.load(Ordering::Acquire) {
+                        break;
                     }
-                    OpOutcome::Timeout => obs.timeout += 1,
-                }
-                if pressure {
-                    if obs.first_error_global_index.is_none() {
-                        obs.first_error_global_index = Some(prior);
+                    if let Some(deadline) = stop_at
+                        && Instant::now() >= deadline
+                    {
+                        halted.store(true, Ordering::Release);
+                        break;
                     }
-                    current_streak += 1;
-                    if current_streak > obs.max_consecutive {
-                        obs.max_consecutive = current_streak;
+                    let prior = ops_dispatched.fetch_add(1, Ordering::AcqRel);
+                    if prior >= op_cap {
+                        halted.store(true, Ordering::Release);
+                        break;
                     }
-                } else {
-                    current_streak = 0;
+                    let t0 = Instant::now();
+                    let outcome = op(worker_id);
+                    let dt = t0.elapsed();
+                    obs.latencies_ns.push(duration_to_ns(dt));
+                    let pressure = !matches!(outcome, OpOutcome::Ok);
+                    match outcome {
+                        OpOutcome::Ok => obs.ok += 1,
+                        OpOutcome::Err { kind } => {
+                            obs.err += 1;
+                            *obs.err_kinds.entry(kind.to_string()).or_insert(0) += 1;
+                        }
+                        OpOutcome::Timeout => obs.timeout += 1,
+                    }
+                    if pressure {
+                        if obs.first_error_global_index.is_none() {
+                            obs.first_error_global_index = Some(prior);
+                        }
+                        current_streak += 1;
+                        if current_streak > obs.max_consecutive {
+                            obs.max_consecutive = current_streak;
+                        }
+                    } else {
+                        current_streak = 0;
+                    }
                 }
-            }
-            obs
-        });
-        handles.push(handle);
-    }
+                obs
+            });
+            handles.push(handle);
+        }
 
-    let started = Instant::now();
-    start_gate.wait();
-    let mut combined = WorkerObs::default();
-    for handle in handles {
-        let obs = handle.join().expect("worker join");
-        combined.merge(obs);
-    }
-    let elapsed = started.elapsed();
+        let started = Instant::now();
+        start_gate.wait();
+        let mut combined = WorkerObs::default();
+        for handle in handles {
+            let obs = handle.join().expect("worker join");
+            combined.merge(obs);
+        }
+        (combined, started.elapsed())
+    });
 
     // No observation closure means nothing was checked — including no leak
     // check. The default is unchecked, not clean.
@@ -777,6 +782,24 @@ mod tests {
         assert_eq!(report.ops_timeout, 0);
         assert!(!report.leak_checked, "no leak check was supplied");
         assert_eq!(counter.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn operation_can_borrow_a_caller_owned_host() {
+        let host = String::from("borrowed host");
+        let report = run_with_observation(
+            LoadRun {
+                workers: 2,
+                stop: LoadStop::ops(4),
+                label: "borrowed_host",
+            },
+            |_| {
+                assert_eq!(host, "borrowed host");
+                OpOutcome::Ok
+            },
+            None::<fn() -> LoadObservation>,
+        );
+        assert_eq!(report.ops_ok, 4);
     }
 
     #[test]

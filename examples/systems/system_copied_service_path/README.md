@@ -24,7 +24,8 @@ One `Gateway` isolate runs behind the `LocalSystem` application facade:
 - **Typed timer pressure** — the bounded timer lane is part of `RunConfig`,
   and refusal is reported as `WorkFailed(TimerFull)` rather than folded into
   application `Full` or a timeout.
-- **Graceful shutdown** — `run()` shuts the app down and re-reads the
+- **Graceful shutdown** — `run()` uses `run_to_shutdown_reported`, shuts the app
+  down even when registration or reporting fails, and re-reads the
   scope: `scope_current_at_drain` must be `0`. Owner stop drops every
   captured flow authority, which drops its `SharedLease` and releases the
   charge.
@@ -34,6 +35,10 @@ load runner against the real runtime, and the run asserts
 `assert_cold_work_made_progress` and `assert_no_leaked_capacity_at_shutdown`
 against the terminal scope snapshot recorded after `LocalSystem` shutdown,
 not a pre-shutdown or default observation.
+
+The load harness scopes and joins its workers, so the operation closure borrows
+the runner-owned `LocalSystem`; no application-wide `Arc` or separate shutdown
+owner is required.
 
 ## What this specimen leaves out
 

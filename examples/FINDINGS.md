@@ -143,7 +143,22 @@ shutdown-only, dual failure, bounded terminal timeout, real registration and
 host-call early returns, panic propagation, admission timeout without a second
 blocking owner drop, escaped-handle retry, partial multi-shard progress, and
 single-/multi-shard parity.
-Motivating example migrations remain separate follow-up cohorts.
+
+The motivating `specimen_bounded_batcher`, `system_lock_manager`,
+`system_soak_http_db`, and `system_copied_service_path` hosts now use this
+runner directly. Their concurrent workloads borrow the runner-owned facade
+through scoped threads, so application code no longer needs an exclusive
+`Arc<LocalSystem>` plus a separately captured shutdown handle. This sweep also
+found that `tina-proof-harness::run_with_observation` joined every worker before
+returning but still required its operation closure to be `'static`. The harness
+now uses scoped workers and accepts borrowed operations; a focused regression
+test proves caller-owned host state can be borrowed. The copied-service
+specimen applies that contract to its real `LocalSystem` host.
+
+Two adversarial tests retain lower-level shutdown handles intentionally: they
+initiate shutdown while a caller is still parked to prove closed-caller and
+exact lease-settlement behavior. That is a distinct control-flow probe, not an
+application lifecycle workaround.
 
 ### 2026-07-12 Address-aware LocalSystem root construction prerequisite
 

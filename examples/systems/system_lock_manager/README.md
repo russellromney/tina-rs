@@ -85,7 +85,8 @@ What felt good:
   matches or it does not.
 - `LocalSystem` supplies every host operation this specimen needs:
   fallible startup, split registration, typed blocking request calls,
-  shared shutdown control, and a clean terminal report.
+  scoped concurrent callers, and a consuming `run_to_shutdown_reported`
+  terminal report that keeps workload and shutdown failures distinct.
 - Carrying `SleepReply` into `LeaseExpired` makes timer admission failure
   visible and typed instead of treating every continuation as a wake. A
   current timer failure retires or hands off the lease immediately because an
@@ -123,7 +124,7 @@ Tina capability pulled:
 - Linear caller authority (`RequestCall`).
 - Runtime-owned time with typed completion (`sleep().then_service_event(...)`).
 - Generation-stamped messages for stale-event dedup.
-- Fallible `LocalSystem` ownership and truthful bounded shutdown.
+- Fallible `LocalSystem` ownership and truthful bounded consuming shutdown.
 
 Suggested follow-up:
 - Local: try a `Lease` newtype if a future change to this specimen
