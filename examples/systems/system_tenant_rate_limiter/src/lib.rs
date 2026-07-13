@@ -1,166 +1,176 @@
-//! Per-tenant rate-limit specimen for the admission policy layer.
-//!
-//! A single ingress isolate serves requests for many tenants. Each tenant
-//! gets its own token bucket. A hot tenant fills its bucket and the next
-//! request comes back as `Limited { retry_after }`; a cold tenant arriving
-//! at the same moment still succeeds because each tenant owns its own
-//! bucket.
-//!
-//! Two truths the specimen proves:
-//!
-//! 1. `retry_after` is a deterministic function of `(rate, burst, now,
-//!    key history)`. Two runs with the same script produce byte-identical
-//!    `retry_after` values.
-//! 2. Cold tenants make progress while a hot tenant is rate-limited.
-//!
-//! The service itself is plain Tina: bounded mailbox, request/reply with
-//! `CallContext`, no hidden retry, no background sweeper. The policy
-//! lives in `tina_runtime::RateLimit`.
+//! Per-tenant rate limiting with owner-stamped admission time.
 
 use std::convert::Infallible;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::error::Error;
+use std::fmt;
+use std::time::Duration;
 
-use tina::CallRejectedReason;
 use tina::prelude::*;
 use tina_runtime::{
-    AdmissionDecision, CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, RateLimit,
+    CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, RateLimit, RateLimitDecision,
+    ReportedWorkloadError, RunToShutdownError, StartupError, ThreadedRuntimeError,
     format_discovery_line,
 };
 
-/// Tenant identifier. Static strings keep the specimen allocation-free
-/// in the hot path.
+/// Tenant identifier. Static strings keep the request path allocation-free.
 pub type TenantId = &'static str;
 
-/// One request from a caller to the gateway.
-#[derive(Debug)]
-pub enum GatewayMsg {
-    /// `now` is the caller-supplied admission timestamp. In production
-    /// services this is `ctx.now()` on the caller side; the specimen
-    /// drives it explicitly so the replay determinism is visible.
-    Request {
-        /// Tenant to charge against.
+/// Requests understood by the request-only gateway service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayRequest {
+    /// Attempt one admission for a tenant.
+    Admit {
+        /// Tenant to charge.
         tenant: TenantId,
-        /// Admission timestamp.
-        now: Instant,
     },
-    /// Read the limiter's current capacity surface. Equivalent to a
-    /// `GET /debug/capacity` probe in a real edge service.
+    /// Read the limiter's current capacity state.
     Snapshot,
+    /// Close the policy and probe the resulting terminal decision.
+    CloseAndProbe {
+        /// Tenant used for the probe.
+        tenant: TenantId,
+    },
 }
 
-/// Reply shape. Honest about which rejection bucket the policy chose.
+/// Reply shape preserving every decision in `RateLimitDecision`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatewayReply {
-    /// Admitted. Caller proceeds.
-    Ok {
-        /// Tenant the request was charged to.
+    /// One token was admitted and its move-only grant was settled.
+    Admitted {
+        /// Tenant charged by the decision.
         tenant: TenantId,
     },
-    /// Tenant rate-limit empty; caller should sleep at least `retry_after`
-    /// and try again. The retry decision itself is caller-owned.
-    Limited {
-        /// Tenant that hit its bucket.
+    /// The tenant's token bucket was empty.
+    RateLimited {
+        /// Tenant refused by the decision.
         tenant: TenantId,
-        /// Earliest moment the caller could retry.
+        /// Exact owner-computed delay until another token is available.
         retry_after: Duration,
     },
-    /// Key table full — no slot for a fresh tenant.
-    TenantTableFull {
-        /// Tenant that could not be admitted.
+    /// No key-table slot was available for a new tenant.
+    TableFull {
+        /// Tenant refused by the decision.
         tenant: TenantId,
     },
-    /// Snapshot of the limiter's capacity surface and rejection counts.
+    /// The rate-limit policy was closed.
+    Closed {
+        /// Tenant refused by the decision.
+        tenant: TenantId,
+    },
+    /// Capacity state observed by the owner.
     Snapshot(SnapshotReport),
 }
 
-/// Snapshot of the limiter as seen by the gateway.
+/// Snapshot of gateway-owned capacity and grant settlement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotReport {
-    /// Live distinct tenants the limiter is tracking.
+    /// Live distinct tenants tracked by the fixed table.
     pub live_tenants: usize,
-    /// Cumulative `RateLimited` decisions.
+    /// Cumulative rate-limited decisions.
     pub rate_limited_count: u64,
-    /// Cumulative `Full` (table full) decisions.
+    /// Cumulative table-full decisions.
     pub full_count: u64,
-    /// One-line discovery summary for the capacity surface.
+    /// Grants produced by admitted decisions.
+    pub grants_admitted: u64,
+    /// Grants explicitly consumed before the reply was produced.
+    pub grants_settled: u64,
+    /// Grep-friendly capacity discovery line.
     pub discovery_line: String,
 }
 
-/// Gateway isolate. Exposed so smoke tests can construct it directly.
+/// Request-only rate-limit owner.
 pub struct Gateway {
     rate: RateLimit<TenantId>,
+    grants_admitted: u64,
+    grants_settled: u64,
 }
 
 impl Gateway {
-    /// Build a gateway around a pre-configured limiter.
+    /// Build a gateway around a configured rate limiter.
     pub fn new(rate: RateLimit<TenantId>) -> Self {
-        Self { rate }
+        Self {
+            rate,
+            grants_admitted: 0,
+            grants_settled: 0,
+        }
+    }
+
+    fn admit(&mut self, tenant: TenantId, now: std::time::Instant) -> GatewayReply {
+        match self.rate.try_admit(&tenant, now) {
+            RateLimitDecision::Admitted(grant) => {
+                self.grants_admitted = self.grants_admitted.saturating_add(1);
+                drop(grant);
+                self.grants_settled = self.grants_settled.saturating_add(1);
+                GatewayReply::Admitted { tenant }
+            }
+            RateLimitDecision::RateLimited { retry_after, .. } => GatewayReply::RateLimited {
+                tenant,
+                retry_after,
+            },
+            RateLimitDecision::TableFull(_) => GatewayReply::TableFull { tenant },
+            RateLimitDecision::Closed(_) => GatewayReply::Closed { tenant },
+        }
+    }
+
+    fn snapshot(&self) -> SnapshotReport {
+        let report = self.rate.report();
+        SnapshotReport {
+            live_tenants: report.current,
+            rate_limited_count: report.rate_limited_count,
+            full_count: report.full_count,
+            grants_admitted: self.grants_admitted,
+            grants_settled: self.grants_settled,
+            discovery_line: format_discovery_line(&self.rate.capacity_surface()),
+        }
     }
 }
 
-#[tina_runtime::isolate(message = GatewayMsg, reply = GatewayReply)]
+#[tina_runtime::isolate(request = GatewayRequest, reply = GatewayReply)]
 impl Gateway {
-    fn handle(
+    fn handle_request(
         &mut self,
-        _msg: GatewayMsg,
-        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
-    ) -> Effect<Self> {
-        noop()
-    }
-
-    fn handle_call(&mut self, msg: GatewayMsg, call: tina::CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            GatewayMsg::Request { tenant, now } => match self.rate.try_admit(&tenant, now) {
-                AdmissionDecision::Admitted(_grant) => call.reply(GatewayReply::Ok { tenant }),
-                AdmissionDecision::RateLimited { retry_after, .. } => {
-                    call.reply(GatewayReply::Limited {
-                        tenant,
-                        retry_after,
-                    })
-                }
-                AdmissionDecision::Full(_) => call.reply(GatewayReply::TenantTableFull { tenant }),
-                AdmissionDecision::Closed(_)
-                | AdmissionDecision::Wait { .. }
-                | AdmissionDecision::Degrade { .. }
-                | AdmissionDecision::TimedOut(_) => {
-                    // The policy is configured as Shed; these arms are
-                    // unreachable in the default first form. Reject loudly
-                    // if a future change rewires the policy.
-                    call.reject(CallRejectedReason::UnsupportedMessage)
-                }
-            },
-            GatewayMsg::Snapshot => {
-                let report = self.rate.report();
-                let line = format_discovery_line(&self.rate.capacity_surface());
-                call.reply(GatewayReply::Snapshot(SnapshotReport {
-                    live_tenants: report.current,
-                    rate_limited_count: report.rate_limited_count,
-                    full_count: report.full_count,
-                    discovery_line: line,
-                }))
+        request: GatewayRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            GatewayRequest::Admit { tenant } => {
+                let now = call.now();
+                call.reply(self.admit(tenant, now))
+            }
+            GatewayRequest::Snapshot => call.reply(GatewayReply::Snapshot(self.snapshot())),
+            GatewayRequest::CloseAndProbe { tenant } => {
+                self.rate.close();
+                let now = call.now();
+                call.reply(self.admit(tenant, now))
             }
         }
     }
 }
 
-/// Specimen configuration. Each field is grep-friendly so changing the
-/// load shape stays explicit.
+const MAX_MAILBOX: usize = 65_536;
+const MAX_TENANTS: usize = 65_536;
+const MAX_REQUESTS_PER_TENANT: usize = 2_000_000;
+const MAX_TOTAL_REQUESTS: usize = 2_000_000;
+const MAX_RATE_PER_SEC: u64 = 1_000_000_000;
+const MAX_BURST: u32 = 1_000_000;
+const MAX_CALL_TIMEOUT_MS: u64 = 60_000;
+
+/// Specimen configuration.
 #[derive(Debug, Clone, Copy)]
 pub struct RunConfig {
-    /// Gateway mailbox capacity (call admissions + replies).
+    /// Gateway mailbox capacity.
     pub mailbox: usize,
-    /// Maximum number of distinct tenants the limiter remembers at once.
+    /// Maximum number of distinct tenants retained.
     pub max_tenants: usize,
-    /// Per-tenant rate in tokens per second.
+    /// Tokens refilled per tenant per second.
     pub rate_per_sec: u64,
-    /// Per-tenant burst (max tokens the bucket holds).
+    /// Maximum tokens held per tenant.
     pub burst: u32,
-    /// Number of requests the hot tenant fires.
+    /// Requests issued for the hot tenant.
     pub hot_requests: usize,
-    /// Number of requests the cold tenant fires.
+    /// Requests issued for the cold tenant.
     pub cold_requests: usize,
-    /// Caller timeout for each request.
+    /// Host deadline for each call.
     pub call_timeout_ms: u64,
 }
 
@@ -178,139 +188,440 @@ impl Default for RunConfig {
     }
 }
 
+/// Invalid configuration rejected before runtime construction or allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunConfigError {
+    /// A non-zero bounded field was zero.
+    Zero { field: &'static str },
+    /// A bounded field exceeded its public limit.
+    TooLarge {
+        field: &'static str,
+        requested: u128,
+        max: u128,
+    },
+    /// The combined request count overflowed or exceeded its public limit.
+    TotalRequests { hot: usize, cold: usize },
+}
+
+impl fmt::Display for RunConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zero { field } => write!(f, "{field} must be greater than zero"),
+            Self::TooLarge {
+                field,
+                requested,
+                max,
+            } => write!(f, "{field} {requested} exceeds maximum {max}"),
+            Self::TotalRequests { hot, cold } => write!(
+                f,
+                "combined request count for hot={hot} and cold={cold} exceeds {MAX_TOTAL_REQUESTS}"
+            ),
+        }
+    }
+}
+
+impl Error for RunConfigError {}
+
+impl RunConfig {
+    /// Validate all panic and allocation bounds before starting Tina.
+    pub fn validate(self) -> Result<Self, RunConfigError> {
+        validate_usize("mailbox", self.mailbox, MAX_MAILBOX)?;
+        validate_usize("max_tenants", self.max_tenants, MAX_TENANTS)?;
+        validate_u64("rate_per_sec", self.rate_per_sec, MAX_RATE_PER_SEC)?;
+        validate_u32("burst", self.burst, MAX_BURST)?;
+        validate_usize("hot_requests", self.hot_requests, MAX_REQUESTS_PER_TENANT)?;
+        validate_usize("cold_requests", self.cold_requests, MAX_REQUESTS_PER_TENANT)?;
+        validate_u64("call_timeout_ms", self.call_timeout_ms, MAX_CALL_TIMEOUT_MS)?;
+        let Some(total) = self.hot_requests.checked_add(self.cold_requests) else {
+            return Err(RunConfigError::TotalRequests {
+                hot: self.hot_requests,
+                cold: self.cold_requests,
+            });
+        };
+        if total > MAX_TOTAL_REQUESTS {
+            return Err(RunConfigError::TotalRequests {
+                hot: self.hot_requests,
+                cold: self.cold_requests,
+            });
+        }
+        Ok(self)
+    }
+}
+
+fn validate_usize(field: &'static str, value: usize, max: usize) -> Result<(), RunConfigError> {
+    if value == 0 {
+        Err(RunConfigError::Zero { field })
+    } else if value > max {
+        Err(RunConfigError::TooLarge {
+            field,
+            requested: value as u128,
+            max: max as u128,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_u64(field: &'static str, value: u64, max: u64) -> Result<(), RunConfigError> {
+    if value == 0 {
+        Err(RunConfigError::Zero { field })
+    } else if value > max {
+        Err(RunConfigError::TooLarge {
+            field,
+            requested: u128::from(value),
+            max: u128::from(max),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_u32(field: &'static str, value: u32, max: u32) -> Result<(), RunConfigError> {
+    validate_u64(field, u64::from(value), u64::from(max))
+}
+
 /// What the run observed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunReport {
-    /// Hot-tenant admitted count.
+    /// Hot-tenant admitted replies.
     pub hot_admitted: usize,
-    /// Hot-tenant Limited count.
+    /// Hot-tenant rate-limited replies.
     pub hot_limited: usize,
-    /// Cold-tenant admitted count.
+    /// Cold-tenant admitted replies.
     pub cold_admitted: usize,
-    /// Cold-tenant Limited count (zero under the default config).
+    /// Cold-tenant rate-limited replies.
     pub cold_limited: usize,
-    /// Hot-tenant `retry_after` values, in order, in milliseconds.
-    /// Deterministic for fixed `(rate, burst, now-sequence)` inputs.
+    /// Hot-tenant retry delays in observation order.
     pub hot_retry_afters_ms: Vec<u128>,
-    /// Snapshot of the limiter at the end of the run, before shutdown.
+    /// Owner snapshot immediately before shutdown.
     pub snapshot: SnapshotReport,
-    /// One-line grep-friendly summary.
+    /// Grep-friendly outcome summary.
     pub summary_line: String,
 }
 
-/// Drive the specimen with `config`.
-pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(
-        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
-    );
-    let shutdown = runtime.shutdown_handle();
-    let result = (|| {
-        let rate = RateLimit::<TenantId>::new(
-            "tenant.rate",
-            config.max_tenants,
-            config.rate_per_sec,
-            config.burst,
-        );
-
-        let gateway = runtime
-            .register_root::<_, Infallible>(Gateway::new(rate), config.mailbox)
-            .map_err(|e| anyhow::anyhow!("register gateway: {e:?}"))?;
-
-        let timeout = Duration::from_millis(config.call_timeout_ms);
-        let base = Instant::now();
-
-        let mut hot_admitted = 0usize;
-        let mut hot_limited = 0usize;
-        let mut hot_retry_afters_ms: Vec<u128> = Vec::with_capacity(config.hot_requests);
-        for _ in 0..config.hot_requests {
-            let outcome = runtime
-                .call_blocking(
-                    gateway,
-                    GatewayMsg::Request {
-                        tenant: "tenant.hot",
-                        now: base,
-                    },
-                    timeout,
-                )
-                .map_err(|e| anyhow::anyhow!("hot call: {e:?}"))?;
-            match outcome {
-                CallOutcome::Replied(GatewayReply::Ok { .. }) => hot_admitted += 1,
-                CallOutcome::Replied(GatewayReply::Limited { retry_after, .. }) => {
-                    hot_limited += 1;
-                    hot_retry_afters_ms.push(retry_after.as_millis());
-                }
-                CallOutcome::Replied(other) => anyhow::bail!("hot reply: {other:?}"),
-                other => anyhow::bail!("hot outcome: {other:?}"),
-            }
-        }
-
-        let mut cold_admitted = 0usize;
-        let mut cold_limited = 0usize;
-        for _ in 0..config.cold_requests {
-            let outcome = runtime
-                .call_blocking(
-                    gateway,
-                    GatewayMsg::Request {
-                        tenant: "tenant.cold",
-                        now: base,
-                    },
-                    timeout,
-                )
-                .map_err(|e| anyhow::anyhow!("cold call: {e:?}"))?;
-            match outcome {
-                CallOutcome::Replied(GatewayReply::Ok { .. }) => cold_admitted += 1,
-                CallOutcome::Replied(GatewayReply::Limited { .. }) => cold_limited += 1,
-                CallOutcome::Replied(other) => anyhow::bail!("cold reply: {other:?}"),
-                other => anyhow::bail!("cold outcome: {other:?}"),
-            }
-        }
-
-        let snap_outcome = runtime
-            .call_blocking(gateway, GatewayMsg::Snapshot, timeout)
-            .map_err(|e| anyhow::anyhow!("snapshot call: {e:?}"))?;
-        let snapshot = match snap_outcome {
-            CallOutcome::Replied(GatewayReply::Snapshot(s)) => s,
-            other => anyhow::bail!("snapshot outcome: {other:?}"),
-        };
-
-        let summary_line = format!(
-            "system=system_tenant_rate_limiter hot_admitted={hot_admitted} hot_limited={hot_limited} \
-             cold_admitted={cold_admitted} cold_limited={cold_limited} \
-             live_tenants={live} rate_limited_count={rl}",
-            live = snapshot.live_tenants,
-            rl = snapshot.rate_limited_count,
-        );
-
-        Ok(RunReport {
-            hot_admitted,
-            hot_limited,
-            cold_admitted,
-            cold_limited,
-            hot_retry_afters_ms,
-            snapshot,
-            summary_line,
-        })
-    })();
-
-    finish_after_shutdown(result, shutdown, runtime)
+/// Typed workload failure retaining runtime errors and complete call outcomes.
+#[derive(Debug)]
+pub enum WorkloadError {
+    /// The runtime refused gateway registration.
+    Registration(ThreadedRuntimeError),
+    /// The host could not complete a runtime call operation.
+    HostCall {
+        /// Workload phase issuing the call.
+        phase: &'static str,
+        /// Zero-based call index within the phase.
+        index: usize,
+        /// Exact runtime/control-plane failure.
+        source: ThreadedRuntimeError,
+    },
+    /// The call completed with a domain-terminal outcome this phase cannot use.
+    UnexpectedOutcome {
+        /// Workload phase issuing the call.
+        phase: &'static str,
+        /// Zero-based call index within the phase.
+        index: usize,
+        /// Complete Tina terminal outcome, including rejection reason.
+        outcome: CallOutcome<GatewayReply>,
+    },
 }
 
-fn finish_after_shutdown<T>(
-    result: anyhow::Result<T>,
-    shutdown: tina_runtime::ThreadedShutdownHandle,
-    runtime: Arc<LocalSystem<SingleShard, DefaultThreadedMailboxFactory>>,
-) -> anyhow::Result<T> {
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5));
-    drop(runtime);
-    let shutdown_result: anyhow::Result<()> = terminal
-        .map_err(Into::into)
-        .and_then(|report| report.ensure_clean().map_err(Into::into));
+impl fmt::Display for WorkloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registration(error) => write!(f, "gateway registration failed: {error}"),
+            Self::HostCall {
+                phase,
+                index,
+                source,
+            } => write!(f, "{phase} call {index} failed: {source}"),
+            Self::UnexpectedOutcome {
+                phase,
+                index,
+                outcome,
+            } => write!(f, "{phase} call {index} returned {outcome:?}"),
+        }
+    }
+}
 
-    match (result, shutdown_result) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-        (Err(error), Err(shutdown_error)) => Err(anyhow::anyhow!(
-            "{error:#}; shutdown also failed: {shutdown_error}"
-        )),
+impl Error for WorkloadError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Registration(error) | Self::HostCall { source: error, .. } => Some(error),
+            Self::UnexpectedOutcome { .. } => None,
+        }
+    }
+}
+
+impl AsRef<dyn Error + Send + Sync + 'static> for WorkloadError {
+    fn as_ref(&self) -> &(dyn Error + Send + Sync + 'static) {
+        self
+    }
+}
+
+pub type TerminalError = RunToShutdownError<ReportedWorkloadError<WorkloadError>>;
+
+/// Top-level run failure with configuration, startup, and terminal truth intact.
+#[derive(Debug)]
+pub enum RunError {
+    /// Configuration failed bounded preflight validation.
+    InvalidConfig(RunConfigError),
+    /// The local threaded runtime could not start.
+    Startup(StartupError),
+    /// Workload failure, shutdown failure, or both.
+    Terminal(Box<TerminalError>),
+}
+
+impl fmt::Display for RunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfig(error) => write!(f, "invalid tenant limiter config: {error}"),
+            Self::Startup(error) => write!(f, "tenant limiter startup failed: {error}"),
+            Self::Terminal(error) => write!(f, "tenant limiter run failed: {error}"),
+        }
+    }
+}
+
+impl Error for RunError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidConfig(error) => Some(error),
+            Self::Startup(error) => Some(error),
+            Self::Terminal(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+/// Run the live specimen with bounded, consuming shutdown.
+pub fn run(config: RunConfig) -> Result<RunReport, RunError> {
+    let config = config.validate().map_err(RunError::InvalidConfig)?;
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+        .try_build()
+        .map_err(RunError::Startup)?;
+    app.run_to_shutdown_reported(Duration::from_secs(5), |app| run_workload(app, config))
+        .map_err(|error| RunError::Terminal(Box::new(error)))
+}
+
+fn run_workload(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    config: RunConfig,
+) -> Result<RunReport, WorkloadError> {
+    let rate = RateLimit::<TenantId>::new(
+        "tenant.rate",
+        config.max_tenants,
+        config.rate_per_sec,
+        config.burst,
+    );
+    let gateway = app
+        .register_request_service::<Gateway, GatewayRequest, Infallible>(
+            Gateway::new(rate),
+            config.mailbox,
+        )
+        .map_err(WorkloadError::Registration)?;
+    let timeout = Duration::from_millis(config.call_timeout_ms);
+
+    let mut hot_admitted = 0;
+    let mut hot_limited = 0;
+    let mut hot_retry_afters_ms = Vec::with_capacity(config.hot_requests);
+    for index in 0..config.hot_requests {
+        match call(app, gateway, "hot", index, "tenant.hot", timeout)? {
+            GatewayReply::Admitted { .. } => hot_admitted += 1,
+            GatewayReply::RateLimited { retry_after, .. } => {
+                hot_limited += 1;
+                hot_retry_afters_ms.push(retry_after.as_millis());
+            }
+            reply => {
+                return Err(WorkloadError::UnexpectedOutcome {
+                    phase: "hot",
+                    index,
+                    outcome: CallOutcome::Replied(reply),
+                });
+            }
+        }
+    }
+
+    let mut cold_admitted = 0;
+    let mut cold_limited = 0;
+    for index in 0..config.cold_requests {
+        match call(app, gateway, "cold", index, "tenant.cold", timeout)? {
+            GatewayReply::Admitted { .. } => cold_admitted += 1,
+            GatewayReply::RateLimited { .. } => cold_limited += 1,
+            reply => {
+                return Err(WorkloadError::UnexpectedOutcome {
+                    phase: "cold",
+                    index,
+                    outcome: CallOutcome::Replied(reply),
+                });
+            }
+        }
+    }
+
+    let snapshot =
+        match call_outcome(app, gateway, GatewayRequest::Snapshot, timeout).map_err(|source| {
+            WorkloadError::HostCall {
+                phase: "snapshot",
+                index: 0,
+                source,
+            }
+        })? {
+            CallOutcome::Replied(GatewayReply::Snapshot(snapshot)) => snapshot,
+            outcome => {
+                return Err(WorkloadError::UnexpectedOutcome {
+                    phase: "snapshot",
+                    index: 0,
+                    outcome,
+                });
+            }
+        };
+
+    let summary_line = format!(
+        "system=system_tenant_rate_limiter hot_admitted={hot_admitted} hot_limited={hot_limited} \
+         cold_admitted={cold_admitted} cold_limited={cold_limited} live_tenants={} \
+         rate_limited_count={} grants_settled={}",
+        snapshot.live_tenants, snapshot.rate_limited_count, snapshot.grants_settled,
+    );
+    Ok(RunReport {
+        hot_admitted,
+        hot_limited,
+        cold_admitted,
+        cold_limited,
+        hot_retry_afters_ms,
+        snapshot,
+        summary_line,
+    })
+}
+
+fn call(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    gateway: tina_runtime::RequestServiceHandle<GatewayRequest, GatewayReply>,
+    phase: &'static str,
+    index: usize,
+    tenant: TenantId,
+    timeout: Duration,
+) -> Result<GatewayReply, WorkloadError> {
+    let outcome = call_outcome(app, gateway, GatewayRequest::Admit { tenant }, timeout).map_err(
+        |source| WorkloadError::HostCall {
+            phase,
+            index,
+            source,
+        },
+    )?;
+    expect_reply(phase, index, outcome)
+}
+
+fn expect_reply(
+    phase: &'static str,
+    index: usize,
+    outcome: CallOutcome<GatewayReply>,
+) -> Result<GatewayReply, WorkloadError> {
+    match outcome {
+        CallOutcome::Replied(reply) => Ok(reply),
+        outcome => Err(WorkloadError::UnexpectedOutcome {
+            phase,
+            index,
+            outcome,
+        }),
+    }
+}
+
+fn call_outcome(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    gateway: tina_runtime::RequestServiceHandle<GatewayRequest, GatewayReply>,
+    request: GatewayRequest,
+    timeout: Duration,
+) -> Result<CallOutcome<GatewayReply>, ThreadedRuntimeError> {
+    app.call_blocking_request(gateway, request, timeout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn maps_all_rate_limit_decisions_and_settles_every_grant() {
+        let now = Instant::now();
+        let mut gateway = Gateway::new(RateLimit::new("test", 1, 10, 1));
+        assert!(matches!(
+            gateway.admit("hot", now),
+            GatewayReply::Admitted { tenant: "hot" }
+        ));
+        assert!(matches!(
+            gateway.admit("hot", now),
+            GatewayReply::RateLimited { tenant: "hot", .. }
+        ));
+        assert!(matches!(
+            gateway.admit("cold", now),
+            GatewayReply::TableFull { tenant: "cold" }
+        ));
+        gateway.rate.close();
+        assert!(matches!(
+            gateway.admit("hot", now),
+            GatewayReply::Closed { tenant: "hot" }
+        ));
+        let snapshot = gateway.snapshot();
+        assert_eq!(snapshot.grants_admitted, 1);
+        assert_eq!(snapshot.grants_settled, snapshot.grants_admitted);
+        assert_eq!(snapshot.rate_limited_count, 1);
+        assert_eq!(snapshot.full_count, 1);
+    }
+
+    #[test]
+    fn refill_uses_monotonic_owner_time() {
+        let now = Instant::now();
+        let mut gateway = Gateway::new(RateLimit::new("test", 1, 10, 1));
+        assert!(matches!(
+            gateway.admit("hot", now),
+            GatewayReply::Admitted { .. }
+        ));
+        assert!(matches!(
+            gateway.admit("hot", now),
+            GatewayReply::RateLimited { .. }
+        ));
+        assert!(matches!(
+            gateway.admit("hot", now + Duration::from_millis(100)),
+            GatewayReply::Admitted { .. }
+        ));
+        assert_eq!(gateway.snapshot().grants_settled, 2);
+    }
+
+    #[test]
+    fn host_terminal_vocabulary_is_retained_without_collapse() {
+        use tina::CallRejectedReason;
+
+        let outcomes = [
+            CallOutcome::Full,
+            CallOutcome::Closed,
+            CallOutcome::Timeout,
+            CallOutcome::Rejected(CallRejectedReason::UnsupportedMessage),
+        ];
+        for outcome in outcomes {
+            let error = expect_reply("probe", 7, outcome).expect_err("must retain terminal");
+            match error {
+                WorkloadError::UnexpectedOutcome {
+                    phase: "probe",
+                    index: 7,
+                    outcome: actual,
+                } => match actual {
+                    CallOutcome::Full
+                    | CallOutcome::Closed
+                    | CallOutcome::Timeout
+                    | CallOutcome::Rejected(CallRejectedReason::UnsupportedMessage) => {}
+                    other => panic!("collapsed outcome: {other:?}"),
+                },
+                other => panic!("wrong error: {other:?}"),
+            }
+        }
+
+        let error = WorkloadError::HostCall {
+            phase: "probe",
+            index: 9,
+            source: ThreadedRuntimeError::WorkerUnresponsive,
+        };
+        assert!(matches!(
+            error,
+            WorkloadError::HostCall {
+                source: ThreadedRuntimeError::WorkerUnresponsive,
+                ..
+            }
+        ));
     }
 }
