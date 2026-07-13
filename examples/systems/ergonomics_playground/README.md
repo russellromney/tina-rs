@@ -29,22 +29,24 @@ What felt good:
 
 - `RequestContext` makes the original caller authority visible without making it
   ambient.
-- `CallGroup` is the right semantic object for first-success races: it keeps
-  winner, losers, and cancel outcomes named.
-- `CallGroup::start_cancelable` is the copied path now: it reserves the token,
-  stores the cancel handle, and only then returns the child effect.
+- `CallSelectSet` is the right semantic object for a classified first-success
+  race: it keeps every named branch and cancellation outcome bounded.
+- `CallSelectSet::start_service` reserves the branch token, stores the cancel
+  handle, and returns one typed `CallSelectEvent` continuation.
+- `CallSelectSet::advance_service` applies the business-success classifier,
+  validates reply/cancel tokens, and returns any bounded loser-cancellation
+  work without application-owned adapter variants.
 - `SharedWork::reply_all_clone` and `drain_all_with` express batch completion
   and service drain without caller ids or a sidecar correlation table.
 - Single-flight cache fill is a natural Tina shape: one explicit fill call, one
   bounded `SharedWork`, one flush of replies.
 
-What felt rough:
+What remains explicit:
 
-- Race handling still has honest state: after the winner replies to the
-  original caller, loser cancellation completions can arrive later and must
-  still be recorded.
-- A service that replies to the original caller before loser cancellations settle
-  needs a little state dance: the request is gone, but the race is not complete.
+- A winner can reply to the original caller before loser cancellation settles.
+  The service therefore retains the bounded `CallSelectSet` until its typed
+  cancel acknowledgement arrives. This is the operation lifecycle, not
+  adapter plumbing or caller-authority duplication.
 - A timer-backed batch is one `SharedWork<BatchId, Reply>` plus one typed
   `flow!` step. `TimerFull` remains a work failure rather than masquerading as
   application admission pressure.
@@ -53,9 +55,9 @@ What felt rough:
 
 Verdict:
 
-- Keep the explicit model.
-- Consider a tiny "race two/all" builder later if more services repeat the
-  token/insert/cancel plumbing without needing custom branch state.
+- Keep the explicit classifier and settlement model.
+- Use the unified select event/start/advance path rather than reintroducing
+  application-owned key, token, or cancel adapters.
 - Keep `SharedWork` as the keyed-waiter helper until another system proves it
   needs a higher-level `SingleFlight` wrapper.
 - Do not add a batch-specific framework abstraction yet; the shared-work form

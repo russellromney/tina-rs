@@ -1,13 +1,13 @@
 fn main() -> anyhow::Result<()> {
     let quote = ergonomics_playground::run_quote_race_probe()?;
     println!(
-        "quote_race replies={:?} cancel_outcomes={} late_cancelled_rejections={} rough_edges={:?}",
+        "quote_race replies={:?} cancel_outcomes={:?} late_cancelled_rejections={} rough_edges={:?}",
         quote.replies, quote.cancel_outcomes, quote.late_cancelled_rejections, quote.rough_edges
     );
 
     let no_winner = ergonomics_playground::run_quote_race_no_winner_probe()?;
     println!(
-        "quote_race_no_winner replies={:?} cancel_outcomes={} rough_edges={:?}",
+        "quote_race_no_winner replies={:?} cancel_outcomes={:?} rough_edges={:?}",
         no_winner.replies, no_winner.cancel_outcomes, no_winner.rough_edges
     );
 

@@ -27,7 +27,11 @@ bounded loser-cancellation effect plus exact completion state. The helper does
 not choose business success, own the parent caller, or report completion before
 every required cancel acknowledgement settles. The dependent playground
 migration keeps that honest lifecycle visible while removing the adapter
-variants and cancel mapper.
+variants and cancel mapper. Its public report now carries the exact
+`CancelOutcome` instead of a count, removes the synthetic `completed: true`
+field, and returns no known rough edges for winner, no-winner, batch, or cache
+probes. The whole-crate pass also moved every simulator send boundary to
+exhaustive `IngressSendError::{Full, Closed, ForeignSystem}` handling.
 
 ### 2026-07-13 Typed multi-shard host routing
 
@@ -707,6 +711,9 @@ helpers:
 - `CallGroup` / `CallJoinSet` / `CallSelectSet::start_cancelable_service_event`
 - `RequestScope::cancel_into_service_event_effect`
 
+The later classified select-race phase replaces the playground's remaining
+select adapters with `CallSelectEvent`, `start_service`, and `advance_service`.
+
 **Migrated (no remaining envelope construction in effect/call sites):**
 
 - specimens: `backpressure_chain`, `cancellation_chain`,
@@ -767,9 +774,10 @@ behavior). What moved, and what was deliberately left:
   the reject arm (where present) documents a real policy invariant.
 - `ServiceB`/`ServiceA` in `specimen_backpressure_chain` — now split-service
   after finding 36 added `RequestCall::now()`.
-- `QuoteGateway` race in `ergonomics_playground` — stays on `CallGroup`;
-  it needs a business-success classifier (`|q| q.available`) that
-  `CallJoinSet`/`CallSelectSet` cannot carry.
+- `QuoteGateway` race in `ergonomics_playground` — later migrated to
+  `CallSelectSet`; `record_classified_reply` added its business-success
+  classifier, and the classified select-race phase removed the remaining
+  reply/cancel adapters.
 - `specimen_sharded_fanout_read` (Bind/Start is open runtime gap,
   finding 3), `specimen_dynamic_worker_pool` / `specimen_supervised_worker`
   (now canonical: observed spawn plus typed request / `spawn_observed`),
@@ -879,10 +887,10 @@ What is still active after reading the specimens and systems:
   intentionally explicit because it changes which external budget is held.
 - **Race / cancel / retry ceremony.** `ergonomics_playground` and
   `system_job_queue` show the model is correct. `CallGroup::start_cancelable`
-  now removes the branch-start token/handle ceremony, and Phase 120 added
-  `CallJoinSet` / `CallSelectSet` for the common join-all and select-next
-  cases. Re-binding a cancelable caller after worker crash remains
-  intentionally unsolved.
+  removes branch-start token/handle ceremony; `CallJoinSet` / `CallSelectSet`
+  cover common join-all and select-next cases; and the classified select event
+  start/advance path removes manual loser-cancel adapter plumbing. Re-binding
+  a cancelable caller after worker crash remains intentionally unsolved.
 - **Cross-isolate setup.** Scatter/gather and paired registration still make
   users write bind/start adapter plumbing for the happy path.
 - **Runtime observation while running.** Several protocol/IPC specimens still
