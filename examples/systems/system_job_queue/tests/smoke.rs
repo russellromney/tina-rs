@@ -1,6 +1,6 @@
 use system_job_queue::{
-    JobOutcome, QueueReply, RunConfig, run_cancel_in_flight, run_overflow, run_poison_crash,
-    run_respawn_then_admit,
+    JobOutcome, QueueReply, RunConfig, RunConfigError, run_caller_gone, run_cancel_in_flight,
+    run_overflow, run_poison_crash, run_respawn_then_admit,
 };
 
 fn config() -> RunConfig {
@@ -19,6 +19,11 @@ fn overflow_burst_admits_workers_and_rest_get_busy() {
     let report = run_overflow(config()).expect("overflow run");
     assert_eq!(report.completed, 2);
     assert_eq!(report.busy, 3);
+    assert_eq!(report.full, 0);
+    assert_eq!(report.closed, 0);
+    assert_eq!(report.timeout, 0);
+    assert_eq!(report.rejected, 0);
+    assert!(report.rejection_reasons.is_empty());
     assert_eq!(report.stats.jobs_admitted, 2);
     assert_eq!(report.stats.jobs_busy_rejected, 3);
     assert_eq!(report.stats.jobs_completed, 2);
@@ -39,13 +44,32 @@ fn cancel_in_flight_replies_immediately_to_parked_caller() {
         QueueReply::Cancelled(_) => {}
         other => panic!("expected Cancelled cancel reply, got {other:?}"),
     }
-    // Stats: exactly one cancel, no completion, no failure. The worker's
-    // eventual reply is rejected by the runtime (cancel_call closed the
-    // wait), so no `Completed` or `Failed` ticks here.
+    let JobOutcome::Completed { value, .. } = report.refill_outcome else {
+        panic!("expected completed refill, got {:?}", report.refill_outcome);
+    };
+    assert_eq!(value, 42);
+    // Both parked callers settle exactly once and the cancelled worker slot
+    // admits new work immediately after its cancel event releases the worker.
     assert_eq!(report.stats.jobs_cancelled, 1);
-    assert_eq!(report.stats.jobs_completed, 0);
+    assert_eq!(report.stats.jobs_completed, 1);
     assert_eq!(report.stats.jobs_failed, 0);
+    assert_eq!(report.stats.jobs_admitted, 2);
+    assert_eq!(report.stats.in_flight, 0);
     assert_eq!(report.stats.workers_alive, 2);
+}
+
+#[test]
+fn caller_timeout_does_not_strand_pending_authority() {
+    let report = run_caller_gone(config()).expect("caller-gone run");
+    assert!(matches!(
+        report.submit_outcome,
+        tina_runtime::CallOutcome::Timeout
+    ));
+    assert_eq!(report.stats.jobs_admitted, 1);
+    assert_eq!(report.stats.jobs_completed, 1);
+    assert_eq!(report.stats.jobs_cancelled, 0);
+    assert_eq!(report.stats.jobs_failed, 0);
+    assert_eq!(report.stats.in_flight, 0);
 }
 
 #[test]
@@ -82,4 +106,69 @@ fn admission_recovers_after_respawn() {
     assert_eq!(report.stats.worker_crashes, 1);
     assert_eq!(report.stats.worker_respawns, 1);
     assert_eq!(report.stats.workers_alive, config().workers);
+}
+
+#[test]
+fn run_config_rejects_all_unbounded_allocation_and_wait_inputs() {
+    let base = config();
+    for (field, invalid) in [
+        ("workers", RunConfig { workers: 0, ..base }),
+        (
+            "queue_mailbox",
+            RunConfig {
+                queue_mailbox: 0,
+                ..base
+            },
+        ),
+        (
+            "worker_mailbox",
+            RunConfig {
+                worker_mailbox: 0,
+                ..base
+            },
+        ),
+    ] {
+        assert_eq!(invalid.validate(), Err(RunConfigError::Zero(field)));
+    }
+    for (field, invalid) in [
+        (
+            "job_sleep_ms",
+            RunConfig {
+                job_sleep_ms: 0,
+                ..base
+            },
+        ),
+        (
+            "call_timeout_ms",
+            RunConfig {
+                call_timeout_ms: 0,
+                ..base
+            },
+        ),
+    ] {
+        assert_eq!(invalid.validate(), Err(RunConfigError::Zero(field)));
+    }
+
+    assert!(matches!(
+        RunConfig {
+            workers: usize::MAX,
+            ..base
+        }
+        .validate(),
+        Err(RunConfigError::TooLarge {
+            field: "workers",
+            ..
+        })
+    ));
+    assert!(matches!(
+        RunConfig {
+            job_sleep_ms: u64::MAX,
+            ..base
+        }
+        .validate(),
+        Err(RunConfigError::DurationTooLarge {
+            field: "job_sleep_ms",
+            ..
+        })
+    ));
 }
