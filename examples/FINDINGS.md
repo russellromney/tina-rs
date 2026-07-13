@@ -11,6 +11,24 @@ valid; the long-form history lives in
 
 ## Active
 
+### 2026-07-13 Classified select-race continuation routing
+
+`ergonomics_playground` showed that `CallSelectSet` already owned branch
+reservation and cancel handles, but application code still repeated the
+mechanical continuation protocol. Every race declared separate reply and
+cancel variants carrying `(key, token, outcome)`, unpacked each loser cancel
+request, rebuilt its continuation, and assembled the cancellation batch.
+
+`CallSelectEvent<K, R>` is now that protocol vocabulary.
+`CallSelectSet::start_service` installs one cancelable split-service branch,
+and `advance_service` validates the returned token, applies the caller's
+business-success classifier, records reply/cancel truth, and returns the
+bounded loser-cancellation effect plus exact completion state. The helper does
+not choose business success, own the parent caller, or report completion before
+every required cancel acknowledgement settles. The dependent playground
+migration keeps that honest lifecycle visible while removing the adapter
+variants and cancel mapper.
+
 ### 2026-07-13 Typed multi-shard host routing
 
 `ThreadedRuntime`, `ThreadedMultiShardRuntime`, `LocalSystem`, and
