@@ -32,7 +32,9 @@ use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, SleepReply, call_request, sleep,
 };
 
-use crate::{FAST_C_MS, REQUEST_COUNT, Report, SLOW_C_MS, TOTAL_DEADLINE_MS, c_is_slow};
+use crate::{
+    FAST_C_MS, REQUEST_COUNT, Report, SLOW_C_MS, TOTAL_DEADLINE_MS, c_is_domain_failure, c_is_slow,
+};
 
 // ---------- Service C: does the slow work ----------
 
@@ -52,6 +54,7 @@ enum CEvent {
 enum CReply {
     Ok,
     DomainFailure,
+    RuntimeFailure,
 }
 
 struct ServiceC;
@@ -65,7 +68,7 @@ impl ServiceC {
     ) -> Effect<Self> {
         match event {
             CEvent::Done(req, Ok(())) => reply_to(req, CReply::Ok),
-            CEvent::Done(req, Err(_)) => reply_to(req, CReply::DomainFailure),
+            CEvent::Done(req, Err(_)) => reply_to(req, CReply::RuntimeFailure),
         }
     }
 
@@ -76,6 +79,9 @@ impl ServiceC {
     ) -> RequestEffect<Self> {
         match request {
             CRequest::Compute { iteration } => {
+                if c_is_domain_failure(iteration) {
+                    return call.reply(CReply::DomainFailure);
+                }
                 let work = if c_is_slow(iteration) {
                     Duration::from_millis(SLOW_C_MS)
                 } else {
@@ -113,6 +119,7 @@ enum BReply {
     Closed,
     Rejected,
     DomainFailure,
+    RuntimeFailure,
 }
 
 struct ServiceB {
@@ -162,6 +169,7 @@ fn map_c_outcome(outcome: CallOutcome<CReply>) -> BReply {
     match outcome {
         CallOutcome::Replied(CReply::Ok) => BReply::Ok,
         CallOutcome::Replied(CReply::DomainFailure) => BReply::DomainFailure,
+        CallOutcome::Replied(CReply::RuntimeFailure) => BReply::RuntimeFailure,
         CallOutcome::Timeout => BReply::CTimedOut,
         CallOutcome::Full => BReply::Full,
         CallOutcome::Closed => BReply::Closed,
@@ -190,11 +198,12 @@ enum AEvent {
 enum AReply {
     Success,
     CTimedOut,
-    Timeout,
+    BTimedOut,
     Full,
     Closed,
     Rejected,
     DomainFailure,
+    RuntimeFailure,
 }
 
 struct ServiceA {
@@ -254,7 +263,8 @@ fn map_b_outcome(outcome: CallOutcome<BReply>) -> AReply {
         CallOutcome::Replied(BReply::Closed) | CallOutcome::Closed => AReply::Closed,
         CallOutcome::Replied(BReply::Rejected) | CallOutcome::Rejected(_) => AReply::Rejected,
         CallOutcome::Replied(BReply::DomainFailure) => AReply::DomainFailure,
-        CallOutcome::Timeout => AReply::Timeout,
+        CallOutcome::Replied(BReply::RuntimeFailure) => AReply::RuntimeFailure,
+        CallOutcome::Timeout => AReply::BTimedOut,
     }
 }
 
@@ -291,11 +301,13 @@ fn record_a_outcome(report: &mut Report, outcome: CallOutcome<AReply>) {
     match outcome {
         CallOutcome::Replied(AReply::Success) => report.successful += 1,
         CallOutcome::Replied(AReply::CTimedOut) => report.c_timed_out += 1,
-        CallOutcome::Replied(AReply::Timeout) | CallOutcome::Timeout => report.caller_timeout += 1,
+        CallOutcome::Replied(AReply::BTimedOut) => report.b_timed_out += 1,
+        CallOutcome::Timeout => report.caller_timeout += 1,
         CallOutcome::Replied(AReply::Full) | CallOutcome::Full => report.full += 1,
         CallOutcome::Replied(AReply::Closed) | CallOutcome::Closed => report.closed += 1,
         CallOutcome::Replied(AReply::Rejected) | CallOutcome::Rejected(_) => report.rejected += 1,
         CallOutcome::Replied(AReply::DomainFailure) => report.domain_failure += 1,
+        CallOutcome::Replied(AReply::RuntimeFailure) => report.runtime_failure += 1,
     }
 }
 
@@ -386,10 +398,17 @@ mod tests {
             map_c_outcome(CallOutcome::Replied(CReply::DomainFailure)),
             BReply::DomainFailure
         );
+        assert_eq!(
+            map_c_outcome(CallOutcome::Replied(CReply::RuntimeFailure)),
+            BReply::RuntimeFailure
+        );
         assert_eq!(map_c_outcome(CallOutcome::Timeout), BReply::CTimedOut);
         assert_eq!(map_c_outcome(CallOutcome::Full), BReply::Full);
         assert_eq!(map_c_outcome(CallOutcome::Closed), BReply::Closed);
-        assert_eq!(map_c_outcome(CallOutcome::Rejected(REJECTED)), BReply::Rejected);
+        assert_eq!(
+            map_c_outcome(CallOutcome::Rejected(REJECTED)),
+            BReply::Rejected
+        );
     }
 
     #[test]
@@ -404,7 +423,11 @@ mod tests {
                 CallOutcome::Replied(BReply::DomainFailure),
                 AReply::DomainFailure,
             ),
-            (CallOutcome::Timeout, AReply::Timeout),
+            (
+                CallOutcome::Replied(BReply::RuntimeFailure),
+                AReply::RuntimeFailure,
+            ),
+            (CallOutcome::Timeout, AReply::BTimedOut),
             (CallOutcome::Full, AReply::Full),
             (CallOutcome::Closed, AReply::Closed),
             (CallOutcome::Rejected(REJECTED), AReply::Rejected),
@@ -420,11 +443,12 @@ mod tests {
         for outcome in [
             CallOutcome::Replied(AReply::Success),
             CallOutcome::Replied(AReply::CTimedOut),
-            CallOutcome::Replied(AReply::Timeout),
+            CallOutcome::Replied(AReply::BTimedOut),
             CallOutcome::Replied(AReply::Full),
             CallOutcome::Replied(AReply::Closed),
             CallOutcome::Replied(AReply::Rejected),
             CallOutcome::Replied(AReply::DomainFailure),
+            CallOutcome::Replied(AReply::RuntimeFailure),
         ] {
             record_a_outcome(&mut report, outcome);
         }
@@ -433,11 +457,13 @@ mod tests {
             Report {
                 successful: 1,
                 c_timed_out: 1,
-                caller_timeout: 1,
+                b_timed_out: 1,
+                caller_timeout: 0,
                 full: 1,
                 closed: 1,
                 rejected: 1,
                 domain_failure: 1,
+                runtime_failure: 1,
                 exit_clean: false,
             }
         );

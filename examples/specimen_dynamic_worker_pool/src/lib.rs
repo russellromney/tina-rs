@@ -8,22 +8,16 @@
 //! - **Tokio**: `tokio::task::JoinSet`. The coordinator spawns N
 //!   tasks, then loops on `join_next()` until every task has
 //!   reported.
-//! - **Tina**: a `Coordinator` isolate spawns N child `Worker`
-//!   isolates via `spawn(ChildDefinition::new(...))` with a bootstrap
-//!   `Compute` message. Each child sends its partial sum back to the
-//!   coordinator via `send(parent_addr, CoordMsg::WorkerDone(sum))`.
-//!   When the coordinator has heard from every child it
-//!   `stop_with(report)`.
+//! - **Tina**: a `Coordinator` observes N child spawns, then calls each
+//!   request-only worker. Each exhaustive call outcome settles one child, so
+//!   premature child termination cannot strand the aggregate.
 //!
 //! What this teaches:
 //!
 //! - Dynamic spawn ergonomics. The Tokio shape is the standard
-//!   `JoinSet` pattern; the Tina shape uses `ChildDefinition` plus a
-//!   parent-address handshake.
-//! - Partial-failure aggregation as the join semantic. Both sides
-//!   produce one `Report`; an unfinished worker would surface as a
-//!   missing partial in the aggregate. (Real partial failure beyond
-//!   "we got every reply" is sketched in the README.)
+//!   `JoinSet` pattern; the Tina shape uses `spawn_observed` plus typed calls.
+//! - Partial-failure aggregation as the join semantic. Both sides produce one
+//!   `Report`; Tina preserves every spawn and call terminal outcome.
 
 pub mod tina_impl;
 pub mod tokio_impl;
@@ -41,6 +35,26 @@ pub struct Report {
     pub results_collected: u32,
     /// Sum of every worker's partial sum.
     pub total_sum: u64,
+    /// Child construction requested an invalid zero-capacity mailbox.
+    pub spawn_zero_capacity: u32,
+    /// Cross-shard child construction could not reach its destination.
+    pub spawn_destination_unavailable: u32,
+    /// A future non-exhaustive spawn rejection reason.
+    pub spawn_other: u32,
+    /// A child request could not enter its bounded mailbox.
+    pub call_full: u32,
+    /// A child stopped before producing its typed reply.
+    pub call_closed: u32,
+    /// The child request exceeded its mandatory timeout.
+    pub call_timeout: u32,
+    /// The child address belonged to another system incarnation.
+    pub rejected_foreign_system: u32,
+    /// The worker returned without settling request authority.
+    pub rejected_reply_abandoned: u32,
+    /// The worker panicked before settling request authority.
+    pub rejected_handler_panicked: u32,
+    /// The worker did not support the request message shape.
+    pub rejected_unsupported_message: u32,
     /// Whether the run finished cleanly.
     pub exit_clean: bool,
 }
@@ -51,5 +65,26 @@ pub fn expected_report() -> Report {
         results_collected: WORKER_COUNT,
         total_sum: WORK_VALUES.iter().sum(),
         exit_clean: true,
+        ..Report::default()
     }
+}
+
+/// Every spawned worker must settle into exactly one visible terminal bucket.
+pub fn assert_tina_report_accounted(report: &Report) {
+    let settled = report.results_collected
+        + report.spawn_zero_capacity
+        + report.spawn_destination_unavailable
+        + report.spawn_other
+        + report.call_full
+        + report.call_closed
+        + report.call_timeout
+        + report.rejected_foreign_system
+        + report.rejected_reply_abandoned
+        + report.rejected_handler_panicked
+        + report.rejected_unsupported_message;
+    assert_eq!(settled, WORKER_COUNT, "unsettled worker: {report:?}");
+    assert!(
+        report.exit_clean,
+        "coordinator did not exit cleanly: {report:?}"
+    );
 }

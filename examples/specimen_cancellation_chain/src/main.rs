@@ -19,10 +19,25 @@ fn main() -> anyhow::Result<()> {
 fn print_side(side: &str, report: Report) {
     println!(
         "comparison=specimen_cancellation_chain side={} replies_before_cancel={} \
-         replies_after_cancel={} cancel_observed={} exit_clean={}",
+         replies_after_cancel={} call_full={} call_closed={} call_timeout={} call_rejected={} \
+         cancel_cancelled={} cancel_not_admitted={} cancel_already_completed={} \
+         cancel_already_cancelled={} cancel_wrong_shard={} pending={} \
+         settlement_complete={} settlement_protocol_errors={} cancel_observed={} exit_clean={}",
         side,
         report.replies_before_cancel,
         report.replies_after_cancel,
+        report.call_full,
+        report.call_closed,
+        report.call_timeout,
+        report.call_rejected,
+        report.cancel_cancelled,
+        report.cancel_not_admitted,
+        report.cancel_already_completed,
+        report.cancel_already_cancelled,
+        report.cancel_wrong_shard,
+        report.pending,
+        report.settlement_complete,
+        report.settlement_protocol_errors,
         report.cancel_observed,
         report.exit_clean,
     );

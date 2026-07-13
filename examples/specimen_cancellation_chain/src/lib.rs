@@ -44,6 +44,30 @@ pub struct Report {
     /// - Tokio: `abort_all` preempts at the next await; aborted
     ///   tasks never run their reply path. Always 0.
     pub replies_after_cancel: u32,
+    /// Calls rejected because the destination mailbox was full.
+    pub call_full: u32,
+    /// Calls rejected because the destination was closed.
+    pub call_closed: u32,
+    /// Calls whose mandatory wait timed out before cancellation.
+    pub call_timeout: u32,
+    /// Calls rejected for another typed runtime reason.
+    pub call_rejected: u32,
+    /// Waits successfully reclaimed by cancellation.
+    pub cancel_cancelled: u32,
+    /// Cancellation raced before runtime admission.
+    pub cancel_not_admitted: u32,
+    /// Cancellation arrived after the call had settled.
+    pub cancel_already_completed: u32,
+    /// Duplicate cancellation attempts.
+    pub cancel_already_cancelled: u32,
+    /// Cancellation attempted from the wrong shard.
+    pub cancel_wrong_shard: u32,
+    /// Entries still unsettled when the implementation join was consumed.
+    pub pending: u32,
+    /// Whether the implementation observed every required settlement fact.
+    pub settlement_complete: bool,
+    /// Stale, duplicate, or otherwise invalid settlement continuations.
+    pub settlement_protocol_errors: u32,
     /// True when the host actually delivered the cancel signal.
     pub cancel_observed: bool,
     /// True when the side reached the end of `run` cleanly.
@@ -66,6 +90,15 @@ fn assert_shared_invariants(side: &str, report: &Report) {
         report.exit_clean,
         "{side}: expected exit_clean, got {report:?}"
     );
+    assert_eq!(report.pending, 0, "{side}: unsettled calls: {report:?}");
+    assert!(
+        report.settlement_complete,
+        "{side}: incomplete settlement: {report:?}"
+    );
+    assert_eq!(
+        report.settlement_protocol_errors, 0,
+        "{side}: settlement protocol errors: {report:?}"
+    );
 }
 
 /// Tina-side invariants. The runtime does not preempt the workers'
@@ -82,6 +115,37 @@ pub fn assert_tina_report_invariants(report: &Report) {
     assert_eq!(
         total, FANOUT,
         "tina: every worker should finish (delivered or rejected), got {report:?}",
+    );
+    assert_eq!(
+        report.cancel_cancelled,
+        FANOUT - report.replies_before_cancel,
+        "tina: each pending call should be cancelled exactly once, got {report:?}",
+    );
+    assert_eq!(report.call_full, 0, "unexpected full call: {report:?}");
+    assert_eq!(report.call_closed, 0, "unexpected closed call: {report:?}");
+    assert_eq!(
+        report.call_timeout, 0,
+        "unexpected timed-out call: {report:?}"
+    );
+    assert_eq!(
+        report.call_rejected, 0,
+        "unexpected rejected call: {report:?}"
+    );
+    assert_eq!(
+        report.cancel_not_admitted, 0,
+        "unexpected cancel race: {report:?}"
+    );
+    assert_eq!(
+        report.cancel_already_completed, 0,
+        "unexpected late cancel: {report:?}"
+    );
+    assert_eq!(
+        report.cancel_already_cancelled, 0,
+        "unexpected duplicate cancel: {report:?}"
+    );
+    assert_eq!(
+        report.cancel_wrong_shard, 0,
+        "unexpected wrong-shard cancel: {report:?}"
     );
 }
 

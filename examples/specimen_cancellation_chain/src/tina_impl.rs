@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    BoundedItems, CallGroup, CallGroupToken, CallOutcome, CallReplyRejectedReason,
+    BoundedItems, CallGroup, CallGroupReport, CallGroupToken, CallOutcome, CallReplyRejectedReason,
     DefaultThreadedMailboxFactory, DeferredReplyRejectedReason, LocalSystem, RuntimeEventKind,
     SleepReply, bounded_batch, call_cancelable_request, cancel_call, sleep,
 };
@@ -102,10 +102,9 @@ struct Driver {
     /// Bounded named wait group: one entry per worker, keyed by worker
     /// index. `with_capacity(FANOUT)` rejects extra inserts as `Full`
     /// rather than growing — a known-size fan-out fits exactly.
-    group: CallGroup<u32, WorkerReply>,
-    replies_before_cancel: u32,
+    group: Option<CallGroup<u32, WorkerReply>>,
     cancel_observed: bool,
-    group_error: bool,
+    settlement_protocol_errors: u32,
 }
 
 #[tina_runtime::isolate(message = DriverMsg)]
@@ -123,8 +122,9 @@ impl Driver {
                 )
                 .expect("worker fan-out is capped by FANOUT");
                 bounded_batch(workers.map_effects(|(idx, worker)| {
-                    self
-                        .group
+                    self.group
+                        .as_mut()
+                        .expect("group exists until the driver stops")
                         .start_cancelable(
                             idx as u32,
                             call_cancelable_request(worker, WorkerRequest::Do, CALL_TIMEOUT),
@@ -145,28 +145,29 @@ impl Driver {
                 // Explicit slot cleanup on completion — Tina's
                 // CallGroup has no Drop magic. A normal reply settled
                 // the call; the slot is reusable.
-                let replied = matches!(outcome, CallOutcome::Replied(_));
                 if self
                     .group
+                    .as_mut()
+                    .expect("group exists until the driver stops")
                     .record_reply(worker, token, outcome, |_| false)
                     .is_err()
                 {
-                    self.group_error = true;
-                }
-                if replied {
-                    self.replies_before_cancel += 1;
+                    self.settlement_protocol_errors += 1;
                 }
                 self.finish_if_settled()
             }
             DriverMsg::Cancel => {
                 self.cancel_observed = true;
-                let cancel_requests = self.group.drain_pending_for_cancel();
+                let cancel_requests = self
+                    .group
+                    .as_mut()
+                    .expect("group exists until the driver stops")
+                    .drain_pending_for_cancel();
                 if cancel_requests.is_empty() {
                     return self.finish_if_settled();
                 }
-                let cancel_requests =
-                    BoundedItems::try_from_iter(FANOUT as usize, cancel_requests)
-                        .expect("cancel fan-out is capped by FANOUT");
+                let cancel_requests = BoundedItems::try_from_iter(FANOUT as usize, cancel_requests)
+                    .expect("cancel fan-out is capped by FANOUT");
                 bounded_batch(cancel_requests.map_effects(|request| {
                     let (worker, token, handle) = request.into_parts();
                     cancel_call(handle).then(move |outcome| DriverMsg::Cancelled {
@@ -181,8 +182,14 @@ impl Driver {
                 token,
                 outcome,
             } => {
-                if self.group.record_cancel(worker, token, outcome).is_err() {
-                    self.group_error = true;
+                if self
+                    .group
+                    .as_mut()
+                    .expect("group exists until the driver stops")
+                    .record_cancel(worker, token, outcome)
+                    .is_err()
+                {
+                    self.settlement_protocol_errors += 1;
                 }
                 self.finish_if_settled()
             }
@@ -191,17 +198,60 @@ impl Driver {
 }
 
 impl Driver {
-    fn finish_if_settled(&self) -> Effect<Self> {
-        if self.cancel_observed && self.group.report_ready() {
-            stop_with(Report {
-                replies_before_cancel: self.replies_before_cancel,
-                replies_after_cancel: 0,
-                cancel_observed: true,
-                exit_clean: !self.group_error,
-            })
+    fn finish_if_settled(&mut self) -> Effect<Self> {
+        let ready = self.group.as_ref().is_some_and(CallGroup::report_ready);
+        if self.cancel_observed && ready {
+            let group = self
+                .group
+                .take()
+                .expect("a ready group exists until its report is consumed")
+                .into_report();
+            stop_with(report_from_group(group, self.settlement_protocol_errors))
         } else {
             noop()
         }
+    }
+}
+
+fn report_from_group(
+    group: CallGroupReport<u32, WorkerReply>,
+    settlement_protocol_errors: u32,
+) -> Report {
+    let mut report = Report {
+        cancel_observed: true,
+        pending: u32::try_from(group.pending).expect("group capacity fits u32"),
+        settlement_complete: group.complete,
+        settlement_protocol_errors,
+        ..Report::default()
+    };
+    for branch in group.branch_outcomes {
+        record_branch_outcome(&mut report, branch.outcome);
+    }
+    for cancel in group.cancel_outcomes {
+        record_cancel_outcome(&mut report, cancel.outcome);
+    }
+    report.exit_clean =
+        report.settlement_complete && report.pending == 0 && report.settlement_protocol_errors == 0;
+    report
+}
+
+fn record_branch_outcome(report: &mut Report, outcome: CallOutcome<WorkerReply>) {
+    match outcome {
+        CallOutcome::Replied(_) => report.replies_before_cancel += 1,
+        CallOutcome::Full => report.call_full += 1,
+        CallOutcome::Closed => report.call_closed += 1,
+        CallOutcome::Timeout => report.call_timeout += 1,
+        CallOutcome::Rejected(_) => report.call_rejected += 1,
+    }
+}
+
+fn record_cancel_outcome(report: &mut Report, outcome: CancelOutcome) {
+    match outcome {
+        CancelOutcome::Cancelled => report.cancel_cancelled += 1,
+        CancelOutcome::NotAdmitted => report.cancel_not_admitted += 1,
+        CancelOutcome::AlreadyCompleted => report.cancel_already_completed += 1,
+        CancelOutcome::AlreadyCancelled => report.cancel_already_cancelled += 1,
+        CancelOutcome::WrongShard => report.cancel_wrong_shard += 1,
     }
 }
 
@@ -233,10 +283,9 @@ fn run_application(
         .register_root::<_, Infallible>(
             Driver {
                 workers,
-                group: CallGroup::with_capacity(FANOUT as usize),
-                replies_before_cancel: 0,
+                group: Some(CallGroup::with_capacity(FANOUT as usize)),
                 cancel_observed: false,
-                group_error: false,
+                settlement_protocol_errors: 0,
             },
             32,
         )
@@ -296,4 +345,66 @@ fn run_application(
     report.replies_after_cancel = count_rejected(&app.trace());
 
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tina::CallRejectedReason;
+
+    #[test]
+    fn branch_terminal_outcomes_have_independent_buckets() {
+        let mut report = Report::default();
+        for outcome in [
+            CallOutcome::Replied(WorkerReply),
+            CallOutcome::Full,
+            CallOutcome::Closed,
+            CallOutcome::Timeout,
+            CallOutcome::Rejected(CallRejectedReason::UnsupportedMessage),
+        ] {
+            record_branch_outcome(&mut report, outcome);
+        }
+        assert_eq!(report.replies_before_cancel, 1);
+        assert_eq!(report.call_full, 1);
+        assert_eq!(report.call_closed, 1);
+        assert_eq!(report.call_timeout, 1);
+        assert_eq!(report.call_rejected, 1);
+    }
+
+    #[test]
+    fn cancel_terminal_outcomes_have_independent_buckets() {
+        let mut report = Report::default();
+        for outcome in [
+            CancelOutcome::Cancelled,
+            CancelOutcome::NotAdmitted,
+            CancelOutcome::AlreadyCompleted,
+            CancelOutcome::AlreadyCancelled,
+            CancelOutcome::WrongShard,
+        ] {
+            record_cancel_outcome(&mut report, outcome);
+        }
+        assert_eq!(report.cancel_cancelled, 1);
+        assert_eq!(report.cancel_not_admitted, 1);
+        assert_eq!(report.cancel_already_completed, 1);
+        assert_eq!(report.cancel_already_cancelled, 1);
+        assert_eq!(report.cancel_wrong_shard, 1);
+    }
+
+    #[test]
+    fn incomplete_or_invalid_group_cannot_report_clean_exit() {
+        let report = report_from_group(
+            CallGroupReport {
+                winner: None,
+                branch_outcomes: Vec::new(),
+                cancel_outcomes: Vec::new(),
+                pending: 1,
+                complete: false,
+            },
+            2,
+        );
+        assert_eq!(report.pending, 1);
+        assert!(!report.settlement_complete);
+        assert_eq!(report.settlement_protocol_errors, 2);
+        assert!(!report.exit_clean);
+    }
 }

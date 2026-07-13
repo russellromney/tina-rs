@@ -16,8 +16,8 @@ cargo test --manifest-path examples/specimen_backpressure_chain/Cargo.toml
 ```
 
 ```
-side=tokio successful=3 c_timed_out=0 caller_timeout=3 full=0 closed=0 rejected=0 domain_failure=0 exit_clean=true
-side=tina  successful=3 c_timed_out=3 caller_timeout=0 full=0 closed=0 rejected=0 domain_failure=0 exit_clean=true
+side=tokio successful=2 c_timed_out=0 b_timed_out=0 caller_timeout=3 full=0 closed=0 rejected=0 domain_failure=1 runtime_failure=0 exit_clean=true
+side=tina  successful=2 c_timed_out=3 b_timed_out=0 caller_timeout=0 full=0 closed=0 rejected=0 domain_failure=1 runtime_failure=0 exit_clean=true
 ```
 
 ## Read
@@ -76,15 +76,17 @@ When C is too slow, B's `IsolateCall` to C resolves as
 and replies fast. A receives `CallOutcome::Replied(CTimedOut)` and
 knows *exactly* which hop ran out. No invisible drops:
 
-| Outcome at A             | Report bucket / truth       |
-|--------------------------|-----------------------------|
-| `Replied(Success)`       | chain finished              |
-| `Replied(CTimedOut)`     | C ran past `budget`         |
-| `Timeout`                | caller wait expired         |
-| `Full`                   | bounded admission was full  |
-| `Closed`                 | destination was closed      |
-| `Rejected(_)`            | typed runtime rejection     |
-| `Replied(DomainFailure)` | service-domain failure      |
+| Outcome at A              | Report bucket / truth             |
+|---------------------------|-----------------------------------|
+| `Replied(Success)`        | chain finished                    |
+| `Replied(CTimedOut)`      | C ran past `budget`               |
+| `Replied(BTimedOut)`      | A's wait for B expired            |
+| outer `Timeout`           | driver's wait for A expired       |
+| `Full`                    | bounded admission was full        |
+| `Closed`                  | destination was closed            |
+| `Rejected(_)`             | typed runtime rejection           |
+| `Replied(DomainFailure)`  | service-domain failure            |
+| `Replied(RuntimeFailure)` | runtime-owned continuation failed |
 
 ## Discussion
 
@@ -106,7 +108,8 @@ What feels better:
   virtual clock anchor, so DST/replay tests see deterministic
   deadline math.
 - **The reply translator is exhaustive.** B and A preserve `Full`,
-  `Closed`, `Rejected`, caller `Timeout`, and domain failure as distinct
+  `Closed`, `Rejected`, B timeout, outer caller timeout, domain failure, and
+  runtime-owned continuation failure as distinct
   typed replies. The driver counts those buckets independently instead of
   collapsing them into a generic error.
 

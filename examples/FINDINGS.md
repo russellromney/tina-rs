@@ -117,17 +117,23 @@ constructor returns. Panic consumes the monotonic id without registering an
 isolate; bounded threaded pre-admission and unknown-shard rejection do not
 execute the closure. An accepted threaded constructor may still publish after
 `WorkerUnresponsive`, so the returned error does not counterfeit address
-authority. The motivating specimen migration remains in its example cohort,
-not this framework prerequisite.
+authority. A later adversarial pass found an even smaller shape for the
+motivating specimen: `spawn_observed` followed by a typed child request removes
+the parent's need to know its own address. The constructor API remains useful
+for applications whose children genuinely need a parent capability, but the
+example no longer retains that dependency merely because it works.
 
 ### 2026-07-12 Pure bounded-workload LocalSystem migration
 
 Five bounded-workload specimens were reviewed as one host-authoring cohort.
 All five now use the fallible `LocalSystem` application facade and
-`run_to_shutdown_reported`. The dynamic worker pool also uses address-aware
-root construction directly on the facade. Cancellation now bounds both effect
-producers and reports only after `CallGroup::report_ready()`. Backpressure
-preserves Full, Closed, Rejected, caller Timeout, and domain failure through
+`run_to_shutdown_reported`. The dynamic worker pool's final migration uses
+`spawn_observed` plus a typed request to each request-only child, so every spawn
+and call outcome settles the parent even if a child panics before replying.
+Cancellation now bounds both effect
+producers, reports only after `CallGroup::report_ready()`, and consumes the
+exact `CallGroupReport`. Backpressure preserves Full, Closed, Rejected,
+per-hop Timeout, domain failure, and runtime continuation failure through
 the complete chain. Hot-key and rate-limit reports account for every
 `HostBurstSnapshot` terminal bucket. No example-local shutdown combiner, raw
 threaded owner, fake settlement delay, raw request-sized batch, or outcome
@@ -135,9 +141,9 @@ collapse remains.
 
 | Example | Current friction | Desired user-facing form | Current API sufficient | Framework prerequisite | Example PR | Tests | Status |
 |---|---|---|---|---|---|---|---|
-| `specimen_backpressure_chain` | none | exhaustive typed chain outcomes inside `run_to_shutdown_reported` | yes | reported runner merged | this cohort | Tokio/Tina smoke; direct mapping tests for every terminal bucket; Tina 20x | migrated |
-| `specimen_cancellation_chain` | none | bounded cancel fan-out and exact `CallGroup` settlement inside `run_to_shutdown_reported` | yes | reported runner merged | this cohort | Tokio/Tina smoke, exact cancel/rejection invariants; Tina 20x | migrated |
-| `specimen_dynamic_worker_pool` | parent-side child completion/result join remains a product probe, not local glue | `register_root_using` plus `run_to_shutdown_reported` | yes | address-aware root and reported runner merged | this cohort | exact fanout/sum smoke and owner-parity framework tests | migrated |
+| `specimen_backpressure_chain` | none | exhaustive typed chain outcomes inside `run_to_shutdown_reported` | yes | reported runner merged | this cohort | Tokio/Tina smoke with real domain failure; direct mapping tests for every terminal bucket; Tina 20x | migrated |
+| `specimen_cancellation_chain` | none | bounded cancel fan-out and consumed exact `CallGroupReport` inside `run_to_shutdown_reported` | yes | reported runner merged | this cohort | Tokio/Tina smoke; direct exhaustive branch/cancel mapping tests; exact cancellation invariants; Tina 20x | migrated |
+| `specimen_dynamic_worker_pool` | none | observed spawn plus typed request outcome as the bounded join | yes | none | this cohort | happy-path fanout/sum smoke; injected child panic proves exact `HandlerPanicked` settlement without hang | migrated |
 | `specimen_hot_key_fairness` | none | exhaustive bounded observed bursts inside `run_to_shutdown_reported` | yes | reported runner merged | this cohort | Tokio/Tina invariant smoke, terminal-bucket negative tests; Tina 20x | migrated |
 | `specimen_rate_limited_worker` | none | exhaustive observed burst/control/result inside `run_to_shutdown_reported` | yes | reported runner merged | this cohort | Tokio/Tina boundedness/refill and terminal-bucket invariants; Tina 20x | migrated |
 
@@ -606,17 +612,17 @@ behavior). What moved, and what was deliberately left:
   `specimen_idempotent_retry`, `system_live_replay_bugbox` — all-request
   or single-variant message sets; no event/request split to make, and
   the reject arm (where present) documents a real policy invariant.
-- `ServiceB`/`ServiceA` in `specimen_backpressure_chain` — blocked by
-  finding 36 (`RequestCall` has no `now()`).
+- `ServiceB`/`ServiceA` in `specimen_backpressure_chain` — now split-service
+  after finding 36 added `RequestCall::now()`.
 - `QuoteGateway` race in `ergonomics_playground` — stays on `CallGroup`;
   it needs a business-success classifier (`|q| q.available`) that
   `CallJoinSet`/`CallSelectSet` cannot carry.
 - `specimen_sharded_fanout_read` (Bind/Start is open runtime gap,
-  finding 3), `specimen_dynamic_worker_pool` /
-  `specimen_supervised_worker` (already canonical: self-address ctor /
-  `spawn_observed`), `specimen_pool_cancel_reclaim` /
-  `specimen_cancellation_chain` pending shape (already on
-  `PendingCallSet`, finding 8), `specimen_graceful_pool_shutdown` /
+  finding 3), `specimen_dynamic_worker_pool` / `specimen_supervised_worker`
+  (now canonical: observed spawn plus typed request / `spawn_observed`),
+  `specimen_pool_cancel_reclaim` / `specimen_cancellation_chain` (now on
+  their canonical pending structure / consumed `CallGroupReport`),
+  `specimen_graceful_pool_shutdown` /
   `specimen_graceful_drain_server` / `specimen_webhook_publisher`
   (README frames the manual shape as the lesson, or register→observe
   ordering is load-bearing).
@@ -882,9 +888,10 @@ the threaded mirror; `MultiShardRuntime` and
 `ThreadedMultiShardRuntime` expose `register_with_capacity_using_on`;
 `LocalSystem` and `LocalMultiShardSystem` expose
 `register_root_using[_on]`; and both simulator owners mirror the explicit-step
-vocabulary. `specimen_dynamic_worker_pool` removed its chicken-and-egg
-`Begin { self_addr }` variant with the lower-level method; its pending
-LocalSystem migration can now keep that shape without an owner escape hatch.
+vocabulary. `specimen_dynamic_worker_pool` first removed its chicken-and-egg
+`Begin { self_addr }` variant with the lower-level method, then its final
+LocalSystem migration removed the parent-address dependency entirely through
+`spawn_observed` plus a typed child request.
 
 Still open: the cross-isolate handshake half — `Bind { bridge }` in
 `specimen_sharded_fanout_read` is *not* about self-address, it's about

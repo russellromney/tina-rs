@@ -48,7 +48,10 @@ slot. `drain_pending_for_cancel` transfers each move-only handle to
 one explicit `cancel_call` effect without growing past `FANOUT`. The
 driver emits its report only after `CallGroup::report_ready()` says every
 reply and cancel fact is recorded; no host delay or finish message stands
-in for settlement.
+in for settlement. It then consumes `CallGroup::into_report()` and exposes
+independent buckets for `Replied`, `Full`, `Closed`, `Timeout`, `Rejected`,
+and every `CancelOutcome`; stale or duplicate continuations increment a
+separate protocol-error bucket instead of disappearing.
 
 ## What feels better
 

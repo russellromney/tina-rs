@@ -43,6 +43,7 @@ pub fn run() -> anyhow::Result<Report> {
                 }
             }
         }
+        report.settlement_complete = true;
         report.exit_clean = true;
         Ok(report)
     })

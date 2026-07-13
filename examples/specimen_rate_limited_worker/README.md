@@ -63,7 +63,7 @@ state keeps one timer in flight. The host closes the burst with a
 normal Tina message: `BurstClosed(admitted)`.
 
 ```rust
-WorkerMsg::Submit(_) => {
+WorkerMsg::Submit => {
     self.report.jobs_admitted += 1;
     self.pending += 1;
     if self.pacing { noop() } else { self.drive(ctx) }
@@ -100,8 +100,8 @@ preserves every typed outcome (admitted / mailbox_full / mailbox_closed
 
 ```rust
 let outcomes = HostBurstOutcomes::new();
-for n in 0..BURST_JOBS {
-    let _ = app.try_send_outcome(worker_addr, Submit(n), &outcomes);
+for _ in 0..BURST_JOBS {
+    let _ = app.try_send_outcome(worker_addr, Submit, &outcomes);
 }
 outcomes.wait_complete(deadline)?;
 let snap = outcomes.snapshot();

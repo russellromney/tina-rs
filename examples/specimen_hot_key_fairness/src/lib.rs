@@ -46,8 +46,14 @@ pub fn assert_report_invariants(side: &str, r: &Report) {
     assert_eq!(hot_total, HOT_WRITES, "{side}: {r:?}");
     let cold_expected = (SHARDS - 1) * COLD_WRITES_PER_SHARD;
     assert_eq!(cold_total, cold_expected, "{side}: {r:?}");
-    assert_eq!(r.hot_terminal, 0, "{side}: hot worker stopped during burst: {r:?}");
-    assert_eq!(r.cold_terminal, 0, "{side}: cold worker stopped during burst: {r:?}");
+    assert_eq!(
+        r.hot_terminal, 0,
+        "{side}: hot worker stopped during burst: {r:?}"
+    );
+    assert_eq!(
+        r.cold_terminal, 0,
+        "{side}: cold worker stopped during burst: {r:?}"
+    );
     assert!(
         r.hot_rejected > 0,
         "{side}: hot shard should overflow under skew, got {r:?}",

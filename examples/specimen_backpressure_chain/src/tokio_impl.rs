@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use tokio::runtime::Builder;
 
-use crate::{FAST_C_MS, REQUEST_COUNT, Report, SLOW_C_MS, TOTAL_DEADLINE_MS, c_is_slow};
+use crate::{
+    FAST_C_MS, REQUEST_COUNT, Report, SLOW_C_MS, TOTAL_DEADLINE_MS, c_is_domain_failure, c_is_slow,
+};
 
 pub fn run() -> anyhow::Result<Report> {
     let rt = Builder::new_current_thread().enable_all().build()?;
@@ -24,6 +26,7 @@ pub fn run() -> anyhow::Result<Report> {
                     // Tokio's outer timeout names only the caller wait.
                     report.caller_timeout += 1;
                 }
+                AOutcome::DomainFailure => report.domain_failure += 1,
             }
         }
         report.exit_clean = true;
@@ -34,26 +37,35 @@ pub fn run() -> anyhow::Result<Report> {
 enum AOutcome {
     Success,
     Timeout,
+    DomainFailure,
 }
 
 async fn service_a(i: u32) -> AOutcome {
     let total = Duration::from_millis(TOTAL_DEADLINE_MS);
     match tokio::time::timeout(total, service_b(i)).await {
-        Ok(()) => AOutcome::Success,
+        Ok(Ok(())) => AOutcome::Success,
+        Ok(Err(DomainFailure)) => AOutcome::DomainFailure,
         Err(_) => AOutcome::Timeout,
     }
 }
 
-async fn service_b(i: u32) {
+#[derive(Debug)]
+struct DomainFailure;
+
+async fn service_b(i: u32) -> Result<(), DomainFailure> {
     // B is fast and just calls C.
-    service_c(i).await;
+    service_c(i).await
 }
 
-async fn service_c(i: u32) {
+async fn service_c(i: u32) -> Result<(), DomainFailure> {
+    if c_is_domain_failure(i) {
+        return Err(DomainFailure);
+    }
     let work = if c_is_slow(i) {
         Duration::from_millis(SLOW_C_MS)
     } else {
         Duration::from_millis(FAST_C_MS)
     };
     tokio::time::sleep(work).await;
+    Ok(())
 }

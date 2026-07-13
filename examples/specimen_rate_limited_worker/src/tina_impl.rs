@@ -44,10 +44,8 @@ use crate::{BURST_JOBS, QUEUE_CAPACITY, RATE_WINDOW_MS, Report};
 
 #[derive(Debug)]
 enum WorkerMsg {
-    /// One job submission from the host. The `u32` is the job index;
-    /// the worker only logs it (and we deliberately bind it in the
-    /// handler so the payload stays a real lesson, not a unit hole).
-    Submit(u32),
+    /// One job submission from the host.
+    Submit,
     /// Backoff continuation marking "the rate window elapsed, try the next
     /// job." Carries `SleepReply` so a cancelled timer (shutdown) is
     /// visible at the reply site.
@@ -73,9 +71,6 @@ struct Worker {
     /// `Some(n)` after [`WorkerMsg::BurstClosed`] arrives, naming the
     /// final admitted count the worker should stop at.
     expected: Option<u32>,
-    /// Last job index the worker processed. Tracked so `Submit(u32)`
-    /// is bound and read deliberately rather than ignored.
-    last_index: Option<u32>,
 }
 
 #[tina_runtime::isolate(message = WorkerMsg)]
@@ -86,9 +81,8 @@ impl Worker {
         ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            WorkerMsg::Submit(index) => {
+            WorkerMsg::Submit => {
                 self.report.jobs_admitted += 1;
-                self.last_index = Some(index);
                 self.pending += 1;
                 // Kick the pace loop only if no timer is already in flight.
                 if self.pacing { noop() } else { self.drive(ctx) }
@@ -194,7 +188,6 @@ fn run_application(
         pending: 0,
         pacing: false,
         expected: None,
-        last_index: None,
     };
     let worker_addr = app
         .register_root::<_, Infallible>(worker, QUEUE_CAPACITY)
@@ -215,8 +208,8 @@ fn run_application(
     // (admitted, mailbox_full, mailbox_closed, ingress_full,
     // worker_stopped); none of them are collapsed.
     let outcomes = HostBurstOutcomes::new();
-    for n in 0..BURST_JOBS {
-        let _ = app.try_send_outcome(worker_addr, WorkerMsg::Submit(n), &outcomes);
+    for _ in 0..BURST_JOBS {
+        let _ = app.try_send_outcome(worker_addr, WorkerMsg::Submit, &outcomes);
     }
     outcomes
         .wait_complete(Duration::from_secs(2))

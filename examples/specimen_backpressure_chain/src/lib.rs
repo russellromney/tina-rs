@@ -27,8 +27,9 @@
 //! - `c_timed_out` — Tina: B observed `CallOutcome::Timeout` from C
 //!   (or Tokio: outer timeout fired while we believe C was the slow
 //!   hop). Counted from each side's own visible state;
-//! - `caller_timeout` — a caller's own wait expired;
-//! - `full`, `closed`, `rejected`, and `domain_failure` — distinct
+//! - `b_timed_out` — A's call to B expired before B produced a typed reply;
+//! - `caller_timeout` — the driver's own wait for A expired;
+//! - `full`, `closed`, `rejected`, `domain_failure`, and `runtime_failure` — distinct
 //!   terminal truths preserved through every hop.
 
 pub mod tina_impl;
@@ -55,18 +56,23 @@ pub fn c_is_slow(i: u32) -> bool {
     i % 2 == 1
 }
 
+/// One fast request exercises a real service-domain failure.
+pub fn c_is_domain_failure(i: u32) -> bool {
+    i == 4
+}
+
 /// What each side observed end-to-end.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Report {
     /// Requests where A → B → C all replied within the budget.
     pub successful: u32,
-    /// Requests where the deadline fired and the runtime can name C
-    /// as the slow hop. Tokio reports this when the outer timeout
-    /// fires (it does not actually know it was C, but the test
-    /// scripts that side so we can pretend); Tina reports this when
-    /// B observes `CallOutcome::Timeout` from its `call(C, ..., budget)`.
+    /// Requests where B can name C as the timed-out hop. Tina reports this
+    /// when B observes `CallOutcome::Timeout`; Tokio leaves it zero because
+    /// its outer timeout cannot recover hop provenance.
     pub c_timed_out: u32,
-    /// A caller's own wait expired before a typed downstream reply arrived.
+    /// A's wait for B expired before B produced a typed reply.
+    pub b_timed_out: u32,
+    /// The driver's own wait for A expired.
     pub caller_timeout: u32,
     /// A bounded call admission was full.
     pub full: u32,
@@ -76,23 +82,30 @@ pub struct Report {
     pub rejected: u32,
     /// The service completed with a domain failure.
     pub domain_failure: u32,
+    /// Runtime-owned continuation work failed.
+    pub runtime_failure: u32,
     /// Whether each side reached the end of `run` cleanly.
     pub exit_clean: bool,
 }
 
-/// Expected Tina counts under the constants above: three successful
-/// requests and three typed C-hop timeouts.
+/// Expected Tina counts under the constants above: two successful requests,
+/// three typed C-hop timeouts, and one service-domain failure.
 pub fn expected_tina_report() -> Report {
     let slow_count = (0..REQUEST_COUNT).filter(|i| c_is_slow(*i)).count() as u32;
-    let fast_count = REQUEST_COUNT - slow_count;
+    let domain_failure_count = (0..REQUEST_COUNT)
+        .filter(|i| c_is_domain_failure(*i))
+        .count() as u32;
+    let fast_count = REQUEST_COUNT - slow_count - domain_failure_count;
     Report {
         successful: fast_count,
         c_timed_out: slow_count,
+        b_timed_out: 0,
         caller_timeout: 0,
         full: 0,
         closed: 0,
         rejected: 0,
-        domain_failure: 0,
+        domain_failure: domain_failure_count,
+        runtime_failure: 0,
         exit_clean: true,
     }
 }
@@ -100,10 +113,14 @@ pub fn expected_tina_report() -> Report {
 /// Tokio can only name its outer caller timeout, not the C hop.
 pub fn expected_tokio_report() -> Report {
     let slow_count = (0..REQUEST_COUNT).filter(|i| c_is_slow(*i)).count() as u32;
-    let fast_count = REQUEST_COUNT - slow_count;
+    let domain_failure_count = (0..REQUEST_COUNT)
+        .filter(|i| c_is_domain_failure(*i))
+        .count() as u32;
+    let fast_count = REQUEST_COUNT - slow_count - domain_failure_count;
     Report {
         successful: fast_count,
         caller_timeout: slow_count,
+        domain_failure: domain_failure_count,
         exit_clean: true,
         ..Report::default()
     }
