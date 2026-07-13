@@ -167,6 +167,70 @@ struct ObservedParent {
     spawn_error: Rc<RefCell<Option<SpawnObservedError>>>,
 }
 
+#[derive(Debug)]
+enum RestartObservedParentEvent {
+    Start,
+    Restart,
+    RestartWithFullMailbox,
+    Fill,
+    ChildStarted(Result<ChildRef<ChildEvent>, SpawnObservedError>),
+    ChildRestarted(ChildRef<ChildEvent>),
+}
+
+struct RestartObservedParent {
+    child_seen: Rc<RefCell<Vec<u8>>>,
+    order_log: Rc<RefCell<Vec<&'static str>>>,
+    incarnations: Rc<RefCell<Vec<ChildRef<ChildEvent>>>>,
+}
+
+impl Isolate for RestartObservedParent {
+    tina::isolate_types! {
+        message: RestartObservedParentEvent,
+        reply: (),
+        send: Outbound<RestartObservedParentEvent>,
+        spawn: tina::RestartableChildDefinition<Child>,
+        spawn_observed: tina::SpawnObserved<tina::RestartableChildDefinition<Child>, RestartObservedParentEvent, ChildEvent>,
+        io: Infallible,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            RestartObservedParentEvent::Start => {
+                let child_seen = Rc::clone(&self.child_seen);
+                let order_log = Rc::clone(&self.order_log);
+                spawn_observed(tina::RestartableChildDefinition::new(
+                    move || Child {
+                        seen: Rc::clone(&child_seen),
+                        order_log: Rc::clone(&order_log),
+                    },
+                    4,
+                ))
+                .then_with_restarts(
+                    RestartObservedParentEvent::ChildStarted,
+                    RestartObservedParentEvent::ChildRestarted,
+                )
+            }
+            RestartObservedParentEvent::Restart => restart_children(),
+            RestartObservedParentEvent::RestartWithFullMailbox => batch([
+                send(ctx.me(), RestartObservedParentEvent::Fill),
+                restart_children(),
+            ]),
+            RestartObservedParentEvent::Fill => noop(),
+            RestartObservedParentEvent::ChildStarted(Ok(child))
+            | RestartObservedParentEvent::ChildRestarted(child) => {
+                self.incarnations.borrow_mut().push(child);
+                noop()
+            }
+            RestartObservedParentEvent::ChildStarted(Err(_)) => stop(),
+        }
+    }
+}
+
 impl Isolate for ObservedParent {
     tina::isolate_types! {
         message: ObservedParentEvent,
@@ -485,6 +549,101 @@ fn spawn_observed_parent_delivery_full_is_traced_without_hidden_queue() {
 
     assert_eq!(runtime.step(), 1);
     assert!(!child_started_delivered.get());
+}
+
+#[test]
+fn observed_restart_delivers_each_typed_replacement_and_stales_old_address() {
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let child_seen = Rc::new(RefCell::new(Vec::new()));
+    let incarnations = Rc::new(RefCell::new(Vec::new()));
+    let parent = runtime.register(
+        RestartObservedParent {
+            child_seen: Rc::clone(&child_seen),
+            order_log: Rc::new(RefCell::new(Vec::new())),
+            incarnations: Rc::clone(&incarnations),
+        },
+        TestMailbox::new(4),
+    );
+
+    assert!(
+        runtime
+            .try_send(parent, RestartObservedParentEvent::Start)
+            .is_ok()
+    );
+    assert_eq!(runtime.step(), 1);
+    assert!(incarnations.borrow().is_empty());
+    assert_eq!(runtime.step(), 1);
+    let first = incarnations.borrow()[0];
+
+    for expected_len in 2..=4 {
+        assert!(
+            runtime
+                .try_send(parent, RestartObservedParentEvent::Restart)
+                .is_ok()
+        );
+        assert_eq!(runtime.step(), 1);
+        assert_eq!(incarnations.borrow().len(), expected_len - 1);
+        assert_eq!(runtime.step(), 1);
+        assert_eq!(incarnations.borrow().len(), expected_len);
+    }
+
+    let latest = *incarnations.borrow().last().expect("replacement child ref");
+    assert_eq!(latest.address.system(), parent.system());
+    assert_eq!(latest.address.shard(), parent.shard());
+    assert_ne!(latest.address.isolate(), first.address.isolate());
+    assert!(matches!(
+        runtime.try_send(first.address, ChildEvent::Data(1)),
+        Err(tina_runtime::IngressSendError::Closed(ChildEvent::Data(1)))
+    ));
+    assert_eq!(
+        runtime.try_send(latest.address, ChildEvent::Data(9)),
+        Ok(())
+    );
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(&*child_seen.borrow(), &[9]);
+}
+
+#[test]
+fn observed_restart_parent_full_rejects_without_hidden_delivery_queue() {
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let incarnations = Rc::new(RefCell::new(Vec::new()));
+    let parent = runtime.register(
+        RestartObservedParent {
+            child_seen: Rc::new(RefCell::new(Vec::new())),
+            order_log: Rc::new(RefCell::new(Vec::new())),
+            incarnations: Rc::clone(&incarnations),
+        },
+        TestMailbox::new(1),
+    );
+
+    assert!(
+        runtime
+            .try_send(parent, RestartObservedParentEvent::Start)
+            .is_ok()
+    );
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 1);
+    let initial = incarnations.borrow()[0];
+
+    assert!(
+        runtime
+            .try_send(parent, RestartObservedParentEvent::RestartWithFullMailbox)
+            .is_ok()
+    );
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(incarnations.borrow().as_slice(), &[initial]);
+    assert!(runtime.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::SendRejected {
+                target_isolate,
+                reason: tina_runtime::SendRejectedReason::Full,
+                ..
+            } if target_isolate == parent.isolate()
+        )
+    }));
+    assert_eq!(runtime.step(), 0, "no hidden replacement delivery remains");
 }
 
 #[test]

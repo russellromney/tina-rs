@@ -74,8 +74,28 @@ impl Parent {
 
 Then runtime/sim supervision config decides restart behavior.
 
-Exact wiring depends on the runner being used. Look at existing supervision
-tests before making a new shape.
+When the parent needs to keep talking to replacement children, observe the
+restartable spawn and map both lifecycle points into parent messages:
+
+```rust
+spawn_observed(RestartableChildDefinition::new(|| Worker::default(), 32))
+    .then_with_restarts(
+        ParentMsg::ChildStarted,
+        ParentMsg::ChildRestarted,
+    )
+```
+
+`ChildStarted` receives the initial
+`Result<ChildRef<WorkerMsg>, SpawnObservedError>`. `ChildRestarted` receives a
+fresh `ChildRef<WorkerMsg>` after each successful replacement. Store that ref
+in the parent and route work through the parent; do not reconstruct an address
+from untyped isolate/generation fields. The old ref remains honestly stale.
+
+Both continuations use the parent's ordinary bounded mailbox. Full or stopped
+delivery is traced as the corresponding send rejection, with no hidden retry
+or lifecycle queue.
+
+The effect has the same semantics in the live runtime and simulator.
 
 ## Budget
 

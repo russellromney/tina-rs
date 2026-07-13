@@ -596,6 +596,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn simulator_observed_restart_delivers_each_typed_replacement() {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let incarnations = Rc::new(RefCell::new(Vec::new()));
+        let mut sim = Simulator::new(NumberedShard(9), SimulatorConfig::default());
+        let parent = sim.register_with_mailbox_capacity::<
+            SimRestartObservedParent,
+            SimRestartObservedParentMsg,
+            Infallible,
+        >(
+            SimRestartObservedParent {
+                seen: Rc::clone(&seen),
+                incarnations: Rc::clone(&incarnations),
+            },
+            4,
+        );
+
+        assert!(
+            sim.try_send(parent, SimRestartObservedParentMsg::Start)
+                .is_ok()
+        );
+        assert_eq!(sim.step(), 1);
+        assert_eq!(sim.step(), 1);
+        let initial = incarnations.borrow()[0];
+
+        for expected_len in 2..=4 {
+            assert!(
+                sim.try_send(parent, SimRestartObservedParentMsg::Restart)
+                    .is_ok()
+            );
+            assert_eq!(sim.step(), 1);
+            assert_eq!(incarnations.borrow().len(), expected_len - 1);
+            assert_eq!(sim.step(), 1);
+            assert_eq!(incarnations.borrow().len(), expected_len);
+        }
+
+        let replacement = *incarnations.borrow().last().expect("replacement child ref");
+        assert_eq!(replacement.address.system(), parent.system());
+        assert_eq!(replacement.address.shard(), parent.shard());
+        assert_ne!(replacement.address.isolate(), initial.address.isolate());
+        assert!(
+            sim.try_send(replacement.address, SimObservedChildMsg::Record(11))
+                .is_ok()
+        );
+        assert_eq!(sim.step(), 1);
+        assert_eq!(&*seen.borrow(), &[11]);
+        assert!(matches!(
+            sim.try_send(initial.address, SimObservedChildMsg::Record(1)),
+            Err(tina_runtime::IngressSendError::Closed(
+                SimObservedChildMsg::Record(1)
+            ))
+        ));
+    }
+
     #[derive(Debug, Clone, Copy)]
     struct NumberedShard(u32);
 
@@ -765,6 +819,14 @@ mod tests {
     }
 
     #[derive(Debug)]
+    enum SimRestartObservedParentMsg {
+        Start,
+        Restart,
+        ChildStarted(Result<ChildRef<SimObservedChildMsg>, SpawnObservedError>),
+        ChildRestarted(ChildRef<SimObservedChildMsg>),
+    }
+
+    #[derive(Debug)]
     struct SimObservedChild {
         seen: Rc<RefCell<Vec<u8>>>,
     }
@@ -798,6 +860,52 @@ mod tests {
         seen: Rc<RefCell<Vec<u8>>>,
         child_ref: Rc<RefCell<Option<ChildRef<SimObservedChildMsg>>>>,
         spawn_error: Rc<RefCell<Option<SpawnObservedError>>>,
+    }
+
+    struct SimRestartObservedParent {
+        seen: Rc<RefCell<Vec<u8>>>,
+        incarnations: Rc<RefCell<Vec<ChildRef<SimObservedChildMsg>>>>,
+    }
+
+    impl Isolate for SimRestartObservedParent {
+        type Message = SimRestartObservedParentMsg;
+        type Reply = ();
+        type Send = Outbound<Infallible>;
+        type Spawn = tina::RestartableChildDefinition<SimObservedChild>;
+        type SpawnObserved =
+            tina::SpawnObserved<Self::Spawn, Self::Message, SimObservedChildMsg, ()>;
+        type Io = RuntimeCall<Self::Message>;
+        type Fact = ::std::convert::Infallible;
+        type Shard = NumberedShard;
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                SimRestartObservedParentMsg::Start => {
+                    let seen = Rc::clone(&self.seen);
+                    spawn_observed(tina::RestartableChildDefinition::new(
+                        move || SimObservedChild {
+                            seen: Rc::clone(&seen),
+                        },
+                        4,
+                    ))
+                    .then_with_restarts(
+                        SimRestartObservedParentMsg::ChildStarted,
+                        SimRestartObservedParentMsg::ChildRestarted,
+                    )
+                }
+                SimRestartObservedParentMsg::Restart => tina::restart_children(),
+                SimRestartObservedParentMsg::ChildStarted(Ok(child))
+                | SimRestartObservedParentMsg::ChildRestarted(child) => {
+                    self.incarnations.borrow_mut().push(child);
+                    noop()
+                }
+                SimRestartObservedParentMsg::ChildStarted(Err(_)) => stop(),
+            }
+        }
     }
 
     impl Isolate for SimObservedParent {

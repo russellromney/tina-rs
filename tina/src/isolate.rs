@@ -13,6 +13,7 @@
 //! live in `mod address`.
 
 use std::marker::PhantomData;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::{
@@ -643,8 +644,15 @@ pub type SpawnObservedResult<M, R = ()> = Result<ChildRef<M, R>, SpawnObservedEr
 /// Continuation invoked by the runtime after an observed spawn is processed.
 pub type SpawnObservedContinuation<P, M, R = ()> = Box<dyn FnOnce(SpawnObservedResult<M, R>) -> P>;
 
+/// Repeatable continuation invoked for each successful replacement child.
+pub type SpawnRestartedContinuation<P, M, R = ()> = Rc<dyn Fn(ChildRef<M, R>) -> P>;
+
 /// Parts consumed by runtime adapters that understand observed spawn.
-pub type SpawnObservedParts<S, P, M, R = ()> = (S, SpawnObservedContinuation<P, M, R>);
+pub type SpawnObservedParts<S, P, M, R = ()> = (
+    S,
+    SpawnObservedContinuation<P, M, R>,
+    Option<SpawnRestartedContinuation<P, M, R>>,
+);
 
 type SpawnObservedMarker<M, R> = PhantomData<fn() -> (M, R)>;
 
@@ -674,6 +682,29 @@ impl<S, M, R> SpawnObservedBuilder<S, M, R> {
         Effect::SpawnObserved(SpawnObserved {
             spawn: self.spawn,
             continuation: Box::new(continuation),
+            restart_continuation: None,
+            marker: PhantomData,
+        })
+    }
+
+    /// Maps the initial spawn result and every successful replacement child
+    /// into ordinary parent messages.
+    ///
+    /// The initial continuation can receive `Err` when child construction is
+    /// rejected. The restart continuation only runs after a replacement
+    /// exists, so it receives a `ChildRef` directly. Each message uses the
+    /// parent's bounded mailbox and normal traced send path; a full or stopped
+    /// parent does not gain a hidden lifecycle queue.
+    pub fn then_with_restarts<I, P, F, G>(self, initial: F, restarted: G) -> Effect<I>
+    where
+        I: Isolate<Message = P, SpawnObserved = SpawnObserved<S, P, M, R>>,
+        F: FnOnce(SpawnObservedResult<M, R>) -> P + 'static,
+        G: Fn(ChildRef<M, R>) -> P + 'static,
+    {
+        Effect::SpawnObserved(SpawnObserved {
+            spawn: self.spawn,
+            continuation: Box::new(initial),
+            restart_continuation: Some(Rc::new(restarted)),
             marker: PhantomData,
         })
     }
@@ -684,6 +715,7 @@ impl<S, M, R> SpawnObservedBuilder<S, M, R> {
 pub struct SpawnObserved<S, P, M, R = ()> {
     spawn: S,
     continuation: SpawnObservedContinuation<P, M, R>,
+    restart_continuation: Option<SpawnRestartedContinuation<P, M, R>>,
     marker: SpawnObservedMarker<M, R>,
 }
 
@@ -702,7 +734,7 @@ where
 impl<S, P, M, R> SpawnObserved<S, P, M, R> {
     /// Consumes this request into its spawn payload and continuation.
     pub fn into_parts(self) -> SpawnObservedParts<S, P, M, R> {
-        (self.spawn, self.continuation)
+        (self.spawn, self.continuation, self.restart_continuation)
     }
 }
 

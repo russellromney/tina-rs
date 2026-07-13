@@ -1556,6 +1556,7 @@ where
                     child_ordinal,
                     mailbox_capacity,
                     restart_recipe: None,
+                    restart_continuation: None,
                 });
                 parent
             }
@@ -1601,6 +1602,7 @@ where
             child,
             mailbox_capacity,
             restart_recipe: None,
+            restart_continuation: None,
             bootstrap_message: bootstrap_message.map(|message| Box::new(message) as Box<dyn Any>),
         }
     }
@@ -1618,6 +1620,7 @@ where
             child_ordinal,
             mailbox_capacity: outcome.mailbox_capacity,
             restart_recipe: outcome.restart_recipe,
+            restart_continuation: outcome.restart_continuation,
         });
     }
 
@@ -1848,6 +1851,10 @@ where
         cause: tina_runtime::CauseId,
         round_messages: &mut [Option<DeliveredMessage>],
     ) {
+        let Some(parent_generation) = self.entry_by_isolate(parent).map(|entry| entry.generation)
+        else {
+            return;
+        };
         let child_ordinal = self.child_records[child_record_index].child_ordinal;
         let old_child = self.child_records[child_record_index].child;
         let attempted = self.push_event(
@@ -1911,6 +1918,21 @@ where
         );
         if let Some(message) = bootstrap_message {
             self.enqueue_bootstrap_message(new_child, message, restarted.into());
+        }
+        if let Some(continuation) = self.child_records[child_record_index]
+            .restart_continuation
+            .clone()
+        {
+            self.deliver_observed_continuation(
+                RegisteredAddress {
+                    system: self.system_incarnation,
+                    shard: self.shard.id(),
+                    isolate: parent,
+                    generation: parent_generation,
+                },
+                continuation(new_child),
+                restarted.into(),
+            );
         }
     }
 
@@ -7003,9 +7025,9 @@ where
         sim: &mut Simulator<S>,
         parent: IsolateId,
     ) -> SpawnObservedOutcome<S> {
-        let (spawn, continuation) = self.inner.into_parts();
+        let (spawn, continuation, restart_continuation) = self.inner.into_parts();
         match spawn.into_erased_spawn().try_spawn_observed(sim, parent) {
-            Ok(outcome) => {
+            Ok(mut outcome) => {
                 let child_address = Address::<ChildMessage, ChildReply>::new_with_generation_in(
                     outcome.child.system,
                     outcome.child.shard,
@@ -7013,6 +7035,17 @@ where
                     outcome.child.generation,
                 );
                 let message = continuation(Ok(ChildRef::new(child_address)));
+                outcome.restart_continuation = restart_continuation.map(|continuation| {
+                    Rc::new(move |child: RegisteredAddress| {
+                        let address = Address::<ChildMessage, ChildReply>::new_with_generation_in(
+                            child.system,
+                            child.shard,
+                            child.isolate,
+                            child.generation,
+                        );
+                        Box::new(continuation(ChildRef::new(address))) as Box<dyn Any>
+                    }) as Rc<dyn Fn(RegisteredAddress) -> Box<dyn Any>>
+                });
                 SpawnObservedOutcome {
                     spawn: Some(outcome),
                     continuation: Some(Box::new(message)),

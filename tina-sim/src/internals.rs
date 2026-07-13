@@ -1164,6 +1164,7 @@ where
     pub(crate) child: RegisteredAddress,
     pub(crate) mailbox_capacity: usize,
     pub(crate) restart_recipe: Option<Rc<dyn ErasedRestartRecipe<S>>>,
+    pub(crate) restart_continuation: Option<ErasedRestartContinuation>,
     pub(crate) bootstrap_message: Option<Box<dyn Any>>,
 }
 
@@ -1184,7 +1185,10 @@ where
     pub(crate) child_ordinal: usize,
     pub(crate) mailbox_capacity: usize,
     pub(crate) restart_recipe: Option<Rc<dyn ErasedRestartRecipe<S>>>,
+    pub(crate) restart_continuation: Option<ErasedRestartContinuation>,
 }
+
+pub(crate) type ErasedRestartContinuation = Rc<dyn Fn(RegisteredAddress) -> Box<dyn Any>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SupervisorRecord {
