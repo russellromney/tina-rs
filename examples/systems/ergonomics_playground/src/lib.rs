@@ -7,9 +7,10 @@ use tina::{
     send_event,
 };
 use tina_runtime::{
-    CallError, CallGroupToken, CallOutcome, CallReplyRejectedReason, CallSelectSet,
-    DeferredReplyRejectedReason, RuntimeEventKind, SharedWork, SharedWorkError, SleepReply,
-    call_cancelable_request, call_request, cancel_call, request_effect_after_shared_wait, sleep,
+    CallError, CallOutcome, CallReplyRejectedReason, CallSelectEvent, CallSelectSet,
+    DeferredReplyRejectedReason, IngressSendError, RuntimeEventKind, SelectedCallOutcome,
+    SharedWork, SharedWorkError, SleepReply, call_cancelable_request, call_request,
+    request_effect_after_shared_wait, sleep,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -18,9 +19,8 @@ const CALL_TIMEOUT: Duration = Duration::from_millis(100);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuoteRaceReport {
     pub replies: Vec<QuoteReply>,
-    pub cancel_outcomes: usize,
+    pub cancel_outcomes: Vec<CancelOutcome>,
     pub late_cancelled_rejections: usize,
-    pub completed: bool,
     pub rough_edges: Vec<&'static str>,
 }
 
@@ -82,16 +82,7 @@ impl Provider {
 
 #[derive(Debug)]
 enum QuoteEvent {
-    ProviderReturned {
-        key: u32,
-        token: CallGroupToken,
-        outcome: CallOutcome<ProviderQuote>,
-    },
-    Cancelled {
-        key: u32,
-        token: CallGroupToken,
-        outcome: CancelOutcome,
-    },
+    Race(CallSelectEvent<u32, ProviderQuote>),
 }
 
 #[derive(Debug)]
@@ -102,10 +93,6 @@ enum QuoteRequest {
 #[derive(Debug)]
 struct PendingQuote {
     request: Option<RequestContext<QuoteReply>>,
-    // `CallSelectSet` + `record_classified_reply(.., |q| q.available)`
-    // gives the same first-success-wins-and-cancels-losers race
-    // `CallGroup` provided, using the `q.available` business classifier
-    // instead of "first reply wins".
     set: CallSelectSet<u32, ProviderQuote>,
 }
 
@@ -113,7 +100,7 @@ struct PendingQuote {
 struct QuoteGateway {
     providers: [ServiceRequestAddress<ProviderEvent, ProviderRequest, ProviderQuote>; 2],
     pending: Option<PendingQuote>,
-    cancel_outcomes: Rc<RefCell<usize>>,
+    cancel_outcomes: Rc<RefCell<Vec<CancelOutcome>>>,
 }
 
 impl QuoteGateway {
@@ -124,14 +111,10 @@ impl QuoteGateway {
         for (idx, provider) in self.providers.iter().copied().enumerate() {
             let key = idx as u32;
             let effect = set
-                .start_cancelable_service_event(
+                .start_service(
                     key,
                     call_cancelable_request(provider, ProviderRequest::Quote, CALL_TIMEOUT),
-                    |key, token, outcome| QuoteEvent::ProviderReturned {
-                        key,
-                        token,
-                        outcome,
-                    },
+                    QuoteEvent::Race,
                 )
                 .expect("fresh set accepts each provider");
             effects.push(effect);
@@ -143,22 +126,6 @@ impl QuoteGateway {
         });
         Effect::Batch(effects)
     }
-
-    fn cancel_effects(
-        requests: Vec<tina_runtime::CallSetCancelRequest<u32, ProviderQuote>>,
-    ) -> Vec<Effect<Self>> {
-        requests
-            .into_iter()
-            .map(|request| {
-                let (key, token, handle) = request.into_parts();
-                cancel_call(handle).then_service_event(move |outcome| QuoteEvent::Cancelled {
-                    key,
-                    token,
-                    outcome,
-                })
-            })
-            .collect()
-    }
 }
 
 #[tina_runtime::isolate(event = QuoteEvent, request = QuoteRequest, reply = QuoteReply)]
@@ -169,61 +136,46 @@ impl QuoteGateway {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match event {
-            QuoteEvent::ProviderReturned {
-                key,
-                token,
-                outcome,
-            } => {
+            QuoteEvent::Race(event) => {
                 let Some(pending) = self.pending.as_mut() else {
                     return noop();
-                };
-                let winner = match &outcome {
-                    CallOutcome::Replied(q) if q.available => Some(QuoteReply::Quote {
-                        provider: q.provider,
-                        cents: q.cents,
-                    }),
-                    _ => None,
                 };
                 let step = pending
                     .set
-                    .record_classified_reply(key, token, outcome, |q| q.available)
-                    .expect("continuation carries a live CallSelectSet token");
-
-                let mut effects = Self::cancel_effects(step.cancel_losers);
-                if let Some(reply) = winner {
-                    if let Some(request) = pending.request.take() {
-                        effects.insert(0, reply_to(request, reply));
+                    .advance_service(event, |quote| quote.available, QuoteEvent::Race)
+                    .expect("race continuation carries a live CallSelectSet token");
+                let winner = match &step.selected.outcome {
+                    SelectedCallOutcome::Reply(CallOutcome::Replied(q))
+                        if step.classified_success =>
+                    {
+                        Some(QuoteReply::Quote {
+                        provider: q.provider,
+                        cents: q.cents,
+                        })
                     }
-                } else if pending.set.report_ready() {
-                    if let Some(request) = pending.request.take() {
-                        effects.insert(0, reply_to(request, QuoteReply::Unavailable));
-                    }
-                    self.pending = None;
-                }
-
-                if effects.is_empty() {
-                    noop()
-                } else {
-                    Effect::Batch(effects)
-                }
-            }
-            QuoteEvent::Cancelled {
-                key,
-                token,
-                outcome,
-            } => {
-                *self.cancel_outcomes.borrow_mut() += 1;
-                let Some(pending) = self.pending.as_mut() else {
-                    return noop();
+                    _ => None,
                 };
-                let _ = pending
-                    .set
-                    .record_cancel(key, token, outcome)
-                    .expect("cancel continuation carries a live CallSelectSet token");
-                if pending.set.report_ready() && pending.request.is_none() {
+                if let SelectedCallOutcome::Cancel(outcome) = step.selected.outcome {
+                    self.cancel_outcomes.borrow_mut().push(outcome);
+                }
+
+                let mut reply = None;
+                if let Some(winner_reply) = winner {
+                    if let Some(request) = pending.request.take() {
+                        reply = Some(reply_to(request, winner_reply));
+                    }
+                } else if step.complete && pending.request.is_some() {
+                    if let Some(request) = pending.request.take() {
+                        reply = Some(reply_to(request, QuoteReply::Unavailable));
+                    }
+                }
+                if step.complete {
                     self.pending = None;
                 }
-                noop()
+                match reply {
+                    Some(reply) => Effect::Batch(vec![reply, step.effect]),
+                    None => step.effect,
+                }
             }
         }
     }
@@ -313,7 +265,7 @@ fn run_quote_race_with(quotes: [ProviderQuote; 2]) -> anyhow::Result<QuoteRaceRe
         )
         .requests;
 
-    let cancel_outcomes = Rc::new(RefCell::new(0));
+    let cancel_outcomes = Rc::new(RefCell::new(Vec::new()));
     let gateway = sim
         .register_split_service::<QuoteGateway, QuoteEvent, QuoteRequest, std::convert::Infallible>(
             QuoteGateway {
@@ -330,7 +282,13 @@ fn run_quote_race_with(quotes: [ProviderQuote; 2]) -> anyhow::Result<QuoteRaceRe
     });
 
     sim.try_send(client, QuoteClientMsg::Begin(gateway))
-        .map_err(|e| anyhow::anyhow!("send quote client: {e:?}"))?;
+        .map_err(|error| match error {
+            IngressSendError::Full(_) => anyhow::anyhow!("quote client mailbox full"),
+            IngressSendError::Closed(_) => anyhow::anyhow!("quote client closed"),
+            IngressSendError::ForeignSystem { .. } => {
+                anyhow::anyhow!("quote client belongs to another simulator")
+            }
+        })?;
     sim.run_until_quiescent();
 
     let late_cancelled_rejections = sim
@@ -352,13 +310,9 @@ fn run_quote_race_with(quotes: [ProviderQuote; 2]) -> anyhow::Result<QuoteRaceRe
 
     Ok(QuoteRaceReport {
         replies: replies.borrow().clone(),
-        cancel_outcomes: *cancel_outcomes.borrow(),
+        cancel_outcomes: cancel_outcomes.borrow().clone(),
         late_cancelled_rejections,
-        completed: true,
-        rough_edges: vec![
-            "two-provider race still needs token/handle plumbing",
-            "gateway keeps pending state after replying until loser cancel settles",
-        ],
+        rough_edges: Vec::new(),
     })
 }
 
@@ -603,8 +557,11 @@ pub fn run_debounced_batch_probe() -> anyhow::Result<DebouncedBatchReport> {
 
     sim.try_send(client, BatchClientMsg::Begin(batcher))
         .map_err(|error| match error {
-            tina::TrySendError::Full(_) => anyhow::anyhow!("batch client mailbox full"),
-            tina::TrySendError::Closed(_) => anyhow::anyhow!("batch client closed"),
+            IngressSendError::Full(_) => anyhow::anyhow!("batch client mailbox full"),
+            IngressSendError::Closed(_) => anyhow::anyhow!("batch client closed"),
+            IngressSendError::ForeignSystem { .. } => {
+                anyhow::anyhow!("batch client belongs to another simulator")
+            }
         })?;
     sim.run_until_quiescent();
 
@@ -683,8 +640,11 @@ pub fn run_debounced_batch_drain_probe() -> anyhow::Result<DebouncedBatchReport>
 
     sim.try_send(client, BatchClientMsg::Begin(batcher))
         .map_err(|error| match error {
-            tina::TrySendError::Full(_) => anyhow::anyhow!("drain batch client mailbox full"),
-            tina::TrySendError::Closed(_) => anyhow::anyhow!("drain batch client closed"),
+            IngressSendError::Full(_) => anyhow::anyhow!("drain batch client mailbox full"),
+            IngressSendError::Closed(_) => anyhow::anyhow!("drain batch client closed"),
+            IngressSendError::ForeignSystem { .. } => {
+                anyhow::anyhow!("drain batch client belongs to another simulator")
+            }
         })?;
     sim.run_until_quiescent();
 
@@ -901,7 +861,13 @@ pub fn run_single_flight_cache_probe() -> anyhow::Result<CacheFillReport> {
     });
 
     sim.try_send(client, CacheClientMsg::Begin(cache))
-        .map_err(|e| anyhow::anyhow!("send cache client: {e:?}"))?;
+        .map_err(|error| match error {
+            IngressSendError::Full(_) => anyhow::anyhow!("cache client mailbox full"),
+            IngressSendError::Closed(_) => anyhow::anyhow!("cache client closed"),
+            IngressSendError::ForeignSystem { .. } => {
+                anyhow::anyhow!("cache client belongs to another simulator")
+            }
+        })?;
     sim.run_until_quiescent();
 
     let replies = replies.borrow();
@@ -924,10 +890,7 @@ pub fn run_single_flight_cache_probe() -> anyhow::Result<CacheFillReport> {
         full,
         upstream_calls: *upstream_calls.borrow(),
         values,
-        rough_edges: vec![
-            "single-flight is a natural Tina shape once SharedWork owns the parked callers",
-            "the service still names the fill-in-flight state and late fill policy",
-        ],
+        rough_edges: Vec::new(),
     })
 }
 
@@ -1025,18 +988,18 @@ mod tests {
                 cents: 525,
             }]
         );
-        assert_eq!(report.cancel_outcomes, 1);
+        assert_eq!(report.cancel_outcomes, vec![CancelOutcome::Cancelled]);
         assert_eq!(report.late_cancelled_rejections, 1);
-        assert!(report.completed);
+        assert!(report.rough_edges.is_empty());
     }
 
     #[test]
     fn quote_race_no_provider_available_replies_unavailable() {
         let report = run_quote_race_no_winner_probe().unwrap();
         assert_eq!(report.replies, vec![QuoteReply::Unavailable]);
-        assert_eq!(report.cancel_outcomes, 0);
+        assert!(report.cancel_outcomes.is_empty());
         assert_eq!(report.late_cancelled_rejections, 0);
-        assert!(report.completed);
+        assert!(report.rough_edges.is_empty());
     }
 
     #[test]
@@ -1213,10 +1176,13 @@ mod tests {
         for _ in 0..2 {
             match sim.try_send(client, BatchClientMsg::Begin(batcher)) {
                 Ok(()) => {}
-                Err(tina::TrySendError::Full(_)) => {
+                Err(IngressSendError::Full(_)) => {
                     panic!("batch client mailbox unexpectedly full")
                 }
-                Err(tina::TrySendError::Closed(_)) => panic!("batch client unexpectedly closed"),
+                Err(IngressSendError::Closed(_)) => panic!("batch client unexpectedly closed"),
+                Err(IngressSendError::ForeignSystem { .. }) => {
+                    panic!("batch client unexpectedly belongs to another simulator")
+                }
             }
             sim.run_until_quiescent();
         }
@@ -1255,8 +1221,11 @@ mod tests {
 
         match sim.try_send(client, TimeoutBatchClientMsg::Begin(batcher.requests)) {
             Ok(()) => {}
-            Err(tina::TrySendError::Full(_)) => panic!("timeout client mailbox unexpectedly full"),
-            Err(tina::TrySendError::Closed(_)) => panic!("timeout client unexpectedly closed"),
+            Err(IngressSendError::Full(_)) => panic!("timeout client mailbox unexpectedly full"),
+            Err(IngressSendError::Closed(_)) => panic!("timeout client unexpectedly closed"),
+            Err(IngressSendError::ForeignSystem { .. }) => {
+                panic!("timeout client unexpectedly belongs to another simulator")
+            }
         }
         sim.run_until_quiescent();
 
@@ -1303,5 +1272,6 @@ mod tests {
         assert_eq!(report.full, 2);
         assert_eq!(report.upstream_calls, 1);
         assert_eq!(report.values, vec![42, 42, 42]);
+        assert!(report.rough_edges.is_empty());
     }
 }
