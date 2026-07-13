@@ -57,7 +57,9 @@ worker panics in a loop, this code respawns forever.
 A worker, a parent, and a supervisor config:
 
 - **`Worker`** — owns no state worth preserving. Panics on
-  `Job::Poison`. The runtime catches the panic.
+  `Job::Poison`; replies `Processed` only after a work job actually runs. The
+  runtime catches the panic and settles that request as
+  `Rejected(HandlerPanicked)`.
 - **`Parent`** — spawns the worker as a `RestartableChildDefinition` and owns
   the current typed `ChildRef`. Each restart re-runs the factory closure and
   delivers the fresh ref back to the parent.
@@ -71,9 +73,12 @@ A worker, a parent, and a supervisor config:
   host's ground-truth synchronization signal per `Poison` job. It counts
   restarts but no longer acts as address authority.
 
-The host starts the parent with a typed request, then submits each job through
-that parent. After a poison job it waits for restart completion before sending
-the next request; the replacement continuation is already ahead of that next
+The host starts the parent with a typed request, then calls through that parent
+for each job. The parent forwards one typed request to its current worker and
+maps `Replied`, `Full`, `Closed`, `Timeout`, and `Rejected` without collapsing
+them. Report counters advance only after the exact expected worker outcome.
+After a poison job the host waits for restart completion before sending the
+next request; the replacement continuation is already ahead of that next
 request in the parent's FIFO mailbox.
 
 ## Discussion
@@ -93,6 +98,9 @@ What feels better:
 - **The parent receives typed replacements.** Application code never handles
   an untyped isolate id/generation pair and cannot accidentally stamp a
   replacement with the wrong system or shard.
+- **The report proves worker outcomes.** Work is counted only after the worker
+  replies, while poison is counted only after `HandlerPanicked`; it is not
+  inferred from the input script or a fire-and-forget send.
 - **The worker stays trivial.** No supervisor logic in the worker;
   no `catch_unwind`; no respawn loop. Tina's runtime catches the
   panic at the isolate boundary and reboots cleanly.

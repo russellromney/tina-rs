@@ -1268,10 +1268,14 @@ and bounded parent delivery. A full parent mailbox records the normal
 
 `specimen_supervised_worker` now stores the current child ref only in its
 parent. Startup carries a typed host request through the initial continuation;
-subsequent work routes through the parent. The `WorkerSlot`, `Arc<Mutex>`,
-polling loop, and manual `Address::new_with_generation_in` reconstruction are
-gone. The host restart waiter remains only as a synchronization/reporting
-fact, not as address authority.
+subsequent work routes through the parent as a typed worker request. Work is
+counted only after the worker replies, poison only after
+`Rejected(HandlerPanicked)`, and every other call terminal remains distinct.
+The parent also names its in-progress startup state so concurrent starts cannot
+create duplicate children. The `WorkerSlot`, `Arc<Mutex>`, polling loop, and
+manual `Address::new_with_generation_in` reconstruction are gone. The host
+restart waiter remains only as a synchronization/reporting fact, not as address
+authority.
 
 **Still open:** join/stop child convenience. Typed restart refresh is closed.
 Existing `observe_child_restarted` remains the appropriate host waiter when
