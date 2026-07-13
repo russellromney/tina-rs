@@ -15,15 +15,12 @@
 //!   current worker addresses keyed by stable slot. The dispatcher sends
 //!   `Forward` requests to the registry and the registry forwards to the
 //!   current incarnation by `send(...)`.
-//! - After a supervised restart, the test reads the runtime trace, finds
-//!   the `RestartChildCompleted` event for each replaced worker, and sends
-//!   `Register` messages to refresh the registry.
+//! - `spawn_observed(...).then_with_restarts(...)` refreshes the registry with
+//!   each typed replacement before later dispatcher work is handled.
 //!
-//! Production code should follow this shape: a registry isolate, refreshed
-//! through messages, not by parsing trace events. The test parses the trace
-//! only because it has no other way to discover replacement addresses (the
-//! runtime intentionally exposes none — that is the slice 007 "logical
-//! naming is user-space" commitment).
+//! Production code should follow this shape: a registry isolate refreshed by
+//! typed parent continuations, not by parsing trace events. This test inspects
+//! restart events only to assert policy selection and stale-address truth.
 //!
 //! What this test is not:
 //!
@@ -44,7 +41,7 @@ use std::rc::Rc;
 use tina::{
     AddressGeneration, IsolateId, Mailbox, RestartBudget, RestartPolicy, TrySendError, prelude::*,
 };
-use tina_runtime::{MailboxFactory, Runtime, RuntimeEvent, RuntimeEventKind, SendRejectedReason};
+use tina_runtime::{MailboxFactory, Runtime, RuntimeEvent, RuntimeEventKind};
 use tina_supervisor::SupervisorConfig;
 
 // ---------------------------------------------------------------------------
@@ -146,8 +143,21 @@ enum WorkerEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DispatcherEvent {
-    SpawnWorker,
-    Submit { slot: u32, task: Task },
+    SpawnWorker {
+        slot: u32,
+    },
+    WorkerReady {
+        slot: u32,
+        result: Result<ChildRef<WorkerEvent>, SpawnObservedError>,
+    },
+    WorkerRestarted {
+        slot: u32,
+        child: ChildRef<WorkerEvent>,
+    },
+    Submit {
+        slot: u32,
+        task: Task,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +234,7 @@ impl Isolate for Dispatcher {
         reply: (),
         send: Outbound<RegistryEvent>,
         spawn: RestartableChildDefinition<Worker>,
+        spawn_observed: tina::SpawnObserved<RestartableChildDefinition<Worker>, DispatcherEvent, WorkerEvent>,
         io: Infallible,
         shard: TestShard,
     }
@@ -234,15 +245,31 @@ impl Isolate for Dispatcher {
         _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            DispatcherEvent::SpawnWorker => {
+            DispatcherEvent::SpawnWorker { slot } => {
                 let completed = Rc::clone(&self.completed);
-                spawn(RestartableChildDefinition::new(
+                spawn_observed(RestartableChildDefinition::new(
                     move || Worker {
                         completed: Rc::clone(&completed),
                     },
                     self.worker_capacity,
                 ))
+                .then_with_restarts(
+                    move |result| DispatcherEvent::WorkerReady { slot, result },
+                    move |child| DispatcherEvent::WorkerRestarted { slot, child },
+                )
             }
+            DispatcherEvent::WorkerReady {
+                slot,
+                result: Ok(child),
+            }
+            | DispatcherEvent::WorkerRestarted { slot, child } => send(
+                self.registry,
+                RegistryEvent::Register {
+                    slot,
+                    address: child.address,
+                },
+            ),
+            DispatcherEvent::WorkerReady { result: Err(_), .. } => stop(),
             DispatcherEvent::Submit { slot, task } => {
                 send(self.registry, RegistryEvent::Forward { slot, task })
             }
@@ -257,7 +284,7 @@ impl Isolate for Dispatcher {
 // forwards `Run(task)` messages to the current incarnation. Missing slots
 // are a loud programmer error in this reference workload: the registry
 // panics instead of silently dropping work. Updates happen through
-// `Register` messages from the test after observing a restart.
+// `Register` messages from the dispatcher's typed lifecycle continuations.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
@@ -357,7 +384,6 @@ struct Harness {
     runtime: Runtime<TestShard, TestMailboxFactory>,
     completed: Rc<RefCell<Vec<(IsolateId, u32)>>>,
     dispatcher: Address<DispatcherEvent>,
-    registry: Address<RegistryEvent>,
 }
 
 impl Harness {
@@ -381,7 +407,6 @@ impl Harness {
             runtime,
             completed,
             dispatcher,
-            registry,
         }
     }
 
@@ -391,14 +416,17 @@ impl Harness {
     fn spawn_workers(&mut self, count: usize) -> Vec<Address<WorkerEvent>> {
         let trace_len_before = self.runtime.trace().len();
 
-        for _ in 0..count {
+        for slot in 0..count {
             self.runtime
-                .try_send(self.dispatcher, DispatcherEvent::SpawnWorker)
+                .try_send(
+                    self.dispatcher,
+                    DispatcherEvent::SpawnWorker { slot: slot as u32 },
+                )
                 .expect("dispatcher mailbox accepts SpawnWorker");
-            // One step delivers the SpawnWorker message; the dispatcher
-            // returns Effect::Spawn which the runtime executes immediately,
-            // but the new worker child only runs on a later step.
-            assert_eq!(self.runtime.step(), 1);
+            // Spawn, typed parent continuation, then registry refresh.
+            for _ in 0..3 {
+                assert_eq!(self.runtime.step(), 1);
+            }
         }
 
         // Each spawn produced one new isolate id; collect them from the
@@ -422,18 +450,10 @@ impl Harness {
             .collect()
     }
 
-    /// Registers a worker address in the registry under `slot`. Steps the
-    /// runtime once so the registry handler observes the registration.
-    fn register_worker(&mut self, slot: u32, address: Address<WorkerEvent>) {
-        self.runtime
-            .try_send(self.registry, RegistryEvent::Register { slot, address })
-            .expect("registry mailbox accepts Register");
-        assert_eq!(self.runtime.step(), 1);
-    }
-
     /// Submits a task to the dispatcher. The dispatcher delegates lookup to
     /// the registry isolate, and the registry forwards to the current worker
-    /// address. Three steps are enough in this registration order:
+    /// address. The loop also drains a typed restart continuation queued by
+    /// the task, so the registry is refreshed before this method returns.
     /// - step 1: dispatcher handles `Submit` and enqueues `Forward`
     /// - step 2: registry handles `Forward` and enqueues `Run`
     /// - step 3: worker handles `Run`
@@ -442,8 +462,12 @@ impl Harness {
             .try_send(self.dispatcher, DispatcherEvent::Submit { slot, task })
             .expect("dispatcher mailbox accepts Submit");
         let mut total = 0;
-        for _ in 0..3 {
-            total += self.runtime.step();
+        for _ in 0..6 {
+            let handled = self.runtime.step();
+            total += handled;
+            if handled == 0 {
+                break;
+            }
         }
         assert!(
             total >= 1,
@@ -469,8 +493,6 @@ fn one_for_one_restarts_only_failed_worker_and_keeps_siblings_running() {
     let workers = h.spawn_workers(2);
     let worker_a = workers[0];
     let worker_b = workers[1];
-    h.register_worker(0, worker_a);
-    h.register_worker(1, worker_b);
 
     // Both workers handle one normal task before any failure.
     h.submit(0, Task::Normal(10));
@@ -513,7 +535,8 @@ fn one_for_one_restarts_only_failed_worker_and_keeps_siblings_running() {
         )))
     ));
 
-    // Discover the replacement worker A and refresh the registry.
+    // Inspect the replacement identity; the typed continuation already
+    // refreshed the registry.
     let new_worker_a = replacement_address_for(
         h.runtime.system_incarnation(),
         worker_a.isolate(),
@@ -521,7 +544,6 @@ fn one_for_one_restarts_only_failed_worker_and_keeps_siblings_running() {
     )
     .expect("replacement worker A address");
     assert_ne!(new_worker_a.isolate(), worker_a.isolate());
-    h.register_worker(0, new_worker_a);
 
     // Worker B's identity is unchanged (OneForOne does not restart siblings).
     assert!(
@@ -556,9 +578,6 @@ fn one_for_all_restarts_every_worker_after_one_panic() {
 
     let workers = h.spawn_workers(3);
     let original_ids: Vec<IsolateId> = workers.iter().map(|a| a.isolate()).collect();
-    for (slot, address) in workers.iter().enumerate() {
-        h.register_worker(slot as u32, *address);
-    }
 
     // Pre-panic work: each worker handles one task. Order matters because
     // OneForAll will abandon any messages buffered when the panic fires.
@@ -587,7 +606,8 @@ fn one_for_all_restarts_every_worker_after_one_panic() {
         ));
     }
 
-    // Refresh the registry from trace-derived replacements for every slot.
+    // Inspect the replacement ids for policy assertions. Registry refresh is
+    // already owned by the typed restart continuations.
     let replacements: Vec<Address<WorkerEvent>> = original_ids
         .iter()
         .map(|old| {
@@ -600,10 +620,6 @@ fn one_for_all_restarts_every_worker_after_one_panic() {
     // All three replacements must be fresh ids distinct from originals.
     for (old, new) in original_ids.iter().zip(replacement_ids.iter()) {
         assert_ne!(old, new);
-    }
-
-    for (slot, address) in replacements.iter().enumerate() {
-        h.register_worker(slot as u32, *address);
     }
 
     // Later work routes to every replacement.
@@ -627,9 +643,6 @@ fn rest_for_one_keeps_older_siblings_and_restarts_failed_and_younger() {
 
     let workers = h.spawn_workers(3);
     let original_ids: Vec<IsolateId> = workers.iter().map(|a| a.isolate()).collect();
-    for (slot, address) in workers.iter().enumerate() {
-        h.register_worker(slot as u32, *address);
-    }
 
     // Each worker handles one task before the panic.
     for (slot, _) in workers.iter().enumerate() {
@@ -681,10 +694,6 @@ fn rest_for_one_keeps_older_siblings_and_restarts_failed_and_younger() {
         Err(tina_runtime::IngressSendError::Closed(_))
     ));
 
-    // Refresh registry for restarted slots only.
-    h.register_worker(1, new_1);
-    h.register_worker(2, new_2);
-
     // Later work goes to all three slots and lands on the surviving older
     // worker plus the replacements.
     h.submit(0, Task::Normal(40));
@@ -710,7 +719,6 @@ fn budget_exhaustion_emits_visible_rejection_and_creates_no_replacement() {
 
     let workers = h.spawn_workers(1);
     let worker_a = workers[0];
-    h.register_worker(0, worker_a);
 
     h.submit(0, Task::Normal(1));
     assert_eq!(h.completed.borrow().clone(), vec![(worker_a.isolate(), 1)]);
@@ -723,7 +731,6 @@ fn budget_exhaustion_emits_visible_rejection_and_creates_no_replacement() {
         h.runtime.trace(),
     )
     .expect("first restart should succeed");
-    h.register_worker(0, new_worker_a);
     h.submit(0, Task::Normal(2));
     assert_eq!(
         h.completed.borrow().clone(),
@@ -769,45 +776,40 @@ fn budget_exhaustion_emits_visible_rejection_and_creates_no_replacement() {
 }
 
 #[test]
-fn stale_address_send_through_runtime_returns_closed_without_auto_routing() {
-    // The runtime does not auto-route stale-address sends to the
-    // replacement; user-space refresh is required. This guarantees the
-    // registry-isolate pattern remains the only refresh path.
+fn typed_restart_continuation_refreshes_registry_without_host_routing() {
     let mut h = Harness::new(RestartPolicy::OneForOne, generous_budget(), 4);
 
-    let workers = h.spawn_workers(1);
-    let worker_a = workers[0];
-    h.register_worker(0, worker_a);
+    let worker = h.spawn_workers(1)[0];
     h.submit(0, Task::Poison);
 
-    // Without refreshing the registry, submitting through the dispatcher will
-    // still have the registry try to send to the stale slot-0 address. Verify
-    // the trace shape directly: the next Submit produces a SendRejected{Closed}
-    // event from the registry's dispatch attempt.
+    assert!(matches!(
+        h.runtime
+            .try_send(worker, WorkerEvent::Run(Task::Normal(99))),
+        Err(tina_runtime::IngressSendError::Closed(_))
+    ));
+    let replacement = replacement_address_for(
+        h.runtime.system_incarnation(),
+        worker.isolate(),
+        h.runtime.trace(),
+    )
+    .expect("replacement worker");
+
     let trace_len_before = h.runtime.trace().len();
     h.submit(0, Task::Normal(100));
-
     let post_kinds = event_kinds(&h.runtime.trace()[trace_len_before..]);
     assert!(
-        post_kinds.iter().any(|k| matches!(
-            k,
+        !post_kinds.iter().any(|kind| matches!(
+            kind,
             RuntimeEventKind::SendRejected {
-                reason: SendRejectedReason::Closed,
+                reason: tina_runtime::SendRejectedReason::Closed,
                 ..
             }
         )),
-        "stale-address forward should emit SendRejected{{Closed}}, got: {post_kinds:?}"
+        "typed refresh must prevent stale registry routing: {post_kinds:?}"
     );
-    // No worker handler ran because the rejected send did not deliver.
-    let trailing_handler_starts = post_kinds
-        .iter()
-        .filter(|k| matches!(k, RuntimeEventKind::HandlerStarted))
-        .count();
-    // `Submit` runs the dispatcher first, then the registry. No worker handler
-    // should run because the rejected send did not deliver.
     assert_eq!(
-        trailing_handler_starts, 2,
-        "stale submit should run dispatcher + registry, not the worker"
+        h.completed.borrow().as_slice(),
+        &[(replacement.isolate(), 100)]
     );
 }
 
@@ -838,21 +840,19 @@ fn repeated_runs_produce_identical_traces_and_completed_logs() {
 
         let workers = h.spawn_workers(2);
         let worker_a = workers[0];
-        let worker_b = workers[1];
-        h.register_worker(0, worker_a);
-        h.register_worker(1, worker_b);
 
         h.submit(0, Task::Normal(1));
         h.submit(1, Task::Normal(2));
         h.submit(0, Task::Poison);
 
-        let new_worker_a = replacement_address_for(
-            h.runtime.system_incarnation(),
-            worker_a.isolate(),
-            h.runtime.trace(),
-        )
-        .expect("replacement worker A");
-        h.register_worker(0, new_worker_a);
+        assert!(
+            replacement_address_for(
+                h.runtime.system_incarnation(),
+                worker_a.isolate(),
+                h.runtime.trace(),
+            )
+            .is_some()
+        );
 
         h.submit(0, Task::Normal(3));
         h.submit(1, Task::Normal(4));

@@ -3129,9 +3129,20 @@ where
         if let Some(message) = bootstrap_message {
             self.enqueue_bootstrap_message(new_child, message, restarted.into());
         }
-        // Notify *after* the bootstrap message has been enqueued so a host
-        // that wakes from `wait()` cannot race a `try_send` ahead of the
-        // bootstrap delivery.
+        if let Some(continuation) = self.child_records[child_record_index]
+            .restart_continuation
+            .clone()
+        {
+            let owner = RegisteredAddress {
+                system: self.system_incarnation,
+                shard: self.shard.id(),
+                isolate: parent,
+                generation: parent_generation,
+            };
+            self.deliver_observed_continuation(owner, continuation(new_child), restarted.into());
+        }
+        // Notify *after* bootstrap and typed parent refresh are enqueued so a
+        // host that wakes from `wait()` cannot race new work ahead of either.
         self.observation.notify_child_restarted(
             self.shard.id(),
             parent,
@@ -3379,6 +3390,7 @@ where
     pub(crate) child: RegisteredAddress,
     pub(crate) mailbox_capacity: usize,
     pub(crate) restart_recipe: Option<Rc<dyn ErasedRestartRecipe<S, F>>>,
+    pub(crate) restart_continuation: Option<ErasedRestartContinuation>,
     pub(crate) bootstrap_message: Option<Box<dyn Any>>,
 }
 
@@ -3402,11 +3414,14 @@ where
     pub(crate) child_ordinal: usize,
     pub(crate) mailbox_capacity: usize,
     pub(crate) restart_recipe: Option<Rc<dyn ErasedRestartRecipe<S, F>>>,
+    pub(crate) restart_continuation: Option<ErasedRestartContinuation>,
     pub(crate) remote_request_id: Option<CallId>,
     pub(crate) remote_owner: Option<RegisteredAddress>,
     pub(crate) remote_restartable: bool,
     pub(crate) terminal: bool,
 }
+
+pub(crate) type ErasedRestartContinuation = Rc<dyn Fn(RegisteredAddress) -> ErasedMessage>;
 
 pub(crate) struct SupervisorRecord {
     pub(crate) parent: RegisteredAddress,
@@ -4005,12 +4020,12 @@ where
         runtime: &mut Runtime<S, F>,
         parent: IsolateId,
     ) -> SpawnObservedOutcome<S, F> {
-        let (spawn, continuation) = self.inner.into_parts();
+        let (spawn, continuation, restart_continuation) = self.inner.into_parts();
         match spawn
             .into_erased_spawn()
             .try_spawn_observed(runtime, parent)
         {
-            Ok(outcome) => {
+            Ok(mut outcome) => {
                 let child_address = Address::<ChildMessage, ChildReply>::new_with_generation_in(
                     outcome.child.system,
                     outcome.child.shard,
@@ -4019,6 +4034,17 @@ where
                 );
                 let child_ref = ChildRef::new(child_address);
                 let message = continuation(Ok(child_ref));
+                outcome.restart_continuation = restart_continuation.map(|continuation| {
+                    Rc::new(move |child: RegisteredAddress| {
+                        let address = Address::<ChildMessage, ChildReply>::new_with_generation_in(
+                            child.system,
+                            child.shard,
+                            child.isolate,
+                            child.generation,
+                        );
+                        ErasedMessage::Local(Box::new(continuation(ChildRef::new(address))))
+                    }) as Rc<dyn Fn(RegisteredAddress) -> ErasedMessage>
+                });
                 SpawnObservedOutcome {
                     spawn: Some(outcome),
                     continuation: Some(ErasedMessage::Local(Box::new(message))),

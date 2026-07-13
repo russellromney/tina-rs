@@ -300,7 +300,12 @@ every timer-driven worker.
 Use `runtime.observe_child_restarted(parent).wait(timeout)` to learn
 when a supervised child has been restarted.
 
-Do not hand-roll an `Arc<AtomicU64>` generation counter.
+When the parent needs the replacement address, use
+`spawn_observed(restartable).then_with_restarts(initial, restarted)` and store
+the delivered typed `ChildRef` in parent state.
+
+Do not hand-roll an `Arc<AtomicU64>` generation counter or rebuild an address
+from isolate/generation fields.
 
 ### Operation completion
 
