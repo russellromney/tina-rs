@@ -149,8 +149,8 @@ impl QuoteGateway {
                         if step.classified_success =>
                     {
                         Some(QuoteReply::Quote {
-                        provider: q.provider,
-                        cents: q.cents,
+                            provider: q.provider,
+                            cents: q.cents,
                         })
                     }
                     _ => None,
