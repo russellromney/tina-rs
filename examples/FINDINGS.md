@@ -285,7 +285,8 @@ caller departure, completion, rollback, and refill settle the guarded
 authority exactly. The cache uses `SharedWork` for bounded single-flight
 callers and generation-stamps invalidation. The request-only tenant limiter
 stamps `RateLimit` admission with `RequestCall::now()` and preserves the narrow
-four-way decision vocabulary on live and simulator owners. The request-only
+four-way decision vocabulary on live and simulator owners. `Admitted` consumes
+the token in place, so the example carries no permit-shaped cleanup. The request-only
 webhook fake removes its dummy event lane and preserves every outer call,
 bridge, rejection, and worker-domain outcome. A final audit also stopped the
 gateway from treating a failed runtime timer as successful held work.

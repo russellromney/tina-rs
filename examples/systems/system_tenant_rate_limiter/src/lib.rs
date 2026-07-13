@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, RateLimit, RateLimitDecision,
-    ReportedWorkloadError, RunToShutdownError, StartupError, ThreadedRuntimeError,
-    format_discovery_line,
+    CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, RateLimit, RateLimitConfig,
+    RateLimitDecision, ReportedWorkloadError, RunToShutdownError, StartupError,
+    ThreadedRuntimeError, format_discovery_line,
 };
 
 /// Tenant identifier. Static strings keep the request path allocation-free.
@@ -35,7 +35,7 @@ pub enum GatewayRequest {
 /// Reply shape preserving every decision in `RateLimitDecision`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatewayReply {
-    /// One token was admitted and its move-only grant was settled.
+    /// One token was admitted and consumed by the decision.
     Admitted {
         /// Tenant charged by the decision.
         tenant: TenantId,
@@ -48,7 +48,7 @@ pub enum GatewayReply {
         retry_after: Duration,
     },
     /// No key-table slot was available for a new tenant.
-    TableFull {
+    KeyCapacityFull {
         /// Tenant refused by the decision.
         tenant: TenantId,
     },
@@ -61,19 +61,15 @@ pub enum GatewayReply {
     Snapshot(SnapshotReport),
 }
 
-/// Snapshot of gateway-owned capacity and grant settlement.
+/// Snapshot of gateway-owned capacity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotReport {
     /// Live distinct tenants tracked by the fixed table.
     pub live_tenants: usize,
     /// Cumulative rate-limited decisions.
     pub rate_limited_count: u64,
-    /// Cumulative table-full decisions.
+    /// Cumulative key-capacity-full decisions.
     pub full_count: u64,
-    /// Grants produced by admitted decisions.
-    pub grants_admitted: u64,
-    /// Grants explicitly consumed before the reply was produced.
-    pub grants_settled: u64,
     /// Grep-friendly capacity discovery line.
     pub discovery_line: String,
 }
@@ -81,33 +77,22 @@ pub struct SnapshotReport {
 /// Request-only rate-limit owner.
 pub struct Gateway {
     rate: RateLimit<TenantId>,
-    grants_admitted: u64,
-    grants_settled: u64,
 }
 
 impl Gateway {
     /// Build a gateway around a configured rate limiter.
     pub fn new(rate: RateLimit<TenantId>) -> Self {
-        Self {
-            rate,
-            grants_admitted: 0,
-            grants_settled: 0,
-        }
+        Self { rate }
     }
 
     fn admit(&mut self, tenant: TenantId, now: std::time::Instant) -> GatewayReply {
-        match self.rate.try_admit(&tenant, now) {
-            RateLimitDecision::Admitted(grant) => {
-                self.grants_admitted = self.grants_admitted.saturating_add(1);
-                drop(grant);
-                self.grants_settled = self.grants_settled.saturating_add(1);
-                GatewayReply::Admitted { tenant }
-            }
+        match self.rate.try_admit_at(&tenant, now) {
+            RateLimitDecision::Admitted => GatewayReply::Admitted { tenant },
             RateLimitDecision::RateLimited { retry_after, .. } => GatewayReply::RateLimited {
                 tenant,
                 retry_after,
             },
-            RateLimitDecision::TableFull(_) => GatewayReply::TableFull { tenant },
+            RateLimitDecision::KeyCapacityFull(_) => GatewayReply::KeyCapacityFull { tenant },
             RateLimitDecision::Closed(_) => GatewayReply::Closed { tenant },
         }
     }
@@ -118,8 +103,6 @@ impl Gateway {
             live_tenants: report.current,
             rate_limited_count: report.rate_limited_count,
             full_count: report.full_count,
-            grants_admitted: self.grants_admitted,
-            grants_settled: self.grants_settled,
             discovery_line: format_discovery_line(&self.rate.capacity_surface()),
         }
     }
@@ -406,9 +389,11 @@ fn run_workload(
 ) -> Result<RunReport, WorkloadError> {
     let rate = RateLimit::<TenantId>::new(
         "tenant.rate",
-        config.max_tenants,
-        config.rate_per_sec,
-        config.burst,
+        RateLimitConfig {
+            max_keys: config.max_tenants,
+            rate_per_sec: config.rate_per_sec,
+            burst: config.burst,
+        },
     );
     let gateway = app
         .register_request_service::<Gateway, GatewayRequest, Infallible>(
@@ -475,8 +460,8 @@ fn run_workload(
     let summary_line = format!(
         "system=system_tenant_rate_limiter hot_admitted={hot_admitted} hot_limited={hot_limited} \
          cold_admitted={cold_admitted} cold_limited={cold_limited} live_tenants={} \
-         rate_limited_count={} grants_settled={}",
-        snapshot.live_tenants, snapshot.rate_limited_count, snapshot.grants_settled,
+         rate_limited_count={}",
+        snapshot.live_tenants, snapshot.rate_limited_count,
     );
     Ok(RunReport {
         hot_admitted,
@@ -537,9 +522,16 @@ mod tests {
     use std::time::Instant;
 
     #[test]
-    fn maps_all_rate_limit_decisions_and_settles_every_grant() {
+    fn maps_all_rate_limit_decisions() {
         let now = Instant::now();
-        let mut gateway = Gateway::new(RateLimit::new("test", 1, 10, 1));
+        let mut gateway = Gateway::new(RateLimit::new(
+            "test",
+            RateLimitConfig {
+                max_keys: 1,
+                rate_per_sec: 10,
+                burst: 1,
+            },
+        ));
         assert!(matches!(
             gateway.admit("hot", now),
             GatewayReply::Admitted { tenant: "hot" }
@@ -550,7 +542,7 @@ mod tests {
         ));
         assert!(matches!(
             gateway.admit("cold", now),
-            GatewayReply::TableFull { tenant: "cold" }
+            GatewayReply::KeyCapacityFull { tenant: "cold" }
         ));
         gateway.rate.close();
         assert!(matches!(
@@ -558,8 +550,6 @@ mod tests {
             GatewayReply::Closed { tenant: "hot" }
         ));
         let snapshot = gateway.snapshot();
-        assert_eq!(snapshot.grants_admitted, 1);
-        assert_eq!(snapshot.grants_settled, snapshot.grants_admitted);
         assert_eq!(snapshot.rate_limited_count, 1);
         assert_eq!(snapshot.full_count, 1);
     }
@@ -567,7 +557,14 @@ mod tests {
     #[test]
     fn refill_uses_monotonic_owner_time() {
         let now = Instant::now();
-        let mut gateway = Gateway::new(RateLimit::new("test", 1, 10, 1));
+        let mut gateway = Gateway::new(RateLimit::new(
+            "test",
+            RateLimitConfig {
+                max_keys: 1,
+                rate_per_sec: 10,
+                burst: 1,
+            },
+        ));
         assert!(matches!(
             gateway.admit("hot", now),
             GatewayReply::Admitted { .. }
@@ -580,7 +577,7 @@ mod tests {
             gateway.admit("hot", now + Duration::from_millis(100)),
             GatewayReply::Admitted { .. }
         ));
-        assert_eq!(gateway.snapshot().grants_settled, 2);
+        assert_eq!(gateway.snapshot().rate_limited_count, 1);
     }
 
     #[test]

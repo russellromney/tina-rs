@@ -8,8 +8,8 @@ use system_tenant_rate_limiter::{
 };
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, RateLimit, RequestServiceHandle,
-    RunToShutdownError, call_request,
+    CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, RateLimit, RateLimitConfig,
+    RequestServiceHandle, RunToShutdownError, call_request,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -32,14 +32,6 @@ fn hot_tenant_is_limited_while_cold_tenant_progresses() {
     );
     assert_eq!(report.snapshot.full_count, 0);
     assert_eq!(report.snapshot.live_tenants, 2);
-    assert_eq!(
-        report.snapshot.grants_settled,
-        report.snapshot.grants_admitted
-    );
-    assert_eq!(
-        report.snapshot.grants_admitted,
-        (report.hot_admitted + report.cold_admitted) as u64
-    );
     assert!(
         report
             .snapshot
@@ -181,13 +173,20 @@ fn invalid_configs_are_typed_and_do_not_start_a_runtime() {
 }
 
 #[test]
-fn live_owner_maps_hot_cold_table_full_closed_and_refill() {
+fn live_owner_maps_hot_cold_key_capacity_full_closed_and_refill() {
     let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
         .try_build()
         .expect("runtime");
     app.run_to_shutdown_reported(Duration::from_secs(5), |app| -> anyhow::Result<()> {
         let gateway = app.register_request_service::<Gateway, GatewayRequest, Infallible>(
-            Gateway::new(RateLimit::new("test.live", 2, 20, 1)),
+            Gateway::new(RateLimit::new(
+                "test.live",
+                RateLimitConfig {
+                    max_keys: 2,
+                    rate_per_sec: 20,
+                    burst: 1,
+                },
+            )),
             16,
         )?;
         let timeout = Duration::from_secs(1);
@@ -226,7 +225,7 @@ fn live_owner_maps_hot_cold_table_full_closed_and_refill() {
                 GatewayRequest::Admit { tenant: "third" },
                 timeout
             )?,
-            GatewayReply::TableFull { tenant: "third" }
+            GatewayReply::KeyCapacityFull { tenant: "third" }
         ));
 
         std::thread::sleep(Duration::from_millis(60));
@@ -252,8 +251,6 @@ fn live_owner_maps_hot_cold_table_full_closed_and_refill() {
         let GatewayReply::Snapshot(snapshot) = snapshot else {
             panic!("expected snapshot, got {snapshot:?}");
         };
-        assert_eq!(snapshot.grants_admitted, 3);
-        assert_eq!(snapshot.grants_settled, 3);
         assert_eq!(snapshot.rate_limited_count, 1);
         assert_eq!(snapshot.full_count, 1);
         Ok(())
@@ -274,7 +271,7 @@ fn live_call(
 }
 
 #[test]
-fn run_retains_exact_table_full_reply_inside_typed_terminal_error() {
+fn run_retains_exact_key_capacity_full_reply_inside_typed_terminal_error() {
     let error = run(RunConfig {
         max_tenants: 1,
         hot_requests: 1,
@@ -292,7 +289,7 @@ fn run_retains_exact_table_full_reply_inside_typed_terminal_error() {
                 phase: "cold",
                 index: 0,
                 outcome:
-                    CallOutcome::Replied(GatewayReply::TableFull {
+                    CallOutcome::Replied(GatewayReply::KeyCapacityFull {
                         tenant: "tenant.cold",
                     }),
             } => {}
@@ -343,8 +340,17 @@ fn sim_script(seed: u64) -> Vec<GatewayReply> {
             ..SimulatorConfig::default()
         },
     );
-    let gateway =
-        sim.register_request_service(Gateway::new(RateLimit::new("test.sim", 2, 10, 1)), 16);
+    let gateway = sim.register_request_service(
+        Gateway::new(RateLimit::new(
+            "test.sim",
+            RateLimitConfig {
+                max_keys: 2,
+                rate_per_sec: 10,
+                burst: 1,
+            },
+        )),
+        16,
+    );
     let probe = sim.register_with_mailbox_capacity::<Probe, ProbeMessage, Infallible>(
         Probe {
             gateway,
@@ -388,7 +394,7 @@ fn request_service_replays_deterministically_under_simulator_owned_time() {
             retry_after: Duration::from_millis(100),
         },
         GatewayReply::Admitted { tenant: "cold" },
-        GatewayReply::TableFull { tenant: "third" },
+        GatewayReply::KeyCapacityFull { tenant: "third" },
         GatewayReply::Admitted { tenant: "hot" },
         GatewayReply::Closed { tenant: "hot" },
     ];

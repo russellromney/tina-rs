@@ -5,15 +5,17 @@ bucket.
 
 The request API carries only tenant intent. `Gateway` stamps admission with
 `RequestCall::now()`, so callers cannot mint credit or regress limiter time.
-It consumes `RateLimitDecision::{Admitted, RateLimited, TableFull, Closed}`
+It consumes
+`RateLimitDecision::{Admitted, RateLimited, KeyCapacityFull, Closed}`
 exhaustively and exposes the same typed vocabulary in live Tina and the
 simulator.
 
 The tests prove:
 
 - a hot tenant is limited while a cold tenant still progresses;
-- table-full and closed are distinct typed replies;
-- every move-only admission grant is explicitly settled exactly once;
+- key-capacity-full and closed are distinct typed replies;
+- `Admitted` means the token was already consumed, with no permit or grant
+  cleanup required;
 - refill follows runtime-owned time in live Tina and virtual time in the sim;
 - the request service produces byte-identical decisions across simulator
   replays and seeds;
