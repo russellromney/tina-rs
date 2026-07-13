@@ -13,6 +13,8 @@ S3 backend through [`run_against_s3`]. The bridge's two-layer outcome
 (`CallOutcome::Full/Closed/Timeout` outer, `S3Error::*` inner) is mapped
 into the lane's typed `WorkFailure` reply without losing the exact bridge
 rejection reason, worker error, or unexpected response.
+`RunReport::work_failures` retains those values instead of reducing them to a
+failure count.
 
 ## Run
 

@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use system_webhook_relay::{
     DeadLetterReason, DriverReply, FakeOutboundProgram, OutboundError, RelayReply,
@@ -15,9 +15,24 @@ use tina_runtime::RunToShutdownError;
 
 fn one_shot_http_500() -> (String, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake SQS");
+    listener
+        .set_nonblocking(true)
+        .expect("make fake SQS accept bounded");
     let address = listener.local_addr().expect("fake SQS address");
     let thread = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept fake SQS request");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept fake SQS request: {error}"),
+            }
+        };
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set fake SQS timeout");
@@ -240,9 +255,11 @@ fn real_sqs_path_installs_on_the_same_facade_and_drains_before_shutdown() {
 
         assert!(matches!(
             report.workload.replies.as_slice(),
-            [DriverReply::Reply(RelayReply::Retry { .. })]
+            [DriverReply::Reply(RelayReply::DeadLetter {
+                reason: DeadLetterReason::Fatal(BridgeFatal::SdkUnknown),
+            })]
         ));
-        assert_eq!(report.workload.stats.transient, 1);
+        assert_eq!(report.workload.stats.dead_letter, 1);
         assert!(report.drain.closed);
         assert!(report.drain.drained);
         assert_eq!(report.drain.in_flight_remaining, 0);

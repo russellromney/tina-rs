@@ -1,16 +1,33 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use system_bounded_object_lane::{S3RunError, S3WorkloadError, RunConfig, run, run_against_s3};
+use system_bounded_object_lane::{
+    RunConfig, S3RunError, S3WorkloadError, WorkFailure, run, run_against_s3,
+};
 use tina_aws_bridge::{InstallError, S3Config, S3ConfigError, S3Credentials};
 use tina_runtime::RunToShutdownError;
 
 fn one_shot_http_500() -> (String, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake S3");
+    listener
+        .set_nonblocking(true)
+        .expect("make fake S3 accept bounded");
     let address = listener.local_addr().expect("fake S3 address");
     let thread = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept fake S3 request");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept fake S3 request: {error}"),
+            }
+        };
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set fake S3 timeout");
@@ -38,6 +55,7 @@ fn overload_is_visible_as_busy_not_hidden_queueing() {
 
     assert_eq!(report.callers, 10);
     assert_eq!(report.failed, 0);
+    assert!(report.work_failures.is_empty());
     assert_eq!(report.stored, 2);
     assert_eq!(report.busy, 8);
     assert_eq!(report.stats.accepted, 2);
@@ -128,6 +146,10 @@ fn real_s3_path_installs_on_the_same_facade_and_drains_before_shutdown() {
 
         assert_eq!(report.workload.callers, 1);
         assert_eq!(report.workload.failed, 1);
+        assert!(matches!(
+            report.workload.work_failures.as_slice(),
+            [WorkFailure::S3(tina_aws_bridge::S3Error::Sdk(_))]
+        ));
         assert_eq!(report.workload.stats.current, 0);
         assert!(report.workload.stats.settlements_agree);
         assert!(report.drain.closed);

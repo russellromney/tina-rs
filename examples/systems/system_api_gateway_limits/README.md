@@ -59,7 +59,7 @@ system=system_api_gateway_limits upload_admitted=A upload_full=F upload_timeout=
 
 | Claim | Evidence |
 |---|---|
-| Two routes share one in-flight cap | `upload_admitted * 2 + list_admitted * 1 <= shared_cap` at peak; both routes can see `Full` from the same scope name. |
+| Two routes share one in-flight cap | `scope_high_water <= shared_cap`; both routes can see `Full` from the same scope name. |
 | Two routes share one body-bytes cap | `body_bytes_budget_fills_independently_of_in_flight`: with a loose in-flight cap and a tight body cap, `body_full_count > 0` while `scope_full_count == 0`, and every `Full` came from `gateway.body_bytes`. |
 | Owner stop releases both budgets | `scope_admitted == scope_released`, `scope_current_at_drain == 0`, `body_admitted == body_released`, `body_current_at_drain == 0` after shutdown. |
 | Pending-capacity refusal rolls back both budgets | `pending_full_rolls_back_both_scopes_and_refills` observes the exact `gateway.pending` refusal, proves both scopes have `admitted == released` and `current == 0`, then completes a refill call. |

@@ -66,6 +66,8 @@ pub enum OutboundError {
     Throttled,
     /// SDK/service transient error.
     SdkTransient,
+    /// Generic SDK error with no typed retry evidence.
+    SdkUnknown,
     /// Resource not found (topic / queue gone).
     NotFound,
     /// Service rejected parameters.
@@ -87,6 +89,7 @@ impl OutboundError {
             Self::Timeout => BridgeOutcomeClass::Retryable(BridgeRetryable::BridgeTimeout),
             Self::Throttled => BridgeOutcomeClass::Retryable(BridgeRetryable::ServiceThrottled),
             Self::SdkTransient => BridgeOutcomeClass::Retryable(BridgeRetryable::SdkRetryable),
+            Self::SdkUnknown => BridgeOutcomeClass::Fatal(BridgeFatal::SdkUnknown),
             Self::NotFound => BridgeOutcomeClass::Fatal(BridgeFatal::NotFound),
             Self::InvalidParameter => BridgeOutcomeClass::Fatal(BridgeFatal::InvalidParameter),
             Self::AccessDenied => BridgeOutcomeClass::Fatal(BridgeFatal::AccessDenied),
@@ -211,7 +214,7 @@ fn map_sqs_error(err: SqsError) -> OutboundError {
         SqsError::InvalidRequest(_) => OutboundError::InvalidRequest,
         SqsError::QueueDoesNotExist(_) => OutboundError::NotFound,
         SqsError::Throttled(_) => OutboundError::Throttled,
-        SqsError::Sdk(_) => OutboundError::SdkTransient,
+        SqsError::Sdk(_) => OutboundError::SdkUnknown,
         SqsError::Internal(_) => OutboundError::Internal,
     }
 }
@@ -944,6 +947,7 @@ mod tests {
             (OutboundError::AccessDenied, BridgeFatal::AccessDenied),
             (OutboundError::InvalidRequest, BridgeFatal::InvalidRequest),
             (OutboundError::Internal, BridgeFatal::Internal),
+            (OutboundError::SdkUnknown, BridgeFatal::SdkUnknown),
         ];
         for (error, expected) in fatal {
             assert_eq!(
@@ -987,7 +991,7 @@ mod tests {
             RelayStats {
                 delivered: 1,
                 transient: 6,
-                dead_letter: 8,
+                dead_letter: 9,
             }
         );
     }

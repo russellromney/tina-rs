@@ -17,7 +17,8 @@ or raw service envelope. No AWS account required.
 The same relay can be wired to the SQS bridge through `SqsOutbound` and the
 `map_sqs_outcome` helper. The mapping into `OutboundError` walks the typed
 `SqsError` variants explicitly so the retry/dead-letter policy stays
-visible.
+visible. In particular, generic `SqsError::Sdk` is `SdkUnknown` and is not
+guessed retryable without typed retry evidence.
 
 ## Run
 

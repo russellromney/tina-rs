@@ -123,6 +123,8 @@ pub struct RunReport {
     pub stored: usize,
     pub busy: usize,
     pub failed: usize,
+    /// Exact worker-side failures, in caller observation order.
+    pub work_failures: Vec<WorkFailure>,
     pub full: usize,
     pub closed: usize,
     pub timeout: usize,
@@ -612,6 +614,7 @@ fn drive_callers(
     let mut stored = 0;
     let mut busy = 0;
     let mut failed = 0;
+    let mut work_failures = Vec::new();
     let mut full = 0;
     let mut closed = 0;
     let mut timeout = 0;
@@ -621,8 +624,15 @@ fn drive_callers(
         match outcome? {
             CallOutcome::Replied(LaneReply::Stored(_)) => stored += 1,
             CallOutcome::Replied(LaneReply::Busy { .. }) => busy += 1,
-            CallOutcome::Replied(LaneReply::Failed(_))
-            | CallOutcome::Replied(LaneReply::Stats(_)) => failed += 1,
+            CallOutcome::Replied(LaneReply::Failed(error)) => {
+                failed += 1;
+                work_failures.push(error);
+            }
+            CallOutcome::Replied(LaneReply::Stats(stats)) => {
+                return Err(anyhow::anyhow!(HostFailure::UnexpectedPutReply(
+                    LaneReply::Stats(stats),
+                )));
+            }
             CallOutcome::Full => full += 1,
             CallOutcome::Closed => closed += 1,
             CallOutcome::Timeout => timeout += 1,
@@ -651,6 +661,7 @@ fn drive_callers(
         stored,
         busy,
         failed,
+        work_failures,
         full,
         closed,
         timeout,
@@ -663,6 +674,7 @@ fn drive_callers(
 
 #[derive(Debug)]
 enum HostFailure {
+    UnexpectedPutReply(LaneReply),
     UnexpectedStatsReply(LaneReply),
     StatsFull,
     StatsClosed,
@@ -673,6 +685,9 @@ enum HostFailure {
 impl fmt::Display for HostFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnexpectedPutReply(reply) => {
+                write!(f, "put call returned unexpected reply: {reply:?}")
+            }
             Self::UnexpectedStatsReply(reply) => write!(f, "unexpected stats reply: {reply:?}"),
             Self::StatsFull => f.write_str("stats call mailbox was full"),
             Self::StatsClosed => f.write_str("stats service was closed"),

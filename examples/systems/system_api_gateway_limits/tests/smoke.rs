@@ -91,7 +91,7 @@ fn shared_scope_fills_and_releases_across_routes() {
 #[test]
 fn owner_stop_releases_charges_when_isolate_is_torn_down_mid_flight() {
     // Hold longer than the caller timeout. Every request the gateway
-    // admits parks a SharedLease in the isolate's HashMap and starts
+    // admits parks guarded caller authority in ConcurrencyPendingReplies and starts
     // a sleep. The caller times out before the sleep finishes, so
     // every admitted call is still holding a charge at runtime
     // shutdown. Owner-stop must release them.

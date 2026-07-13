@@ -4,7 +4,7 @@ This system is a tiny read-through cache with single-flight fills.
 
 Many callers request the same cold key at once. The cache isolate starts
 one upstream fill, parks admitted callers in a bounded `SharedWork` table
-keyed by the cache key, and replies `Busy` to overflow instead of
+keyed by the cache key, and replies `Rejected(PendingFull)` to overflow instead of
 creating a hidden wait queue.
 
 It also tests stale fill handling: an invalidation during a fill replies
@@ -57,7 +57,7 @@ Copied helpers this specimen uses:
 - `SharedWork::with_capacity(N).named(...)` for bounded waiters;
 - `SharedWork::wait(...)` for admission with caller authority returned
   on overload;
-- `request_effect_after_shared_wait(&ticket, fill_effect)` for the
+- `request_effect_after_shared_wait(permit, fill_effect)` for the
   request-lane effect that schedules the upstream work;
 - `SharedWork::reply_all_with(&key, ...)` for fanout on fill;
 - `SharedWork::close_all_clone(&key, ...)` for invalidation reply.
