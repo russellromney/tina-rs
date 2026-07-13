@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use crate::{
     Address, AddressGeneration, CallContext, CallRejectedReason, Context, Effect, IsolateId,
-    ShardId,
+    ServiceMessage, ShardId,
 };
 
 /// A typed state machine that consumes one message at a time and returns an
@@ -676,6 +676,21 @@ impl<S, M, R> SpawnObservedBuilder<S, M, R> {
             continuation: Box::new(continuation),
             marker: PhantomData,
         })
+    }
+
+    /// Maps the observed child result into a split-service event without
+    /// exposing the service envelope.
+    pub fn then_service_event<I, Event, Request, F>(self, continuation: F) -> Effect<I>
+    where
+        I: Isolate<
+                Message = ServiceMessage<Event, Request>,
+                SpawnObserved = SpawnObserved<S, ServiceMessage<Event, Request>, M, R>,
+            >,
+        F: FnOnce(SpawnObservedResult<M, R>) -> Event + 'static,
+        Event: 'static,
+        Request: 'static,
+    {
+        self.then(move |result| ServiceMessage::Event(continuation(result)))
     }
 }
 

@@ -269,6 +269,47 @@ where
         SplitServiceHandle::from_address(address)
     }
 
+    /// Registers one split service and atomically prefills its first event.
+    #[allow(private_bounds, clippy::type_complexity)]
+    pub fn register_split_service_with_bootstrap<I, Event, Request, Outbound>(
+        &mut self,
+        isolate: I,
+        mailbox_capacity: usize,
+        bootstrap: Event,
+    ) -> Result<SplitServiceHandle<Event, Request, I::Reply>, RegisterBootstrapError<Event>>
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<Event, Request>,
+                Send = TinaOutbound<Outbound>,
+            > + tina::CallableIsolate
+            + 'static,
+        Event: 'static,
+        Request: 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: IntoRuntimeFact + 'static,
+        Outbound: 'static,
+    {
+        self.register_with_capacity_and_bootstrap::<I, Outbound>(
+            isolate,
+            mailbox_capacity,
+            tina::ServiceMessage::Event(bootstrap),
+        )
+        .map(SplitServiceHandle::from_address)
+        .map_err(|error| {
+            error.map_message(|message| match message {
+                tina::ServiceMessage::Event(event) => event,
+                tina::ServiceMessage::Request(_) => {
+                    unreachable!("split-service bootstrap was constructed as an event")
+                }
+            })
+        })
+    }
+
     /// Registers an event-only service and returns only its event capability.
     #[allow(private_bounds)]
     pub fn register_event_service<I, Event, Outbound>(

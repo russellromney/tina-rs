@@ -91,6 +91,110 @@ fn fresh_service() -> (Service, Arc<AtomicU32>, Arc<AtomicU32>) {
     )
 }
 
+#[derive(Debug)]
+enum SplitEvent {
+    Bootstrap(DropProbe),
+}
+
+#[derive(Debug)]
+enum SplitRequest {
+    Inspect,
+}
+
+struct SplitService {
+    booted: bool,
+    deliveries: Arc<AtomicU32>,
+}
+
+#[tina_runtime::isolate(
+    event = SplitEvent,
+    request = SplitRequest,
+    reply = BootState,
+    shard = TestShard
+)]
+impl SplitService {
+    fn handle_event(
+        &mut self,
+        event: SplitEvent,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match event {
+            SplitEvent::Bootstrap(_authority) => {
+                self.booted = true;
+                self.deliveries.fetch_add(1, Ordering::AcqRel);
+                noop()
+            }
+        }
+    }
+
+    fn handle_request(
+        &mut self,
+        request: SplitRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            SplitRequest::Inspect => call.reply(BootState(self.booted)),
+        }
+    }
+}
+
+#[test]
+fn local_system_split_bootstrap_hides_envelope_and_is_first() {
+    let app = LocalSystem::single_shard(TestShard(11), DefaultThreadedMailboxFactory)
+        .try_build()
+        .expect("fallible startup");
+    let deliveries = Arc::new(AtomicU32::new(0));
+    let message_drops = Arc::new(AtomicU32::new(0));
+    let service = app
+        .register_split_service_with_bootstrap::<SplitService, _, _, Infallible>(
+            SplitService {
+                booted: false,
+                deliveries: Arc::clone(&deliveries),
+            },
+            4,
+            SplitEvent::Bootstrap(DropProbe(Arc::clone(&message_drops))),
+        )
+        .expect("typed split bootstrap");
+
+    assert_eq!(
+        app.call_blocking_request(
+            service.requests,
+            SplitRequest::Inspect,
+            Duration::from_secs(2),
+        )
+        .expect("typed host call"),
+        CallOutcome::Replied(BootState(true)),
+    );
+    assert_eq!(deliveries.load(Ordering::Acquire), 1);
+    assert_eq!(message_drops.load(Ordering::Acquire), 1);
+    app.shutdown().drain().join().expect("clean shutdown");
+}
+
+#[test]
+fn local_system_split_bootstrap_full_returns_event_authority() {
+    let app = LocalSystem::single_shard(TestShard(12), DefaultThreadedMailboxFactory)
+        .try_build()
+        .expect("fallible startup");
+    let deliveries = Arc::new(AtomicU32::new(0));
+    let message_drops = Arc::new(AtomicU32::new(0));
+    let error = app
+        .register_split_service_with_bootstrap::<SplitService, _, _, Infallible>(
+            SplitService {
+                booted: false,
+                deliveries: Arc::clone(&deliveries),
+            },
+            0,
+            SplitEvent::Bootstrap(DropProbe(Arc::clone(&message_drops))),
+        )
+        .expect_err("zero-capacity split bootstrap");
+    assert!(matches!(error, ThreadedRegisterBootstrapError::Full(_)));
+    assert_eq!(deliveries.load(Ordering::Acquire), 0);
+    assert_eq!(message_drops.load(Ordering::Acquire), 0);
+    drop(error);
+    assert_eq!(message_drops.load(Ordering::Acquire), 1);
+    app.shutdown().drain().join().expect("clean shutdown");
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ClosedAtCapacityFactory(usize);
 

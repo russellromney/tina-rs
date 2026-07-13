@@ -24,7 +24,7 @@ use crate::driver::{self, BetelgeuseDriver};
 use crate::errors::{
     SendObservedUntilError, ShutdownWaitError, StartupError, SuperviseError,
     ThreadedRegisterBootstrapError, ThreadedRuntimeConfigError, ThreadedRuntimeError,
-    ThreadedSendObservedError, ThreadedTrySendError,
+    ThreadedSendObservedError, ThreadedTrySendError, map_service_bootstrap_error,
 };
 use crate::host_burst::HostBurstOutcomes;
 use crate::host_call_dispatcher::{
@@ -1099,6 +1099,44 @@ where
     {
         self.register_with_capacity::<I, Outbound>(isolate, mailbox_capacity)
             .map(crate::SplitServiceHandle::from_address)
+    }
+
+    /// Registers one split service and atomically prefills its first event.
+    #[allow(private_bounds, clippy::type_complexity)]
+    pub fn register_split_service_with_bootstrap<I, Event, Request, Outbound>(
+        &self,
+        isolate: I,
+        mailbox_capacity: usize,
+        bootstrap: Event,
+    ) -> Result<
+        crate::SplitServiceHandle<Event, Request, I::Reply>,
+        ThreadedRegisterBootstrapError<Event>,
+    >
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<Event, Request>,
+                Send = TinaOutbound<Outbound>,
+            > + tina::CallableIsolate
+            + Send
+            + 'static,
+        Event: Send + 'static,
+        Request: Send + 'static,
+        I::Reply: 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: 'static,
+    {
+        self.register_with_capacity_and_bootstrap::<I, Outbound>(
+            isolate,
+            mailbox_capacity,
+            tina::ServiceMessage::Event(bootstrap),
+        )
+        .map(crate::SplitServiceHandle::from_address)
+        .map_err(map_service_bootstrap_error)
     }
 
     /// Threaded mirror of [`crate::Runtime::register_event_service`].

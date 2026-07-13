@@ -350,6 +350,16 @@ pub enum RegisterBootstrapError<M> {
     Closed(M),
 }
 
+impl<M> RegisterBootstrapError<M> {
+    /// Maps the returned bootstrap authority without changing its refusal.
+    pub fn map_message<T>(self, map: impl FnOnce(M) -> T) -> RegisterBootstrapError<T> {
+        match self {
+            Self::Full(message) => RegisterBootstrapError::Full(map(message)),
+            Self::Closed(message) => RegisterBootstrapError::Closed(map(message)),
+        }
+    }
+}
+
 impl<M> fmt::Display for RegisterBootstrapError<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -394,6 +404,37 @@ pub enum ThreadedRegisterBootstrapError<M> {
     WorkerUnresponsive,
     /// A multi-shard operation targeted a shard this runtime does not own.
     UnknownShard(ShardId, M),
+}
+
+impl<M> ThreadedRegisterBootstrapError<M> {
+    /// Maps bootstrap authority returned before admission while preserving
+    /// message-less accepted-command terminals.
+    pub fn map_message<T>(self, map: impl FnOnce(M) -> T) -> ThreadedRegisterBootstrapError<T> {
+        match self {
+            Self::Full(message) => ThreadedRegisterBootstrapError::Full(map(message)),
+            Self::Closed(message) => ThreadedRegisterBootstrapError::Closed(map(message)),
+            Self::CommandFull(message) => ThreadedRegisterBootstrapError::CommandFull(map(message)),
+            Self::CommandClosed(message) => {
+                ThreadedRegisterBootstrapError::CommandClosed(map(message))
+            }
+            Self::WorkerStopped => ThreadedRegisterBootstrapError::WorkerStopped,
+            Self::WorkerUnresponsive => ThreadedRegisterBootstrapError::WorkerUnresponsive,
+            Self::UnknownShard(shard, message) => {
+                ThreadedRegisterBootstrapError::UnknownShard(shard, map(message))
+            }
+        }
+    }
+}
+
+pub(crate) fn map_service_bootstrap_error<Event, Request>(
+    error: ThreadedRegisterBootstrapError<tina::ServiceMessage<Event, Request>>,
+) -> ThreadedRegisterBootstrapError<Event> {
+    error.map_message(|message| match message {
+        tina::ServiceMessage::Event(event) => event,
+        tina::ServiceMessage::Request(_) => {
+            unreachable!("split-service bootstrap was constructed as an event")
+        }
+    })
 }
 
 impl<M> fmt::Display for ThreadedRegisterBootstrapError<M> {

@@ -27,6 +27,7 @@ use crate::driver::BetelgeuseDriver;
 use crate::errors::{
     SendObservedUntilError, ShutdownWaitError, StartupError, ThreadedRegisterBootstrapError,
     ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError,
+    map_service_bootstrap_error,
 };
 use crate::host_burst::HostBurstOutcomes;
 use crate::live_report::{
@@ -598,6 +599,47 @@ where
     {
         self.register_with_capacity_on::<I, Outbound>(shard, isolate, mailbox_capacity)
             .map(crate::SplitServiceHandle::from_address)
+    }
+
+    /// Registers one split service on `shard` and atomically prefills its
+    /// first event.
+    #[allow(private_bounds, clippy::type_complexity)]
+    pub fn register_split_service_with_bootstrap_on<I, Event, Request, Outbound>(
+        &self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+        bootstrap: Event,
+    ) -> Result<
+        crate::SplitServiceHandle<Event, Request, I::Reply>,
+        ThreadedRegisterBootstrapError<Event>,
+    >
+    where
+        I: Isolate<
+                Shard = S,
+                Message = tina::ServiceMessage<Event, Request>,
+                Send = TinaOutbound<Outbound>,
+            > + tina::CallableIsolate
+            + Send
+            + 'static,
+        Event: Send + 'static,
+        Request: Send + 'static,
+        I::Reply: Send + 'static,
+        I::Spawn: IntoErasedSpawn<S, F> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSendErasedSpawnObserved<S, F, I::Message> + 'static,
+        I::Io: IntoErasedCall<I::Message> + 'static,
+        I::Fact: crate::fact::IntoRuntimeFact + 'static,
+        Outbound: Send + 'static,
+    {
+        self.register_with_capacity_and_bootstrap_on::<I, Outbound>(
+            shard,
+            isolate,
+            mailbox_capacity,
+            tina::ServiceMessage::Event(bootstrap),
+        )
+        .map(crate::SplitServiceHandle::from_address)
+        .map_err(map_service_bootstrap_error)
     }
 
     /// Registers one event-only service on a chosen shard.

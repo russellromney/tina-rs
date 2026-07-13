@@ -357,6 +357,58 @@ where
         )
     }
 
+    /// Registers one split service on `shard` and atomically prefills its
+    /// first event.
+    #[allow(private_bounds, clippy::type_complexity)]
+    pub fn register_split_service_with_bootstrap_on<I, Event, Request, Outbound>(
+        &mut self,
+        shard: ShardId,
+        isolate: I,
+        mailbox_capacity: usize,
+        bootstrap: Event,
+    ) -> Result<
+        tina_runtime::SplitServiceHandle<Event, Request, I::Reply>,
+        tina_runtime::RegisterBootstrapError<Event>,
+    >
+    where
+        I: Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Shard = S,
+                Send = TinaOutbound<Outbound>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            > + tina::CallableIsolate
+            + 'static,
+        I::Io: RuntimeCallable,
+        I::Spawn: IntoErasedSpawn<S> + 'static,
+        I::SpawnObserved: IntoErasedSpawnObserved<S, I::Message> + 'static,
+        I::SpawnObservedRemote: IntoSimRemoteSpawnObserved<S, I::Message> + 'static,
+        I::Reply: 'static,
+        I::Fact: tina_runtime::IntoRuntimeFact + 'static,
+        Event: 'static,
+        Request: 'static,
+        Outbound: 'static,
+    {
+        self.register_with_capacity_and_bootstrap_on::<
+            I,
+            tina::ServiceMessage<Event, Request>,
+            Outbound,
+        >(
+            shard,
+            isolate,
+            mailbox_capacity,
+            tina::ServiceMessage::Event(bootstrap),
+        )
+        .map(tina_runtime::SplitServiceHandle::from_address)
+        .map_err(|error| {
+            error.map_message(|message| match message {
+                tina::ServiceMessage::Event(event) => event,
+                tina::ServiceMessage::Request(_) => {
+                    unreachable!("split-service bootstrap was constructed as an event")
+                }
+            })
+        })
+    }
+
     /// Registers one event-only service on the requested shard.
     ///
     /// # Panics
