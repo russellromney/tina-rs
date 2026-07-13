@@ -7,13 +7,13 @@
 //!
 //! When a worker panics on a poison task, the dispatcher's `OneForOne` policy
 //! replaces only the failed worker. The replacement gets a fresh isolate
-//! identity; the old address fails closed. The host learns the replacement
-//! from a typed restart waiter and refreshes the registry.
+//! identity; the old address fails closed. The dispatcher receives the typed
+//! replacement and refreshes the registry before the host restart waiter wakes.
 //!
 //! The dispatcher never scrapes the runtime trace to find a child. It spawns
-//! with `spawn_observed(...).then(...)`, so the runtime hands it the typed
-//! child address back as an ordinary message, which it forwards to the
-//! registry.
+//! with `spawn_observed(...).then_with_restarts(...)`, so the runtime hands it
+//! every typed child incarnation as an ordinary message, which it forwards to
+//! the registry.
 //!
 //! Run with:
 //! ```bash
@@ -24,13 +24,14 @@
 
 use std::collections::HashMap;
 use std::panic;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use tina::{Address, ChildRef, IsolateId, SpawnObservedError, prelude::*};
 use tina::{RestartBudget, RestartPolicy};
-use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedSendObservedError};
+use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime};
 use tina_supervisor::SupervisorConfig;
 
 // ---------------------------------------------------------------------------
@@ -70,10 +71,8 @@ enum RegistryEvent {
     },
 }
 
-// Shared, host-visible state. Isolates run on the worker thread, so these are
-// `Arc<Mutex<_>>`, not `Rc<RefCell<_>>`.
+// Shared completed-work log for the executable's final assertions.
 type CompletedLog = Arc<Mutex<Vec<(IsolateId, u32)>>>;
-type PublishedWorker = Arc<Mutex<Option<Address<WorkerEvent>>>>;
 
 // ---------------------------------------------------------------------------
 // Worker, Dispatcher, Registry.
@@ -133,7 +132,9 @@ impl Dispatcher {
                     },
                     4,
                 ))
-                .then(DispatcherEvent::WorkerReady)
+                .then_with_restarts(DispatcherEvent::WorkerReady, |child| {
+                    DispatcherEvent::WorkerReady(Ok(child))
+                })
             }
             DispatcherEvent::WorkerReady(Ok(child)) => {
                 // Register the fresh worker under slot 0.
@@ -156,8 +157,7 @@ impl Dispatcher {
 #[derive(Debug)]
 struct Registry {
     addresses: HashMap<u32, Address<WorkerEvent>>,
-    // Published so the host can see slot 0 is live before it submits work.
-    published: PublishedWorker,
+    ready: Arc<AtomicBool>,
 }
 
 #[tina::isolate(message = RegistryEvent, send = Outbound<WorkerEvent>)]
@@ -171,10 +171,7 @@ impl Registry {
             RegistryEvent::Register { slot, address } => {
                 self.addresses.insert(slot, address);
                 if slot == 0 {
-                    *self
-                        .published
-                        .lock()
-                        .expect("published slot never poisoned") = Some(address);
+                    self.ready.store(true, Ordering::Release);
                 }
                 noop()
             }
@@ -214,15 +211,14 @@ fn main() {
     panic::set_hook(Box::new(|_| {}));
 
     let completed: CompletedLog = Arc::new(Mutex::new(Vec::new()));
-    let published: PublishedWorker = Arc::new(Mutex::new(None));
-
+    let registry_ready = Arc::new(AtomicBool::new(false));
     let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
 
     let registry = runtime
         .register_with_capacity::<Registry, WorkerEvent>(
             Registry {
                 addresses: HashMap::new(),
-                published: Arc::clone(&published),
+                ready: Arc::clone(&registry_ready),
             },
             8,
         )
@@ -245,16 +241,14 @@ fn main() {
         .expect("supervise dispatcher");
 
     // Spawn one worker through the dispatcher. The dispatcher learns the child
-    // address as a message and registers it; the registry publishes slot 0.
+    // address as a message and registers it before work is submitted.
     runtime
         .try_send(dispatcher, DispatcherEvent::SpawnWorker)
         .expect("ask dispatcher to spawn");
-    let worker = wait_for(Duration::from_secs(2), || {
-        *published.lock().expect("published lock")
+    wait_for(Duration::from_secs(2), || {
+        registry_ready.load(Ordering::Acquire).then_some(())
     })
     .expect("worker registered under slot 0");
-    println!("spawned worker {:?}", worker.isolate());
-
     // Submit a normal task. Dispatcher -> registry -> worker.
     runtime
         .try_send(
@@ -269,10 +263,8 @@ fn main() {
         (completed.lock().expect("completed lock").len() == 1).then_some(())
     })
     .expect("normal task completed");
-    println!(
-        "after normal task: completed = {:?}",
-        completed.lock().expect("completed lock")
-    );
+    let first_worker = completed.lock().expect("completed lock")[0].0;
+    println!("spawned worker {first_worker:?}");
 
     // Watch for the supervised restart before poisoning the worker.
     let restart = runtime
@@ -289,36 +281,9 @@ fn main() {
             },
         )
         .expect("submit poison task");
-    let restarted = restart
+    restart
         .wait(Duration::from_secs(3))
         .expect("worker restarted");
-
-    // The old worker address now fails closed.
-    let stale = runtime.send_and_observe(worker, WorkerEvent::Run(Task::Normal(99)));
-    assert!(matches!(
-        stale,
-        Err(ThreadedSendObservedError::MailboxClosed)
-    ));
-    println!("stale address rejected as expected: {stale:?}");
-
-    // Refresh the registry with the replacement address. The host learned the
-    // new incarnation from the typed restart waiter, not from the trace.
-    let replacement = Address::<WorkerEvent>::new_with_generation_in(
-        dispatcher.system(),
-        restarted.new_shard,
-        restarted.new_isolate,
-        restarted.new_generation,
-    );
-    println!("replacement worker {:?}", replacement.isolate());
-    runtime
-        .send_and_observe(
-            registry,
-            RegistryEvent::Register {
-                slot: 0,
-                address: replacement,
-            },
-        )
-        .expect("re-register replacement");
 
     // Submit another normal task. It now lands on the replacement worker.
     runtime
@@ -340,11 +305,9 @@ fn main() {
     );
 
     let final_log = completed.lock().expect("completed lock").clone();
-    assert_eq!(
-        final_log,
-        vec![(worker.isolate(), 42), (replacement.isolate(), 43)],
-        "worker should record original then replacement completion"
-    );
+    assert_eq!(final_log[0], (first_worker, 42));
+    assert_eq!(final_log[1].1, 43);
+    assert_ne!(final_log[1].0, first_worker);
 
     println!("dead worker is not a dead system.");
 
