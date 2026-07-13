@@ -58,19 +58,23 @@ A worker, a parent, and a supervisor config:
 
 - **`Worker`** — owns no state worth preserving. Panics on
   `Job::Poison`. The runtime catches the panic.
-- **`Parent`** — spawns the worker as a `RestartableChildDefinition`
-  with an initial `WorkerMsg::Boot`. Each restart re-runs the
-  factory closure to produce a fresh `Worker`.
+- **`Parent`** — spawns the worker as a `RestartableChildDefinition` and owns
+  the current typed `ChildRef`. Each restart re-runs the factory closure and
+  delivers the fresh ref back to the parent.
 - **`runtime.try_supervise(parent, SupervisorConfig::new(OneForOne,
   RestartBudget::new(N)))`** — the budget is typed and finite. If
   the worker exceeds N restarts, the supervisor stops trying.
+- **`spawn_observed(...).then_with_restarts(...)`** — the initial spawn result
+  and every successful replacement arrive as ordinary bounded parent
+  messages. No shared address slot or manual reconstruction.
 - **`runtime.observe_child_restarted(parent).wait(timeout)`** — the
-  ground-truth signal that a restart happened, used per-`Poison`
-  job. No `AtomicU64` generation counter, no trace polling.
+  host's ground-truth synchronization signal per `Poison` job. It counts
+  restarts but no longer acts as address authority.
 
-The host loops over the script: send a job; if it was a `Poison`,
-wait for the restart waiter to fire and re-read the worker's address
-from a one-shot publish slot.
+The host starts the parent with a typed request, then submits each job through
+that parent. After a poison job it waits for restart completion before sending
+the next request; the replacement continuation is already ahead of that next
+request in the parent's FIFO mailbox.
 
 ## Discussion
 
@@ -86,34 +90,30 @@ What feels better:
 - **`observe_child_restarted` is ground truth.** The host waits for
   a typed event the runtime emits. No "did it work?" guessing, no
   trace polling, no atomic generation counters.
+- **The parent receives typed replacements.** Application code never handles
+  an untyped isolate id/generation pair and cannot accidentally stamp a
+  replacement with the wrong system or shard.
 - **The worker stays trivial.** No supervisor logic in the worker;
   no `catch_unwind`; no respawn loop. Tina's runtime catches the
   panic at the isolate boundary and reboots cleanly.
 
 What feels worse:
 
-- **The "first worker address" still uses a side channel.**
-  `Arc<Mutex<Option<WorkerAddr>>>` because Tina doesn't yet ship an
-  observe-child-spawned waiter for the *initial* spawn. Each restart
-  *publishes* through the same slot when its `Boot` message fires.
-  `FINDINGS.md` tracks the broader typed-result / observation gap.
-- **`send_until_accepted` is a manual ingress-full retry loop.**
-  `runtime.try_send` returns `IngressFull` when the worker's mailbox
-  ingress is saturated; we yield + retry. Bounded inboxes mean this
-  shape is real, but every supervisor will write it the same way —
-  a small "send-with-retry" helper would be welcome.
-- **Wait for "next worker boot" after restart.** Same shape as the
-  initial wait, polling `slot.current()` for a *different* address.
-  Same root cause: no child-spawned waiter yet.
+- **The parent remains an explicit ingress hop.** That is intentional here:
+  the parent is the authority that tracks child incarnations. Applications
+  that hand a child ref directly to unrelated hosts must still define what
+  makes those hosts learn a replacement.
+- **Restart continuation delivery is bounded.** A full or stopped parent
+  rejects it like any other message. Tina traces that terminal fact but does
+  not hide it behind an unbounded lifecycle queue.
 
 What this suggests:
 
 - The supervisor + restart budget is the right shape. The Tokio
   hand-rolled loop is exactly the kind of thing that quietly
   diverges across codebases; Tina names it once.
-- The next ergonomics win for supervised systems is a
-  child-spawned / first-boot observation handle. Once that lands,
-  the `WorkerSlot` side channel and both `wait_until` calls can go.
-- A higher-level "send with bounded backoff" would retire
-  `send_until_accepted` across every example that touches a bounded
-  ingress.
+- `then_with_restarts` keeps typed address ownership in the parent without
+  creating a second observation registry or asking the host to assert the
+  child's message type.
+- Join/stop-child convenience remains separate lifecycle work; this specimen
+  no longer needs an address-side-channel workaround.

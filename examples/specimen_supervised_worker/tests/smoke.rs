@@ -27,3 +27,12 @@ fn tina_smoke() {
     let report = tina_impl::run().expect("tina side ran");
     assert_eq!(report, expected());
 }
+
+#[test]
+fn tina_restart_handoff_is_race_stable() {
+    for attempt in 0..20 {
+        let report = tina_impl::run()
+            .unwrap_or_else(|error| panic!("tina restart attempt {attempt} failed: {error:#}"));
+        assert_eq!(report, expected(), "restart attempt {attempt}");
+    }
+}
