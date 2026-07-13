@@ -9,9 +9,10 @@ use std::time::Duration;
 use tina::prelude::*;
 use tina_runtime::{
     CallCompletionRejectedReason, CallError, CallKind, DefaultMailboxFactory, LoopStep, Runtime,
-    RuntimeEventKind, UnixAcceptReply, UnixBindReply, UnixListenerCloseReply, UnixListenerId,
-    UnixReadReply, UnixStreamCloseReply, UnixStreamId, UnixWriteAll, UnixWriteOwnedReply,
-    unix_accept, unix_bind, unix_close_listener, unix_close_stream, unix_connect, unix_read,
+    RuntimeEventKind, UnixAcceptReply, UnixBindReply, UnixFramedWriter, UnixListenerCloseReply,
+    UnixListenerId, UnixReadReply, UnixStreamCloseReply, UnixStreamId, UnixWriteAll,
+    UnixWriteOwnedReply, unix_accept, unix_bind, unix_close_listener, unix_close_stream,
+    unix_connect, unix_read,
 };
 use tina_sim::{Simulator, SimulatorConfig};
 
@@ -227,6 +228,90 @@ fn writer(
     )
 }
 
+#[derive(Debug)]
+enum FramedWriterEvent {
+    Start,
+    Connected(Result<UnixStreamId, CallError>),
+    Wrote(UnixWriteOwnedReply),
+    Closed(UnixStreamCloseReply),
+}
+
+struct FramedWriter {
+    path: PathBuf,
+    stream: Option<UnixStreamId>,
+    writer: Option<UnixFramedWriter>,
+    report: FramedWriterReport,
+}
+
+type FramedWriterReport = Arc<Mutex<Option<Result<usize, CallError>>>>;
+
+#[tina_runtime::isolate(event = FramedWriterEvent, shard = UnixServiceShard)]
+impl FramedWriter {
+    fn handle_event(
+        &mut self,
+        event: FramedWriterEvent,
+        _ctx: &mut Context<'_, UnixServiceShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match event {
+            FramedWriterEvent::Start => {
+                unix_connect(self.path.clone()).then_service_event(FramedWriterEvent::Connected)
+            }
+            FramedWriterEvent::Connected(Ok(stream)) => {
+                self.stream = Some(stream);
+                let mut writer = UnixFramedWriter::lines(stream, 8, 16);
+                writer.push_frame(b"ping").expect("bounded frame");
+                writer.push_frame(b"status").expect("bounded frame");
+                let effect = writer
+                    .next_service_event(FramedWriterEvent::Wrote)
+                    .expect("framed batch is non-empty");
+                assert_eq!(
+                    writer.push_frame(b"late"),
+                    Err(tina_runtime::FramedWriteError::AlreadyStarted)
+                );
+                self.writer = Some(writer);
+                effect
+            }
+            FramedWriterEvent::Connected(Err(error)) => self.finish(Err(error)),
+            FramedWriterEvent::Wrote(reply) => {
+                let writer = self.writer.as_mut().expect("framed writer armed");
+                match writer.advance_service_event(reply, FramedWriterEvent::Wrote) {
+                    LoopStep::Pending(effect) => effect,
+                    LoopStep::Done(written) => self.finish(Ok(written)),
+                    LoopStep::Failed(error) => self.finish(Err(error)),
+                }
+            }
+            FramedWriterEvent::Closed(Ok(())) => stop(),
+            FramedWriterEvent::Closed(Err(error)) => {
+                panic!("framed writer close failed: {error:?}")
+            }
+        }
+    }
+}
+
+impl FramedWriter {
+    fn finish(&mut self, result: Result<usize, CallError>) -> Effect<Self> {
+        *self.report.lock().unwrap() = Some(result);
+        self.writer = None;
+        let Some(stream) = self.stream.take() else {
+            return stop();
+        };
+        unix_close_stream(stream).then_service_event(FramedWriterEvent::Closed)
+    }
+}
+
+fn framed_writer(path: PathBuf) -> (FramedWriter, FramedWriterReport) {
+    let report = Arc::new(Mutex::new(None));
+    (
+        FramedWriter {
+            path,
+            stream: None,
+            writer: None,
+            report: Arc::clone(&report),
+        },
+        report,
+    )
+}
+
 #[test]
 fn live_runtime_and_simulator_share_event_only_write_all_authoring() {
     let payload = b"event-only-unix-write".to_vec();
@@ -290,6 +375,70 @@ fn live_runtime_and_simulator_share_event_only_write_all_authoring() {
     assert!(sim_report.allocation_preserved);
     assert_eq!(sim_report.write_completions, payload.len().div_ceil(2));
     assert_eq!(*sim_received.lock().unwrap(), payload);
+}
+
+#[test]
+fn live_runtime_and_simulator_share_bounded_framed_writer_authoring() {
+    let expected = b"ping\nstatus\n".to_vec();
+
+    let live_path = socket_path("framed-live");
+    let live_received = Arc::new(Mutex::new(Vec::new()));
+    let (live_writer, live_report) = framed_writer(live_path.clone());
+    let mut runtime = Runtime::new(UnixServiceShard, DefaultMailboxFactory);
+    let server = runtime.register_event_service::<Server, ServerEvent, Infallible>(
+        Server {
+            path: live_path.clone(),
+            listener: None,
+            stream: None,
+            received: Arc::clone(&live_received),
+            close_on_accept: false,
+            read: true,
+        },
+        16,
+    );
+    let client = runtime
+        .register_event_service::<FramedWriter, FramedWriterEvent, Infallible>(live_writer, 16);
+    assert!(runtime.try_send_event(server, ServerEvent::Start).is_ok());
+    assert!(
+        runtime
+            .try_send_event(client, FramedWriterEvent::Start)
+            .is_ok()
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while live_report.lock().unwrap().is_none() && std::time::Instant::now() < deadline {
+        runtime.step();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    while runtime.step() > 0 {}
+    assert_eq!(*live_report.lock().unwrap(), Some(Ok(expected.len())));
+    assert_eq!(*live_received.lock().unwrap(), expected);
+    drop(runtime);
+    let _ = std::fs::remove_file(live_path);
+
+    let sim_path = socket_path("framed-sim");
+    let sim_received = Arc::new(Mutex::new(Vec::new()));
+    let (sim_writer, sim_report) = framed_writer(sim_path.clone());
+    let mut config = SimulatorConfig::default();
+    config.unix.default_inbound_capacity = 2;
+    config.unix.default_write_cap = 2;
+    let mut sim = Simulator::new(UnixServiceShard, config);
+    let server = sim.register_event_service(
+        Server {
+            path: sim_path,
+            listener: None,
+            stream: None,
+            received: Arc::clone(&sim_received),
+            close_on_accept: false,
+            read: true,
+        },
+        16,
+    );
+    let client = sim.register_event_service(sim_writer, 16);
+    assert!(sim.try_send_event(server, ServerEvent::Start).is_ok());
+    assert!(sim.try_send_event(client, FramedWriterEvent::Start).is_ok());
+    sim.run_until_quiescent();
+    assert_eq!(*sim_report.lock().unwrap(), Some(Ok(expected.len())));
+    assert_eq!(*sim_received.lock().unwrap(), expected);
 }
 
 #[test]

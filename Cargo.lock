@@ -3610,6 +3610,7 @@ dependencies = [
  "rustls 0.23.40",
  "signal-hook",
  "tina",
+ "tina-codec",
  "tina-macros",
  "tina-supervisor",
  "trybuild",

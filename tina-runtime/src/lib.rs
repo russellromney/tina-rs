@@ -95,6 +95,7 @@ pub mod tcp_loops;
 mod threaded;
 mod threaded_multi_shard;
 mod trace;
+mod unix_framed;
 pub mod unix_loops;
 mod wait_list;
 
@@ -355,6 +356,7 @@ pub use trace::{
     RuntimeEvent, RuntimeEventKind, RuntimeTraceExt, SendRejectedReason, SupervisionRejectedReason,
     TerminalCompletionAction, stable_trace_hash,
 };
+pub use unix_framed::{FramedWriteError, UnixFramedWriter};
 pub use unix_loops::{UnixReadToEof, UnixWriteAll};
 
 #[derive(Debug, Clone, Copy)]

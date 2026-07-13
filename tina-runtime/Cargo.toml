@@ -20,6 +20,7 @@ loom = ["dep:loom"]
 
 [dependencies]
 tina = { path = "../tina", version = "0.1.0" }
+tina-codec = { path = "../tina-codec", version = "0.1.0" }
 tina-macros = { path = "../tina-macros", version = "0.1.0" }
 tina-supervisor = { path = "../tina-supervisor", version = "0.1.0" }
 # Runtime substrate target. Vendored from Pekka Enberg's Betelgeuse with
