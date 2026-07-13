@@ -4,6 +4,17 @@ This file records completed work.
 
 ## Unreleased
 
+### Narrow rate-limit decisions
+
+- `RateLimit::try_admit` now returns
+  `RateLimitDecision::{Admitted, RateLimited, TableFull, Closed}` directly.
+  The unused speculative rate-specific table-pressure builders were removed;
+  generic `ServicePolicy::decide` remains the explicit widening boundary to
+  `AdmissionDecision`. This is a nightly pre-0.1 API correction.
+- Direct callers should import `RateLimitDecision` and rename the former
+  `AdmissionDecision::Full` arm to `TableFull`; generic `ServicePolicy`
+  callers retain the broad decision shape unchanged.
+
 ### Report-preserving application shutdown
 
 - `LocalSystem::run_to_shutdown_reported` and its multi-shard parity method

@@ -11,6 +11,33 @@ valid; the long-form history lives in
 
 ## Active
 
+### 2026-07-12 Narrow rate-limit decision prerequisite
+
+`system_tenant_rate_limiter` configured immediate shedding for key-table
+pressure but had to match the full seven-variant `AdmissionDecision`, then
+collapse `Wait`, `Degrade`, `TimedOut`, and pressure-triggered close into an
+unsupported-message rejection. Those outcomes were impossible for the chosen
+policy, so the exhaustive match made the example less truthful rather than
+more defensive.
+
+`RateLimit::try_admit` now returns `RateLimitDecision::{Admitted, RateLimited,
+TableFull, Closed}` directly. The unused speculative rate-specific
+table-pressure builders were removed; `ServicePolicy::decide` is the explicit
+widening boundary for generic code.
+Reports retain exact rate-limited, table-full, and explicit-close counts; the
+move-only `RateGrant` still proves token consumption. Runtime and simulator
+tests cover admission, exact retry timing, refill, table-capacity eviction,
+closed state, grant settlement, and deterministic virtual-time replay across
+runs, seeds, and stable trace hashes.
+
+The dependent example migration must update both current direct users to
+`RateLimitDecision`: `system_tenant_rate_limiter` and
+`specimen_rate_limited_worker`. The tenant system must also remove
+caller-supplied `Instant` from `GatewayMsg::Request` and charge against the
+gateway owner's `call.now()`. The current message grants callers timestamp
+authority and can let them mint refill credit. Those example migrations remain
+separate from this framework prerequisite and are not yet closed here.
+
 ### 2026-07-12 Report-preserving LocalSystem terminal runner prerequisite
 
 Five application-shaped specimens use `anyhow::Result` for their host
@@ -765,10 +792,9 @@ paragraphs to `FINDINGS_HISTORY.md`.
 
 What felt good:
 
-- One decision shape (`AdmissionDecision`) reads identically across every
-  limiter — gateway, tenant rate limiter, pacing worker, retry relay all
-  match the same `Admitted | Full | RateLimited { retry_after } | Wait |
-  Degrade | Closed | TimedOut`. Learn it once, use it everywhere.
+- Concurrency policies share `AdmissionDecision`; rate limiting now uses the
+  smaller `RateLimitDecision::{Admitted, RateLimited, TableFull, Closed}`.
+  Generic `ServicePolicy` code can still widen rate outcomes explicitly.
 - Passing `now` in explicitly (`try_admit(&key, ctx.now())`) feels like
   boilerplate until replay. The sim test runs the exact same line under
   virtual time and gets byte-identical decisions across runs *and across
@@ -798,16 +824,10 @@ What felt rough:
   rollback.** Closed by `SharedCapacityReservation::try_reserve([...])`, which
   admits every charge or drops earlier leases before returning the full scope.
   `ConcurrencyLimit::with_shared_scope` still takes only one shared scope.
-- **The exhaustive 7-variant match is honest but verbose.** A policy that
-  can only produce 2–3 variants (`RateLimit<()>` in the pacing worker)
-  still forces a pile of `_ => unreachable!()`. `into_admitted()` saves the
-  tests; handlers usually want a per-variant reply and eat the match.
-  **Build (maybe):** a decision→reply mapping helper, or narrower decision
-  subsets per policy.
-- `PressureAction` on `RateLimit` governs only the *table-full* path, not
-  the per-key rate decision (which always returns `RateLimited`). Correct,
-  but `on_table_pressure` needs a comment so a reader doesn't expect it to
-  reshape rate-limit rejections.
+- **Closed: the exhaustive 7-variant rate match was not honest.** The
+  canonical inherent `RateLimit::try_admit` now returns the four outcomes its
+  state machine can produce. Speculative table-pressure wait/degrade/close
+  builders were removed before 0.1; explicit `close()` remains typed.
 - `evict_key_for_capacity` is a footgun the type system can't guard —
   convention + the `evicted_count()` counter only. And the
   `KeyedLimit`-has-no-eviction / `RateLimit`-does asymmetry (live permits

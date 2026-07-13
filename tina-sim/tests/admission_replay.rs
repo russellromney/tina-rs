@@ -19,7 +19,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina_runtime::{AdmissionDecision, RateLimit, RuntimeEvent, stable_trace_hash};
+use tina_runtime::{RateLimit, RateLimitDecision, RuntimeEvent, stable_trace_hash};
 use tina_sim::{Simulator, SimulatorConfig};
 
 type DecisionLog = Rc<RefCell<Vec<String>>>;
@@ -48,12 +48,12 @@ impl Gate {
                 // virtual clock, not the wall clock.
                 let now = ctx.now();
                 let decision = match self.limiter.try_admit(&key, now) {
-                    AdmissionDecision::Admitted(_) => format!("{key}=ok"),
-                    AdmissionDecision::RateLimited { retry_after, .. } => {
+                    RateLimitDecision::Admitted(_) => format!("{key}=ok"),
+                    RateLimitDecision::RateLimited { retry_after, .. } => {
                         format!("{key}=rate({}ms)", retry_after.as_millis())
                     }
-                    AdmissionDecision::Full(_) => format!("{key}=full"),
-                    other => format!("{key}=other({other:?})"),
+                    RateLimitDecision::TableFull(_) => format!("{key}=table_full"),
+                    RateLimitDecision::Closed(_) => format!("{key}=closed"),
                 };
                 self.log.borrow_mut().push(decision);
                 noop()
@@ -71,7 +71,7 @@ const SCRIPT: &[(&str, u64)] = &[
     ("a", 50),  // 50ms < refill window → still limited
     ("a", 120), // enough time for one token → ok
     ("b", 200),
-    ("c", 200), // a third distinct key (max_keys = 4) → ok
+    ("c", 200), // a third distinct key (max_keys = 2) → table full
     ("a", 260),
 ];
 
@@ -88,8 +88,8 @@ fn run(seed: u64) -> (Vec<String>, Vec<RuntimeEvent>) {
         },
     );
     let gate = sim.register::<_, _, Infallible>(Gate {
-        // 10 tokens/sec, burst 2, up to 4 keys.
-        limiter: RateLimit::new("sim.rate", 4, 10, 2),
+        // 10 tokens/sec, burst 2, up to 2 keys.
+        limiter: RateLimit::new("sim.rate", 2, 10, 2),
         log: Rc::clone(&log),
     });
 
@@ -130,6 +130,10 @@ fn rate_limit_decisions_replay_byte_identical_under_sim_time() {
         "script did not hit the rate-limit path: {decisions_a:?}",
     );
     assert!(
+        decisions_a.iter().any(|d| d.ends_with("=table_full")),
+        "script did not hit key-table pressure: {decisions_a:?}",
+    );
+    assert!(
         decisions_a.iter().filter(|d| d.ends_with("=ok")).count() >= 3,
         "script did not exercise enough admits: {decisions_a:?}",
     );
@@ -141,11 +145,16 @@ fn rate_limit_decisions_are_independent_of_seed() {
     // changing the simulator seed (which only steers fault injection, off
     // here) must not change a single decision. This is the strongest form
     // of "no live-only / nondeterministic rate timing".
-    let (decisions_1, _) = run(1);
-    let (decisions_2, _) = run(999_999);
+    let (decisions_1, trace_1) = run(1);
+    let (decisions_2, trace_2) = run(999_999);
     assert_eq!(
         decisions_1, decisions_2,
         "RateLimit decisions must not depend on the simulator seed",
+    );
+    assert_eq!(
+        stable_trace_hash(trace_1.iter()),
+        stable_trace_hash(trace_2.iter()),
+        "with fault injection disabled, seed changes must not alter the trace",
     );
 }
 

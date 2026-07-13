@@ -17,12 +17,17 @@
 //!
 //! - [`ConcurrencyLimit`] — fixed-cap local concurrency over [`LocalPermitGate`].
 //! - [`KeyedLimit`] — fixed-cap per-key concurrency with explicit slot reuse.
-//! - [`RateLimit`] — replayable token-bucket per key, decisions are pure
-//!   functions of `(config, now, key history)`.
+//! - [`RateLimit`] — replayable shed-only token bucket per key, decisions are
+//!   pure functions of `(config, now, key history)` and use the four-variant
+//!   [`RateLimitDecision`].
 //!
-//! All three return [`AdmissionDecision`]. Successful admission carries a
-//! move-only proof object the caller must release explicitly. There is no
-//! hidden retry, no hidden queue, no growing per-key map.
+//! Concurrency policies return [`AdmissionDecision`]. `RateLimit` returns its
+//! smaller decision vocabulary because wait, degrade, and pressure-triggered
+//! close are not part of its canonical configuration.
+//! Successful concurrency admission carries a move-only proof object the
+//! caller must release explicitly; a rate grant instead proves that one token
+//! was consumed. There is no hidden retry, hidden queue, or growing per-key
+//! map.
 //!
 //! Retry remains caller-owned. Pair these policies with [`crate::FullHandling`]
 //! when retry-with-backoff is the right answer, or treat each rejection as
@@ -94,10 +99,11 @@ pub type SurfaceName = Cow<'static, str>;
 
 /// What the caller wants to happen when the policy is full.
 ///
-/// This is configuration, not runtime behavior. Each policy maps the
-/// configured action into the matching [`AdmissionDecision`] variant.
-/// The decision is still typed truth; the action just chooses the
-/// vocabulary.
+/// This is configuration, not runtime behavior. Policies with configurable
+/// hard-cap pressure map the action into the matching [`AdmissionDecision`]
+/// variant. The decision is still typed truth; the action just chooses the
+/// vocabulary. [`RateLimit`] instead fixes key-table pressure to
+/// [`RateLimitDecision::TableFull`] so its inherent decision stays narrow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PressureAction {
     /// On full, return [`AdmissionDecision::Full`] immediately.
@@ -414,10 +420,12 @@ impl std::error::Error for AdmissionFailure {}
 /// A custom admission/rate policy.
 ///
 /// This is the open extension seam for service pressure policies. The
-/// built-in policies ([`ConcurrencyLimit`], [`KeyedLimit`], [`RateLimit`])
-/// keep their ergonomic inherent `try_admit` methods, and also implement
-/// this trait so generic service code can drive a built-in or custom
-/// policy through one `(key, now) -> decision` shape. Policies that are
+/// configurable built-in policies ([`ConcurrencyLimit`], [`KeyedLimit`],
+/// [`RateLimit`]) keep their ergonomic inherent `try_admit` methods and also
+/// implement this trait so generic service code can drive a built-in or custom
+/// policy through one `(key, now) -> decision` shape. `RateLimit::try_admit`
+/// returns its narrow [`RateLimitDecision`]; this trait explicitly widens that
+/// result to [`AdmissionDecision`] for generic policy code. Policies that are
 /// not time-based ignore `now`.
 ///
 /// The contract a custom policy must keep:
@@ -461,7 +469,18 @@ impl<K: Eq + Clone> ServicePolicy for RateLimit<K> {
     type Permit = RateGrant<K>;
 
     fn decide(&mut self, key: &K, now: Instant) -> AdmissionDecision<RateGrant<K>> {
-        self.try_admit(key, now)
+        match self.try_admit(key, now) {
+            RateLimitDecision::Admitted(grant) => AdmissionDecision::Admitted(grant),
+            RateLimitDecision::RateLimited {
+                retry_after,
+                report,
+            } => AdmissionDecision::RateLimited {
+                retry_after,
+                report,
+            },
+            RateLimitDecision::TableFull(report) => AdmissionDecision::Full(report),
+            RateLimitDecision::Closed(report) => AdmissionDecision::Closed(report),
+        }
     }
 
     fn report(&self) -> AdmissionReport {
@@ -1245,9 +1264,11 @@ pub enum KeyedReleaseError<K> {
 /// Token-bucket rate limiter with replayable time.
 ///
 /// Decisions are pure functions of `(config, now, key history)`. The policy
-/// never reads wall-clock time; the caller passes `now` from `ctx.now()` (or
-/// sim-supplied time) on every admit. Math is integer-only — token credit is
-/// tracked in nano-tokens so partial gain is preserved across calls.
+/// never reads wall-clock time; the admission owner passes `now` from
+/// `ctx.now()` / `call.now()` (or sim-supplied time) on every admit. Do not
+/// accept this timestamp from an untrusted request. Math is integer-only —
+/// token credit is tracked in nano-tokens so partial gain is preserved across
+/// calls.
 ///
 /// Per-key storage is fixed-capacity. The default first form does not evict
 /// keys silently. Use [`RateLimit::evict_key_for_capacity`] to make room explicitly.
@@ -1262,12 +1283,8 @@ pub struct RateLimit<K> {
     slots: Vec<Option<RateSlot<K>>>,
     live_keys: usize,
     high_water_keys: usize,
-    action: PressureAction,
-    wait_hint: Duration,
     full_count: u64,
     rate_limited_count: u64,
-    degrade_count: u64,
-    wait_count: u64,
     evicted_count: u64,
     closed: bool,
     closed_count: u64,
@@ -1278,6 +1295,37 @@ struct RateSlot<K> {
     key: K,
     available_nt: u128,
     last_seen: Instant,
+}
+
+/// Decision returned by [`RateLimit::try_admit`].
+#[derive(Debug)]
+#[must_use = "RateLimitDecision must be matched; on failure the caller decides reply or retry"]
+pub enum RateLimitDecision<T> {
+    /// Admitted. The move-only grant proves one token was consumed.
+    Admitted(T),
+    /// Refused because the key's token bucket was empty.
+    RateLimited {
+        /// Earliest delay after which the caller could try again.
+        retry_after: Duration,
+        /// Snapshot at decision time.
+        report: AdmissionReport,
+    },
+    /// Refused because the fixed-capacity key table had no free slot.
+    TableFull(AdmissionReport),
+    /// Refused because the policy was explicitly closed.
+    Closed(AdmissionReport),
+}
+
+impl<T> RateLimitDecision<T> {
+    /// Borrow the report carried by a rejection, if any.
+    pub const fn report(&self) -> Option<&AdmissionReport> {
+        match self {
+            Self::Admitted(_) => None,
+            Self::RateLimited { report, .. } | Self::TableFull(report) | Self::Closed(report) => {
+                Some(report)
+            }
+        }
+    }
 }
 
 const ONE_TOKEN_NT: u128 = 1_000_000_000;
@@ -1312,12 +1360,8 @@ impl<K: Eq + Clone> RateLimit<K> {
             slots,
             live_keys: 0,
             high_water_keys: 0,
-            action: PressureAction::Shed,
-            wait_hint: Duration::ZERO,
             full_count: 0,
             rate_limited_count: 0,
-            degrade_count: 0,
-            wait_count: 0,
             evicted_count: 0,
             closed: false,
             closed_count: 0,
@@ -1327,25 +1371,6 @@ impl<K: Eq + Clone> RateLimit<K> {
     /// Set the configured capacity mode.
     pub fn with_mode(mut self, mode: CapacityMode) -> Self {
         self.mode = mode;
-        self
-    }
-
-    /// Choose what to return when the key *table* is full (no slot for a
-    /// new key). Default is [`PressureAction::Shed`] (`Full`).
-    ///
-    /// This does **not** change the per-key rate decision: a key whose
-    /// bucket is empty always returns `RateLimited { retry_after }`, which
-    /// is more useful than a generic `Degrade`. The action only governs the
-    /// hard table-capacity rejection.
-    pub fn on_table_pressure(mut self, action: PressureAction) -> Self {
-        self.action = action;
-        self
-    }
-
-    /// Wait hint returned under [`PressureAction::Wait`] for the table-full
-    /// path. Ignored otherwise.
-    pub fn wait_hint(mut self, delay: Duration) -> Self {
-        self.wait_hint = delay;
         self
     }
 
@@ -1375,7 +1400,7 @@ impl<K: Eq + Clone> RateLimit<K> {
         self.evicted_count
     }
 
-    /// Try to admit one request for `key` at `now`.
+    /// Try to admit one request for `key` at the admission owner's `now`.
     ///
     /// `key` is borrowed for the lookup. The implementation only clones it
     /// when allocating a new slot, so the hot path of an existing tenant
@@ -1384,10 +1409,10 @@ impl<K: Eq + Clone> RateLimit<K> {
     /// `now` must be monotonic across calls for the same policy. Going
     /// backwards is treated as "no new credit since last call" — the
     /// previous `last_seen` is preserved.
-    pub fn try_admit(&mut self, key: &K, now: Instant) -> AdmissionDecision<RateGrant<K>> {
+    pub fn try_admit(&mut self, key: &K, now: Instant) -> RateLimitDecision<RateGrant<K>> {
         if self.closed {
             self.closed_count = self.closed_count.saturating_add(1);
-            return AdmissionDecision::Closed(self.report());
+            return RateLimitDecision::Closed(self.report());
         }
         // Find existing slot.
         if let Some(idx) = self.find_slot(key) {
@@ -1413,42 +1438,17 @@ impl<K: Eq + Clone> RateLimit<K> {
                 self.high_water_keys = self.live_keys;
             }
             // burst >= 1 (we panic in `new`), so first admit always succeeds.
-            return AdmissionDecision::Admitted(RateGrant { _key: PhantomData });
+            return RateLimitDecision::Admitted(RateGrant { _key: PhantomData });
         }
-        // Table full of other keys — map onto the configured table action.
-        self.refuse_table()
+        RateLimitDecision::TableFull(self.refuse_table())
     }
 
-    /// Map a table-full rejection onto the configured [`PressureAction`].
-    /// `full_count` is bumped only when the decision surfaces as `Full`.
-    fn refuse_table(&mut self) -> AdmissionDecision<RateGrant<K>> {
-        match self.action {
-            PressureAction::Shed => {
-                self.full_count = self.full_count.saturating_add(1);
-                AdmissionDecision::Full(self.report())
-            }
-            PressureAction::Degrade => {
-                self.degrade_count = self.degrade_count.saturating_add(1);
-                AdmissionDecision::Degrade {
-                    report: self.report(),
-                }
-            }
-            PressureAction::Close => {
-                self.closed = true;
-                self.closed_count = self.closed_count.saturating_add(1);
-                AdmissionDecision::Closed(self.report())
-            }
-            PressureAction::Wait => {
-                self.wait_count = self.wait_count.saturating_add(1);
-                AdmissionDecision::Wait {
-                    delay: self.wait_hint,
-                    report: self.report(),
-                }
-            }
-        }
+    fn refuse_table(&mut self) -> AdmissionReport {
+        self.full_count = self.full_count.saturating_add(1);
+        self.report()
     }
 
-    fn admit_existing(&mut self, idx: usize, now: Instant) -> AdmissionDecision<RateGrant<K>> {
+    fn admit_existing(&mut self, idx: usize, now: Instant) -> RateLimitDecision<RateGrant<K>> {
         let burst_nt = self.burst_nano_tokens;
         let rate = self.rate_per_sec;
         let slot = self
@@ -1471,7 +1471,7 @@ impl<K: Eq + Clone> RateLimit<K> {
         if new_available >= ONE_TOKEN_NT {
             slot.available_nt = new_available - ONE_TOKEN_NT;
             slot.last_seen = next_last_seen;
-            AdmissionDecision::Admitted(RateGrant { _key: PhantomData })
+            RateLimitDecision::Admitted(RateGrant { _key: PhantomData })
         } else {
             // Not enough credit. Compute `retry_after` deterministically.
             let needed_nt = ONE_TOKEN_NT - new_available;
@@ -1481,7 +1481,7 @@ impl<K: Eq + Clone> RateLimit<K> {
             slot.available_nt = new_available;
             slot.last_seen = next_last_seen;
             self.rate_limited_count = self.rate_limited_count.saturating_add(1);
-            AdmissionDecision::RateLimited {
+            RateLimitDecision::RateLimited {
                 retry_after,
                 report: self.report_const(),
             }
@@ -1552,8 +1552,8 @@ impl<K: Eq + Clone> RateLimit<K> {
             high_water: self.high_water_keys,
             full_count: self.full_count,
             rate_limited_count: self.rate_limited_count,
-            wait_count: self.wait_count,
-            degrade_count: self.degrade_count,
+            wait_count: 0,
+            degrade_count: 0,
             closed_count: self.closed_count,
             timed_out_count: 0,
             evicted_count: self.evicted_count,
@@ -1608,6 +1608,13 @@ mod tests {
 
     fn fixed_now() -> Instant {
         Instant::now()
+    }
+
+    fn rate_admitted<T: fmt::Debug>(decision: RateLimitDecision<T>) -> T {
+        match decision {
+            RateLimitDecision::Admitted(value) => value,
+            other => panic!("expected rate admission, got {other:?}"),
+        }
     }
 
     /// Drive a policy through the trait, never the concrete type. Proves
@@ -1888,7 +1895,7 @@ mod tests {
     fn rate_limit_first_admit_consumes_one_token() {
         let mut limit = RateLimit::<&'static str>::new("rate.first", 4, 10, 5);
         let now = fixed_now();
-        let _ = limit.try_admit(&"alpha", now).into_admitted().unwrap();
+        let _ = rate_admitted(limit.try_admit(&"alpha", now));
         let state = limit.key_state(&"alpha").unwrap();
         assert_eq!(state.available_tokens, 4);
     }
@@ -1900,10 +1907,10 @@ mod tests {
         let now = fixed_now();
         // First 3 admits succeed (burst).
         for _ in 0..3 {
-            let _ = limit.try_admit(&"alpha", now).into_admitted().unwrap();
+            let _ = rate_admitted(limit.try_admit(&"alpha", now));
         }
         match limit.try_admit(&"alpha", now) {
-            AdmissionDecision::RateLimited {
+            RateLimitDecision::RateLimited {
                 retry_after,
                 report,
             } => {
@@ -1919,20 +1926,20 @@ mod tests {
     fn rate_limit_refills_over_time_deterministically() {
         let mut limit = RateLimit::<u32>::new("rate.refill", 4, 10, 2);
         let t0 = fixed_now();
-        let _ = limit.try_admit(&1, t0).into_admitted().unwrap();
-        let _ = limit.try_admit(&1, t0).into_admitted().unwrap();
+        let _ = rate_admitted(limit.try_admit(&1, t0));
+        let _ = rate_admitted(limit.try_admit(&1, t0));
         match limit.try_admit(&1, t0) {
-            AdmissionDecision::RateLimited { retry_after, .. } => {
+            RateLimitDecision::RateLimited { retry_after, .. } => {
                 assert_eq!(retry_after, Duration::from_millis(100));
             }
             other => panic!("expected RateLimited, got {other:?}"),
         }
         // After 100ms, one token has refilled.
         let t1 = t0 + Duration::from_millis(100);
-        let _ = limit.try_admit(&1, t1).into_admitted().unwrap();
+        let _ = rate_admitted(limit.try_admit(&1, t1));
         // The next admit is rate-limited again.
         match limit.try_admit(&1, t1) {
-            AdmissionDecision::RateLimited { retry_after, .. } => {
+            RateLimitDecision::RateLimited { retry_after, .. } => {
                 assert_eq!(retry_after, Duration::from_millis(100));
             }
             other => panic!("expected RateLimited, got {other:?}"),
@@ -1945,14 +1952,14 @@ mod tests {
         let now = fixed_now();
         // Hot key exhausts its bucket.
         for _ in 0..2 {
-            let _ = limit.try_admit(&"hot", now).into_admitted().unwrap();
+            let _ = rate_admitted(limit.try_admit(&"hot", now));
         }
         match limit.try_admit(&"hot", now) {
-            AdmissionDecision::RateLimited { .. } => {}
+            RateLimitDecision::RateLimited { .. } => {}
             other => panic!("hot must be limited, got {other:?}"),
         }
         // Cold key still succeeds with its own bucket.
-        let _ = limit.try_admit(&"cold", now).into_admitted().unwrap();
+        let _ = rate_admitted(limit.try_admit(&"cold", now));
     }
 
     #[test]
@@ -1975,8 +1982,8 @@ mod tests {
             ];
             for (key, offset) in inputs {
                 let outcome = match limit.try_admit(key, now0 + *offset) {
-                    AdmissionDecision::Admitted(_) => "ok".to_string(),
-                    AdmissionDecision::RateLimited { retry_after, .. } => {
+                    RateLimitDecision::Admitted(_) => "ok".to_string(),
+                    RateLimitDecision::RateLimited { retry_after, .. } => {
                         format!("rate:{}ms", retry_after.as_millis())
                     }
                     other => format!("other:{other:?}"),
@@ -1999,17 +2006,16 @@ mod tests {
         let mut limit = RateLimit::<&'static str>::new("rate.skew", 2, 10, 1);
         let t0 = fixed_now();
         // First admit at t0 consumes the only burst token.
-        let _ = limit.try_admit(&"alpha", t0).into_admitted().unwrap();
+        let _ = rate_admitted(limit.try_admit(&"alpha", t0));
         // At t0 + 200ms the bucket would have refilled 2 tokens but caps
         // at burst=1, so the next admit succeeds.
         let t_forward = t0 + Duration::from_millis(200);
-        let _ = limit
-            .try_admit(&"alpha", t_forward)
-            .into_admitted()
-            .unwrap();
+        let _ = rate_admitted(limit.try_admit(&"alpha", t_forward));
         // Now go backwards.
         match limit.try_admit(&"alpha", t0) {
-            AdmissionDecision::RateLimited { .. } => {}
+            RateLimitDecision::RateLimited { retry_after, .. } => {
+                assert_eq!(retry_after, Duration::from_millis(100));
+            }
             other => panic!("expected RateLimited on backward clock, got {other:?}"),
         }
         // After the backward call, last_seen must still be t_forward; the
@@ -2017,7 +2023,9 @@ mod tests {
         // last admit at t_forward. At t_forward + 50ms there should not
         // yet be enough credit for an admit.
         match limit.try_admit(&"alpha", t_forward + Duration::from_millis(50)) {
-            AdmissionDecision::RateLimited { .. } => {}
+            RateLimitDecision::RateLimited { retry_after, .. } => {
+                assert_eq!(retry_after, Duration::from_millis(50));
+            }
             other => panic!("backwards clock must not let bucket over-refill — got {other:?}"),
         }
     }
@@ -2026,11 +2034,11 @@ mod tests {
     fn rate_limit_table_full_does_not_evict() {
         let mut limit = RateLimit::<u32>::new("rate.cap", 2, 5, 1);
         let now = fixed_now();
-        let _ = limit.try_admit(&1, now).into_admitted().unwrap();
-        let _ = limit.try_admit(&2, now).into_admitted().unwrap();
+        let _ = rate_admitted(limit.try_admit(&1, now));
+        let _ = rate_admitted(limit.try_admit(&2, now));
         // Third key — table full, no automatic eviction.
         match limit.try_admit(&3, now) {
-            AdmissionDecision::Full(r) => {
+            RateLimitDecision::TableFull(r) => {
                 assert_eq!(r.capacity, 2);
                 assert_eq!(r.current, 2);
             }
@@ -2043,7 +2051,7 @@ mod tests {
         assert!(limit.evict_key_for_capacity(&1));
         assert_eq!(limit.evicted_count(), 1);
         assert_eq!(limit.live_keys(), 1);
-        let _ = limit.try_admit(&3, now).into_admitted().unwrap();
+        let _ = rate_admitted(limit.try_admit(&3, now));
         // A second eviction of an absent key is a no-op for telemetry.
         assert!(!limit.evict_key_for_capacity(&99));
         assert_eq!(limit.evicted_count(), 1);
@@ -2057,19 +2065,16 @@ mod tests {
         // as a request-path "reset" because it bypasses rate-limiting.
         let mut limit = RateLimit::<&'static str>::new("rate.reset", 2, 10, 1);
         let t0 = fixed_now();
-        let _ = limit.try_admit(&"alpha", t0).into_admitted().unwrap();
+        let _ = rate_admitted(limit.try_admit(&"alpha", t0));
         // Bucket exhausted — next admit at the same instant is rate-limited.
         match limit.try_admit(&"alpha", t0) {
-            AdmissionDecision::RateLimited { .. } => {}
+            RateLimitDecision::RateLimited { .. } => {}
             other => panic!("expected RateLimited, got {other:?}"),
         }
         // Evict and re-admit. The evicted key admits immediately, with
         // a fresh burst, even though no time has passed.
         assert!(limit.evict_key_for_capacity(&"alpha"));
-        let _ = limit
-            .try_admit(&"alpha", t0)
-            .into_admitted()
-            .expect("evicted key starts fresh");
+        let _ = rate_admitted(limit.try_admit(&"alpha", t0));
         // Telemetry records the eviction; CI can alarm on a runaway
         // counter that would mean a request-path bypass.
         assert_eq!(limit.evicted_count(), 1);
@@ -2281,7 +2286,7 @@ mod tests {
         assert_eq!(a.live_keys(), 0);
     }
 
-    // ---- PressureAction on KeyedLimit / RateLimit (#1, #18) ---------------
+    // ---- PressureAction on KeyedLimit (#1, #18) ---------------------------
 
     #[test]
     fn keyed_limit_honors_pressure_action() {
@@ -2327,42 +2332,6 @@ mod tests {
                 assert_eq!(report.closed_count, 2);
             }
             other => panic!("closed keyed policy must stay closed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rate_limit_table_pressure_action_applies_only_to_table_full() {
-        let mut limit = RateLimit::<u32>::new("rate.degrade_table", 1, 5, 1)
-            .on_table_pressure(PressureAction::Degrade);
-        let now = fixed_now();
-        // First key admits.
-        let _ = limit.try_admit(&1, now).into_admitted().unwrap();
-        // Same key, bucket empty → RateLimited (NOT Degrade — per-key rate
-        // decision is unaffected by the table action).
-        match limit.try_admit(&1, now) {
-            AdmissionDecision::RateLimited { .. } => {}
-            other => panic!("expected RateLimited, got {other:?}"),
-        }
-        // New key, table full → Degrade (the table action).
-        match limit.try_admit(&2, now) {
-            AdmissionDecision::Degrade { report } => assert_eq!(report.degrade_count, 1),
-            other => panic!("expected Degrade for table-full, got {other:?}"),
-        }
-
-        let mut closing = RateLimit::<u32>::new("rate.close_table", 1, 5, 1)
-            .on_table_pressure(PressureAction::Close);
-        let _ = closing.try_admit(&1, now).into_admitted().unwrap();
-        match closing.try_admit(&2, now) {
-            AdmissionDecision::Closed(report) => assert_eq!(report.closed_count, 1),
-            other => panic!("expected Closed for table-full, got {other:?}"),
-        }
-        assert!(
-            closing.is_closed(),
-            "Close action must stop future admission"
-        );
-        match closing.try_admit(&1, now + Duration::from_secs(1)) {
-            AdmissionDecision::Closed(report) => assert_eq!(report.closed_count, 2),
-            other => panic!("closed rate policy must stay closed, got {other:?}"),
         }
     }
 
@@ -2419,12 +2388,12 @@ mod tests {
     fn rate_limit_close_with_live_tenants_returns_closed_and_keeps_counts() {
         let mut limit = RateLimit::<&'static str>::new("rate.close", 4, 10, 2);
         let now = fixed_now();
-        let _ = limit.try_admit(&"alpha", now).into_admitted().unwrap();
-        let _ = limit.try_admit(&"beta", now).into_admitted().unwrap();
+        let _ = rate_admitted(limit.try_admit(&"alpha", now));
+        let _ = rate_admitted(limit.try_admit(&"beta", now));
         assert_eq!(limit.live_keys(), 2);
         limit.close();
         match limit.try_admit(&"gamma", now) {
-            AdmissionDecision::Closed(r) => {
+            RateLimitDecision::Closed(r) => {
                 assert!(r.closed_count >= 1);
                 // Live tenant state is preserved through close — close is
                 // admission-only, not a state reset.
@@ -2470,7 +2439,7 @@ mod tests {
         // and grant-consumption cannot corrupt anything. Pin that.
         let mut limit = RateLimit::<&'static str>::new("rate.evict_race", 4, 10, 2);
         let now = fixed_now();
-        let grant = limit.try_admit(&"alpha", now).into_admitted().unwrap();
+        let grant = rate_admitted(limit.try_admit(&"alpha", now));
         // Evict alpha while the grant is still in hand.
         assert!(limit.evict_key_for_capacity(&"alpha"));
         assert_eq!(limit.live_keys(), 0);
@@ -2479,7 +2448,7 @@ mod tests {
         drop(grant);
         assert_eq!(limit.live_keys(), 0);
         // A fresh admit for alpha starts a new bucket.
-        let _ = limit.try_admit(&"alpha", now).into_admitted().unwrap();
+        let _ = rate_admitted(limit.try_admit(&"alpha", now));
         assert_eq!(limit.live_keys(), 1);
     }
 
@@ -2529,19 +2498,19 @@ mod tests {
         let now = fixed_now();
         // Each key admits exactly once (burst 1), then is rate-limited.
         for k in 0..max_keys as u32 {
-            let _ = limit.try_admit(&k, now).into_admitted().unwrap();
+            let _ = rate_admitted(limit.try_admit(&k, now));
         }
         assert_eq!(limit.live_keys(), max_keys);
         for k in 0..max_keys as u32 {
             assert!(matches!(
                 limit.try_admit(&k, now),
-                AdmissionDecision::RateLimited { .. }
+                RateLimitDecision::RateLimited { .. }
             ));
         }
         // Table full for a brand-new key.
         assert!(matches!(
             limit.try_admit(&99_999, now),
-            AdmissionDecision::Full(_)
+            RateLimitDecision::TableFull(_)
         ));
     }
 
@@ -2559,14 +2528,16 @@ mod tests {
     }
 
     #[test]
-    fn admission_failure_display_includes_retry_after() {
+    fn rate_limit_decision_includes_exact_retry_after() {
         let mut limit = RateLimit::<&'static str>::new("rate.display", 4, 10, 1);
         let now = fixed_now();
-        let _ = limit.try_admit(&"alpha", now).into_admitted().unwrap();
-        let failure = limit.try_admit(&"alpha", now).into_admitted().unwrap_err();
-        let line = format!("{failure}");
-        assert!(line.contains("admission_rejected=rate_limited"), "{line}");
-        assert!(line.contains("retry_after_ms=100"), "{line}");
+        let _ = rate_admitted(limit.try_admit(&"alpha", now));
+        match limit.try_admit(&"alpha", now) {
+            RateLimitDecision::RateLimited { retry_after, .. } => {
+                assert_eq!(retry_after, Duration::from_millis(100));
+            }
+            other => panic!("expected rate-limited decision, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2575,7 +2546,7 @@ mod tests {
         let name = format!("route.{}", "items");
         let mut limit = RateLimit::<&'static str>::new(name.clone(), 4, 5, 1);
         let now = fixed_now();
-        let _ = limit.try_admit(&"t", now).into_admitted().unwrap();
+        let _ = rate_admitted(limit.try_admit(&"t", now));
         assert_eq!(limit.report().surface, name);
         assert_eq!(limit.capacity_surface().name, name);
     }
@@ -2584,7 +2555,7 @@ mod tests {
     fn evicted_count_in_report_but_not_in_rejection_sum() {
         let mut limit = RateLimit::<u32>::new("rate.evict_report", 2, 5, 1);
         let now = fixed_now();
-        let _ = limit.try_admit(&1, now).into_admitted().unwrap();
+        let _ = rate_admitted(limit.try_admit(&1, now));
         assert!(limit.evict_key_for_capacity(&1));
         let report = limit.report();
         assert_eq!(report.evicted_count, 1);
