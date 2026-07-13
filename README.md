@@ -204,7 +204,10 @@ hello
 hello
 ```
 
-Press Enter in the server's terminal to stop it with a clean shutdown.
+Each connection makes the server log `accepted connection` in its own terminal.
+Press Enter there to stop it with a clean shutdown. This is a minimal demo: a
+failed `accept` stops the server rather than retrying, so an accept error stays
+visible instead of being swallowed.
 
 The bounded-mailbox contract has its own self-terminating demo. It bursts a
 worker whose mailbox holds only four records; the surplus comes back as a typed
