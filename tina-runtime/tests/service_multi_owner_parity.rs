@@ -8,8 +8,8 @@ use tina_runtime::sharded::{ShardPlacement, ShardRequestServiceTable};
 use tina_runtime::{
     CallError, CallOutcome, DefaultMailboxFactory, DefaultThreadedMailboxFactory,
     EventServiceHandle, LocalSystem, LocalSystemConfig, MultiShardRuntime, RequestServiceHandle,
-    ResultWaitError, SplitServiceHandle, ThreadedMultiShardRuntime, ThreadedRuntimeConfig,
-    ThreadedRuntimeError, sleep,
+    ResultWaitError, SplitServiceHandle, ThreadedMultiShardRuntime, ThreadedRuntime,
+    ThreadedRuntimeConfig, ThreadedRuntimeError, sleep,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -384,6 +384,175 @@ fn threaded_multi_registration_returns_typed_unknown_shard() {
 }
 
 #[test]
+fn threaded_single_host_operations_reject_routing_before_admission() {
+    let local_system = tina::SystemIncarnation::new(0x5050);
+    let foreign_system = tina::SystemIncarnation::new(0x5051);
+    let config_for = |system_incarnation| ThreadedRuntimeConfig {
+        system_incarnation: Some(system_incarnation),
+        ..ThreadedRuntimeConfig::default()
+    };
+    let local = ThreadedRuntime::with_config(
+        ServiceShard(50),
+        DefaultThreadedMailboxFactory,
+        config_for(local_system),
+    );
+    let unowned = ThreadedRuntime::with_config(
+        ServiceShard(99),
+        DefaultThreadedMailboxFactory,
+        config_for(local_system),
+    );
+    let foreign = ThreadedRuntime::with_config(
+        ServiceShard(99),
+        DefaultThreadedMailboxFactory,
+        config_for(foreign_system),
+    );
+    let local_drop = local
+        .register_with_capacity::<DropService, std::convert::Infallible>(DropService, 4)
+        .expect("local drop service registered");
+    let unowned_drop = unowned
+        .register_with_capacity::<DropService, std::convert::Infallible>(DropService, 4)
+        .expect("same-system unowned drop service registered");
+    let unowned_request = unowned
+        .register_request_service(DropRequestService, 4)
+        .expect("same-system unowned request service registered");
+    let foreign_drop = foreign
+        .register_with_capacity::<DropService, std::convert::Infallible>(DropService, 4)
+        .expect("foreign drop service registered");
+    let foreign_request = foreign
+        .register_request_service(DropRequestService, 4)
+        .expect("foreign request service registered");
+    let drops = Arc::new(AtomicU32::new(0));
+
+    assert!(matches!(
+        local.call_blocking(
+            unowned_drop,
+            DropMessage(Arc::clone(&drops)),
+            Duration::from_millis(50),
+        ),
+        Err(ThreadedRuntimeError::UnknownShard(shard)) if shard == ShardId::new(99)
+    ));
+    assert!(matches!(
+        local.call_blocking_with_host_timeout(
+            unowned_drop,
+            DropMessage(Arc::clone(&drops)),
+            Duration::from_secs(1),
+            Duration::ZERO,
+        ),
+        Err(ThreadedRuntimeError::UnknownShard(shard)) if shard == ShardId::new(99)
+    ));
+    assert!(matches!(
+        local.call_blocking_typed(
+            unowned_drop.callable(),
+            DropMessage(Arc::clone(&drops)),
+            Duration::from_millis(50),
+        ),
+        Err(ThreadedRuntimeError::UnknownShard(shard)) if shard == ShardId::new(99)
+    ));
+    assert!(matches!(
+        local.call_blocking_request(
+            unowned_request,
+            DropRequest(Arc::clone(&drops)),
+            Duration::from_millis(50),
+        ),
+        Err(ThreadedRuntimeError::UnknownShard(shard)) if shard == ShardId::new(99)
+    ));
+
+    // Exceed the registry's 1024-slot bound. Routing failures must never reach
+    // the worker command queue or consume an observation slot.
+    for _ in 0..=1024 {
+        assert_eq!(
+            local.observe_result::<u32, _, _>(unowned_drop).err(),
+            Some(ResultWaitError::UnknownShard(ShardId::new(99)))
+        );
+    }
+    let local_waiter = local
+        .observe_result::<u32, _, _>(local_drop)
+        .expect("unowned-shard rejections did not exhaust observation capacity");
+    drop(local_waiter);
+
+    assert!(matches!(
+        local.call_blocking(
+            foreign_drop,
+            DropMessage(Arc::clone(&drops)),
+            Duration::from_millis(50),
+        ),
+        Err(ThreadedRuntimeError::ForeignSystem { expected, actual })
+            if expected == local_system && actual == foreign_system
+    ));
+    assert!(matches!(
+        local.call_blocking_with_host_timeout(
+            foreign_drop,
+            DropMessage(Arc::clone(&drops)),
+            Duration::from_secs(1),
+            Duration::ZERO,
+        ),
+        Err(ThreadedRuntimeError::ForeignSystem { expected, actual })
+            if expected == local_system && actual == foreign_system
+    ));
+    assert!(matches!(
+        local.call_blocking_typed(
+            foreign_drop.callable(),
+            DropMessage(Arc::clone(&drops)),
+            Duration::from_millis(50),
+        ),
+        Err(ThreadedRuntimeError::ForeignSystem { expected, actual })
+            if expected == local_system && actual == foreign_system
+    ));
+    assert!(matches!(
+        local.call_blocking_request(
+            foreign_request,
+            DropRequest(Arc::clone(&drops)),
+            Duration::from_millis(50),
+        ),
+        Err(ThreadedRuntimeError::ForeignSystem { expected, actual })
+            if expected == local_system && actual == foreign_system
+    ));
+    assert!(matches!(
+        local.observe_result::<u32, _, _>(foreign_drop),
+        Err(ResultWaitError::ForeignSystem { expected, actual })
+            if expected == local_system && actual == foreign_system
+    ));
+    assert_eq!(drops.load(Ordering::Acquire), 8);
+
+    let report = local
+        .shutdown_handle()
+        .request_and_wait_report(Duration::from_secs(2))
+        .expect("local worker stops");
+    assert!(report.error().is_none());
+    assert!(matches!(
+        local.call_blocking(
+            unowned_drop,
+            DropMessage(Arc::clone(&drops)),
+            Duration::ZERO,
+        ),
+        Err(ThreadedRuntimeError::UnknownShard(shard)) if shard == ShardId::new(99)
+    ));
+    assert!(matches!(
+        local.call_blocking(
+            foreign_drop,
+            DropMessage(Arc::clone(&drops)),
+            Duration::ZERO,
+        ),
+        Err(ThreadedRuntimeError::ForeignSystem { expected, actual })
+            if expected == local_system && actual == foreign_system
+    ));
+    assert_eq!(
+        local.observe_result::<u32, _, _>(unowned_drop).err(),
+        Some(ResultWaitError::UnknownShard(ShardId::new(99)))
+    );
+    assert!(matches!(
+        local.observe_result::<u32, _, _>(foreign_drop),
+        Err(ResultWaitError::ForeignSystem { expected, actual })
+            if expected == local_system && actual == foreign_system
+    ));
+    assert_eq!(drops.load(Ordering::Acquire), 10);
+
+    drop(local);
+    unowned.shutdown().expect("unowned runtime shuts down");
+    foreign.shutdown().expect("foreign runtime shuts down");
+}
+
+#[test]
 fn threaded_multi_host_operations_reject_same_system_unowned_shard_before_admission() {
     let system = tina::SystemIncarnation::new(0x5100);
     let config = ThreadedRuntimeConfig {
@@ -399,6 +568,15 @@ fn threaded_multi_host_operations_reject_same_system_unowned_shard_before_admiss
         [ServiceShard(99)],
         DefaultThreadedMailboxFactory,
         config,
+    );
+    let foreign_system = tina::SystemIncarnation::new(0x5101);
+    let foreign = ThreadedMultiShardRuntime::with_config(
+        [ServiceShard(99)],
+        DefaultThreadedMailboxFactory,
+        ThreadedRuntimeConfig {
+            system_incarnation: Some(foreign_system),
+            ..ThreadedRuntimeConfig::default()
+        },
     );
     let local_drop = local
         .register_with_capacity_on::<DropService, std::convert::Infallible>(
@@ -417,6 +595,16 @@ fn threaded_multi_host_operations_reject_same_system_unowned_shard_before_admiss
     let other_request = other
         .register_request_service_on(ShardId::new(99), DropRequestService, 4)
         .expect("other request service registered");
+    let foreign_drop = foreign
+        .register_with_capacity_on::<DropService, std::convert::Infallible>(
+            ShardId::new(99),
+            DropService,
+            4,
+        )
+        .expect("foreign drop service registered");
+    let foreign_request = foreign
+        .register_request_service_on(ShardId::new(99), DropRequestService, 4)
+        .expect("foreign request service registered");
     let drops = Arc::new(AtomicU32::new(0));
 
     assert!(matches!(
@@ -445,17 +633,88 @@ fn threaded_multi_host_operations_reject_same_system_unowned_shard_before_admiss
         Err(ThreadedRuntimeError::UnknownShard(shard)) if shard == ShardId::new(99)
     ));
     assert_eq!(drops.load(Ordering::Acquire), 3);
-    assert_eq!(
-        local.observe_result::<u32, _, _>(other_drop).err(),
-        Some(ResultWaitError::UnknownShard(ShardId::new(99)))
-    );
+    for _ in 0..=1024 {
+        assert_eq!(
+            local.observe_result::<u32, _, _>(other_drop).err(),
+            Some(ResultWaitError::UnknownShard(ShardId::new(99)))
+        );
+    }
     let local_waiter = local
         .observe_result::<u32, _, _>(local_drop)
         .expect("unknown-shard rejection did not claim observation capacity");
     drop(local_waiter);
 
-    local.shutdown().expect("local runtime shuts down");
+    assert!(matches!(
+        local.call_blocking(
+            foreign_drop,
+            DropMessage(Arc::clone(&drops)),
+            Duration::from_millis(50),
+        ),
+        Err(ThreadedRuntimeError::ForeignSystem { expected, actual })
+            if expected == system && actual == foreign_system
+    ));
+    assert!(matches!(
+        local.call_blocking_with_host_timeout(
+            foreign_drop,
+            DropMessage(Arc::clone(&drops)),
+            Duration::from_secs(1),
+            Duration::ZERO,
+        ),
+        Err(ThreadedRuntimeError::ForeignSystem { expected, actual })
+            if expected == system && actual == foreign_system
+    ));
+    assert!(matches!(
+        local.call_blocking_request(
+            foreign_request,
+            DropRequest(Arc::clone(&drops)),
+            Duration::from_millis(50),
+        ),
+        Err(ThreadedRuntimeError::ForeignSystem { expected, actual })
+            if expected == system && actual == foreign_system
+    ));
+    assert!(matches!(
+        local.observe_result::<u32, _, _>(foreign_drop),
+        Err(ResultWaitError::ForeignSystem { expected, actual })
+            if expected == system && actual == foreign_system
+    ));
+    assert_eq!(drops.load(Ordering::Acquire), 6);
+
+    let report = local
+        .shutdown_handle()
+        .request_and_wait_report(Duration::from_secs(2))
+        .expect("local workers stop");
+    assert!(report.error().is_none());
+    assert!(matches!(
+        local.call_blocking(
+            other_drop,
+            DropMessage(Arc::clone(&drops)),
+            Duration::ZERO,
+        ),
+        Err(ThreadedRuntimeError::UnknownShard(shard)) if shard == ShardId::new(99)
+    ));
+    assert!(matches!(
+        local.call_blocking(
+            foreign_drop,
+            DropMessage(Arc::clone(&drops)),
+            Duration::ZERO,
+        ),
+        Err(ThreadedRuntimeError::ForeignSystem { expected, actual })
+            if expected == system && actual == foreign_system
+    ));
+    assert_eq!(
+        local.observe_result::<u32, _, _>(other_drop).err(),
+        Some(ResultWaitError::UnknownShard(ShardId::new(99)))
+    );
+    assert!(matches!(
+        local.observe_result::<u32, _, _>(foreign_drop),
+        Err(ResultWaitError::ForeignSystem { expected, actual })
+            if expected == system && actual == foreign_system
+    ));
+    assert_eq!(drops.load(Ordering::Acquire), 8);
+
+    drop(local);
     other.shutdown().expect("other runtime shuts down");
+    foreign.shutdown().expect("foreign runtime shuts down");
 }
 
 #[test]
@@ -510,6 +769,15 @@ fn canonical_local_facades_delegate_service_registration_and_events() {
             )
             .expect("single rejected request call driven"),
         CallOutcome::Rejected(tina::CallRejectedReason::UnsupportedMessage)
+    );
+    assert_eq!(
+        single.call_blocking_with_host_timeout(
+            single_split.requests.address().address(),
+            tina::ServiceMessage::Request(SplitRequest::Hold),
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+        ),
+        Err(ThreadedRuntimeError::HostWaitTimeout)
     );
     assert_eq!(
         single
@@ -591,6 +859,15 @@ fn canonical_local_facades_delegate_service_registration_and_events() {
             .expect("multi split request call driven"),
         CallOutcome::Replied(7)
     );
+    assert_eq!(
+        multi.call_blocking_with_host_timeout(
+            multi_split.requests.address().address(),
+            tina::ServiceMessage::Request(SplitRequest::Hold),
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+        ),
+        Err(ThreadedRuntimeError::HostWaitTimeout)
+    );
     assert_eq!(multi_root.shard(), ShardId::new(70));
     assert_eq!(
         multi
@@ -633,6 +910,13 @@ fn local_single_host_operations_reject_same_system_unowned_shard_before_admissio
     let other = LocalSystem::single_shard(ServiceShard(99), DefaultThreadedMailboxFactory)
         .config(config)
         .build();
+    let foreign_system = tina::SystemIncarnation::new(0x5151);
+    let foreign = LocalSystem::single_shard(ServiceShard(99), DefaultThreadedMailboxFactory)
+        .config(LocalSystemConfig {
+            system_incarnation: Some(foreign_system),
+            ..LocalSystemConfig::default()
+        })
+        .build();
     let local_drop = local
         .register_root::<DropService, std::convert::Infallible>(DropService, 4)
         .expect("local drop service registered");
@@ -642,6 +926,12 @@ fn local_single_host_operations_reject_same_system_unowned_shard_before_admissio
     let other_request = other
         .register_request_service(DropRequestService, 4)
         .expect("other request service registered");
+    let foreign_drop = foreign
+        .register_root::<DropService, std::convert::Infallible>(DropService, 4)
+        .expect("foreign drop service registered");
+    let foreign_request = foreign
+        .register_request_service(DropRequestService, 4)
+        .expect("foreign request service registered");
     let drops = Arc::new(AtomicU32::new(0));
 
     assert!(matches!(
@@ -670,17 +960,58 @@ fn local_single_host_operations_reject_same_system_unowned_shard_before_admissio
         Err(ThreadedRuntimeError::UnknownShard(shard)) if shard == ShardId::new(99)
     ));
     assert_eq!(drops.load(Ordering::Acquire), 3);
-    assert_eq!(
-        local.observe_result::<u32, _, _>(other_drop).err(),
-        Some(ResultWaitError::UnknownShard(ShardId::new(99)))
-    );
+    for _ in 0..=1024 {
+        assert_eq!(
+            local.observe_result::<u32, _, _>(other_drop).err(),
+            Some(ResultWaitError::UnknownShard(ShardId::new(99)))
+        );
+    }
     let local_waiter = local
         .observe_result::<u32, _, _>(local_drop)
         .expect("unknown-shard rejection did not claim observation capacity");
     drop(local_waiter);
 
+    assert!(matches!(
+        local.call_blocking(
+            foreign_drop,
+            DropMessage(Arc::clone(&drops)),
+            Duration::from_millis(50),
+        ),
+        Err(ThreadedRuntimeError::ForeignSystem { expected, actual })
+            if expected == system && actual == foreign_system
+    ));
+    assert!(matches!(
+        local.call_blocking_with_host_timeout(
+            foreign_drop,
+            DropMessage(Arc::clone(&drops)),
+            Duration::from_secs(1),
+            Duration::ZERO,
+        ),
+        Err(ThreadedRuntimeError::ForeignSystem { expected, actual })
+            if expected == system && actual == foreign_system
+    ));
+    assert!(matches!(
+        local.call_blocking_request(
+            foreign_request,
+            DropRequest(Arc::clone(&drops)),
+            Duration::from_millis(50),
+        ),
+        Err(ThreadedRuntimeError::ForeignSystem { expected, actual })
+            if expected == system && actual == foreign_system
+    ));
+    assert!(matches!(
+        local.observe_result::<u32, _, _>(foreign_drop),
+        Err(ResultWaitError::ForeignSystem { expected, actual })
+            if expected == system && actual == foreign_system
+    ));
+    assert_eq!(drops.load(Ordering::Acquire), 6);
+
     local.shutdown().join().expect("local system shuts down");
     other.shutdown().join().expect("other system shuts down");
+    foreign
+        .shutdown()
+        .join()
+        .expect("foreign system shuts down");
 }
 
 #[test]
@@ -759,6 +1090,14 @@ fn local_multi_host_operations_reject_same_system_unowned_shard_before_admission
         .shard(ServiceShard(99))
         .config(config)
         .build();
+    let foreign_system = tina::SystemIncarnation::new(0x5201);
+    let foreign = LocalSystem::multi_shard(DefaultThreadedMailboxFactory)
+        .shard(ServiceShard(99))
+        .config(LocalSystemConfig {
+            system_incarnation: Some(foreign_system),
+            ..LocalSystemConfig::default()
+        })
+        .build();
     let local_drop = local
         .register_root_on::<DropService, std::convert::Infallible>(ShardId::new(80), DropService, 4)
         .expect("local drop service registered");
@@ -768,6 +1107,12 @@ fn local_multi_host_operations_reject_same_system_unowned_shard_before_admission
     let other_request = other
         .register_request_service_on(ShardId::new(99), DropRequestService, 4)
         .expect("other request service registered");
+    let foreign_drop = foreign
+        .register_root_on::<DropService, std::convert::Infallible>(ShardId::new(99), DropService, 4)
+        .expect("foreign drop service registered");
+    let foreign_request = foreign
+        .register_request_service_on(ShardId::new(99), DropRequestService, 4)
+        .expect("foreign request service registered");
     let drops = Arc::new(AtomicU32::new(0));
 
     assert!(matches!(
@@ -796,15 +1141,56 @@ fn local_multi_host_operations_reject_same_system_unowned_shard_before_admission
         Err(ThreadedRuntimeError::UnknownShard(shard)) if shard == ShardId::new(99)
     ));
     assert_eq!(drops.load(Ordering::Acquire), 3);
-    assert_eq!(
-        local.observe_result::<u32, _, _>(other_drop).err(),
-        Some(ResultWaitError::UnknownShard(ShardId::new(99)))
-    );
+    for _ in 0..=1024 {
+        assert_eq!(
+            local.observe_result::<u32, _, _>(other_drop).err(),
+            Some(ResultWaitError::UnknownShard(ShardId::new(99)))
+        );
+    }
     let local_waiter = local
         .observe_result::<u32, _, _>(local_drop)
         .expect("unknown-shard rejection did not claim observation capacity");
     drop(local_waiter);
 
+    assert!(matches!(
+        local.call_blocking(
+            foreign_drop,
+            DropMessage(Arc::clone(&drops)),
+            Duration::from_millis(50),
+        ),
+        Err(ThreadedRuntimeError::ForeignSystem { expected, actual })
+            if expected == system && actual == foreign_system
+    ));
+    assert!(matches!(
+        local.call_blocking_with_host_timeout(
+            foreign_drop,
+            DropMessage(Arc::clone(&drops)),
+            Duration::from_secs(1),
+            Duration::ZERO,
+        ),
+        Err(ThreadedRuntimeError::ForeignSystem { expected, actual })
+            if expected == system && actual == foreign_system
+    ));
+    assert!(matches!(
+        local.call_blocking_request(
+            foreign_request,
+            DropRequest(Arc::clone(&drops)),
+            Duration::from_millis(50),
+        ),
+        Err(ThreadedRuntimeError::ForeignSystem { expected, actual })
+            if expected == system && actual == foreign_system
+    ));
+    assert!(matches!(
+        local.observe_result::<u32, _, _>(foreign_drop),
+        Err(ResultWaitError::ForeignSystem { expected, actual })
+            if expected == system && actual == foreign_system
+    ));
+    assert_eq!(drops.load(Ordering::Acquire), 6);
+
     local.shutdown().join().expect("local system shuts down");
     other.shutdown().join().expect("other system shuts down");
+    foreign
+        .shutdown()
+        .join()
+        .expect("foreign system shuts down");
 }

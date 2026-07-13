@@ -73,7 +73,7 @@ pub enum ResultWaitError {
         /// Incarnation carried by the address.
         actual: tina::SystemIncarnation,
     },
-    /// The address targets a shard this multi-shard runtime does not own.
+    /// The address targets a shard this runtime/system does not own.
     /// No result authority or observation capacity was claimed.
     UnknownShard(ShardId),
     /// `wait` timed out before the isolate stopped.
