@@ -23,9 +23,16 @@ use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::time::Backoff;
 use tina_runtime::{
     AdmissionDecision, AdmissionFailure, CapacitySummary, ConcurrencyLimit, FullDecision,
-    FullExhaustionReason, FullHandling, KeyedLimit, PressureAction, RateLimit, SharedCapacityScope,
-    format_discovery_line,
+    FullExhaustionReason, FullHandling, KeyedLimit, PressureAction, RateLimit, RateLimitDecision,
+    SharedCapacityScope, format_discovery_line,
 };
+
+fn rate_admitted<T: std::fmt::Debug>(decision: RateLimitDecision<T>) -> T {
+    match decision {
+        RateLimitDecision::Admitted(value) => value,
+        other => panic!("expected rate admission, got {other:?}"),
+    }
+}
 
 #[test]
 fn rate_limit_replay_byte_identical_under_same_inputs() {
@@ -51,13 +58,13 @@ fn rate_limit_replay_byte_identical_under_same_inputs() {
         inputs
             .iter()
             .map(|(key, offset)| match limit.try_admit(key, base + *offset) {
-                AdmissionDecision::Admitted(_) => format!("{key}@{}ms=ok", offset.as_millis()),
-                AdmissionDecision::RateLimited { retry_after, .. } => format!(
+                RateLimitDecision::Admitted(_) => format!("{key}@{}ms=ok", offset.as_millis()),
+                RateLimitDecision::RateLimited { retry_after, .. } => format!(
                     "{key}@{}ms=rate({}ms)",
                     offset.as_millis(),
                     retry_after.as_millis()
                 ),
-                AdmissionDecision::Full(_) => format!("{key}@{}ms=full", offset.as_millis()),
+                RateLimitDecision::TableFull(_) => format!("{key}@{}ms=full", offset.as_millis()),
                 other => format!("{key}@{}ms=other({other:?})", offset.as_millis()),
             })
             .collect()
@@ -81,30 +88,21 @@ fn cold_tenant_progresses_while_hot_tenant_is_limited() {
     let now = Instant::now();
     // Hot tenant exhausts the bucket.
     for _ in 0..2 {
-        let _g = limit
-            .try_admit(&"hot", now)
-            .into_admitted()
-            .expect("hot burst");
+        let _g = rate_admitted(limit.try_admit(&"hot", now));
     }
     // Hot is rate-limited.
     match limit.try_admit(&"hot", now) {
-        AdmissionDecision::RateLimited { .. } => {}
+        RateLimitDecision::RateLimited { .. } => {}
         other => panic!("hot must be rate-limited, got {other:?}"),
     }
     // Cold tenant still succeeds many times within its own bucket.
     for _ in 0..2 {
-        let _g = limit
-            .try_admit(&"cold", now)
-            .into_admitted()
-            .expect("cold success despite hot pressure");
+        let _g = rate_admitted(limit.try_admit(&"cold", now));
     }
     // And cold's bucket can refill independently of hot.
     let later = now + Duration::from_secs(1);
     for _ in 0..2 {
-        let _g = limit
-            .try_admit(&"cold", later)
-            .into_admitted()
-            .expect("cold refilled");
+        let _g = rate_admitted(limit.try_admit(&"cold", later));
     }
 }
 
@@ -169,7 +167,7 @@ fn admission_report_projects_into_capacity_summary() {
 
     let mut rate = RateLimit::<&'static str>::new("svc.rate", 4, 5, 1);
     let now = Instant::now();
-    let _ = rate.try_admit(&"alpha", now).into_admitted().unwrap();
+    let _ = rate_admitted(rate.try_admit(&"alpha", now));
     let _ = rate.try_admit(&"alpha", now); // force RateLimited
 
     let mut summary = CapacitySummary::new();
@@ -203,11 +201,10 @@ fn rate_limit_with_caller_owned_retry_budget_is_visible() {
 
     let now = Instant::now();
     // First admit succeeds.
-    let _grant = rate.try_admit(&"tenant.a", now).into_admitted().unwrap();
+    let _grant = rate_admitted(rate.try_admit(&"tenant.a", now));
     // Second is rate-limited.
     let outcome = rate.try_admit(&"tenant.a", now);
-    let failure = outcome.into_admitted().unwrap_err();
-    assert!(matches!(failure, AdmissionFailure::RateLimited { .. }));
+    assert!(matches!(outcome, RateLimitDecision::RateLimited { .. }));
 
     // Caller chooses to consult the retry budget.
     let first_retry = budget.on_full(now, None::<Deadline>);
@@ -273,10 +270,10 @@ fn retry_requires_an_explicit_budget_value() {
     // there is no `try_admit_with_retry` lives in the absence of such a
     // method on the policy types.)
     let mut rate = RateLimit::<&'static str>::new("rate.no_auto_retry", 2, 5, 1);
-    let _ = rate.try_admit(&"k", now).into_admitted().unwrap();
+    let _ = rate_admitted(rate.try_admit(&"k", now));
     assert!(matches!(
         rate.try_admit(&"k", now),
-        AdmissionDecision::RateLimited { .. }
+        RateLimitDecision::RateLimited { .. }
     ));
 }
 
@@ -389,11 +386,11 @@ fn rate_limit_replay_is_deterministic_across_refill_and_eviction() {
                 Step::Admit(key, ms) => {
                     let now = base + Duration::from_millis(*ms);
                     match limit.try_admit(key, now) {
-                        AdmissionDecision::Admitted(_) => format!("{key}@{ms}=ok"),
-                        AdmissionDecision::RateLimited { retry_after, .. } => {
+                        RateLimitDecision::Admitted(_) => format!("{key}@{ms}=ok"),
+                        RateLimitDecision::RateLimited { retry_after, .. } => {
                             format!("{key}@{ms}=rate({}ms)", retry_after.as_millis())
                         }
-                        AdmissionDecision::Full(_) => format!("{key}@{ms}=full"),
+                        RateLimitDecision::TableFull(_) => format!("{key}@{ms}=full"),
                         other => format!("{key}@{ms}=other({other:?})"),
                     }
                 }

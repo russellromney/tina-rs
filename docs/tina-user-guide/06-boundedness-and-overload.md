@@ -365,11 +365,11 @@ three small policy types that compose with everything above.
 ```rust
 use tina_runtime::{
     AdmissionDecision, ConcurrencyLimit, KeyedLimit, PressureAction, RateLimit,
-    ShedRateLimit, ShedRateLimitDecision,
+    RateLimitDecision, ServicePolicy,
 };
 ```
 
-Three policies, one decision shape:
+Three policies, with decision shapes matched to their configuration:
 
 - `ConcurrencyLimit` — fixed-cap local concurrency. Returns a move-only,
   gate-identified `ConcurrencyPermit`.
@@ -377,16 +377,13 @@ Three policies, one decision shape:
   `KeyedPermit<K>`. Per-key storage is a `Vec<Option<...>>`; nothing
   grows.
 - `RateLimit<K>` — replayable per-key token bucket. Decisions are pure
-  functions of `(rate, burst, now, key history)`. The caller supplies
-  `now` from `ctx.now()` or sim-supplied time.
-- `ShedRateLimit<K>` — the same token bucket with key-table pressure fixed to
-  immediate shedding. Its narrower decision type cannot express wait,
-  degrade, or pressure-triggered close.
+  functions of `(rate, burst, now, key history)`. The admission owner supplies
+  `now` from `ctx.now()` or `call.now()`.
 
-The three configurable policies return the same `AdmissionDecision<T>`:
+Generic `ServicePolicy` code returns `AdmissionDecision<T>`:
 
 ```rust
-match limit.try_admit(tenant, ctx.now()) {
+match policy.decide(key, now) {
     AdmissionDecision::Admitted(grant) => /* charge held */,
     AdmissionDecision::RateLimited { retry_after, .. } => reply_limited(retry_after),
     AdmissionDecision::Full(_) => reply_full(),
@@ -397,23 +394,24 @@ match limit.try_admit(tenant, ctx.now()) {
 }
 ```
 
-When immediate shedding is the configured policy, prefer the narrower form so
-the handler only matches outcomes the limiter can produce:
+`RateLimit::try_admit` uses a narrower decision so handlers only match outcomes
+the token bucket can produce:
 
 ```rust
-match shed_limit.try_admit(tenant, ctx.now()) {
-    ShedRateLimitDecision::Admitted(grant) => serve(tenant, grant),
-    ShedRateLimitDecision::RateLimited { retry_after, .. } => {
+match rate.try_admit(tenant, call.now()) {
+    RateLimitDecision::Admitted(grant) => serve(tenant, grant),
+    RateLimitDecision::RateLimited { retry_after, .. } => {
         reply_limited(retry_after)
     }
-    ShedRateLimitDecision::TableFull(_) => reply_full(),
-    ShedRateLimitDecision::Closed(_) => reply_closed(),
+    RateLimitDecision::TableFull(_) => reply_full(),
+    RateLimitDecision::Closed(_) => reply_closed(),
 }
 ```
 
-`ShedRateLimit::new(...)` encodes that policy at construction; it does not
-expose `on_table_pressure`, so the returned decision vocabulary remains true
-after builder configuration. Explicit `close()` still produces `Closed`.
+`RateLimit` sheds key-table pressure as `TableFull`; it has no hidden wait,
+degrade, or pressure-triggered close configuration. Explicit `close()` still
+produces `Closed`. Generic code can drive it through `ServicePolicy::decide`,
+which deliberately widens these four outcomes into `AdmissionDecision`.
 
 Rules the layer keeps:
 
@@ -426,14 +424,15 @@ Rules the layer keeps:
 - **Capacity report integration.** Every policy projects onto
   `CapacitySurfaceReport`; rejection counts roll into `full_count` so
   `summary.any_full()` stays honest for admission surfaces.
-- **Fixed-capacity per-key storage.** No growing `HashMap`. A new key
-  finds a free slot or sees `Full(report)` — never silent eviction.
+- **Fixed-capacity per-key storage.** No growing `HashMap`. A new rate-limit
+  key finds a free slot or sees `TableFull(report)`; broad admission policies
+  use `Full(report)`. Neither path silently evicts.
 - **Move-only proofs.** `ConcurrencyPermit` / `KeyedPermit` cannot be released
   twice. The compile-fail tests prove it.
 
-`examples/systems/system_tenant_rate_limiter` is the R&D proof: one gateway,
-one `RateLimit<TenantId>`, hot/cold tenants, and a `retry_after` that is
-byte-identical across runs.
+`examples/systems/system_tenant_rate_limiter` is the motivating R&D proof. Its
+dependent migration will adopt `RateLimitDecision` and move timestamp
+authority from the request to the gateway's `call.now()`.
 
 ## Shared Weighted Budgets
 

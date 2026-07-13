@@ -4,13 +4,16 @@ This file records completed work.
 
 ## Unreleased
 
-### Shed-only rate-limit decisions
+### Narrow rate-limit decisions
 
-- Added `ShedRateLimit<K>`, a construction-time shed policy whose
-  `ShedRateLimitDecision` exposes only `Admitted`, `RateLimited`, `TableFull`,
-  and explicit `Closed`. It shares `RateLimit`'s deterministic token bucket and
-  reporting while removing impossible wait, degrade, and timed-out handler
-  arms from immediate-shed services.
+- `RateLimit::try_admit` now returns
+  `RateLimitDecision::{Admitted, RateLimited, TableFull, Closed}` directly.
+  The unused speculative rate-specific table-pressure builders were removed;
+  generic `ServicePolicy::decide` remains the explicit widening boundary to
+  `AdmissionDecision`. This is a nightly pre-0.1 API correction.
+- Direct callers should import `RateLimitDecision` and rename the former
+  `AdmissionDecision::Full` arm to `TableFull`; generic `ServicePolicy`
+  callers retain the broad decision shape unchanged.
 
 ### Report-preserving application shutdown
 
