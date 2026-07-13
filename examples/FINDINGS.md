@@ -155,6 +155,12 @@ now uses scoped workers and accepts borrowed operations; a focused regression
 test proves caller-owned host state can be borrowed. The copied-service
 specimen applies that contract to its real `LocalSystem` host.
 
+The cohort's adversarial review removed the lock-manager FIFO probe's final
+host-scheduling delay in favor of observed server-side waiter admission, and
+made the overflow-holder release assert its exact terminal rather than
+discarding it. Scoped synchronization state is borrowed directly; only the
+lower-level shutdown probes retain shared owners.
+
 Two adversarial tests retain lower-level shutdown handles intentionally: they
 initiate shutdown while a caller is still parked to prove closed-caller and
 exact lease-settlement behavior. That is a distinct control-flow probe, not an

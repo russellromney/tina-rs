@@ -28,9 +28,12 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Barrier, Mutex};
 use std::thread;
 use std::time::Duration;
+
+#[cfg(test)]
+use std::sync::Arc;
 
 use tina::prelude::*;
 use tina_runtime::{
@@ -471,47 +474,24 @@ pub fn run_fifo(config: RunConfig) -> anyhow::Result<FifoReport> {
         ..config
     };
     run_local(cfg, |runtime| {
+        let admitted_order: Vec<u32> = (1..=4).collect();
+        let grant_order = Mutex::new(Vec::new());
         thread::scope(|scope| {
             let lockmgr = register(runtime, cfg)?;
             let timeout = Duration::from_millis(cfg.call_timeout_ms);
 
             let key = "fifo-key".to_string();
-            let admitted_order: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
-            let grant_order: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
 
             // Hold the lock from the host first so every contender parks before
             // any of them can be granted.
             let holder = acquire_handle(runtime, lockmgr, &key, timeout)?;
 
             let contenders = 4u32;
-            // Each contender admits itself in a fixed order via a sequential
-            // gate. That keeps Acquire admission order matching the worker id
-            // and lets us assert FIFO grant order against the same sequence.
-            let admit_gate = Arc::new(Mutex::new(1u32));
             let mut threads = Vec::with_capacity(contenders as usize);
             for id in 1..=contenders {
                 let key_for_thread = key.clone();
-                let gate = Arc::clone(&admit_gate);
-                let admitted = Arc::clone(&admitted_order);
-                let granted = Arc::clone(&grant_order);
+                let granted = &grant_order;
                 threads.push(scope.spawn(move || -> anyhow::Result<()> {
-                    // Wait until it is this contender's turn to enter Acquire.
-                    loop {
-                        {
-                            let g = gate.lock().expect("gate");
-                            if *g == id {
-                                admitted.lock().expect("admitted").push(id);
-                                break;
-                            }
-                        }
-                        thread::sleep(Duration::from_millis(2));
-                    }
-                    // Hand the gate to the next contender once admission is in
-                    // flight. A short pause makes sure the queue receives our
-                    // Acquire message before the next thread races us.
-                    thread::sleep(Duration::from_millis(20));
-                    *gate.lock().expect("gate") = id + 1;
-
                     let handle = expect_granted(runtime.call_blocking_request(
                         lockmgr,
                         LockRequest::Acquire {
@@ -526,12 +506,12 @@ pub fn run_fifo(config: RunConfig) -> anyhow::Result<FifoReport> {
                         timeout,
                     )?)
                 }));
+                // Observe this request parked before admitting the next one.
+                // The server-side waiter count is the FIFO admission proof;
+                // host scheduling delays cannot reorder the cohort.
+                wait_for_waiters(runtime, lockmgr, id as usize, timeout)?;
             }
 
-            // Wait for all four contenders to be parked before releasing the
-            // primary holder. Otherwise the first releaser's grant could race
-            // the slowest contender's Acquire.
-            wait_for_waiters(runtime, lockmgr, contenders as usize, timeout)?;
             expect_released(runtime.call_blocking_request(
                 lockmgr,
                 LockRequest::Release { handle: holder },
@@ -545,7 +525,7 @@ pub fn run_fifo(config: RunConfig) -> anyhow::Result<FifoReport> {
 
             let stats = stats(runtime, lockmgr, timeout)?;
             Ok(FifoReport {
-                admitted_order: admitted_order.lock().expect("admitted").clone(),
+                admitted_order,
                 grant_order: grant_order.lock().expect("granted").clone(),
                 stats,
             })
@@ -634,6 +614,7 @@ pub fn run_renewal(config: RunConfig) -> anyhow::Result<RenewalReport> {
         ..config
     };
     run_local(cfg, |runtime| {
+        let waiter_done = Mutex::new(false);
         thread::scope(|scope| {
             let lockmgr = register(runtime, cfg)?;
             let timeout = Duration::from_millis(cfg.call_timeout_ms);
@@ -641,8 +622,7 @@ pub fn run_renewal(config: RunConfig) -> anyhow::Result<RenewalReport> {
 
             let handle = acquire_handle(runtime, lockmgr, &key, timeout)?;
 
-            let waiter_done = Arc::new(Mutex::new(false));
-            let waiter_done_for_thread = Arc::clone(&waiter_done);
+            let waiter_done_for_thread = &waiter_done;
             let key_for_waiter = key.clone();
             let waiter = scope.spawn(move || {
                 let outcome = runtime.call_blocking_request(
@@ -771,6 +751,9 @@ pub fn run_per_key_overflow(config: RunConfig) -> anyhow::Result<PerKeyOverflowR
         ..config
     };
     run_local(cfg, |runtime| {
+        let overflow = 3;
+        let contenders = (cfg.max_waiters_per_key + overflow) as u32;
+        let barrier = Barrier::new(contenders as usize + 1);
         thread::scope(|scope| {
             let lockmgr = register(runtime, cfg)?;
             let timeout = Duration::from_millis(cfg.call_timeout_ms);
@@ -779,12 +762,9 @@ pub fn run_per_key_overflow(config: RunConfig) -> anyhow::Result<PerKeyOverflowR
             let holder = acquire_handle(runtime, lockmgr, &key, timeout)?;
 
             // 2 admitted to the queue + 3 overflow callers that must see Busy.
-            let overflow = 3;
-            let contenders = (cfg.max_waiters_per_key + overflow) as u32;
-            let barrier = Arc::new(Barrier::new(contenders as usize + 1));
             let mut threads = Vec::with_capacity(contenders as usize);
             for _ in 0..contenders {
-                let gate = Arc::clone(&barrier);
+                let gate = &barrier;
                 let key_for_thread = key.clone();
                 threads.push(
                     scope.spawn(move || -> anyhow::Result<CallOutcome<LockReply>> {
@@ -826,11 +806,11 @@ pub fn run_per_key_overflow(config: RunConfig) -> anyhow::Result<PerKeyOverflowR
             )?;
 
             // Release the holder so admitted waiters can drain.
-            let _ = runtime.call_blocking_request(
+            expect_released(runtime.call_blocking_request(
                 lockmgr,
                 LockRequest::Release { handle: holder },
                 timeout,
-            )?;
+            )?)?;
 
             let mut busy = 0;
             for contender in threads {

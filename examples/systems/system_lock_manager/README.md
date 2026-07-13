@@ -107,12 +107,11 @@ What felt rough:
   choose the per-key cap with that fairness policy in mind.
 
 What felt rough in the smoke harness, not the framework:
-- The contended-FIFO test needed a sequential admission gate
-  (sleep 20ms between threads) because `Barrier` releases all four
-  threads simultaneously and the order in which their `Acquire`
-  messages reach the isolate is racy. Always true of concurrent FIFO
-  testing, but a `host_burst_in_order` helper would pay for itself
-  across cache, queue, and lock.
+- A first contended-FIFO probe used a 20ms sequential-admission delay. The
+  adversarial pass replaced that scheduling assumption with a handshake on the
+  lock manager's observed waiter count before each next admission. The proof
+  now establishes the actual server-side FIFO order without a host timing
+  guess or a framework helper.
 - The first cut of the busy-overflow test deadlocked because granted
   threads didn't auto-release, so the hand-off chain blocked behind a
   long lease (lease_ms == call_timeout_ms). Fixed by releasing on
