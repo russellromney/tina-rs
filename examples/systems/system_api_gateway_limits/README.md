@@ -19,6 +19,13 @@ naming the exact shared surface that was exhausted. The smoke tests
 drive both the in-flight-bound case (default config) and the
 body-bytes-bound case (loose in-flight cap, tight body cap).
 
+The host is a `LocalSystem`. `run` validates every caller count,
+allocation size, request charge, and duration before starting it, then uses
+`LocalSystem::run_to_shutdown_reported` so workload and terminal shutdown
+failures remain independently typed. Scoped caller threads borrow the system;
+the example does not share runtime ownership or combine shutdown errors by
+hand.
+
 ## Run
 
 ```bash
@@ -45,16 +52,20 @@ system=system_api_gateway_limits upload_admitted=A upload_full=F upload_timeout=
   everywhere else. `util_bp` is high-water utilization in basis
   points (0..=10000).
 - `system=system_api_gateway_limits ...` — one-line summary. The
-  smoke test grabs `scope_current_at_drain` after `runtime.shutdown()`
+  smoke test grabs `scope_current_at_drain` after bounded terminal shutdown
   to prove owner-stop release.
 
 ## What proves what
 
 | Claim | Evidence |
 |---|---|
-| Two routes share one in-flight cap | `upload_admitted * 2 + list_admitted * 1 <= shared_cap` at peak; both routes can see `Full` from the same scope name. |
+| Two routes share one in-flight cap | `scope_high_water <= shared_cap`; both routes can see `Full` from the same scope name. |
 | Two routes share one body-bytes cap | `body_bytes_budget_fills_independently_of_in_flight`: with a loose in-flight cap and a tight body cap, `body_full_count > 0` while `scope_full_count == 0`, and every `Full` came from `gateway.body_bytes`. |
 | Owner stop releases both budgets | `scope_admitted == scope_released`, `scope_current_at_drain == 0`, `body_admitted == body_released`, `body_current_at_drain == 0` after shutdown. |
+| Pending-capacity refusal rolls back both budgets | `pending_full_rolls_back_both_scopes_and_refills` observes the exact `gateway.pending` refusal, proves both scopes have `admitted == released` and `current == 0`, then completes a refill call. |
+| Caller timeout releases on owner stop | `owner_stop_releases_charges_when_isolate_is_torn_down_mid_flight` leaves callers parked past their host deadlines and proves both scopes settle exactly during teardown. |
+| Host outcomes remain typed | `RunReport::caller_outcomes` retains every application reply and timeout; `GatewayWorkloadError` distinguishes runtime failure, mailbox `Full`, `Closed`, and `Rejected(reason)`. |
+| Scenario inputs are bounded | `RunConfig::validate` rejects overflow, zero non-mailbox capacities, and oversized caller, charge, allocation, and duration values before runtime/thread allocation. A zero mailbox remains available for the intentional failure proof. |
 | Full counter is honest | `scope_full_count == upload_full + list_full` when in-flight is the binding constraint. |
 | Discovery line is CI-friendly | smoke test greps `scope `, `capacity surface=`, `util_bp=`, and the `gateway.body_bytes` line. |
 
@@ -62,31 +73,21 @@ system=system_api_gateway_limits upload_admitted=A upload_full=F upload_timeout=
 
 - `SharedCapacityReservation::try_reserve` makes the two-budget charge
   all-or-nothing. No manual rollback branch.
-- `GuardedPendingReplies` parks the caller and owns the reservation.
+- `ConcurrencyPendingReplies` parks the caller and owns the reservation.
   Owner-stop release falls out of dropping the parked guard — no
   lifecycle hook needed.
 - `discovery_line` and `surface_report` use the same shape as the
   capacity discovery line, so one grepper covers both.
-
-What felt rough:
-
-- This specimen still names each scope at construction and at reporting
-  time. A service-level scope registry could make that less repetitive.
-- `tina-runtime` does not yet ship a runtime-wide registry of
-  scopes, so each isolate carries its own clone. That is fine for a
-  shard but a service builder may want a `register_scope("name")`
-  one-liner.
+- `LocalSystem::run_to_shutdown_reported` preserves the typed workload report,
+  bounded terminal result, and dual-failure case without an application-local
+  shutdown combiner.
 
 Tina capability pulled:
 
 - `SharedCapacityScope`, `SharedCapacityReservation`, `SharedScopeFull`.
-- `GuardedPendingReplies`.
+- `ConcurrencyPendingReplies`.
 - `CapacitySummary::assert_no_full` for one-shot CI.
 - `format_assertion_failure` for copyable FAIL lines.
-
-Suggested follow-up:
-
-- Service-level scope registry mirroring `register_with_capacity`.
 
 Verdict:
 

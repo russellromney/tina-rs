@@ -11,8 +11,10 @@ By default the lane uses a `FakeSleep` backend so tests are hermetic and
 deterministic. The same lane shape also supports a real `tina-aws-bridge`
 S3 backend through [`run_against_s3`]. The bridge's two-layer outcome
 (`CallOutcome::Full/Closed/Timeout` outer, `S3Error::*` inner) is mapped
-into the lane's `Failed(String)` reply with the layer named in the
-message, so callers see one consistent shape regardless of backend.
+into the lane's typed `WorkFailure` reply without losing the exact bridge
+rejection reason, worker error, or unexpected response.
+`RunReport::work_failures` retains those values instead of reducing them to a
+failure count.
 
 ## Run
 
@@ -24,20 +26,20 @@ cargo test --manifest-path examples/systems/system_bounded_object_lane/Cargo.tom
 ## Findings
 
 What felt good:
-- The in-flight cap is `tina_runtime::LocalPermitGate`: fixed-capacity,
-  move-only `Permit`, explicit release. The pressure invariant is structural
-  rather than a bool/counter pair.
+- `ConcurrencyPendingReplies` owns each parked caller and its concurrency
+  charge together. Completion tickets carry neither caller authority nor a
+  manually released permit, so caller departure and owner stop retire capacity
+  structurally.
 - Overload is a typed reply (`Busy`) instead of a hidden wait queue.
-- `call_ctx.defer(sleep(work)).reply(...)` carries `RequestContext` into the
-  continuation in one line. Multi-turn replies stay visible and the permit
-  rides along with the continuation, so the release point is obvious.
+- The lane reports live, completed, retired, and caller-gone charges and checks
+  both parked/live agreement and full settlement accounting.
+- Host callers borrow `&LocalSystem` through scoped threads, and
+  `run_to_shutdown_reported` retains workload and shutdown failures separately.
 
-What felt rough:
-- The mini service wants a standard pressure-report helper so `accepted`,
-  `busy`, `completed`, and `in_flight` do not become per-service vocabulary.
-  `LocalPermitGate::report()` covers most of this now (current, capacity,
-  full_count, high_water, retired_count, completed_count,
-  invalid_release_count).
+What stays application-specific:
+- `ConcurrencyPendingReplies::report()` covers the authority-sensitive state;
+  `accepted`, `busy`, and backend completion remain application counters because
+  they describe lane policy rather than generic runtime pressure.
 - The real S3 temptation was useful: completion delivery must be observed, not
   best-effort `try_send`, or in-flight capacity can leak.
 
@@ -46,13 +48,16 @@ Tina capability pulled:
 - Runtime-owned time.
 - Bounded in-flight admission.
 - Host-side concurrent calls.
-- Future AWS bridge pressure shape.
+- Typed AWS bridge outcome shape.
 
-Suggested follow-up:
-- A small generic "lane pressure report" shape would help S3/DB/HTTP pool
-  examples converge on one vocabulary.
-- A real `tina-aws-bridge` should reuse this admission shape but provide typed
-  AWS outcomes, cancellation, shutdown, and pressure reports.
+The real S3 path:
+- `run_against_s3` accepts `S3Config`, installs the bridge through the same
+  `LocalSystem` as the lane, and never accepts a foreign runtime address.
+- Typed install, application, bridge-drain, combined application-plus-drain,
+  startup, and facade-shutdown failures remain distinct.
+- The bridge is closed and drained while its facade is still alive;
+  `S3RunReport` makes both `workload` and successful `drain` mandatory.
+- A hermetic HTTP endpoint test exercises this full path without AWS access.
 
 Verdict:
 - keep

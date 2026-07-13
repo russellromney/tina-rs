@@ -1,39 +1,35 @@
 # system_tenant_rate_limiter
 
-Edge-service rate limiter where every tenant owns its own token bucket.
+A request-only edge gateway where each tenant owns a fixed-capacity token
+bucket.
 
-The specimen proves two truths the admission policy layer cares about:
+The request API carries only tenant intent. `Gateway` stamps admission with
+`RequestCall::now()`, so callers cannot mint credit or regress limiter time.
+It consumes
+`RateLimitDecision::{Admitted, RateLimited, KeyCapacityFull, Closed}`
+exhaustively and exposes the same typed vocabulary in live Tina and the
+simulator.
 
-1. **Replayable policy time.** `retry_after` is a pure function of `(rate,
-   burst, now, key history)`. The live gateway supplies owner time from
-   `call.now()`; simulator tests use the same API with virtual time.
-2. **Hot tenant cannot starve cold tenants.** A tenant that exhausts its
-   bucket sees `Limited { retry_after }`; a different tenant arriving at
-   the same moment still gets `Ok`. Pressure stays per-key.
+The tests prove:
 
-What it does not do:
+- a hot tenant is limited while a cold tenant still progresses;
+- key-capacity-full and closed are distinct typed replies;
+- `Admitted` means the token was already consumed, with no permit or grant
+  cleanup required;
+- refill follows runtime-owned time in live Tina and virtual time in the sim;
+- the request service produces byte-identical decisions across simulator
+  replays and seeds;
+- invalid zero, oversized, and overflowing configurations fail before runtime
+  construction or request-sized allocation;
+- host/runtime failures and every `CallOutcome` remain available in typed run
+  errors; and
+- `LocalSystem::run_to_shutdown_reported` retains workload and shutdown truth
+  while owning bounded shutdown.
 
-- No retry. The reply is `Ok` or `Limited { retry_after }`. The caller
-  decides whether to sleep and try again; the gateway never retries.
-- No growing key map. The tenant table is fixed-capacity; the third
-  distinct tenant on a `max_tenants=2` configuration is rejected with a
-  typed `TenantCapacityFull` reply.
-- No background sweeper. State drops with the runtime.
-
-Run it:
+The limiter never retries, grows its key table, or runs a background sweeper.
+Callers decide whether to wait after `RateLimited { retry_after }`; policy code
+must explicitly decide if and when old tenant state is evicted.
 
 ```sh
-cargo test --manifest-path examples/systems/system_tenant_rate_limiter/Cargo.toml
+cargo test --manifest-path examples/systems/system_tenant_rate_limiter/Cargo.toml --all-targets
 ```
-
-## Findings
-
-What felt good: `try_admit_at(&tenant, call.now())` borrows the key
-(allocation-free hot path), names the explicit logical-time boundary, and
-keeps timestamp authority with the gateway owner. The same call is
-deterministic under simulator virtual time.
-
-The narrow `RateLimitDecision::{Admitted, RateLimited, KeyCapacityFull,
-Closed}` match contains only outcomes this policy can produce. `Admitted`
-has no payload because the token is already consumed and nothing remains to
-release.

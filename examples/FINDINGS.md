@@ -270,6 +270,38 @@ framework helper was added: `SharedWork::reply_all_clone` and
 split-service declaration now uses `ServiceOutbound`, so the motivating
 example contains no direct service-envelope vocabulary.
 
+### 2026-07-12 LocalSystem default-host application cohort
+
+`system_api_gateway_limits`, `system_bounded_object_lane`,
+`system_cache_with_fill`, `system_tenant_rate_limiter`, and
+`system_webhook_relay` now construct through fallible `LocalSystem` builders
+and use typed registration, host calls, and `run_to_shutdown_reported` instead
+of shared threaded owners or application-local terminal combiners. Scoped host
+threads borrow the facade. Configurations bound every caller/thread producer,
+mailbox, parked-call table, duration, and result allocation before startup.
+
+The gateway and object lane use `ConcurrencyPendingReplies`; owner stop,
+caller departure, completion, rollback, and refill settle the guarded
+authority exactly. The cache uses `SharedWork` for bounded single-flight
+callers and generation-stamps invalidation. The request-only tenant limiter
+stamps `RateLimit` admission with `RequestCall::now()` and preserves the narrow
+four-way decision vocabulary on live and simulator owners. `Admitted` consumes
+the token in place, so the example carries no permit-shaped cleanup. The
+request-only webhook fake removes its dummy event lane and preserves every
+outer call, bridge, rejection, and worker-domain outcome. A final audit also
+stopped the gateway from treating a failed runtime timer as successful held
+work.
+
+The real AWS paths exposed one final framework prerequisite: an installed
+S3/SQS address could belong to a different threaded owner than the new
+`LocalSystem` created by the runner. AWS bridge installation now has
+`LocalSystem` parity across S3, SQS, SNS, DynamoDB, and Secrets Manager.
+`run_against_s3` and `run_against_sqs` accept bridge config, install into the
+same facade as the application service, retain typed install and application
+failures, close and drain while the facade remains live, preserve a combined
+workload-plus-drain failure, and only then consume facade shutdown. Hermetic
+real bridge tests prove the complete lifecycle without an AWS account.
+
 ### 2026-07-12 Request-aware raw flow prerequisite
 
 `flow!` now accepts `-> raw request T` for typed timer and runtime-I/O

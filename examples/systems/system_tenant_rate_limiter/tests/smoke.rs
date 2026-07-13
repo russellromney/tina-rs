@@ -1,148 +1,404 @@
-use system_tenant_rate_limiter::{RunConfig, run};
+use std::cell::RefCell;
+use std::convert::Infallible;
+use std::rc::Rc;
+use std::time::Duration;
+
+use system_tenant_rate_limiter::{
+    Gateway, GatewayReply, GatewayRequest, RunConfig, RunConfigError, RunError, WorkloadError, run,
+};
+use tina::prelude::*;
+use tina_runtime::{
+    CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, RateLimit, RateLimitConfig,
+    RequestServiceHandle, RunToShutdownError, call_request,
+};
+use tina_sim::{Simulator, SimulatorConfig};
 
 #[test]
 fn hot_tenant_is_limited_while_cold_tenant_progresses() {
-    let config = RunConfig {
-        rate_per_sec: 1,
-        ..RunConfig::default()
-    };
+    let config = RunConfig::default();
     let report = run(config).expect("run");
 
-    // A live runtime owns wall-clock scheduling, so later requests may see
-    // refill credit. Assert accounting and visible pressure, not an exact
-    // admitted/limited split.
+    assert!(report.hot_admitted >= config.burst as usize);
     assert_eq!(
         report.hot_admitted + report.hot_limited,
-        config.hot_requests,
-        "every hot request must receive an admitted or limited reply, got {report:?}"
+        config.hot_requests
     );
-    assert!(
-        report.hot_admitted >= config.burst as usize,
-        "the initial burst must admit, got {report:?}"
-    );
-    assert!(
-        report.hot_limited > 0,
-        "the tight live burst must expose rate pressure, got {report:?}"
-    );
-
-    // Cold tenant: every request admitted (cold_requests <= burst).
+    assert!(report.hot_limited > 0, "hot tenant never reached its limit");
+    assert_eq!(report.cold_admitted, config.cold_requests);
+    assert_eq!(report.cold_limited, 0);
     assert_eq!(
-        report.cold_admitted, config.cold_requests,
-        "cold must admit every request, got {report:?}"
+        report.snapshot.rate_limited_count,
+        report.hot_limited as u64
     );
-    assert_eq!(
-        report.cold_limited, 0,
-        "cold must never be rate-limited under hot pressure, got {report:?}"
-    );
-
-    // Snapshot counts must agree with observed outcomes.
-    assert_eq!(
-        report.snapshot.rate_limited_count, report.hot_limited as u64,
-        "snapshot rate_limited_count must match observed Limited replies, got {report:?}"
-    );
-    assert_eq!(
-        report.snapshot.full_count, 0,
-        "table cap is not exhausted in this run, got {report:?}"
-    );
-    // Both tenants left state behind at the end of the run.
+    assert_eq!(report.snapshot.full_count, 0);
     assert_eq!(report.snapshot.live_tenants, 2);
-
-    // Discovery line is grep-friendly.
     assert!(
         report
             .snapshot
             .discovery_line
-            .contains("surface=tenant.rate"),
-        "missing surface name: {}",
-        report.snapshot.discovery_line
+            .contains("surface=tenant.rate")
     );
 }
 
 #[test]
-fn retry_after_uses_owner_time_and_stays_within_the_token_window() {
-    let config = RunConfig {
-        rate_per_sec: 1,
-        ..RunConfig::default()
-    };
-    let report = run(config).expect("run");
-    assert_eq!(report.hot_retry_afters_ms.len(), report.hot_limited);
-    assert!(
-        report
-            .hot_retry_afters_ms
-            .iter()
-            .all(|ms| *ms > 0 && *ms <= 1_000),
-        "retry_after must stay within the one-second token window: {:?}",
-        report.hot_retry_afters_ms
-    );
+fn invalid_configs_are_typed_and_do_not_start_a_runtime() {
+    let cases = [
+        (
+            RunConfig {
+                mailbox: 0,
+                ..RunConfig::default()
+            },
+            "mailbox",
+        ),
+        (
+            RunConfig {
+                max_tenants: 0,
+                ..RunConfig::default()
+            },
+            "max_tenants",
+        ),
+        (
+            RunConfig {
+                rate_per_sec: 0,
+                ..RunConfig::default()
+            },
+            "rate_per_sec",
+        ),
+        (
+            RunConfig {
+                burst: 0,
+                ..RunConfig::default()
+            },
+            "burst",
+        ),
+        (
+            RunConfig {
+                hot_requests: 0,
+                ..RunConfig::default()
+            },
+            "hot_requests",
+        ),
+        (
+            RunConfig {
+                cold_requests: 0,
+                ..RunConfig::default()
+            },
+            "cold_requests",
+        ),
+        (
+            RunConfig {
+                call_timeout_ms: 0,
+                ..RunConfig::default()
+            },
+            "call_timeout_ms",
+        ),
+    ];
+    for (config, field) in cases {
+        assert!(matches!(
+            run(config),
+            Err(RunError::InvalidConfig(RunConfigError::Zero { field: actual }))
+                if actual == field
+        ));
+    }
+
+    let oversized = [
+        (
+            RunConfig {
+                mailbox: 65_537,
+                ..RunConfig::default()
+            },
+            "mailbox",
+        ),
+        (
+            RunConfig {
+                max_tenants: 65_537,
+                ..RunConfig::default()
+            },
+            "max_tenants",
+        ),
+        (
+            RunConfig {
+                rate_per_sec: 1_000_000_001,
+                ..RunConfig::default()
+            },
+            "rate_per_sec",
+        ),
+        (
+            RunConfig {
+                burst: 1_000_001,
+                ..RunConfig::default()
+            },
+            "burst",
+        ),
+        (
+            RunConfig {
+                hot_requests: 2_000_001,
+                ..RunConfig::default()
+            },
+            "hot_requests",
+        ),
+        (
+            RunConfig {
+                cold_requests: 2_000_001,
+                ..RunConfig::default()
+            },
+            "cold_requests",
+        ),
+        (
+            RunConfig {
+                call_timeout_ms: 60_001,
+                ..RunConfig::default()
+            },
+            "call_timeout_ms",
+        ),
+    ];
+    for (config, field) in oversized {
+        assert!(matches!(
+            run(config),
+            Err(RunError::InvalidConfig(RunConfigError::TooLarge { field: actual, .. }))
+                if actual == field
+        ));
+    }
+    assert!(matches!(
+        run(RunConfig {
+            hot_requests: 1_500_000,
+            cold_requests: 1_500_000,
+            ..RunConfig::default()
+        }),
+        Err(RunError::InvalidConfig(RunConfigError::TotalRequests {
+            hot: 1_500_000,
+            cold: 1_500_000,
+        }))
+    ));
 }
 
 #[test]
-fn key_capacity_full_returns_typed_tenant_capacity_full() {
-    // Drive enough distinct tenants that the table fills, prove the typed
-    // outcome. `max_tenants=2` means the third distinct tenant is
-    // rejected with `TenantCapacityFull`.
-    use std::sync::Arc;
-    use std::time::Duration;
+fn live_owner_maps_hot_cold_key_capacity_full_closed_and_refill() {
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+        .try_build()
+        .expect("runtime");
+    app.run_to_shutdown_reported(Duration::from_secs(5), |app| -> anyhow::Result<()> {
+        let gateway = app.register_request_service::<Gateway, GatewayRequest, Infallible>(
+            Gateway::new(RateLimit::new(
+                "test.live",
+                RateLimitConfig {
+                    max_keys: 2,
+                    rate_per_sec: 20,
+                    burst: 1,
+                },
+            )),
+            16,
+        )?;
+        let timeout = Duration::from_secs(1);
 
-    use tina::prelude::*;
-    use tina_runtime::{
-        CallOutcome, DefaultThreadedMailboxFactory, ServiceHandle, ThreadedRuntime,
-    };
+        assert!(matches!(
+            live_call(
+                app,
+                gateway,
+                GatewayRequest::Admit { tenant: "hot" },
+                timeout
+            )?,
+            GatewayReply::Admitted { tenant: "hot" }
+        ));
+        assert!(matches!(
+            live_call(
+                app,
+                gateway,
+                GatewayRequest::Admit { tenant: "hot" },
+                timeout
+            )?,
+            GatewayReply::RateLimited { tenant: "hot", .. }
+        ));
+        assert!(matches!(
+            live_call(
+                app,
+                gateway,
+                GatewayRequest::Admit { tenant: "cold" },
+                timeout
+            )?,
+            GatewayReply::Admitted { tenant: "cold" }
+        ));
+        assert!(matches!(
+            live_call(
+                app,
+                gateway,
+                GatewayRequest::Admit { tenant: "third" },
+                timeout
+            )?,
+            GatewayReply::KeyCapacityFull { tenant: "third" }
+        ));
 
-    let config = RunConfig {
-        max_tenants: 2,
-        hot_requests: 0,
-        cold_requests: 0,
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(matches!(
+            live_call(
+                app,
+                gateway,
+                GatewayRequest::Admit { tenant: "hot" },
+                timeout
+            )?,
+            GatewayReply::Admitted { tenant: "hot" }
+        ));
+        assert!(matches!(
+            live_call(
+                app,
+                gateway,
+                GatewayRequest::CloseAndProbe { tenant: "hot" },
+                timeout
+            )?,
+            GatewayReply::Closed { tenant: "hot" }
+        ));
+        let snapshot = live_call(app, gateway, GatewayRequest::Snapshot, timeout)?;
+        let GatewayReply::Snapshot(snapshot) = snapshot else {
+            panic!("expected snapshot, got {snapshot:?}");
+        };
+        assert_eq!(snapshot.rate_limited_count, 1);
+        assert_eq!(snapshot.full_count, 1);
+        Ok(())
+    })
+    .expect("clean workload and shutdown");
+}
+
+fn live_call(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    gateway: RequestServiceHandle<GatewayRequest, GatewayReply>,
+    request: GatewayRequest,
+    timeout: Duration,
+) -> anyhow::Result<GatewayReply> {
+    match app.call_blocking_request(gateway, request, timeout)? {
+        CallOutcome::Replied(reply) => Ok(reply),
+        outcome => anyhow::bail!("unexpected live outcome: {outcome:?}"),
+    }
+}
+
+#[test]
+fn run_retains_exact_key_capacity_full_reply_inside_typed_terminal_error() {
+    let error = run(RunConfig {
+        max_tenants: 1,
+        hot_requests: 1,
+        cold_requests: 1,
         ..RunConfig::default()
-    };
+    })
+    .expect_err("cold tenant must find the one-slot table full");
 
-    // Spin up the limiter ourselves so we can drive three distinct
-    // tenants without changing the public `run` shape.
-    let runtime = Arc::new(
-        ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)
-            .expect("start runtime"),
-    );
-    let shutdown = runtime.shutdown_handle();
-    let rate = tina_runtime::RateLimit::<&'static str>::new(
-        "tenant.rate",
-        tina_runtime::RateLimitConfig {
-            max_keys: config.max_tenants,
-            rate_per_sec: config.rate_per_sec,
-            burst: config.burst,
+    let RunError::Terminal(error) = error else {
+        panic!("expected terminal workload error, got {error:?}");
+    };
+    match error.as_ref() {
+        RunToShutdownError::Workload(report) => match report.get_ref() {
+            WorkloadError::UnexpectedOutcome {
+                phase: "cold",
+                index: 0,
+                outcome:
+                    CallOutcome::Replied(GatewayReply::KeyCapacityFull {
+                        tenant: "tenant.cold",
+                    }),
+            } => {}
+            other => panic!("wrong typed workload error: {other:?}"),
+        },
+        other => panic!("wrong terminal error: {other:?}"),
+    }
+}
+
+#[derive(Debug)]
+enum ProbeMessage {
+    Call(GatewayRequest),
+    Returned(CallOutcome<GatewayReply>),
+}
+
+struct Probe {
+    gateway: RequestServiceHandle<GatewayRequest, GatewayReply>,
+    replies: Rc<RefCell<Vec<GatewayReply>>>,
+}
+
+#[tina_runtime::isolate(message = ProbeMessage)]
+impl Probe {
+    fn handle(
+        &mut self,
+        message: ProbeMessage,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match message {
+            ProbeMessage::Call(request) => {
+                call_request(self.gateway, request, Duration::from_secs(1))
+                    .then(ProbeMessage::Returned)
+            }
+            ProbeMessage::Returned(CallOutcome::Replied(reply)) => {
+                self.replies.borrow_mut().push(reply);
+                noop()
+            }
+            ProbeMessage::Returned(outcome) => panic!("sim request failed: {outcome:?}"),
+        }
+    }
+}
+
+fn sim_script(seed: u64) -> Vec<GatewayReply> {
+    let replies = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = Simulator::new(
+        SingleShard,
+        SimulatorConfig {
+            seed,
+            ..SimulatorConfig::default()
         },
     );
-    use system_tenant_rate_limiter::{Gateway, GatewayMsg, GatewayReply};
-    let gateway: ServiceHandle<GatewayMsg, GatewayReply> = runtime
-        .register_service::<_, std::convert::Infallible>(Gateway::new(rate), config.mailbox)
-        .expect("register");
+    let gateway = sim.register_request_service(
+        Gateway::new(RateLimit::new(
+            "test.sim",
+            RateLimitConfig {
+                max_keys: 2,
+                rate_per_sec: 10,
+                burst: 1,
+            },
+        )),
+        16,
+    );
+    let probe = sim.register_with_mailbox_capacity::<Probe, ProbeMessage, Infallible>(
+        Probe {
+            gateway,
+            replies: Rc::clone(&replies),
+        },
+        16,
+    );
 
-    let timeout = Duration::from_millis(config.call_timeout_ms);
-    let mut outcomes: Vec<GatewayReply> = Vec::new();
-    for tenant in ["t.one", "t.two", "t.three"] {
-        let outcome = runtime
-            .call_blocking_typed(
-                gateway.call,
-                GatewayMsg::Request { tenant },
-                timeout,
-            )
-            .expect("call");
-        match outcome {
-            CallOutcome::Replied(reply) => outcomes.push(reply),
-            other => panic!("unexpected outcome: {other:?}"),
-        }
+    for request in [
+        GatewayRequest::Admit { tenant: "hot" },
+        GatewayRequest::Admit { tenant: "hot" },
+        GatewayRequest::Admit { tenant: "cold" },
+        GatewayRequest::Admit { tenant: "third" },
+    ] {
+        sim.try_send(probe, ProbeMessage::Call(request)).unwrap();
+        sim.run_until_quiescent();
     }
-    assert!(matches!(outcomes[0], GatewayReply::Ok { .. }));
-    assert!(matches!(outcomes[1], GatewayReply::Ok { .. }));
-    match &outcomes[2] {
-        GatewayReply::TenantCapacityFull { tenant } => {
-            assert_eq!(*tenant, "t.three");
-        }
-        other => panic!("expected TenantCapacityFull, got {other:?}"),
-    }
+    sim.advance_time(Duration::from_millis(100));
+    sim.try_send(
+        probe,
+        ProbeMessage::Call(GatewayRequest::Admit { tenant: "hot" }),
+    )
+    .unwrap();
+    sim.run_until_quiescent();
+    sim.try_send(
+        probe,
+        ProbeMessage::Call(GatewayRequest::CloseAndProbe { tenant: "hot" }),
+    )
+    .unwrap();
+    sim.run_until_quiescent();
 
-    let terminal = shutdown
-        .request_and_wait_report(Duration::from_secs(5))
-        .expect("request and await shutdown");
-    drop(runtime);
-    terminal.ensure_clean().expect("clean terminal report");
+    replies.borrow().clone()
+}
+
+#[test]
+fn request_service_replays_deterministically_under_simulator_owned_time() {
+    let expected = vec![
+        GatewayReply::Admitted { tenant: "hot" },
+        GatewayReply::RateLimited {
+            tenant: "hot",
+            retry_after: Duration::from_millis(100),
+        },
+        GatewayReply::Admitted { tenant: "cold" },
+        GatewayReply::KeyCapacityFull { tenant: "third" },
+        GatewayReply::Admitted { tenant: "hot" },
+        GatewayReply::Closed { tenant: "hot" },
+    ];
+    assert_eq!(sim_script(7), expected);
+    assert_eq!(sim_script(7), expected);
+    assert_eq!(sim_script(999), expected);
 }
