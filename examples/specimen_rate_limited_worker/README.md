@@ -56,7 +56,7 @@ holds it together.
 The worker is one isolate with mailbox capacity `QUEUE_CAPACITY`.
 There is no separate queue; the mailbox *is* the queue. The rate
 limit is a `RateLimit<()>` token bucket in the worker's state. The
-worker asks `try_admit(&(), ctx.now())`; an admitted token processes
+worker asks `try_admit_at(&(), ctx.now())`; an admitted token processes
 one pending job, while `RateLimited { retry_after }` schedules exactly
 one `sleep(retry_after).then(Tick)`. Explicit `pending` and `pacing`
 state keeps one timer in flight. The host closes the burst with a
@@ -76,17 +76,17 @@ WorkerMsg::Tick(reply) => {
     self.pacing = false;
     self.drive(ctx)
 }
-match self.limiter.try_admit(&(), ctx.now()) {
-    AdmissionDecision::Admitted(_) => {
+match self.limiter.try_admit_at(&(), ctx.now()) {
+    RateLimitDecision::Admitted => {
         self.processed += 1;
         self.pending -= 1;
         // Loop and ask for the next pending job.
     }
-    AdmissionDecision::RateLimited { retry_after, .. } => {
+    RateLimitDecision::RateLimited { retry_after, .. } => {
         self.pacing = true;
         sleep(retry_after).then(WorkerMsg::Tick)
     }
-    _ => {
+    RateLimitDecision::KeyCapacityFull(_) | RateLimitDecision::Closed(_) => {
         self.report.exit_clean = false;
         return stop_with(self.report);
     }

@@ -1,6 +1,6 @@
 //! Tina side. The worker is a single isolate with a bounded mailbox.
 //! Pacing is a `tina_runtime::RateLimit` token bucket: on each "ready to
-//! work" moment the worker asks `try_admit((), ctx.now())`. `Admitted`
+//! work" moment the worker asks `try_admit_at((), ctx.now())`. `Admitted`
 //! means process one job now; `RateLimited { retry_after }` means sleep
 //! exactly that long and ask again. The rate window is no longer a
 //! hand-rolled `sleep(RATE_WINDOW)` constant — it falls out of the
@@ -36,8 +36,8 @@ use std::time::{Duration, Instant};
 
 use tina::prelude::*;
 use tina_runtime::{
-    AdmissionDecision, DefaultThreadedMailboxFactory, HostBurstOutcomes, LocalSystem, RateLimit,
-    SleepReply, sleep,
+    DefaultThreadedMailboxFactory, HostBurstOutcomes, LocalSystem, RateLimit, RateLimitConfig,
+    RateLimitDecision, SleepReply, sleep,
 };
 
 use crate::{BURST_JOBS, QUEUE_CAPACITY, RATE_WINDOW_MS, Report};
@@ -58,7 +58,7 @@ enum WorkerMsg {
 }
 
 struct Worker {
-    /// Pacing policy. `try_admit((), now)` is the rate gate; its
+    /// Pacing policy. `try_admit_at((), now)` is the rate gate; its
     /// `retry_after` is the worker's sleep budget. Single global key `()`.
     limiter: RateLimit<()>,
     report: Report,
@@ -127,8 +127,8 @@ impl Worker {
                     noop()
                 };
             }
-            match self.limiter.try_admit(&(), ctx.now()) {
-                AdmissionDecision::Admitted(_grant) => {
+            match self.limiter.try_admit_at(&(), ctx.now()) {
+                RateLimitDecision::Admitted => {
                     self.processed += 1;
                     self.pending -= 1;
                     self.report.jobs_processed = self.processed;
@@ -140,17 +140,14 @@ impl Worker {
                     // fixed, so burst 1 means the next iteration is
                     // RateLimited and we fall through to the sleep.
                 }
-                AdmissionDecision::RateLimited { retry_after, .. } => {
+                RateLimitDecision::RateLimited { retry_after, .. } => {
                     self.pacing = true;
                     return sleep(retry_after).then(WorkerMsg::Tick);
                 }
                 // Single global key `()` in a 1-key table that is always
-                // present, never closed — these arms are unreachable.
-                AdmissionDecision::Full(_)
-                | AdmissionDecision::Closed(_)
-                | AdmissionDecision::Wait { .. }
-                | AdmissionDecision::Degrade { .. }
-                | AdmissionDecision::TimedOut(_) => {
+                // present, never closed. Preserve those terminal truths if
+                // configuration or lifecycle changes make either reachable.
+                RateLimitDecision::KeyCapacityFull(_) | RateLimitDecision::Closed(_) => {
                     self.report.exit_clean = false;
                     return stop_with(self.report);
                 }
@@ -182,7 +179,14 @@ fn run_application(
 ) -> anyhow::Result<Report> {
     let worker = Worker {
         // burst 1 → one job, then pace at one per refill window.
-        limiter: RateLimit::new("rate_limited_worker.pace", 1, rate_per_sec(), 1),
+        limiter: RateLimit::new(
+            "rate_limited_worker.pace",
+            RateLimitConfig {
+                max_keys: 1,
+                rate_per_sec: rate_per_sec(),
+                burst: 1,
+            },
+        ),
         report: Report::default(),
         processed: 0,
         pending: 0,

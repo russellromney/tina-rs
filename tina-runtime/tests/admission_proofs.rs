@@ -23,14 +23,22 @@ use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::time::Backoff;
 use tina_runtime::{
     AdmissionDecision, AdmissionFailure, CapacitySummary, ConcurrencyLimit, FullDecision,
-    FullExhaustionReason, FullHandling, KeyedLimit, PressureAction, RateLimit, RateLimitDecision,
-    SharedCapacityScope, format_discovery_line,
+    FullExhaustionReason, FullHandling, KeyedLimit, PressureAction, RateLimit, RateLimitConfig,
+    RateLimitDecision, SharedCapacityScope, format_discovery_line,
 };
 
-fn rate_admitted<T: std::fmt::Debug>(decision: RateLimitDecision<T>) -> T {
+fn assert_rate_admitted(decision: RateLimitDecision) {
     match decision {
-        RateLimitDecision::Admitted(value) => value,
+        RateLimitDecision::Admitted => {}
         other => panic!("expected rate admission, got {other:?}"),
+    }
+}
+
+fn rate_config(max_keys: usize, rate_per_sec: u64, burst: u32) -> RateLimitConfig {
+    RateLimitConfig {
+        max_keys,
+        rate_per_sec,
+        burst,
     }
 }
 
@@ -54,19 +62,23 @@ fn rate_limit_replay_byte_identical_under_same_inputs() {
     ];
 
     let run = || -> Vec<String> {
-        let mut limit = RateLimit::<&'static str>::new("rate.replay.proof", 4, 5, 2);
+        let mut limit = RateLimit::<&'static str>::new("rate.replay.proof", rate_config(4, 5, 2));
         inputs
             .iter()
-            .map(|(key, offset)| match limit.try_admit(key, base + *offset) {
-                RateLimitDecision::Admitted(_) => format!("{key}@{}ms=ok", offset.as_millis()),
-                RateLimitDecision::RateLimited { retry_after, .. } => format!(
-                    "{key}@{}ms=rate({}ms)",
-                    offset.as_millis(),
-                    retry_after.as_millis()
-                ),
-                RateLimitDecision::TableFull(_) => format!("{key}@{}ms=full", offset.as_millis()),
-                other => format!("{key}@{}ms=other({other:?})", offset.as_millis()),
-            })
+            .map(
+                |(key, offset)| match limit.try_admit_at(key, base + *offset) {
+                    RateLimitDecision::Admitted => format!("{key}@{}ms=ok", offset.as_millis()),
+                    RateLimitDecision::RateLimited { retry_after, .. } => format!(
+                        "{key}@{}ms=rate({}ms)",
+                        offset.as_millis(),
+                        retry_after.as_millis()
+                    ),
+                    RateLimitDecision::KeyCapacityFull(_) => {
+                        format!("{key}@{}ms=full", offset.as_millis())
+                    }
+                    other => format!("{key}@{}ms=other({other:?})", offset.as_millis()),
+                },
+            )
             .collect()
     };
 
@@ -84,25 +96,25 @@ fn rate_limit_replay_byte_identical_under_same_inputs() {
 
 #[test]
 fn cold_tenant_progresses_while_hot_tenant_is_limited() {
-    let mut limit = RateLimit::<&'static str>::new("rate.fairness", 4, 5, 2);
+    let mut limit = RateLimit::<&'static str>::new("rate.fairness", rate_config(4, 5, 2));
     let now = Instant::now();
     // Hot tenant exhausts the bucket.
     for _ in 0..2 {
-        let _g = rate_admitted(limit.try_admit(&"hot", now));
+        assert_rate_admitted(limit.try_admit_at(&"hot", now));
     }
     // Hot is rate-limited.
-    match limit.try_admit(&"hot", now) {
+    match limit.try_admit_at(&"hot", now) {
         RateLimitDecision::RateLimited { .. } => {}
         other => panic!("hot must be rate-limited, got {other:?}"),
     }
     // Cold tenant still succeeds many times within its own bucket.
     for _ in 0..2 {
-        let _g = rate_admitted(limit.try_admit(&"cold", now));
+        assert_rate_admitted(limit.try_admit_at(&"cold", now));
     }
     // And cold's bucket can refill independently of hot.
     let later = now + Duration::from_secs(1);
     for _ in 0..2 {
-        let _g = rate_admitted(limit.try_admit(&"cold", later));
+        assert_rate_admitted(limit.try_admit_at(&"cold", later));
     }
 }
 
@@ -165,10 +177,10 @@ fn admission_report_projects_into_capacity_summary() {
     let _q = conc.try_admit().into_admitted().unwrap();
     let _ = conc.try_admit(); // force Full
 
-    let mut rate = RateLimit::<&'static str>::new("svc.rate", 4, 5, 1);
+    let mut rate = RateLimit::<&'static str>::new("svc.rate", rate_config(4, 5, 1));
     let now = Instant::now();
-    let _ = rate_admitted(rate.try_admit(&"alpha", now));
-    let _ = rate.try_admit(&"alpha", now); // force RateLimited
+    assert_rate_admitted(rate.try_admit_at(&"alpha", now));
+    let _ = rate.try_admit_at(&"alpha", now); // force RateLimited
 
     let mut summary = CapacitySummary::new();
     summary.push(conc.capacity_surface()).unwrap();
@@ -194,16 +206,16 @@ fn rate_limit_with_caller_owned_retry_budget_is_visible() {
     // Compose RateLimit with FullHandling for caller-owned retry on
     // rate-limit. Retry exhaustion must surface as a typed Exhausted
     // outcome from FullHandling, never a hidden swallow.
-    let mut rate = RateLimit::<&'static str>::new("rate.retry", 2, 1, 1);
+    let mut rate = RateLimit::<&'static str>::new("rate.retry", rate_config(2, 1, 1));
     let mut budget = FullHandling::retry_backoff(
         Backoff::constant(Duration::from_millis(50), 2).expect("backoff"),
     );
 
     let now = Instant::now();
     // First admit succeeds.
-    let _grant = rate_admitted(rate.try_admit(&"tenant.a", now));
+    assert_rate_admitted(rate.try_admit_at(&"tenant.a", now));
     // Second is rate-limited.
-    let outcome = rate.try_admit(&"tenant.a", now);
+    let outcome = rate.try_admit_at(&"tenant.a", now);
     assert!(matches!(outcome, RateLimitDecision::RateLimited { .. }));
 
     // Caller chooses to consult the retry budget.
@@ -265,14 +277,14 @@ fn retry_requires_an_explicit_budget_value() {
         "an explicit budget is the only path to RetryAfter",
     );
 
-    // And a rate-limit rejection is itself terminal: try_admit returns a
+    // And a rate-limit rejection is itself terminal: try_admit_at returns a
     // typed outcome, never a retried admission. (Compile-time proof that
     // there is no `try_admit_with_retry` lives in the absence of such a
     // method on the policy types.)
-    let mut rate = RateLimit::<&'static str>::new("rate.no_auto_retry", 2, 5, 1);
-    let _ = rate_admitted(rate.try_admit(&"k", now));
+    let mut rate = RateLimit::<&'static str>::new("rate.no_auto_retry", rate_config(2, 5, 1));
+    assert_rate_admitted(rate.try_admit_at(&"k", now));
     assert!(matches!(
-        rate.try_admit(&"k", now),
+        rate.try_admit_at(&"k", now),
         RateLimitDecision::RateLimited { .. }
     ));
 }
@@ -379,18 +391,18 @@ fn rate_limit_replay_is_deterministic_across_refill_and_eviction() {
 
     let run = || -> Vec<String> {
         // max_keys 2, 10 tokens/sec, burst 1.
-        let mut limit = RateLimit::<&'static str>::new("rate.replay.strong", 2, 10, 1);
+        let mut limit = RateLimit::<&'static str>::new("rate.replay.strong", rate_config(2, 10, 1));
         script
             .iter()
             .map(|step| match step {
                 Step::Admit(key, ms) => {
                     let now = base + Duration::from_millis(*ms);
-                    match limit.try_admit(key, now) {
-                        RateLimitDecision::Admitted(_) => format!("{key}@{ms}=ok"),
+                    match limit.try_admit_at(key, now) {
+                        RateLimitDecision::Admitted => format!("{key}@{ms}=ok"),
                         RateLimitDecision::RateLimited { retry_after, .. } => {
                             format!("{key}@{ms}=rate({}ms)", retry_after.as_millis())
                         }
-                        RateLimitDecision::TableFull(_) => format!("{key}@{ms}=full"),
+                        RateLimitDecision::KeyCapacityFull(_) => format!("{key}@{ms}=full"),
                         other => format!("{key}@{ms}=other({other:?})"),
                     }
                 }

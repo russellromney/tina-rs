@@ -101,7 +101,7 @@ mod wait_list;
 pub use admission::{
     AdmissionDecision, AdmissionFailure, AdmissionReport, ConcurrencyLimit, ConcurrencyPermit,
     ConcurrencyReleaseError, KeyedLimit, KeyedPermit, KeyedReleaseError, KeyedSlotReport,
-    PressureAction, RateGrant, RateKeyState, RateLimit, RateLimitDecision, ServicePolicy,
+    PressureAction, RateKeyState, RateLimit, RateLimitConfig, RateLimitDecision, ServicePolicy,
     SurfaceName,
 };
 pub use concurrency_pending::{
