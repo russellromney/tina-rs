@@ -155,10 +155,27 @@ fn multi_anyhow_entrypoint() -> anyhow::Result<u32> {
     Ok(value)
 }
 
+fn failing_anyhow_entrypoint() -> anyhow::Result<()> {
+    app().run_to_shutdown_reported(Duration::from_secs(2), |_app| {
+        Err::<(), _>(anyhow::Error::new(LeafError("storage offline")).context("load state"))
+    })?;
+    Ok(())
+}
+
 #[test]
 fn anyhow_entrypoints_can_use_outer_question_mark_for_single_and_multi() {
     assert_eq!(single_anyhow_entrypoint().expect("single reported run"), 42);
     assert_eq!(multi_anyhow_entrypoint().expect("multi reported run"), 84);
+}
+
+#[test]
+fn anyhow_outer_question_mark_preserves_the_failure_chain() {
+    let error = failing_anyhow_entrypoint().expect_err("reported workload must fail");
+    assert_eq!(error.to_string(), "workload failed: load state");
+    assert_eq!(
+        error.root_cause().downcast_ref::<LeafError>(),
+        Some(&LeafError("storage offline"))
+    );
 }
 
 #[test]
@@ -296,4 +313,42 @@ fn reported_workload_value_is_dropped_exactly_once() {
     assert_eq!(observed.load(Ordering::Acquire), 0);
     drop(report);
     assert_eq!(observed.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn dual_failure_drops_the_owned_report_exactly_once() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&drops);
+    let app = LocalSystem::single_shard(TestShard(4), CapacityPanicMailboxFactory).build();
+    let result = app.run_to_shutdown_reported(Duration::from_secs(2), |app| {
+        assert!(matches!(
+            app.register_root::<_, Infallible>(Probe, 13),
+            Err(ThreadedRuntimeError::WorkerStopped)
+        ));
+        Err::<(), _>(GenericReport::tracked(drops))
+    });
+
+    let Err(error @ RunToShutdownError::WorkloadAndShutdown { .. }) = result else {
+        panic!("expected tracked dual failure");
+    };
+    assert_eq!(observed.load(Ordering::Acquire), 0);
+    assert!(error.workload().is_some());
+    assert!(matches!(
+        error.shutdown(),
+        Some(TerminalShutdownError::Unclean(_))
+    ));
+    drop(error);
+    assert_eq!(observed.load(Ordering::Acquire), 1);
+}
+
+#[test]
+fn reported_runner_does_not_convert_workload_panics() {
+    let panic = std::panic::catch_unwind(|| {
+        let _: Result<(), RunToShutdownError<ReportedWorkloadError<GenericReport>>> = app()
+            .run_to_shutdown_reported(
+                Duration::from_secs(2),
+                |_app| -> Result<(), GenericReport> { panic!("reported workload panic") },
+            );
+    });
+    assert!(panic.is_err());
 }
