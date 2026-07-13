@@ -22,12 +22,14 @@ pub fn run() -> anyhow::Result<Report> {
         let mut report = Report::default();
 
         let consumer = tokio::spawn(async move {
+            let mut received = 0u32;
             let mut processed = 0u32;
             while let Some(_job) = rx.recv().await {
+                received += 1;
                 tokio::time::sleep(Duration::from_millis(RATE_WINDOW_MS)).await;
                 processed += 1;
             }
-            processed
+            (received, processed)
         });
 
         for n in 0..BURST_JOBS {
@@ -41,9 +43,10 @@ pub fn run() -> anyhow::Result<Report> {
         }
         drop(tx);
 
-        let processed = consumer
+        let (received, processed) = consumer
             .await
             .map_err(|e| anyhow::anyhow!("consumer task: {e}"))?;
+        report.jobs_received = received;
         report.jobs_processed = processed;
         report.exit_clean = true;
         Ok(report)

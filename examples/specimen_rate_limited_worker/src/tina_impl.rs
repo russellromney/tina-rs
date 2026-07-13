@@ -1,6 +1,6 @@
 //! Tina side. The worker is a single isolate with a bounded mailbox.
 //! Pacing is a `tina_runtime::RateLimit` token bucket: on each "ready to
-//! work" moment the worker asks `try_admit_at((), ctx.now())`. `Admitted`
+//! work" moment the worker asks `try_admit_at(worker_key, ctx.now())`. `Admitted`
 //! means process one job now; `RateLimited { retry_after }` means sleep
 //! exactly that long and ask again. The rate window is no longer a
 //! hand-rolled `sleep(RATE_WINDOW)` constant — it falls out of the
@@ -16,7 +16,7 @@
 //!
 //! - **Bounded mailbox is the data plane.** No internal `VecDeque`
 //!   for queued submits; the runtime mailbox holds them.
-//! - **Pacing is a real admission policy.** `RateLimit<()>` with burst 1
+//! - **Pacing is a real admission policy.** A single-key `RateLimit` with burst 1
 //!   admits one job, then returns `RateLimited { retry_after }` until a
 //!   token refills. The worker owns the wait (`sleep(retry_after)`); the
 //!   limiter never sleeps for it. `ctx.now()` drives the bucket, so the
@@ -37,10 +37,18 @@ use std::time::{Duration, Instant};
 use tina::prelude::*;
 use tina_runtime::{
     DefaultThreadedMailboxFactory, HostBurstOutcomes, LocalSystem, RateLimit, RateLimitConfig,
-    RateLimitDecision, SleepReply, sleep,
+    RateLimitDecision, ResultWaitError, SendObservedUntilError, SleepReply, sleep,
 };
 
-use crate::{BURST_JOBS, QUEUE_CAPACITY, RATE_WINDOW_MS, Report};
+use crate::{
+    BURST_JOBS, BurstCloseSettlement, QUEUE_CAPACITY, RATE_PER_SEC, RatePolicyTerminal, Report,
+    WorkerTerminal,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PacingKey(u8);
+
+const WORKER_PACING_KEY: PacingKey = PacingKey(0);
 
 #[derive(Debug)]
 enum WorkerMsg {
@@ -58,9 +66,9 @@ enum WorkerMsg {
 }
 
 struct Worker {
-    /// Pacing policy. `try_admit_at((), now)` is the rate gate; its
-    /// `retry_after` is the worker's sleep budget. Single global key `()`.
-    limiter: RateLimit<()>,
+    /// Pacing policy. `try_admit_at(worker_key, now)` is the rate gate; its
+    /// `retry_after` is the worker's sleep budget.
+    limiter: RateLimit<PacingKey>,
     report: Report,
     processed: u32,
     /// Jobs admitted into the worker but not yet processed.
@@ -82,7 +90,7 @@ impl Worker {
     ) -> Effect<Self> {
         match msg {
             WorkerMsg::Submit => {
-                self.report.jobs_admitted += 1;
+                self.report.jobs_received += 1;
                 self.pending += 1;
                 // Kick the pace loop only if no timer is already in flight.
                 if self.pacing { noop() } else { self.drive(ctx) }
@@ -90,9 +98,10 @@ impl Worker {
             WorkerMsg::Tick(reply) => {
                 // The backoff sleep is plain time. If it was cancelled
                 // (e.g., runtime shutdown), bail out cleanly.
-                if reply.is_err() {
+                if let Some(terminal) = pacing_terminal(reply) {
+                    self.report.worker_terminal = terminal;
                     self.report.exit_clean = false;
-                    return stop_with(self.report);
+                    return stop_with(std::mem::take(&mut self.report));
                 }
                 self.pacing = false;
                 self.drive(ctx)
@@ -101,13 +110,17 @@ impl Worker {
                 self.expected = Some(admitted);
                 if self.is_done() {
                     self.report.exit_clean = true;
-                    stop_with(self.report)
+                    stop_with(std::mem::take(&mut self.report))
                 } else {
                     noop()
                 }
             }
         }
     }
+}
+
+fn pacing_terminal(reply: SleepReply) -> Option<WorkerTerminal> {
+    reply.err().map(WorkerTerminal::PacingCallFailed)
 }
 
 impl Worker {
@@ -122,19 +135,19 @@ impl Worker {
                 // we've caught up; otherwise wait for the next Submit.
                 return if self.is_done() {
                     self.report.exit_clean = true;
-                    stop_with(self.report)
+                    stop_with(std::mem::take(&mut self.report))
                 } else {
                     noop()
                 };
             }
-            match self.limiter.try_admit_at(&(), ctx.now()) {
+            match self.limiter.try_admit_at(&WORKER_PACING_KEY, ctx.now()) {
                 RateLimitDecision::Admitted => {
                     self.processed += 1;
                     self.pending -= 1;
                     self.report.jobs_processed = self.processed;
                     if self.is_done() {
                         self.report.exit_clean = true;
-                        return stop_with(self.report);
+                        return stop_with(std::mem::take(&mut self.report));
                     }
                     // Loop: try the next job. Within one turn `ctx.now()` is
                     // fixed, so burst 1 means the next iteration is
@@ -144,12 +157,17 @@ impl Worker {
                     self.pacing = true;
                     return sleep(retry_after).then(WorkerMsg::Tick);
                 }
-                // Single global key `()` in a 1-key table that is always
-                // present, never closed. Preserve those terminal truths if
-                // configuration or lifecycle changes make either reachable.
-                RateLimitDecision::KeyCapacityFull(_) | RateLimitDecision::Closed(_) => {
+                RateLimitDecision::KeyCapacityFull(report) => {
+                    self.report.worker_terminal =
+                        WorkerTerminal::RatePolicy(RatePolicyTerminal::KeyCapacityFull(report));
                     self.report.exit_clean = false;
-                    return stop_with(self.report);
+                    return stop_with(std::mem::take(&mut self.report));
+                }
+                RateLimitDecision::Closed(report) => {
+                    self.report.worker_terminal =
+                        WorkerTerminal::RatePolicy(RatePolicyTerminal::Closed(report));
+                    self.report.exit_clean = false;
+                    return stop_with(std::mem::take(&mut self.report));
                 }
             }
         }
@@ -163,30 +181,33 @@ impl Worker {
     }
 }
 
-/// Tokens per second that reproduce one job per [`RATE_WINDOW_MS`].
-fn rate_per_sec() -> u64 {
-    // 1 token per RATE_WINDOW_MS = 1000 / RATE_WINDOW_MS tokens/sec.
-    (1_000 / RATE_WINDOW_MS).max(1)
+pub fn run() -> anyhow::Result<Report> {
+    run_with_limiter(RateLimit::new(
+        "rate_limited_worker.pace",
+        RateLimitConfig {
+            max_keys: 1,
+            rate_per_sec: RATE_PER_SEC,
+            burst: 1,
+        },
+    ))
 }
 
-pub fn run() -> anyhow::Result<Report> {
+fn run_with_limiter(limiter: RateLimit<PacingKey>) -> anyhow::Result<Report> {
     let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
-    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), run_application)?)
+    Ok(
+        app.run_to_shutdown_reported(Duration::from_secs(5), move |app| {
+            run_application(app, limiter)
+        })?,
+    )
 }
 
 fn run_application(
     app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    limiter: RateLimit<PacingKey>,
 ) -> anyhow::Result<Report> {
     let worker = Worker {
         // burst 1 → one job, then pace at one per refill window.
-        limiter: RateLimit::new(
-            "rate_limited_worker.pace",
-            RateLimitConfig {
-                max_keys: 1,
-                rate_per_sec: rate_per_sec(),
-                burst: 1,
-            },
-        ),
+        limiter,
         report: Report::default(),
         processed: 0,
         pending: 0,
@@ -230,17 +251,28 @@ fn run_application(
     // helper. It retries on Full/IngressFull until the deadline and
     // returns typed Closed / WorkerStopped / Timeout. No hidden queue;
     // the control message rides the same bounded data mailbox.
-    app.send_observed_until(
+    let burst_closed = app.send_observed_until(
         worker_addr,
         Instant::now() + Duration::from_secs(2),
         Duration::from_millis(2),
         || WorkerMsg::BurstClosed(admitted_n),
-    )
-    .map_err(|e| anyhow::anyhow!("could not deliver BurstClosed: {e}"))?;
+    );
 
-    let report = waiter
-        .wait(Duration::from_secs(5))
-        .map_err(|e| anyhow::anyhow!("worker did not finish: {e:?}"))?;
+    let (report, burst_close_settlement) =
+        finish_burst_close(burst_closed, || waiter.wait(Duration::from_secs(5)))?;
+
+    anyhow::ensure!(
+        report.jobs_received <= admitted_n,
+        "worker handled more jobs than the host admitted: worker={} host={admitted_n}",
+        report.jobs_received,
+    );
+    if report.worker_terminal == WorkerTerminal::None {
+        anyhow::ensure!(
+            report.jobs_received == admitted_n,
+            "worker/host admission accounting diverged: worker={} host={admitted_n}",
+            report.jobs_received,
+        );
+    }
 
     let final_report = Report {
         jobs_admitted: admitted_n,
@@ -251,9 +283,265 @@ fn run_application(
         // surface here too if the worker had stopped mid-burst.
         jobs_full: burst.mailbox_full + burst.ingress_full,
         jobs_terminal: burst.mailbox_closed + burst.worker_stopped,
+        jobs_received: report.jobs_received,
         jobs_processed: report.jobs_processed,
+        tina_burst: Some(burst),
+        worker_terminal: report.worker_terminal,
+        burst_close_settlement,
         exit_clean: report.exit_clean,
     };
 
     Ok(final_report)
+}
+
+fn finish_burst_close(
+    burst_closed: Result<(), SendObservedUntilError>,
+    wait_for_report: impl FnOnce() -> Result<Report, ResultWaitError>,
+) -> anyhow::Result<(Report, BurstCloseSettlement)> {
+    let possible_settlement = match burst_closed {
+        Ok(()) => BurstCloseSettlement::Delivered,
+        Err(SendObservedUntilError::Closed) => BurstCloseSettlement::Closed,
+        Err(SendObservedUntilError::WorkerStopped) => BurstCloseSettlement::WorkerStopped,
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context("could not deliver BurstClosed"));
+        }
+    };
+
+    let report =
+        wait_for_report().map_err(|error| anyhow::anyhow!("worker did not finish: {error:?}"))?;
+    if possible_settlement != BurstCloseSettlement::Delivered
+        && report.worker_terminal == WorkerTerminal::None
+    {
+        let error = match possible_settlement {
+            BurstCloseSettlement::Closed => SendObservedUntilError::Closed,
+            BurstCloseSettlement::WorkerStopped => SendObservedUntilError::WorkerStopped,
+            BurstCloseSettlement::NotApplicable | BurstCloseSettlement::Delivered => {
+                unreachable!("only terminal control outcomes reach this branch")
+            }
+        };
+        return Err(anyhow::Error::new(error).context("could not deliver BurstClosed"));
+    }
+    Ok((report, possible_settlement))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tina_runtime::CallError;
+
+    fn config(max_keys: usize) -> RateLimitConfig {
+        RateLimitConfig {
+            max_keys,
+            rate_per_sec: RATE_PER_SEC,
+            burst: 1,
+        }
+    }
+
+    #[test]
+    fn rate_decisions_preserve_configuration_retry_and_refill_truth() {
+        let mut limiter = RateLimit::<()>::new("test.pace", config(1));
+        let now = Instant::now();
+
+        assert!(matches!(
+            limiter.try_admit_at(&(), now),
+            RateLimitDecision::Admitted
+        ));
+        assert_eq!(limiter.rate_per_sec(), RATE_PER_SEC);
+        assert_eq!(limiter.burst(), 1);
+        assert_eq!(limiter.max_keys(), 1);
+        assert_eq!(limiter.live_keys(), 1);
+        assert_eq!(limiter.key_state(&()).unwrap().available_nano_tokens, 0);
+
+        let retry_after = match limiter.try_admit_at(&(), now) {
+            RateLimitDecision::RateLimited {
+                retry_after,
+                report,
+            } => {
+                assert_eq!(report.rate_limited_count, 1);
+                retry_after
+            }
+            other => panic!("expected rate limited, got {other:?}"),
+        };
+        assert_eq!(retry_after, Duration::from_millis(crate::RATE_WINDOW_MS));
+
+        assert!(matches!(
+            limiter.try_admit_at(&(), now + retry_after),
+            RateLimitDecision::Admitted
+        ));
+        let report = limiter.report();
+        assert_eq!(report.capacity, 1);
+        assert_eq!(report.current, 1);
+        assert_eq!(report.high_water, 1);
+        assert_eq!(report.rate_limited_count, 1);
+        assert_eq!(report.full_count, 0);
+        assert_eq!(report.closed_count, 0);
+    }
+
+    #[test]
+    fn rate_decisions_keep_key_capacity_full_and_closed_distinct() {
+        let now = Instant::now();
+        let mut limiter = RateLimit::<u8>::new("test.terminals", config(1));
+
+        assert!(matches!(
+            limiter.try_admit_at(&1, now),
+            RateLimitDecision::Admitted
+        ));
+        match limiter.try_admit_at(&2, now) {
+            RateLimitDecision::KeyCapacityFull(report) => {
+                assert_eq!(report.capacity, 1);
+                assert_eq!(report.current, 1);
+                assert_eq!(report.full_count, 1);
+                assert_eq!(report.closed_count, 0);
+            }
+            other => panic!("expected key capacity full, got {other:?}"),
+        }
+        match limiter.try_admit_at(&2, now) {
+            RateLimitDecision::KeyCapacityFull(report) => {
+                assert_eq!(report.full_count, 2);
+                assert_eq!(report.rate_limited_count, 0);
+                assert_eq!(report.closed_count, 0);
+            }
+            other => panic!("expected repeated key capacity full, got {other:?}"),
+        }
+
+        limiter.close();
+        match limiter.try_admit_at(&1, now) {
+            RateLimitDecision::Closed(report) => {
+                assert_eq!(report.capacity, 1);
+                assert_eq!(report.current, 1);
+                assert_eq!(report.high_water, 1);
+                assert_eq!(report.full_count, 2);
+                assert_eq!(report.rate_limited_count, 0);
+                assert_eq!(report.closed_count, 1);
+            }
+            other => panic!("expected closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn closed_policy_survives_host_control_settlement_and_reported_shutdown() {
+        let mut limiter = RateLimit::new("test.closed.live", config(1));
+        limiter.close();
+
+        let report = run_with_limiter(limiter).expect("closed worker report survives shutdown");
+        let WorkerTerminal::RatePolicy(RatePolicyTerminal::Closed(policy)) =
+            &report.worker_terminal
+        else {
+            panic!("expected exact closed policy terminal, got {report:?}");
+        };
+        assert_eq!(policy.capacity, 1);
+        assert_eq!(policy.current, 0);
+        assert_eq!(policy.closed_count, 1);
+        assert_eq!(policy.full_count, 0);
+        assert!(matches!(
+            report.burst_close_settlement,
+            BurstCloseSettlement::Delivered
+                | BurstCloseSettlement::Closed
+                | BurstCloseSettlement::WorkerStopped
+        ));
+        assert!(!report.exit_clean);
+        assert_eq!(report.jobs_received, 1);
+        assert_eq!(report.jobs_processed, 0);
+        assert_eq!(
+            report.jobs_admitted + report.jobs_full + report.jobs_terminal,
+            BURST_JOBS,
+        );
+        assert!(report.jobs_full + report.jobs_terminal > 0);
+        let burst = report.tina_burst.expect("Tina burst snapshot is retained");
+        assert_eq!(burst.submitted, BURST_JOBS);
+        assert_eq!(burst.observed, burst.submitted);
+        assert_eq!(
+            burst.admitted
+                + burst.mailbox_full
+                + burst.mailbox_closed
+                + burst.ingress_full
+                + burst.worker_stopped,
+            burst.submitted,
+        );
+    }
+
+    #[test]
+    fn key_capacity_policy_terminal_survives_control_and_reported_shutdown() {
+        let mut limiter = RateLimit::new("test.capacity.live", config(1));
+        assert!(matches!(
+            limiter.try_admit_at(&PacingKey(1), Instant::now()),
+            RateLimitDecision::Admitted
+        ));
+
+        let report = run_with_limiter(limiter).expect("capacity terminal survives shutdown");
+        let WorkerTerminal::RatePolicy(RatePolicyTerminal::KeyCapacityFull(policy)) =
+            &report.worker_terminal
+        else {
+            panic!("expected exact key-capacity terminal, got {report:?}");
+        };
+        assert_eq!(policy.capacity, 1);
+        assert_eq!(policy.current, 1);
+        assert_eq!(policy.high_water, 1);
+        assert_eq!(policy.full_count, 1);
+        assert_eq!(policy.closed_count, 0);
+        assert!(!report.exit_clean);
+        assert_eq!(report.jobs_received, 1);
+        assert_eq!(report.jobs_processed, 0);
+        assert_eq!(
+            report.jobs_admitted + report.jobs_full + report.jobs_terminal,
+            BURST_JOBS,
+        );
+        let burst = report.tina_burst.expect("Tina burst snapshot is retained");
+        assert_eq!(burst.observed, burst.submitted);
+    }
+
+    #[test]
+    fn pacing_call_failure_keeps_exact_call_error() {
+        assert_eq!(
+            pacing_terminal(Err(CallError::InvalidResource)),
+            Some(WorkerTerminal::PacingCallFailed(CallError::InvalidResource))
+        );
+        assert_eq!(pacing_terminal(Ok(())), None);
+    }
+
+    #[test]
+    fn control_timeout_is_immediate_and_preserves_typed_source() {
+        let error = finish_burst_close(Err(SendObservedUntilError::Timeout), || {
+            panic!("terminal waiter must not run after an unambiguous control timeout")
+        })
+        .expect_err("timeout remains an error");
+        assert_eq!(
+            error.downcast_ref::<SendObservedUntilError>(),
+            Some(&SendObservedUntilError::Timeout)
+        );
+    }
+
+    #[test]
+    fn closed_and_worker_stopped_control_settlements_remain_distinct() {
+        for (control, expected) in [
+            (SendObservedUntilError::Closed, BurstCloseSettlement::Closed),
+            (
+                SendObservedUntilError::WorkerStopped,
+                BurstCloseSettlement::WorkerStopped,
+            ),
+        ] {
+            let policy = RateLimit::<PacingKey>::new("test.control", config(1)).report();
+            let report = Report {
+                worker_terminal: WorkerTerminal::RatePolicy(RatePolicyTerminal::Closed(policy)),
+                ..Report::default()
+            };
+            let (_, settlement) = finish_burst_close(Err(control), || Ok(report))
+                .expect("worker terminal explains terminal control outcome");
+            assert_eq!(settlement, expected);
+        }
+    }
+
+    #[test]
+    fn terminal_control_without_worker_terminal_remains_an_error() {
+        let error =
+            finish_burst_close(
+                Err(SendObservedUntilError::Closed),
+                || Ok(Report::default()),
+            )
+            .expect_err("unexplained closed control must fail");
+        assert_eq!(
+            error.downcast_ref::<SendObservedUntilError>(),
+            Some(&SendObservedUntilError::Closed)
+        );
+    }
 }

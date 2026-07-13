@@ -7,6 +7,10 @@ processes one job per [`RATE_WINDOW_MS`]. The queue is bounded at
 [`QUEUE_CAPACITY`] on both sides. The point of the comparison is how
 overload shows up at the producer.
 
+`RATE_WINDOW_MS` must be non-zero, no greater than one second, and divide one
+second exactly. A compile-time assertion keeps the configured token rate and
+the documented refill interval identical.
+
 Both sides should see at least one rejection at the producer and
 finish processing every admitted job. Exact admit/full counts are
 timing-sensitive (the worker may have drained one slot by the time
@@ -16,7 +20,10 @@ structural invariants:
 - `admitted + full + terminal == BURST_JOBS`
 - `full > 0` (overload was visible)
 - `terminal == 0` (the worker remained live for the burst)
-- `processed == admitted`
+- `received == admitted`
+- `processed == received`
+- `worker_terminal == None`
+- Tina's `burst_close_settlement == Delivered`
 - `exit_clean`
 
 ## Run
@@ -55,8 +62,8 @@ holds it together.
 
 The worker is one isolate with mailbox capacity `QUEUE_CAPACITY`.
 There is no separate queue; the mailbox *is* the queue. The rate
-limit is a `RateLimit<()>` token bucket in the worker's state. The
-worker asks `try_admit_at(&(), ctx.now())`; an admitted token processes
+limit is a single-key `RateLimit` token bucket in the worker's state. The
+worker asks `try_admit_at(worker_key, ctx.now())`; an admitted token processes
 one pending job, while `RateLimited { retry_after }` schedules exactly
 one `sleep(retry_after).then(Tick)`. Explicit `pending` and `pacing`
 state keeps one timer in flight. The host closes the burst with a
@@ -64,19 +71,20 @@ normal Tina message: `BurstClosed(admitted)`.
 
 ```rust
 WorkerMsg::Submit => {
-    self.report.jobs_admitted += 1;
+    self.report.jobs_received += 1;
     self.pending += 1;
     if self.pacing { noop() } else { self.drive(ctx) }
 }
 WorkerMsg::Tick(reply) => {
-    if reply.is_err() {
+    if let Some(terminal) = pacing_terminal(reply) {
+        self.report.worker_terminal = terminal;
         self.report.exit_clean = false;
-        return stop_with(self.report);
+        return stop_with(std::mem::take(&mut self.report));
     }
     self.pacing = false;
     self.drive(ctx)
 }
-match self.limiter.try_admit_at(&(), ctx.now()) {
+match self.limiter.try_admit_at(worker_key, ctx.now()) {
     RateLimitDecision::Admitted => {
         self.processed += 1;
         self.pending -= 1;
@@ -84,11 +92,21 @@ match self.limiter.try_admit_at(&(), ctx.now()) {
     }
     RateLimitDecision::RateLimited { retry_after, .. } => {
         self.pacing = true;
-        sleep(retry_after).then(WorkerMsg::Tick)
+        return sleep(retry_after).then(WorkerMsg::Tick);
     }
-    RateLimitDecision::KeyCapacityFull(_) | RateLimitDecision::Closed(_) => {
+    RateLimitDecision::KeyCapacityFull(report) => {
+        self.report.worker_terminal = WorkerTerminal::RatePolicy(
+            RatePolicyTerminal::KeyCapacityFull(report),
+        );
         self.report.exit_clean = false;
-        return stop_with(self.report);
+        return stop_with(std::mem::take(&mut self.report));
+    }
+    RateLimitDecision::Closed(report) => {
+        self.report.worker_terminal = WorkerTerminal::RatePolicy(
+            RatePolicyTerminal::Closed(report),
+        );
+        self.report.exit_clean = false;
+        return stop_with(std::mem::take(&mut self.report));
     }
 }
 ```
@@ -115,6 +133,22 @@ opens or the deadline elapses; the typed `Closed` / `Timeout` /
 sending" is app control state, so it travels as a message rather than
 an `Arc<AtomicU32>` side channel.
 
+If the worker has already stopped with a typed worker terminal, the host
+still waits for `observe_result` before interpreting a `Closed` or
+`WorkerStopped` control-send result. That preserves the worker's exact
+`KeyCapacityFull`/`Closed` terminal kind and the policy's rejection report; the
+same control outcomes remain errors when no worker terminal explains them.
+`Timeout` and provenance failures return immediately with their typed error
+source instead of being hidden by a later result-wait timeout. The report also
+retains the exact `Delivered`/`Closed`/`WorkerStopped` control settlement
+instead of projecting all three to success.
+
+The report keeps the complete `HostBurstSnapshot` alongside its cross-runtime
+`admitted`/`full`/`terminal` projection. That makes `MailboxFull`,
+`IngressFull`, `MailboxClosed`, and `WorkerStopped` independently auditable.
+If the pacing sleep itself fails, its exact `CallError` is retained in
+`worker_terminal` rather than disappearing into `exit_clean = false`.
+
 The final `Report` comes back via `app.observe_result::<Report>` —
 no mpsc, no atomics for the value, no host-side accumulator.
 
@@ -133,6 +167,13 @@ What feels better:
   thread can't even pick up the command), while also retaining
   `MailboxClosed` and `WorkerStopped` as terminal buckets. Tokio's
   `try_send` has `Full` and `Closed` only.
+- **The rate gate is honestly exhaustive.** `RateLimitDecision` contains
+  only `Admitted`, `RateLimited`, `KeyCapacityFull`, and `Closed`. The specimen
+  reports the two terminal policy outcomes separately instead of hiding them
+  behind a wildcard or a shared failure bucket.
+- **Terminal projections retain their source truth.** The comparison still
+  has compact `full` and `terminal` totals, but Tina's exact burst snapshot,
+  pacing failure, and end-of-burst control settlement remain available.
 - **Final value via `stop_with`.** The host reads the worker's
   `Report` through `observe_result`. No mpsc plumbing, no `Arc<Mutex>`
   for the answer.
