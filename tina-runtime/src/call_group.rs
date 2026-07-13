@@ -1284,6 +1284,42 @@ pub struct CallSelectClassifiedStep<K, R> {
     pub cancel_losers: Vec<CallSetCancelRequest<K, R>>,
 }
 
+/// Unified continuation vocabulary for a bounded select race.
+#[derive(Debug)]
+pub enum CallSelectEvent<K, R> {
+    /// One child call reached a terminal outcome.
+    Reply(K, CallGroupToken, CallOutcome<R>),
+    /// One loser cancellation settled.
+    Cancelled(K, CallGroupToken, CancelOutcome),
+}
+
+/// One recorded select event plus any loser-cancellation work it produced.
+#[must_use = "return the cancellation effect and inspect completion"]
+pub struct CallSelectAdvance<I, K, R>
+where
+    I: tina::Isolate,
+{
+    /// The branch whose terminal truth was just recorded.
+    pub selected: SelectedCall<K, R>,
+    /// Whether this reply satisfied the caller's success classifier.
+    /// Cancellation events always report `false`.
+    pub classified_success: bool,
+    /// Bounded loser-cancellation batch. Empty for non-winning replies and
+    /// cancellation acknowledgements.
+    pub effect: tina::Effect<I>,
+    /// Whether every reply and required cancellation is now settled.
+    pub complete: bool,
+}
+
+/// Why [`CallSelectSet::advance_service`] rejected a continuation.
+#[derive(Debug)]
+pub enum CallSelectAdvanceError<K, R> {
+    /// The reply named a duplicate, stale, or mismatched branch token.
+    Reply(CallSetRecordReplyError<K, R>),
+    /// The cancellation did not name an expected loser.
+    Cancel(CallSetRecordCancelError<K>),
+}
+
 /// Fixed-capacity named set for finite "select next completed call" workflows.
 #[derive(Debug)]
 pub struct CallSelectSet<K, R> {
@@ -1423,6 +1459,31 @@ where
         })
     }
 
+    /// Starts one cancelable split-service branch using the unified
+    /// [`CallSelectEvent`] continuation vocabulary.
+    pub fn start_service<I, Event, Request, T, Wrap>(
+        &mut self,
+        key: K,
+        call: CancelableCall<T, R>,
+        wrap: Wrap,
+    ) -> Result<tina::Effect<I>, CallSetStartError<K>>
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        Wrap: FnOnce(CallSelectEvent<K, R>) -> Event + 'static,
+        K: Clone + 'static,
+        Event: 'static,
+        Request: 'static,
+        T: Send + 'static,
+        R: 'static,
+    {
+        self.start_cancelable_service_event(key, call, move |key, token, outcome| {
+            wrap(CallSelectEvent::Reply(key, token, outcome))
+        })
+    }
+
     /// Records and returns one terminal branch outcome.
     ///
     /// `R: Clone` is required because select workflows both return the
@@ -1534,6 +1595,72 @@ where
             classified_success,
             cancel_losers,
         })
+    }
+
+    /// Records one unified split-service continuation and builds any required
+    /// loser-cancellation effects.
+    ///
+    /// The caller still supplies the business-success classifier and owns the
+    /// parent request. This method owns only the mechanical key/token routing
+    /// and bounded loser-cancel continuation plumbing.
+    pub fn advance_service<I, Event, Request, F, Wrap>(
+        &mut self,
+        event: CallSelectEvent<K, R>,
+        is_success: F,
+        wrap: Wrap,
+    ) -> Result<CallSelectAdvance<I, K, R>, CallSelectAdvanceError<K, R>>
+    where
+        I: tina::Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        K: Clone + 'static,
+        R: Clone + 'static,
+        Event: 'static,
+        Request: 'static,
+        F: FnOnce(&R) -> bool,
+        Wrap: Fn(CallSelectEvent<K, R>) -> Event + Clone + 'static,
+    {
+        match event {
+            CallSelectEvent::Reply(key, token, outcome) => {
+                let step = self
+                    .record_classified_reply(key, token, outcome, is_success)
+                    .map_err(CallSelectAdvanceError::Reply)?;
+                let effects: Vec<_> = step
+                    .cancel_losers
+                    .into_iter()
+                    .map(|request| {
+                        let (key, token, handle) = request.into_parts();
+                        let wrap = wrap.clone();
+                        crate::cancel_call(handle).then_service_event(move |outcome| {
+                            wrap(CallSelectEvent::Cancelled(key, token, outcome))
+                        })
+                    })
+                    .collect();
+                let effect = if effects.is_empty() {
+                    tina::noop()
+                } else {
+                    tina::Effect::Batch(effects)
+                };
+                Ok(CallSelectAdvance {
+                    selected: step.selected,
+                    classified_success: step.classified_success,
+                    effect,
+                    complete: self.report_ready(),
+                })
+            }
+            CallSelectEvent::Cancelled(key, token, outcome) => {
+                let selected = self
+                    .record_cancel(key, token, outcome)
+                    .map_err(CallSelectAdvanceError::Cancel)?;
+                Ok(CallSelectAdvance {
+                    selected,
+                    classified_success: false,
+                    effect: tina::noop(),
+                    complete: self.report_ready(),
+                })
+            }
+        }
     }
 
     /// Drains every live branch for explicit owner-stop cancellation.

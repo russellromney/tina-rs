@@ -250,8 +250,9 @@ pub use call_group::{
     CallGroup, CallGroupBranchOutcome, CallGroupCancelOutcome, CallGroupCancelRequest,
     CallGroupInsertError, CallGroupRecordCancelError, CallGroupRecordReplyError,
     CallGroupReplyStep, CallGroupReport, CallGroupReserveError, CallGroupStartError,
-    CallGroupToken, CallJoinReport, CallJoinSet, CallJoinToken, CallSelectClassifiedStep,
-    CallSelectReport, CallSelectSet, CallSelectToken, CallSetBranchOutcome, CallSetCancelOutcome,
+    CallGroupToken, CallJoinReport, CallJoinSet, CallJoinToken, CallSelectAdvance,
+    CallSelectAdvanceError, CallSelectClassifiedStep, CallSelectEvent, CallSelectReport,
+    CallSelectSet, CallSelectToken, CallSetBranchOutcome, CallSetCancelOutcome,
     CallSetCancelRequest, CallSetInsertError, CallSetRecordCancelError, CallSetRecordReplyError,
     CallSetStartError, SelectedCall, SelectedCallOutcome,
 };

@@ -4,10 +4,10 @@ use std::time::{Duration, Instant};
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallError, CallGroup, CallGroupToken, CallJoinSet, CallOutcome, CallSelectSet,
+    CallError, CallGroup, CallGroupToken, CallJoinSet, CallOutcome, CallSelectEvent, CallSelectSet,
     DefaultThreadedMailboxFactory, FileId, PendingCancelableCallSet, PendingCancelableTicket,
-    RequestScope, RequestScopeId, ScopeCancelCause, SplitServiceHandle, ThreadedRuntime, call,
-    call_cancelable, cancel_call, file_close, sleep,
+    RequestScope, RequestScopeId, ScopeCancelCause, SelectedCallOutcome, SplitServiceHandle,
+    ThreadedRuntime, call, call_cancelable, cancel_call, file_close, sleep,
 };
 
 const TIMEOUT: Duration = Duration::from_secs(1);
@@ -354,7 +354,8 @@ fn service_event_helpers_wrap_envelopes_and_preserve_request_authority() {
 struct SetObservations {
     group_outcomes: Vec<(u32, CallOutcome<u32>)>,
     join_outcomes: Vec<(u32, CallOutcome<u32>)>,
-    select_outcomes: Vec<(u32, CallOutcome<u32>)>,
+    select_outcomes: Vec<(u32, SelectedCallOutcome<u32>)>,
+    select_complete: bool,
     scope_cancels: Vec<(&'static str, CancelOutcome)>,
 }
 
@@ -375,11 +376,7 @@ enum SetEvent {
         token: CallGroupToken,
         outcome: CallOutcome<u32>,
     },
-    SelectReturned {
-        key: u32,
-        token: CallGroupToken,
-        outcome: CallOutcome<u32>,
-    },
+    SelectReturned(CallSelectEvent<u32, u32>),
     /// Hold finished before cancel — counted, not a panic, so a flaky
     /// race cannot fail the suite for the wrong reason.
     ScopeHoldSettled(CallOutcome<u32>),
@@ -427,18 +424,22 @@ impl SetService {
                     },
                 )
                 .expect("join set accepts one branch"),
-            SetEvent::StartSelect => self
-                .select
-                .start_cancelable_service_event(
-                    3u32,
-                    call_cancelable(self.probe, ProbeMessage::Value, TIMEOUT),
-                    |key, token, outcome| SetEvent::SelectReturned {
-                        key,
-                        token,
-                        outcome,
-                    },
-                )
-                .expect("select set accepts one branch"),
+            SetEvent::StartSelect => Effect::Batch(vec![
+                self.select
+                    .start_service(
+                        3u32,
+                        call_cancelable(self.probe, ProbeMessage::Value, TIMEOUT),
+                        SetEvent::SelectReturned,
+                    )
+                    .expect("select set accepts winner branch"),
+                self.select
+                    .start_service(
+                        4u32,
+                        call_cancelable(self.probe, ProbeMessage::Hold, TIMEOUT),
+                        SetEvent::SelectReturned,
+                    )
+                    .expect("select set accepts loser branch"),
+            ]),
             SetEvent::StartScopeHold => {
                 // Admit the cancelable hold first; cancel runs on a later
                 // event so the call slot exists (avoids NotAdmitted).
@@ -490,21 +491,18 @@ impl SetService {
                     .push((key, outcome));
                 noop()
             }
-            SetEvent::SelectReturned {
-                key,
-                token,
-                outcome,
-            } => {
-                let _ = self
+            SetEvent::SelectReturned(event) => {
+                let step = self
                     .select
-                    .record_reply(key, token, outcome.clone())
-                    .expect("select token from start_cancelable_service_event");
-                self.observed
-                    .lock()
-                    .unwrap()
+                    .advance_service(event, |_| true, SetEvent::SelectReturned)
+                    .expect("select event carries a live branch token");
+                let mut observed = self.observed.lock().unwrap();
+                observed
                     .select_outcomes
-                    .push((key, outcome));
-                noop()
+                    .push((step.selected.key, step.selected.outcome));
+                observed.select_complete = step.complete;
+                drop(observed);
+                step.effect
             }
             SetEvent::ScopeHoldSettled(_outcome) => {
                 // Cancelled waits do not normally re-enter here; ignore late
@@ -536,7 +534,7 @@ fn set_and_scope_service_event_helpers_wrap_envelopes_and_preserve_outcomes() {
                 probe,
                 group: CallGroup::with_capacity(1),
                 join: CallJoinSet::with_capacity(1),
-                select: CallSelectSet::with_capacity(1),
+                select: CallSelectSet::with_capacity(2),
                 scope: RequestScope::with_child_cap(RequestScopeId::alloc(), 2),
                 observed: observed.clone(),
             },
@@ -565,7 +563,7 @@ fn set_and_scope_service_event_helpers_wrap_envelopes_and_preserve_outcomes() {
         let obs = observed_for_wait.lock().unwrap();
         !obs.group_outcomes.is_empty()
             && !obs.join_outcomes.is_empty()
-            && !obs.select_outcomes.is_empty()
+            && obs.select_complete
             && !obs.scope_cancels.is_empty()
     });
     assert!(
@@ -583,9 +581,18 @@ fn set_and_scope_service_event_helpers_wrap_envelopes_and_preserve_outcomes() {
     assert_eq!(obs.join_outcomes[0].0, 2);
     assert_eq!(obs.join_outcomes[0].1, CallOutcome::Replied(7));
 
-    assert_eq!(obs.select_outcomes.len(), 1);
+    assert_eq!(obs.select_outcomes.len(), 2);
     assert_eq!(obs.select_outcomes[0].0, 3);
-    assert_eq!(obs.select_outcomes[0].1, CallOutcome::Replied(7));
+    assert_eq!(
+        obs.select_outcomes[0].1,
+        SelectedCallOutcome::Reply(CallOutcome::Replied(7))
+    );
+    assert_eq!(obs.select_outcomes[1].0, 4);
+    assert_eq!(
+        obs.select_outcomes[1].1,
+        SelectedCallOutcome::Cancel(CancelOutcome::Cancelled)
+    );
+    assert!(obs.select_complete);
 
     assert_eq!(obs.scope_cancels.len(), 1);
     assert_eq!(obs.scope_cancels[0].0, "held");
