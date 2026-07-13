@@ -38,7 +38,7 @@ capacity and eviction, closed state, named configuration, and deterministic
 virtual-time replay across runs, seeds, and stable trace hashes.
 
 `specimen_rate_limited_worker` also preserves `KeyCapacityFull` and `Closed`
-as distinct application report terminals. Its policy tests use explicit
+as distinct application report terminals with their policy rejection reports. Its policy tests use explicit
 logical time for exact retry/refill assertions, while its live threaded smoke
 tests assert structural accounting rather than a wall-clock-sensitive exact
 admit/full split. A closed-policy path proves the typed worker terminal
@@ -46,7 +46,8 @@ survives observed host-control settlement and reported shutdown. The returned
 report retains the exact host-burst snapshot, pacing-call failure, and
 `Delivered`/`Closed`/`WorkerStopped` control settlement alongside its compact
 cross-runtime totals, so the comparison projection does not erase source
-truth.
+truth. Host-admitted and worker-received counts also remain distinct, so an
+early worker terminal cannot hide queued messages that it never handled.
 
 ### 2026-07-12 Report-preserving LocalSystem terminal runner prerequisite
 

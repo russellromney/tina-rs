@@ -21,10 +21,10 @@
 //!
 //! Note on naming: the "rate" here is *throughput pacing*, not *admission
 //! rate limiting* (accept/reject at the door). The Tina side paces with a
-//! `tina_runtime::RateLimit<()>` token bucket — `try_admit_at(&(), ctx.now())`
+//! `tina_runtime::RateLimit` token bucket — `try_admit_at(worker_key, ctx.now())`
 //! returns `Admitted` (process one) or `RateLimited { retry_after }` (sleep
 //! that long, then ask again) on the normal path. Its exhaustive decision also
-//! preserves `KeyCapacityFull` and `Closed` if the owner configuration changes,
+//! preserves `KeyCapacityFull` and `Closed` if the owner state or lifecycle changes,
 //! so the rate window falls out of the limiter's deterministic `retry_after`
 //! instead of a hand-rolled sleep without hiding terminal truth.
 //! The overload signal is still the bounded mailbox, mirrored on the Tokio
@@ -32,7 +32,7 @@
 //! For the *reject-at-the-door* use of the same primitive — admit or refuse
 //! per tenant — see `examples/systems/system_tenant_rate_limiter`.
 
-use tina_runtime::{CallError, HostBurstSnapshot};
+use tina_runtime::{AdmissionReport, CallError, HostBurstSnapshot};
 
 pub mod tina_impl;
 pub mod tokio_impl;
@@ -57,16 +57,23 @@ const RATE_PER_SEC: u64 = {
     1_000 / RATE_WINDOW_MS
 };
 
+/// Exact terminal returned by the worker-owned rate policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RatePolicyTerminal {
+    /// The policy had no capacity to track the worker's pacing key.
+    KeyCapacityFull(AdmissionReport),
+    /// The policy had been explicitly closed.
+    Closed(AdmissionReport),
+}
+
 /// Exact reason the worker stopped before completing the healthy run.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub enum WorkerTerminal {
     /// The worker completed without a terminal failure.
     #[default]
     None,
-    /// The policy had no capacity to track another distinct key.
-    RateKeyCapacityFull,
-    /// The policy had been explicitly closed.
-    RateClosed,
+    /// The worker-owned rate policy rejected further work terminally.
+    RatePolicy(RatePolicyTerminal),
     /// The runtime-owned sleep failed before the worker could resume.
     PacingCallFailed(CallError),
 }
@@ -86,15 +93,17 @@ pub enum BurstCloseSettlement {
 }
 
 /// What each side observed end-to-end.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Report {
-    /// Submissions the worker accepted (queued).
+    /// Submissions the host observed as accepted into the worker queue.
     pub jobs_admitted: u32,
     /// Submissions rejected at the producer because the worker queue
     /// was full.
     pub jobs_full: u32,
     /// Submissions rejected because the mailbox closed or worker stopped.
     pub jobs_terminal: u32,
+    /// Admitted submissions the worker actually received from its queue.
+    pub jobs_received: u32,
     /// Jobs the worker actually processed.
     pub jobs_processed: u32,
     /// Exact Tina host-burst outcomes before the domain-level projection.
@@ -124,8 +133,12 @@ pub fn assert_report_invariants(side: &str, report: &Report) {
         "{side}: expected overload to be visible (jobs_full > 0), got {report:?}",
     );
     assert_eq!(
-        report.jobs_processed, report.jobs_admitted,
-        "{side}: every admitted job should have been processed, got {report:?}",
+        report.jobs_received, report.jobs_admitted,
+        "{side}: every host-admitted job should reach the worker, got {report:?}",
+    );
+    assert_eq!(
+        report.jobs_processed, report.jobs_received,
+        "{side}: every received job should have been processed, got {report:?}",
     );
     assert_eq!(
         report.worker_terminal,
@@ -133,6 +146,10 @@ pub fn assert_report_invariants(side: &str, report: &Report) {
         "{side}: no worker terminal expected in the healthy run, got {report:?}",
     );
     if let Some(burst) = report.tina_burst {
+        assert_eq!(
+            side, "tina",
+            "only the Tina side may carry Tina burst truth, got {report:?}",
+        );
         assert_eq!(
             report.burst_close_settlement,
             BurstCloseSettlement::Delivered,
@@ -146,6 +163,15 @@ pub fn assert_report_invariants(side: &str, report: &Report) {
             burst.observed, burst.submitted,
             "{side}: Tina burst observers did not settle, got {report:?}",
         );
+        assert_eq!(
+            burst.admitted
+                + burst.mailbox_full
+                + burst.mailbox_closed
+                + burst.ingress_full
+                + burst.worker_stopped,
+            burst.submitted,
+            "{side}: Tina burst outcomes did not partition every submission, got {report:?}",
+        );
         assert_eq!(burst.admitted, report.jobs_admitted);
         assert_eq!(burst.mailbox_full + burst.ingress_full, report.jobs_full);
         assert_eq!(
@@ -153,6 +179,10 @@ pub fn assert_report_invariants(side: &str, report: &Report) {
             report.jobs_terminal,
         );
     } else {
+        assert_eq!(
+            side, "tokio",
+            "the Tina side must retain its exact burst truth, got {report:?}",
+        );
         assert_eq!(
             report.burst_close_settlement,
             BurstCloseSettlement::NotApplicable,
@@ -178,6 +208,7 @@ mod tests {
                 jobs_admitted: QUEUE_CAPACITY as u32,
                 jobs_full: BURST_JOBS - QUEUE_CAPACITY as u32 - 1,
                 jobs_terminal: 1,
+                jobs_received: QUEUE_CAPACITY as u32,
                 jobs_processed: QUEUE_CAPACITY as u32,
                 tina_burst: None,
                 worker_terminal: WorkerTerminal::None,
@@ -192,6 +223,7 @@ mod tests {
             jobs_admitted: QUEUE_CAPACITY as u32,
             jobs_full: BURST_JOBS - QUEUE_CAPACITY as u32,
             jobs_terminal: 0,
+            jobs_received: QUEUE_CAPACITY as u32,
             jobs_processed: QUEUE_CAPACITY as u32,
             tina_burst: None,
             worker_terminal,
@@ -203,18 +235,73 @@ mod tests {
     #[test]
     #[should_panic(expected = "no worker terminal expected")]
     fn invariants_reject_key_capacity_policy_terminal() {
+        let policy_report = tina_runtime::RateLimit::<u8>::new(
+            "test.invariant",
+            tina_runtime::RateLimitConfig {
+                max_keys: 1,
+                rate_per_sec: 1,
+                burst: 1,
+            },
+        )
+        .report();
         assert_report_invariants(
             "tina",
-            &report_with_worker_terminal(WorkerTerminal::RateKeyCapacityFull),
+            &report_with_worker_terminal(WorkerTerminal::RatePolicy(
+                RatePolicyTerminal::KeyCapacityFull(policy_report),
+            )),
         );
     }
 
     #[test]
     #[should_panic(expected = "no worker terminal expected")]
     fn invariants_reject_closed_policy_terminal() {
+        let policy_report = tina_runtime::RateLimit::<u8>::new(
+            "test.invariant",
+            tina_runtime::RateLimitConfig {
+                max_keys: 1,
+                rate_per_sec: 1,
+                burst: 1,
+            },
+        )
+        .report();
         assert_report_invariants(
             "tina",
-            &report_with_worker_terminal(WorkerTerminal::RateClosed),
+            &report_with_worker_terminal(WorkerTerminal::RatePolicy(RatePolicyTerminal::Closed(
+                policy_report,
+            ))),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Tina side must retain its exact burst truth")]
+    fn invariants_reject_tina_report_without_exact_burst_truth() {
+        assert_report_invariants("tina", &report_with_worker_terminal(WorkerTerminal::None));
+    }
+
+    #[test]
+    #[should_panic(expected = "Tina burst outcomes did not partition every submission")]
+    fn invariants_reject_incomplete_exact_burst_partition() {
+        assert_report_invariants(
+            "tina",
+            &Report {
+                jobs_admitted: QUEUE_CAPACITY as u32,
+                jobs_full: BURST_JOBS - QUEUE_CAPACITY as u32,
+                jobs_terminal: 0,
+                jobs_received: QUEUE_CAPACITY as u32,
+                jobs_processed: QUEUE_CAPACITY as u32,
+                tina_burst: Some(HostBurstSnapshot {
+                    submitted: BURST_JOBS,
+                    observed: BURST_JOBS,
+                    admitted: QUEUE_CAPACITY as u32,
+                    mailbox_full: BURST_JOBS - QUEUE_CAPACITY as u32 - 1,
+                    mailbox_closed: 0,
+                    ingress_full: 0,
+                    worker_stopped: 0,
+                }),
+                worker_terminal: WorkerTerminal::None,
+                burst_close_settlement: BurstCloseSettlement::Delivered,
+                exit_clean: true,
+            },
         );
     }
 }

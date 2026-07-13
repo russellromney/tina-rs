@@ -20,7 +20,8 @@ structural invariants:
 - `admitted + full + terminal == BURST_JOBS`
 - `full > 0` (overload was visible)
 - `terminal == 0` (the worker remained live for the burst)
-- `processed == admitted`
+- `received == admitted`
+- `processed == received`
 - `worker_terminal == None`
 - Tina's `burst_close_settlement == Delivered`
 - `exit_clean`
@@ -61,8 +62,8 @@ holds it together.
 
 The worker is one isolate with mailbox capacity `QUEUE_CAPACITY`.
 There is no separate queue; the mailbox *is* the queue. The rate
-limit is a `RateLimit<()>` token bucket in the worker's state. The
-worker asks `try_admit_at(&(), ctx.now())`; an admitted token processes
+limit is a single-key `RateLimit` token bucket in the worker's state. The
+worker asks `try_admit_at(worker_key, ctx.now())`; an admitted token processes
 one pending job, while `RateLimited { retry_after }` schedules exactly
 one `sleep(retry_after).then(Tick)`. Explicit `pending` and `pacing`
 state keeps one timer in flight. The host closes the burst with a
@@ -70,19 +71,20 @@ normal Tina message: `BurstClosed(admitted)`.
 
 ```rust
 WorkerMsg::Submit => {
-    self.report.jobs_admitted += 1;
+    self.report.jobs_received += 1;
     self.pending += 1;
     if self.pacing { noop() } else { self.drive(ctx) }
 }
 WorkerMsg::Tick(reply) => {
-    if reply.is_err() {
+    if let Some(terminal) = pacing_terminal(reply) {
+        self.report.worker_terminal = terminal;
         self.report.exit_clean = false;
-        return stop_with(self.report);
+        return stop_with(std::mem::take(&mut self.report));
     }
     self.pacing = false;
     self.drive(ctx)
 }
-match self.limiter.try_admit_at(&(), ctx.now()) {
+match self.limiter.try_admit_at(worker_key, ctx.now()) {
     RateLimitDecision::Admitted => {
         self.processed += 1;
         self.pending -= 1;
@@ -92,15 +94,19 @@ match self.limiter.try_admit_at(&(), ctx.now()) {
         self.pacing = true;
         return sleep(retry_after).then(WorkerMsg::Tick);
     }
-    RateLimitDecision::KeyCapacityFull(_) => {
-        self.report.worker_terminal = WorkerTerminal::RateKeyCapacityFull;
+    RateLimitDecision::KeyCapacityFull(report) => {
+        self.report.worker_terminal = WorkerTerminal::RatePolicy(
+            RatePolicyTerminal::KeyCapacityFull(report),
+        );
         self.report.exit_clean = false;
-        return stop_with(self.report);
+        return stop_with(std::mem::take(&mut self.report));
     }
-    RateLimitDecision::Closed(_) => {
-        self.report.worker_terminal = WorkerTerminal::RateClosed;
+    RateLimitDecision::Closed(report) => {
+        self.report.worker_terminal = WorkerTerminal::RatePolicy(
+            RatePolicyTerminal::Closed(report),
+        );
         self.report.exit_clean = false;
-        return stop_with(self.report);
+        return stop_with(std::mem::take(&mut self.report));
     }
 }
 ```
@@ -127,13 +133,15 @@ opens or the deadline elapses; the typed `Closed` / `Timeout` /
 sending" is app control state, so it travels as a message rather than
 an `Arc<AtomicU32>` side channel.
 
-If the worker has already stopped with a typed rate-policy terminal, the host
+If the worker has already stopped with a typed worker terminal, the host
 still waits for `observe_result` before interpreting a `Closed` or
 `WorkerStopped` control-send result. That preserves the worker's exact
-`KeyCapacityFull`/`Closed` terminal kind; the same control outcomes remain
-errors when no policy terminal explains them, and `Timeout` is always an
-error. The report also retains the exact `Delivered`/`Closed`/`WorkerStopped`
-control settlement instead of projecting all three to success.
+`KeyCapacityFull`/`Closed` terminal kind and the policy's rejection report; the
+same control outcomes remain errors when no worker terminal explains them.
+`Timeout` and provenance failures return immediately with their typed error
+source instead of being hidden by a later result-wait timeout. The report also
+retains the exact `Delivered`/`Closed`/`WorkerStopped` control settlement
+instead of projecting all three to success.
 
 The report keeps the complete `HostBurstSnapshot` alongside its cross-runtime
 `admitted`/`full`/`terminal` projection. That makes `MailboxFull`,
