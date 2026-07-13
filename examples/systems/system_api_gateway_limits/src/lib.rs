@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, CapacityNameError, CapacitySummary, ConcurrencyGuardedInsertError,
+    CallError, CallOutcome, CapacityNameError, CapacitySummary, ConcurrencyGuardedInsertError,
     ConcurrencyPendingReplies, DefaultThreadedMailboxFactory, LocalSystem, ReportedWorkloadError,
     RunToShutdownError, SharedCapacityReservation, SharedCapacityScope, SharedScopeReport,
     SleepReply, SplitServiceHandle, StartupError, ThreadedRuntimeError, format_assertion_failure,
@@ -256,6 +256,11 @@ pub enum GatewayWorkloadError {
         replied: &'static str,
     },
     RefillOutcome(CallOutcome<GatewayReply>),
+    HoldFailed {
+        route: Route,
+        caller: usize,
+        error: CallError,
+    },
     CapacityName(CapacityNameError),
 }
 
@@ -302,6 +307,15 @@ impl fmt::Display for GatewayWorkloadError {
                 write!(f, "{} request received {replied} reply", requested.label())
             }
             Self::RefillOutcome(outcome) => write!(f, "refill call did not succeed: {outcome:?}"),
+            Self::HoldFailed {
+                route,
+                caller,
+                error,
+            } => write!(
+                f,
+                "{} caller {caller} hold timer failed: {error:?}",
+                route.label()
+            ),
             Self::CapacityName(error) => write!(f, "capacity summary failed: {error}"),
         }
     }
@@ -377,6 +391,7 @@ pub enum GatewayReply {
         current: usize,
         max: usize,
     },
+    HoldFailed(CallError),
 }
 
 struct Gateway {
@@ -527,16 +542,21 @@ impl Gateway {
         })
     }
 
-    fn hold_done(&mut self, qid: u64, route: Route, _result: SleepReply) -> Effect<Self> {
-        let Some(effect) = self.pending.reply_by_key::<Self>(
-            &qid,
-            GatewayReply::Ok {
-                route: route.label(),
-            },
-        ) else {
+    fn hold_done(&mut self, qid: u64, route: Route, result: SleepReply) -> Effect<Self> {
+        let reply = hold_reply(route, result);
+        let Some(effect) = self.pending.reply_by_key::<Self>(&qid, reply) else {
             return noop();
         };
         effect
+    }
+}
+
+fn hold_reply(route: Route, result: SleepReply) -> GatewayReply {
+    match result {
+        Ok(()) => GatewayReply::Ok {
+            route: route.label(),
+        },
+        Err(error) => GatewayReply::HoldFailed(error),
     }
 }
 
@@ -671,6 +691,13 @@ pub fn run(config: RunConfig) -> Result<RunReport, RunError> {
                         Route::List => list_full += 1,
                     }
                     ObservedCallOutcome::Replied(reply)
+                }
+                CallOutcome::Replied(GatewayReply::HoldFailed(error)) => {
+                    return Err(GatewayWorkloadError::HoldFailed {
+                        route,
+                        caller,
+                        error,
+                    });
                 }
                 CallOutcome::Timeout => {
                     match route {
@@ -812,4 +839,21 @@ pub fn run(config: RunConfig) -> Result<RunReport, RunError> {
         ],
         summary_line,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hold_timer_failure_is_not_reported_as_success() {
+        assert_eq!(
+            hold_reply(Route::Upload, Err(CallError::TimerFull)),
+            GatewayReply::HoldFailed(CallError::TimerFull)
+        );
+        assert_eq!(
+            hold_reply(Route::List, Ok(())),
+            GatewayReply::Ok { route: "list" }
+        );
+    }
 }

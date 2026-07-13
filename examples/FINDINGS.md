@@ -275,11 +275,30 @@ example contains no direct service-envelope vocabulary.
 `system_api_gateway_limits`, `system_bounded_object_lane`,
 `system_cache_with_fill`, `system_tenant_rate_limiter`, and
 `system_webhook_relay` now construct through fallible `LocalSystem` builders
-and use its typed registration and host-call facade instead of naming the
-lower-level threaded runner. The follow-up ergonomics pass still needs to
-replace their shared-owner/manual terminal combiners with the consuming
-reported runner and close the authority, outcome, configuration, and
-request-only authoring findings recorded by these systems.
+and use typed registration, host calls, and `run_to_shutdown_reported` instead
+of shared threaded owners or application-local terminal combiners. Scoped host
+threads borrow the facade. Configurations bound every caller/thread producer,
+mailbox, parked-call table, duration, and result allocation before startup.
+
+The gateway and object lane use `ConcurrencyPendingReplies`; owner stop,
+caller departure, completion, rollback, and refill settle the guarded
+authority exactly. The cache uses `SharedWork` for bounded single-flight
+callers and generation-stamps invalidation. The request-only tenant limiter
+stamps `RateLimit` admission with `RequestCall::now()` and preserves the narrow
+four-way decision vocabulary on live and simulator owners. The request-only
+webhook fake removes its dummy event lane and preserves every outer call,
+bridge, rejection, and worker-domain outcome. A final audit also stopped the
+gateway from treating a failed runtime timer as successful held work.
+
+The real AWS paths expose one remaining framework prerequisite: bridge workers
+can only be installed through `ThreadedRuntime`, while these application
+runners own a `LocalSystem`. Passing an already-installed S3/SQS address into a
+new facade does not establish that the address belongs to the new runtime.
+`tina-aws-bridge` needs LocalSystem installation parity (including typed
+install failure, close/drain, metrics, and shutdown ownership) before
+`run_against_s3` and `run_against_sqs` can be canonical live application
+entry points. The hermetic fake paths are complete; the real bridge runners
+remain integration-shape probes and are not claimed as runnable closures.
 
 ### 2026-07-12 Request-aware raw flow prerequisite
 

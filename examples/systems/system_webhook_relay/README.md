@@ -42,12 +42,14 @@ cargo test --manifest-path examples/systems/system_webhook_relay/Cargo.toml
 - `LocalSystem::run_to_shutdown_reported` owns bounded shutdown and retains a
   workload error alongside any shutdown failure.
 
-## What is weakened
+## Explicit boundary
 
-- replay determinism under `tina-sim` if a real bridge is wired in; bridge IO
-  is not observed by the simulator;
-- the `Retry` reply does not include a backoff suggestion; budget and timing
+- The `Retry` reply does not include a backoff suggestion; budget and timing
   remain caller-owned.
+- `tina-aws-bridge` installation currently requires the lower threaded owner.
+  Until bridge installation has `LocalSystem` parity, `run_against_sqs` is an
+  integration-shape probe rather than a self-contained live application
+  entry point. No simulator parity is claimed for real bridge IO.
 
 ## Tina capability pulled
 
@@ -66,13 +68,6 @@ is consumed for each event in submit order. The example does not claim or
 simulate concurrent callers. Applications that need a concurrent host wave
 should use scoped caller threads and validate the caller cap before spawning
 them.
-
-## Suggested follow-up
-
-- a tiny per-event journal isolate would make the `DeadLetter` path durable
-  rather than just metric-visible;
-- a backoff-budget isolate could ride alongside the relay to suggest delays
-  for `Retry` outcomes without growing a hidden retry loop inside the relay.
 
 ## Authoring a bridge — copied path
 

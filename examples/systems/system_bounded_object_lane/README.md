@@ -34,11 +34,10 @@ What felt good:
 - Host callers borrow `&LocalSystem` through scoped threads, and
   `run_to_shutdown_reported` retains workload and shutdown failures separately.
 
-What felt rough:
-- The mini service wants a standard pressure-report helper so `accepted`,
-  `busy`, `completed`, and `in_flight` do not become per-service vocabulary.
-  `ConcurrencyPendingReplies::report()` covers the authority-sensitive portion;
-  application counters still name accepted work and backend completion.
+What stays application-specific:
+- `ConcurrencyPendingReplies::report()` covers the authority-sensitive state;
+  `accepted`, `busy`, and backend completion remain application counters because
+  they describe lane policy rather than generic runtime pressure.
 - The real S3 temptation was useful: completion delivery must be observed, not
   best-effort `try_send`, or in-flight capacity can leak.
 
@@ -47,13 +46,13 @@ Tina capability pulled:
 - Runtime-owned time.
 - Bounded in-flight admission.
 - Host-side concurrent calls.
-- Future AWS bridge pressure shape.
+- Typed AWS bridge outcome shape.
 
-Suggested follow-up:
-- A small generic "lane pressure report" shape would help S3/DB/HTTP pool
-  examples converge on one vocabulary.
-- A real `tina-aws-bridge` should reuse this admission shape but provide typed
-  AWS outcomes, cancellation, shutdown, and pressure reports.
+Remaining integration limitation:
+- `tina-aws-bridge` installation currently requires the lower threaded owner.
+  Until bridge installation has `LocalSystem` parity, `run_against_s3` is an
+  integration-shape probe rather than a self-contained live application
+  entry point. The hermetic fake path is fully runnable and tested.
 
 Verdict:
 - keep
