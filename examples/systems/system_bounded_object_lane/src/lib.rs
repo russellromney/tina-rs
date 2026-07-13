@@ -1,12 +1,21 @@
-use std::sync::{Arc, Barrier};
+use std::fmt;
 use std::thread;
 use std::time::Duration;
 
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
+
 use tina::prelude::*;
 use tina_runtime::{
-    CallError, CallOutcome, DefaultThreadedMailboxFactory, LocalPermitGate, LocalPermitName,
-    LocalSystem, Permit, SleepReply, sleep,
+    CallError, CallOutcome, ConcurrencyParkError, ConcurrencyParkTicket, ConcurrencyPendingReplies,
+    DefaultThreadedMailboxFactory, LocalSystem, SleepReply, request_effect_after_concurrency_park,
+    sleep,
 };
+
+const MAX_CALLERS: usize = 10_000;
+const MAX_LANE_IN_FLIGHT: usize = 10_000;
+const MAX_LANE_MAILBOX: usize = 100_000;
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy)]
 pub struct RunConfig {
@@ -30,17 +39,64 @@ impl Default for RunConfig {
 }
 
 impl RunConfig {
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self, RunConfigError> {
         let mut config = Self::default();
-        config.callers = env_usize("OBJECT_LANE_CALLERS").unwrap_or(config.callers);
-        config.lane_in_flight = env_usize("OBJECT_LANE_IN_FLIGHT").unwrap_or(config.lane_in_flight);
-        config.lane_mailbox = env_usize("OBJECT_LANE_MAILBOX").unwrap_or(config.lane_mailbox);
-        config.work_ms = env_u64("OBJECT_LANE_WORK_MS").unwrap_or(config.work_ms);
+        config.callers = env_usize("OBJECT_LANE_CALLERS")?.unwrap_or(config.callers);
+        config.lane_in_flight =
+            env_usize("OBJECT_LANE_IN_FLIGHT")?.unwrap_or(config.lane_in_flight);
+        config.lane_mailbox = env_usize("OBJECT_LANE_MAILBOX")?.unwrap_or(config.lane_mailbox);
+        config.work_ms = env_u64("OBJECT_LANE_WORK_MS")?.unwrap_or(config.work_ms);
         config.call_timeout_ms =
-            env_u64("OBJECT_LANE_CALL_TIMEOUT_MS").unwrap_or(config.call_timeout_ms);
-        config
+            env_u64("OBJECT_LANE_CALL_TIMEOUT_MS")?.unwrap_or(config.call_timeout_ms);
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(self) -> Result<Self, RunConfigError> {
+        validate_cap("callers", self.callers, 1, MAX_CALLERS)?;
+        validate_cap("lane_in_flight", self.lane_in_flight, 1, MAX_LANE_IN_FLIGHT)?;
+        // Zero is useful for deterministic mailbox-full tests.
+        validate_cap("lane_mailbox", self.lane_mailbox, 0, MAX_LANE_MAILBOX)?;
+        if self.call_timeout_ms == 0 {
+            return Err(RunConfigError::ZeroDuration("call_timeout_ms"));
+        }
+        Ok(self)
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunConfigError {
+    InvalidEnvironment {
+        name: &'static str,
+        value: String,
+    },
+    OutOfRange {
+        field: &'static str,
+        value: usize,
+        min: usize,
+        max: usize,
+    },
+    ZeroDuration(&'static str),
+}
+
+impl fmt::Display for RunConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidEnvironment { name, value } => {
+                write!(f, "{name} is not a valid integer: {value:?}")
+            }
+            Self::OutOfRange {
+                field,
+                value,
+                min,
+                max,
+            } => write!(f, "{field}={value} is outside {min}..={max}"),
+            Self::ZeroDuration(field) => write!(f, "{field} must be non-zero"),
+        }
+    }
+}
+
+impl std::error::Error for RunConfigError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunReport {
@@ -48,33 +104,62 @@ pub struct RunReport {
     pub stored: usize,
     pub busy: usize,
     pub failed: usize,
+    pub full: usize,
+    pub closed: usize,
+    pub timeout: usize,
+    pub rejected: usize,
+    pub rejection_reasons: Vec<tina::CallRejectedReason>,
     pub stats: LaneStats,
+    pub dropped_permits: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaneStats {
     pub accepted: usize,
     pub busy: usize,
-    pub completed: usize,
-    pub in_flight: usize,
+    pub work_completed: usize,
+    pub completed: u64,
+    pub current: usize,
+    pub retired: u64,
+    pub caller_gone: u64,
+    pub counts_agree: bool,
+    pub settlements_agree: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaneReply {
     Stored(String),
     Busy { in_flight: usize, cap: usize },
-    Failed(String),
+    Failed(WorkFailure),
     Stats(LaneStats),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkFailure {
+    Timer(CallError),
+    Bridge(BridgeFailure),
+    S3(tina_aws_bridge::S3Error),
+    UnexpectedS3Response(tina_aws_bridge::S3Response),
+    Protocol(&'static str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgeFailure {
+    Full,
+    Closed,
+    Timeout,
+    Rejected(tina::CallRejectedReason),
 }
 
 #[derive(Debug)]
 enum LaneEvent {
     PutFinished {
-        request: RequestContext<LaneReply>,
+        ticket: ConcurrencyParkTicket<u64>,
         key: String,
-        permit: Permit,
-        result: WorkResult,
+        result: Result<(), WorkFailure>,
     },
+    #[cfg(test)]
+    Stop,
 }
 
 #[derive(Debug)]
@@ -83,17 +168,10 @@ enum LaneRequest {
     Stats,
 }
 
-type WorkResult = Result<(), String>;
-
 enum WorkBackend {
     FakeSleep {
         work: Duration,
     },
-    /// Real AWS S3 path via `tina-aws-bridge`. The lane uses a real
-    /// `S3Address` for `PutObject` calls. Bridge-level pressure shows
-    /// up as a typed `Failed`; lane-level admission still flows through
-    /// the same `LocalPermitGate` so the user sees one consistent
-    /// `Busy` shape.
     #[allow(dead_code)]
     AwsS3 {
         address: tina_aws_bridge::S3Address,
@@ -104,14 +182,14 @@ enum WorkBackend {
 }
 
 struct ObjectLane {
-    /// Fixed-capacity admission gate for the lane. "Local" here means: not a
-    /// pool, no waiters queue, no auto-release; the permit travels with the
-    /// continuation and the release point is structural.
-    gate: LocalPermitGate,
+    pending: ConcurrencyPendingReplies<u64, LaneReply>,
     backend: WorkBackend,
+    next_id: u64,
     accepted: usize,
     busy: usize,
-    completed: usize,
+    work_completed: usize,
+    #[cfg(test)]
+    lifecycle_audit: Option<Arc<Mutex<Option<LaneStats>>>>,
 }
 
 #[tina_runtime::isolate(event = LaneEvent, request = LaneRequest, reply = LaneReply)]
@@ -123,25 +201,23 @@ impl ObjectLane {
     ) -> Effect<Self> {
         match event {
             LaneEvent::PutFinished {
-                request,
+                ticket,
                 key,
-                permit,
                 result,
             } => {
-                if let Err(error) = self.gate.release(permit) {
-                    return reply_to(
-                        request,
-                        LaneReply::Failed(format!("permit release failed: {error:?}")),
-                    );
-                }
-                match result {
+                let reply = match result {
                     Ok(()) => {
-                        self.completed += 1;
-                        reply_to(request, LaneReply::Stored(key))
+                        self.work_completed += 1;
+                        LaneReply::Stored(key)
                     }
-                    Err(error) => reply_to(request, LaneReply::Failed(format!("{error:?}"))),
-                }
+                    Err(error) => LaneReply::Failed(error),
+                };
+                self.pending
+                    .reply_ticket::<Self>(ticket, reply)
+                    .unwrap_or_else(|_| noop())
             }
+            #[cfg(test)]
+            LaneEvent::Stop => stop(),
         }
     }
 
@@ -151,83 +227,128 @@ impl ObjectLane {
         call: RequestCall<'_, Self>,
     ) -> RequestEffect<Self> {
         match request {
-            LaneRequest::Put { key } => match self.gate.try_admit() {
-                Err(full) => {
-                    self.busy += 1;
-                    let report = full.report();
-                    call.reply(LaneReply::Busy {
-                        in_flight: report.current,
-                        cap: report.capacity,
-                    })
-                }
-                Ok(permit) => {
-                    self.accepted += 1;
-                    match &self.backend {
-                        WorkBackend::FakeSleep { work } => call
-                            .defer(sleep(*work))
-                            .reply_service_event(move |request, result| LaneEvent::PutFinished {
-                                request,
-                                key,
-                                permit,
-                                result: sleep_to_work_result(result),
-                            }),
-                        WorkBackend::AwsS3 {
-                            address,
-                            bucket,
-                            key_prefix,
-                            timeout,
-                        } => {
-                            let full_key = format!("{key_prefix}{key}");
-                            let issued = tina_aws_bridge::send_s3(
-                                *address,
-                                tina_aws_bridge::S3Request::PutObject(
-                                    tina_aws_bridge::S3PutObject {
-                                        bucket: bucket.clone(),
-                                        key: full_key,
-                                        body: key.clone().into_bytes(),
-                                        content_type: Some("application/octet-stream".into()),
-                                    },
-                                ),
-                                *timeout,
-                            );
-                            call.defer(issued)
-                                .reply_service_event(move |request, outcome| {
-                                    LaneEvent::PutFinished {
-                                        request,
-                                        key,
-                                        permit,
-                                        result: s3_outcome_to_work_result(outcome),
-                                    }
-                                })
-                        }
-                    }
-                }
-            },
+            LaneRequest::Put { key } => self.put(key, call),
             LaneRequest::Stats => {
-                let report = self.gate.report();
+                let report = self.pending.report();
                 call.reply(LaneReply::Stats(LaneStats {
                     accepted: self.accepted,
                     busy: self.busy,
-                    completed: self.completed,
-                    in_flight: report.current,
+                    work_completed: self.work_completed,
+                    completed: report.completed_count,
+                    current: report.admission.current,
+                    retired: report.retired_count,
+                    caller_gone: report.caller_gone_count,
+                    counts_agree: report.counts_agree(),
+                    settlements_agree: self.accepted as u64
+                        == report
+                            .completed_count
+                            .saturating_add(report.retired_count)
+                            .saturating_add(report.admission.current as u64),
                 }))
             }
         }
     }
 }
 
-/// Run the lane against a real `tina-aws-bridge` S3 worker.
+impl Drop for ObjectLane {
+    fn drop(&mut self) {
+        let _ = self.pending.drain();
+        #[cfg(test)]
+        if let Some(audit) = &self.lifecycle_audit {
+            let report = self.pending.report();
+            let stats = LaneStats {
+                accepted: self.accepted,
+                busy: self.busy,
+                work_completed: self.work_completed,
+                completed: report.completed_count,
+                current: report.admission.current,
+                retired: report.retired_count,
+                caller_gone: report.caller_gone_count,
+                counts_agree: report.counts_agree(),
+                settlements_agree: self.accepted as u64
+                    == report
+                        .completed_count
+                        .saturating_add(report.retired_count)
+                        .saturating_add(report.admission.current as u64),
+            };
+            *audit.lock().expect("lifecycle audit lock is not poisoned") = Some(stats);
+        }
+    }
+}
+
+impl ObjectLane {
+    fn put(&mut self, key: String, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
+        let id = self.next_id;
+        let Some(next_id) = id.checked_add(1) else {
+            return call.reply(LaneReply::Failed(WorkFailure::Protocol(
+                "operation id space exhausted",
+            )));
+        };
+        let (ticket, effect_permit) = match self.pending.park_request(id, call) {
+            Ok(parked) => parked,
+            Err(ConcurrencyParkError::Admission { call, failure, .. }) => {
+                self.busy += 1;
+                let report = failure.report();
+                return call.reply(LaneReply::Busy {
+                    in_flight: report.current,
+                    cap: report.capacity,
+                });
+            }
+            Err(ConcurrencyParkError::DuplicateKey { call, .. }) => {
+                return call.reply(LaneReply::Failed(WorkFailure::Protocol(
+                    "duplicate operation id",
+                )));
+            }
+            Err(ConcurrencyParkError::PendingFull { call, .. }) => {
+                return call.reply(LaneReply::Failed(WorkFailure::Protocol(
+                    "pending replies full after admission",
+                )));
+            }
+        };
+        self.next_id = next_id;
+        self.accepted += 1;
+
+        let effect = match &self.backend {
+            WorkBackend::FakeSleep { work } => {
+                sleep(*work).then_service_event(move |result| LaneEvent::PutFinished {
+                    ticket,
+                    key,
+                    result: sleep_to_work_result(result),
+                })
+            }
+            WorkBackend::AwsS3 {
+                address,
+                bucket,
+                key_prefix,
+                timeout,
+            } => {
+                let full_key = format!("{key_prefix}{key}");
+                tina_aws_bridge::send_s3(
+                    *address,
+                    tina_aws_bridge::S3Request::PutObject(tina_aws_bridge::S3PutObject {
+                        bucket: bucket.clone(),
+                        key: full_key,
+                        body: key.clone().into_bytes(),
+                        content_type: Some("application/octet-stream".into()),
+                    }),
+                    *timeout,
+                )
+                .then_service_event(move |outcome| LaneEvent::PutFinished {
+                    ticket,
+                    key,
+                    result: s3_outcome_to_work_result(outcome),
+                })
+            }
+        };
+        request_effect_after_concurrency_park(effect_permit, effect)
+    }
+}
+
+/// Runs the lane against an installed `tina-aws-bridge` S3 worker.
 ///
-/// The caller is responsible for installing the bridge and shutting it
-/// down. The lane uses `tina_aws_bridge::send_s3(...).then(...)` for
-/// each admitted call. Bridge-level pressure (`max_in_flight`,
-/// `RequestTooLarge`, SDK errors) becomes a typed `Failed` reply with
-/// the layer named in the message; lane-level admission still uses the
-/// existing `LocalPermitGate`.
-///
-/// Hermetic tests should still use [`run`] (the FakeSleep backend); the
-/// AWS-S3-shaped backend is exercised against a fake S3 HTTP server in
-/// `tina-aws-bridge`'s integration tests.
+/// Lane admission remains local and bounded. Bridge admission, delivery,
+/// rejection, worker, and unexpected-response failures retain their typed
+/// variants in [`WorkFailure`].
 pub fn run_against_s3(
     config: RunConfig,
     s3_address: tina_aws_bridge::S3Address,
@@ -235,177 +356,471 @@ pub fn run_against_s3(
     key_prefix: String,
     bridge_timeout: Duration,
 ) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(
-        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
-    );
-    let shutdown = runtime.shutdown_handle();
-    let result = (|| {
-        let lane = runtime
-            .register_split_service::<ObjectLane, LaneEvent, LaneRequest, std::convert::Infallible>(
-                ObjectLane {
-                    gate: LocalPermitGate::with_capacity(config.lane_in_flight)
-                        .named(LocalPermitName("object_lane")),
-                    backend: WorkBackend::AwsS3 {
-                        address: s3_address,
-                        bucket,
-                        key_prefix,
-                        timeout: bridge_timeout,
-                    },
-                    accepted: 0,
-                    busy: 0,
-                    completed: 0,
+    let config = config.validate()?;
+    let dropped_before = tina_runtime::dropped_permit_count();
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    let mut report = app
+        .run_to_shutdown_reported(SHUTDOWN_TIMEOUT, |app| {
+            let lane = register_lane(
+                app,
+                config,
+                WorkBackend::AwsS3 {
+                    address: s3_address,
+                    bucket,
+                    key_prefix,
+                    timeout: bridge_timeout,
                 },
-                config.lane_mailbox,
-            )
-            .map_err(|e| anyhow::anyhow!("register lane: {e:?}"))?;
-
-        drive_callers(&runtime, lane.requests, config)
-    })();
-    finish_after_shutdown(result, shutdown, runtime)
+            )?;
+            drive_callers(app, lane.requests, config)
+        })
+        .map_err(anyhow::Error::from)?;
+    report.dropped_permits = tina_runtime::dropped_permit_count().saturating_sub(dropped_before);
+    Ok(report)
 }
 
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(
-        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
-    );
-    let shutdown = runtime.shutdown_handle();
-    let result = (|| {
-        let lane = runtime
-            .register_split_service::<ObjectLane, LaneEvent, LaneRequest, std::convert::Infallible>(
-                ObjectLane {
-                    gate: LocalPermitGate::with_capacity(config.lane_in_flight)
-                        .named(LocalPermitName("object_lane")),
-                    backend: WorkBackend::FakeSleep {
-                        work: Duration::from_millis(config.work_ms),
-                    },
-                    accepted: 0,
-                    busy: 0,
-                    completed: 0,
+    let config = config.validate()?;
+    let dropped_before = tina_runtime::dropped_permit_count();
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    let mut report = app
+        .run_to_shutdown_reported(SHUTDOWN_TIMEOUT, |app| {
+            let lane = register_lane(
+                app,
+                config,
+                WorkBackend::FakeSleep {
+                    work: Duration::from_millis(config.work_ms),
                 },
-                config.lane_mailbox,
-            )
-            .map_err(|e| anyhow::anyhow!("register lane: {e:?}"))?;
+            )?;
+            drive_callers(app, lane.requests, config)
+        })
+        .map_err(anyhow::Error::from)?;
+    report.dropped_permits = tina_runtime::dropped_permit_count().saturating_sub(dropped_before);
+    Ok(report)
+}
 
-        drive_callers(&runtime, lane.requests, config)
-    })();
-    finish_after_shutdown(result, shutdown, runtime)
+fn register_lane(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    config: RunConfig,
+    backend: WorkBackend,
+) -> anyhow::Result<tina_runtime::SplitServiceHandle<LaneEvent, LaneRequest, LaneReply>> {
+    app.register_split_service::<ObjectLane, LaneEvent, LaneRequest, std::convert::Infallible>(
+        ObjectLane {
+            pending: ConcurrencyPendingReplies::with_capacity(
+                "system_bounded_object_lane.pending",
+                config.lane_in_flight,
+            ),
+            backend,
+            next_id: 1,
+            accepted: 0,
+            busy: 0,
+            work_completed: 0,
+            #[cfg(test)]
+            lifecycle_audit: None,
+        },
+        config.lane_mailbox,
+    )
+    .map_err(|error| anyhow::anyhow!("register lane: {error:?}"))
 }
 
 fn drive_callers(
-    runtime: &Arc<LocalSystem<SingleShard, DefaultThreadedMailboxFactory>>,
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
     lane: tina::ServiceRequestAddress<LaneEvent, LaneRequest, LaneReply>,
     config: RunConfig,
 ) -> anyhow::Result<RunReport> {
-    let barrier = Arc::new(Barrier::new(config.callers + 1));
-    let mut threads = Vec::with_capacity(config.callers);
+    let barrier = std::sync::Barrier::new(config.callers + 1);
     let call_timeout = Duration::from_millis(config.call_timeout_ms);
-
-    for n in 0..config.callers {
-        let rt = Arc::clone(runtime);
-        let gate = Arc::clone(&barrier);
-        threads.push(thread::spawn(move || {
-            gate.wait();
-            rt.call_blocking_request(
-                lane,
-                LaneRequest::Put {
-                    key: format!("object-{n}"),
-                },
-                call_timeout,
-            )
-        }));
-    }
-
-    barrier.wait();
-    let outcomes = threads
-        .into_iter()
-        .map(|thread| {
-            thread
-                .join()
-                .map_err(|_| anyhow::anyhow!("object-lane caller thread panicked"))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    let outcomes = thread::scope(|scope| {
+        let mut threads = Vec::with_capacity(config.callers);
+        for n in 0..config.callers {
+            let barrier = &barrier;
+            threads.push(scope.spawn(move || {
+                barrier.wait();
+                app.call_blocking_request(
+                    lane,
+                    LaneRequest::Put {
+                        key: format!("object-{n}"),
+                    },
+                    call_timeout,
+                )
+            }));
+        }
+        barrier.wait();
+        threads
+            .into_iter()
+            .map(|thread| {
+                thread
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("object-lane caller thread panicked"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+    })?;
 
     let mut stored = 0;
     let mut busy = 0;
     let mut failed = 0;
-    for outcome in &outcomes {
-        match outcome {
-            Ok(CallOutcome::Replied(LaneReply::Stored(_))) => stored += 1,
-            Ok(CallOutcome::Replied(LaneReply::Busy { .. })) => busy += 1,
-            Ok(_) | Err(_) => failed += 1,
+    let mut full = 0;
+    let mut closed = 0;
+    let mut timeout = 0;
+    let mut rejected = 0;
+    let mut rejection_reasons = Vec::new();
+    for outcome in outcomes {
+        match outcome? {
+            CallOutcome::Replied(LaneReply::Stored(_)) => stored += 1,
+            CallOutcome::Replied(LaneReply::Busy { .. }) => busy += 1,
+            CallOutcome::Replied(LaneReply::Failed(_))
+            | CallOutcome::Replied(LaneReply::Stats(_)) => failed += 1,
+            CallOutcome::Full => full += 1,
+            CallOutcome::Closed => closed += 1,
+            CallOutcome::Timeout => timeout += 1,
+            CallOutcome::Rejected(reason) => {
+                rejected += 1;
+                rejection_reasons.push(reason);
+            }
         }
     }
 
-    let stats =
-        match runtime.call_blocking_request(lane, LaneRequest::Stats, Duration::from_secs(1))? {
-            CallOutcome::Replied(LaneReply::Stats(stats)) => stats,
-            other => anyhow::bail!("stats call failed: {other:?}"),
-        };
+    let stats = match app.call_blocking_request(lane, LaneRequest::Stats, Duration::from_secs(1))? {
+        CallOutcome::Replied(LaneReply::Stats(stats)) => stats,
+        CallOutcome::Replied(other) => {
+            return Err(anyhow::anyhow!(HostFailure::UnexpectedStatsReply(other)));
+        }
+        CallOutcome::Full => return Err(anyhow::anyhow!(HostFailure::StatsFull)),
+        CallOutcome::Closed => return Err(anyhow::anyhow!(HostFailure::StatsClosed)),
+        CallOutcome::Timeout => return Err(anyhow::anyhow!(HostFailure::StatsTimeout)),
+        CallOutcome::Rejected(reason) => {
+            return Err(anyhow::anyhow!(HostFailure::StatsRejected(reason)));
+        }
+    };
 
     Ok(RunReport {
         callers: config.callers,
         stored,
         busy,
         failed,
+        full,
+        closed,
+        timeout,
+        rejected,
+        rejection_reasons,
         stats,
+        dropped_permits: 0,
     })
 }
 
-fn finish_after_shutdown<T>(
-    result: anyhow::Result<T>,
-    shutdown: tina_runtime::ThreadedShutdownHandle,
-    runtime: Arc<LocalSystem<SingleShard, DefaultThreadedMailboxFactory>>,
-) -> anyhow::Result<T> {
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5));
-    drop(runtime);
-    let shutdown_result: anyhow::Result<()> = terminal
-        .map_err(Into::into)
-        .and_then(|report| report.ensure_clean().map_err(Into::into));
+#[derive(Debug)]
+enum HostFailure {
+    UnexpectedStatsReply(LaneReply),
+    StatsFull,
+    StatsClosed,
+    StatsTimeout,
+    StatsRejected(tina::CallRejectedReason),
+}
 
-    match (result, shutdown_result) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-        (Err(error), Err(shutdown_error)) => Err(anyhow::anyhow!(
-            "{error:#}; shutdown also failed: {shutdown_error}"
-        )),
+impl fmt::Display for HostFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnexpectedStatsReply(reply) => write!(f, "unexpected stats reply: {reply:?}"),
+            Self::StatsFull => f.write_str("stats call mailbox was full"),
+            Self::StatsClosed => f.write_str("stats service was closed"),
+            Self::StatsTimeout => f.write_str("stats call timed out"),
+            Self::StatsRejected(reason) => write!(f, "stats call was rejected: {reason:?}"),
+        }
     }
 }
 
-#[allow(dead_code)]
-fn _call_error_is_part_of_the_public_story(_: CallError) {}
+impl std::error::Error for HostFailure {}
 
-fn sleep_to_work_result(result: SleepReply) -> WorkResult {
-    result.map_err(|error| format!("{error:?}"))
+fn sleep_to_work_result(result: SleepReply) -> Result<(), WorkFailure> {
+    result.map_err(WorkFailure::Timer)
 }
 
-/// Maps the AWS S3 bridge's two-layer outcome into the lane's flat
-/// `Result<(), String>`. The lane treats bridge-level `Full/Closed/Timeout`
-/// and worker-level `S3Error` as failures with the typed name visible
-/// in the error string.
 fn s3_outcome_to_work_result(
-    outcome: tina_runtime::CallOutcome<
-        Result<tina_aws_bridge::S3Response, tina_aws_bridge::S3Error>,
-    >,
-) -> WorkResult {
-    use tina_aws_bridge::S3Error;
-    use tina_runtime::CallOutcome;
+    outcome: CallOutcome<Result<tina_aws_bridge::S3Response, tina_aws_bridge::S3Error>>,
+) -> Result<(), WorkFailure> {
     match outcome {
-        CallOutcome::Replied(Ok(_)) => Ok(()),
-        CallOutcome::Replied(Err(S3Error::Closed)) => Err("s3:closed".into()),
-        CallOutcome::Replied(Err(S3Error::Full)) => Err("s3:full".into()),
-        CallOutcome::Replied(Err(S3Error::Timeout)) => Err("s3:timeout".into()),
-        CallOutcome::Replied(Err(other)) => Err(format!("s3:{other}")),
-        CallOutcome::Full => Err("bridge:full".into()),
-        CallOutcome::Closed => Err("bridge:closed".into()),
-        CallOutcome::Timeout => Err("bridge:timeout".into()),
-        CallOutcome::Rejected(r) => Err(format!("bridge:rejected:{r:?}")),
+        CallOutcome::Replied(Ok(tina_aws_bridge::S3Response::PutObject(_))) => Ok(()),
+        CallOutcome::Replied(Ok(other)) => Err(WorkFailure::UnexpectedS3Response(other)),
+        CallOutcome::Replied(Err(error)) => Err(WorkFailure::S3(error)),
+        CallOutcome::Full => Err(WorkFailure::Bridge(BridgeFailure::Full)),
+        CallOutcome::Closed => Err(WorkFailure::Bridge(BridgeFailure::Closed)),
+        CallOutcome::Timeout => Err(WorkFailure::Bridge(BridgeFailure::Timeout)),
+        CallOutcome::Rejected(reason) => Err(WorkFailure::Bridge(BridgeFailure::Rejected(reason))),
     }
 }
 
-fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name).ok()?.parse().ok()
+fn validate_cap(
+    field: &'static str,
+    value: usize,
+    min: usize,
+    max: usize,
+) -> Result<(), RunConfigError> {
+    if (min..=max).contains(&value) {
+        Ok(())
+    } else {
+        Err(RunConfigError::OutOfRange {
+            field,
+            value,
+            min,
+            max,
+        })
+    }
 }
 
-fn env_u64(name: &str) -> Option<u64> {
-    std::env::var(name).ok()?.parse().ok()
+fn env_usize(name: &'static str) -> Result<Option<usize>, RunConfigError> {
+    env_parse(name)
+}
+
+fn env_u64(name: &'static str) -> Result<Option<u64>, RunConfigError> {
+    env_parse(name)
+}
+
+fn env_parse<T>(name: &'static str) -> Result<Option<T>, RunConfigError>
+where
+    T: std::str::FromStr,
+{
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let value = value.to_string_lossy().into_owned();
+    value
+        .parse()
+        .map(Some)
+        .map_err(|_| RunConfigError::InvalidEnvironment { name, value })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn typed_timer_and_bridge_failures_are_preserved() {
+        assert_eq!(
+            sleep_to_work_result(Err(CallError::TimerFull)),
+            Err(WorkFailure::Timer(CallError::TimerFull))
+        );
+        assert_eq!(
+            s3_outcome_to_work_result(CallOutcome::Rejected(
+                tina::CallRejectedReason::HandlerPanicked
+            )),
+            Err(WorkFailure::Bridge(BridgeFailure::Rejected(
+                tina::CallRejectedReason::HandlerPanicked
+            )))
+        );
+        assert_eq!(
+            s3_outcome_to_work_result(CallOutcome::Replied(Err(
+                tina_aws_bridge::S3Error::RequestTooLarge
+            ))),
+            Err(WorkFailure::S3(tina_aws_bridge::S3Error::RequestTooLarge))
+        );
+        assert_eq!(
+            s3_outcome_to_work_result(CallOutcome::Full),
+            Err(WorkFailure::Bridge(BridgeFailure::Full))
+        );
+        assert_eq!(
+            s3_outcome_to_work_result(CallOutcome::Closed),
+            Err(WorkFailure::Bridge(BridgeFailure::Closed))
+        );
+        assert_eq!(
+            s3_outcome_to_work_result(CallOutcome::Timeout),
+            Err(WorkFailure::Bridge(BridgeFailure::Timeout))
+        );
+        let unexpected =
+            tina_aws_bridge::S3Response::DeletedObject(tina_aws_bridge::S3DeletedObject {
+                version_id: Some("v1".into()),
+                delete_marker: Some(true),
+            });
+        assert_eq!(
+            s3_outcome_to_work_result(CallOutcome::Replied(Ok(unexpected.clone()))),
+            Err(WorkFailure::UnexpectedS3Response(unexpected))
+        );
+    }
+
+    #[test]
+    fn invalid_dimensions_are_typed_and_do_not_panic() {
+        assert!(matches!(
+            RunConfig {
+                callers: 0,
+                ..RunConfig::default()
+            }
+            .validate(),
+            Err(RunConfigError::OutOfRange {
+                field: "callers",
+                ..
+            })
+        ));
+        assert!(matches!(
+            RunConfig {
+                lane_in_flight: 0,
+                ..RunConfig::default()
+            }
+            .validate(),
+            Err(RunConfigError::OutOfRange {
+                field: "lane_in_flight",
+                ..
+            })
+        ));
+        assert!(matches!(
+            RunConfig {
+                lane_in_flight: MAX_LANE_IN_FLIGHT + 1,
+                ..RunConfig::default()
+            }
+            .validate(),
+            Err(RunConfigError::OutOfRange {
+                field: "lane_in_flight",
+                ..
+            })
+        ));
+        assert!(
+            RunConfig {
+                lane_mailbox: 0,
+                ..RunConfig::default()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn caller_gone_retires_and_second_wave_refills() {
+        let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+            .try_build()
+            .expect("build app");
+        let stats = app
+            .run_to_shutdown_reported(SHUTDOWN_TIMEOUT, |app| -> anyhow::Result<LaneStats> {
+                let config = RunConfig {
+                    callers: 1,
+                    lane_in_flight: 1,
+                    lane_mailbox: 8,
+                    work_ms: 40,
+                    call_timeout_ms: 5,
+                };
+                let lane = register_lane(
+                    app,
+                    config,
+                    WorkBackend::FakeSleep {
+                        work: Duration::from_millis(config.work_ms),
+                    },
+                )?;
+                assert_eq!(
+                    app.call_blocking_request(
+                        lane.requests,
+                        LaneRequest::Put {
+                            key: "first".into()
+                        },
+                        Duration::from_millis(5),
+                    )?,
+                    CallOutcome::Timeout
+                );
+                thread::sleep(Duration::from_millis(80));
+                assert!(matches!(
+                    app.call_blocking_request(
+                        lane.requests,
+                        LaneRequest::Put { key: "second".into() },
+                        Duration::from_millis(200),
+                    )?,
+                    CallOutcome::Replied(LaneReply::Stored(key)) if key == "second"
+                ));
+                match app.call_blocking_request(
+                    lane.requests,
+                    LaneRequest::Stats,
+                    Duration::from_secs(1),
+                )? {
+                    CallOutcome::Replied(LaneReply::Stats(stats)) => Ok(stats),
+                    other => anyhow::bail!("unexpected stats outcome: {other:?}"),
+                }
+            })
+            .expect("workload and shutdown succeed");
+
+        assert_eq!(stats.current, 0);
+        assert_eq!(stats.work_completed, 2);
+        assert_eq!(stats.completed, 1);
+        assert_eq!(stats.retired, 1);
+        assert_eq!(stats.caller_gone, 1);
+        assert!(stats.counts_agree);
+        assert!(stats.settlements_agree);
+    }
+
+    #[test]
+    fn owner_stop_retires_mid_flight_authority() {
+        let dropped_before = tina_runtime::dropped_permit_count();
+        let audit = Arc::new(Mutex::new(None));
+        let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+            .try_build()
+            .expect("build app");
+        app.run_to_shutdown_reported(SHUTDOWN_TIMEOUT, |app| -> anyhow::Result<()> {
+            let lane = app.register_split_service::<
+                ObjectLane,
+                LaneEvent,
+                LaneRequest,
+                std::convert::Infallible,
+            >(
+                ObjectLane {
+                    pending: ConcurrencyPendingReplies::with_capacity("owner-stop", 1),
+                    backend: WorkBackend::FakeSleep {
+                        work: Duration::from_secs(1),
+                    },
+                    next_id: 1,
+                    accepted: 0,
+                    busy: 0,
+                    work_completed: 0,
+                    lifecycle_audit: Some(Arc::clone(&audit)),
+                },
+                8,
+            )?;
+
+            thread::scope(|scope| -> anyhow::Result<()> {
+                let caller = scope.spawn(|| {
+                    app.call_blocking_request(
+                        lane.requests,
+                        LaneRequest::Put { key: "held".into() },
+                        Duration::from_secs(2),
+                    )
+                });
+
+                let deadline = Instant::now() + Duration::from_secs(1);
+                loop {
+                    match app.call_blocking_request(
+                        lane.requests,
+                        LaneRequest::Stats,
+                        Duration::from_millis(50),
+                    )? {
+                        CallOutcome::Replied(LaneReply::Stats(stats)) if stats.current == 1 => {
+                            break;
+                        }
+                        _ if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+                        other => anyhow::bail!("request was not admitted before stop: {other:?}"),
+                    }
+                }
+
+                app.send_event_observed_until(
+                    lane.events,
+                    Instant::now() + Duration::from_secs(1),
+                    Duration::from_millis(5),
+                    || LaneEvent::Stop,
+                )?;
+                let outcome = caller
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("caller thread panicked"))??;
+                assert!(matches!(
+                    outcome,
+                    CallOutcome::Closed | CallOutcome::Rejected(_)
+                ));
+                Ok(())
+            })
+        })
+        .expect("workload and shutdown succeed");
+
+        let stats = audit
+            .lock()
+            .expect("audit lock")
+            .clone()
+            .expect("owner drop published audit");
+        assert_eq!(stats.current, 0);
+        assert_eq!(stats.completed, 0);
+        assert_eq!(stats.retired, 1);
+        assert!(stats.counts_agree);
+        assert!(stats.settlements_agree);
+        assert_eq!(tina_runtime::dropped_permit_count(), dropped_before);
+    }
 }
