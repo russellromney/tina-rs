@@ -201,8 +201,6 @@ race between the producer and the worker. What is guaranteed, and all the test
 pins, is that every one of the 32 records is accounted for and at least one is
 shed as a typed `Full`.
 
-<!-- TODO: tina_echo.gif -->
-
 The connection isolate is the whole story. Its checked-in source is
 [`examples/specimen_tcp_echo/src/lib.rs`](examples/specimen_tcp_echo/src/lib.rs).
 The specimen is a separate workspace, excluded from the main gate, so
