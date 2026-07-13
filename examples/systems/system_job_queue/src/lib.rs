@@ -470,7 +470,7 @@ impl Queue {
     fn spawn_worker(&self, slot: usize) -> Effect<Self> {
         let cap = self.config.worker_mailbox;
         spawn_observed(ChildDefinition::new(Worker { current: None }, cap))
-            .then(move |result| QueueMsg::Event(QueueEvent::WorkerStarted { slot, result }))
+            .then_service_event(move |result| QueueEvent::WorkerStarted { slot, result })
     }
 
     fn on_worker_started(
@@ -521,13 +521,13 @@ impl Queue {
                 },
                 dispatch_timeout,
             ))
-            .try_admit(&mut self.pending, id, move |key, ticket, outcome| {
-                QueueMsg::Event(QueueEvent::WorkerCallReturned {
+            .try_admit_service_event(&mut self.pending, id, move |key, ticket, outcome| {
+                QueueEvent::WorkerCallReturned {
                     slot,
                     id: key,
                     ticket,
                     outcome,
-                })
+                }
             });
         match admission {
             Ok(effect) => {
@@ -578,8 +578,8 @@ impl Queue {
         // these follow-up effects run. The cancel continuation still owns and
         // explicitly settles the parked submit caller.
         let mut follow_up: Vec<Effect<Self>> = Vec::with_capacity(2);
-        follow_up.push(token.cancel(|key, req, _outcome| {
-            QueueMsg::Event(QueueEvent::ParkedCallerCancelled { id: key, req })
+        follow_up.push(token.cancel_service_event(|key, req, _outcome| {
+            QueueEvent::ParkedCallerCancelled { id: key, req }
         }));
         if let Some((slot, worker)) = worker {
             follow_up.push(
@@ -1037,18 +1037,23 @@ fn register_queue(
 ) -> anyhow::Result<SplitServiceHandle<QueueEvent, QueueRequest, QueueReply>> {
     let ready = Arc::new(ReadyGate::default());
 
-    let address = app
-        .register_root_with_bootstrap::<Queue, std::convert::Infallible>(
+    let service = app
+        .register_split_service_with_bootstrap::<
+            Queue,
+            QueueEvent,
+            QueueRequest,
+            std::convert::Infallible,
+        >(
             Queue::new(config, Arc::clone(&ready)),
             config.queue_mailbox,
-            QueueMsg::Event(QueueEvent::Bootstrap),
+            QueueEvent::Bootstrap,
         )
         .map_err(|e| anyhow::anyhow!("register queue: {e:?}"))?;
 
     wait_until(Duration::from_secs(2), "all workers ready", || {
         ready.ready()
     })?;
-    Ok(SplitServiceHandle::from_address(address))
+    Ok(service)
 }
 
 fn wait_until<F>(timeout: Duration, label: &str, mut predicate: F) -> anyhow::Result<()>
