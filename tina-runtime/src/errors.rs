@@ -426,17 +426,6 @@ impl<M> ThreadedRegisterBootstrapError<M> {
     }
 }
 
-pub(crate) fn map_service_bootstrap_error<Event, Request>(
-    error: ThreadedRegisterBootstrapError<tina::ServiceMessage<Event, Request>>,
-) -> ThreadedRegisterBootstrapError<Event> {
-    error.map_message(|message| match message {
-        tina::ServiceMessage::Event(event) => event,
-        tina::ServiceMessage::Request(_) => {
-            unreachable!("split-service bootstrap was constructed as an event")
-        }
-    })
-}
-
 impl<M> fmt::Display for ThreadedRegisterBootstrapError<M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

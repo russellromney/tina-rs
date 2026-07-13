@@ -1,6 +1,7 @@
 //! LocalSystem parity tests for atomic root register-and-bootstrap.
 
 use std::convert::Infallible;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -9,8 +10,9 @@ use tina::CallRejectedReason;
 use tina::Mailbox;
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, MailboxFactory,
-    ThreadedRegisterBootstrapError,
+    CallOutcome, DefaultMailboxFactory, DefaultThreadedMailboxFactory, LocalSystem, MailboxFactory,
+    MultiShardRuntime, Runtime, ThreadedMultiShardRuntime, ThreadedRegisterBootstrapError,
+    ThreadedRuntime,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -136,6 +138,123 @@ impl SplitService {
             SplitRequest::Inspect => call.reply(BootState(self.booted)),
         }
     }
+}
+
+#[derive(Debug)]
+enum LocalOnlyRequest {
+    Inspect(Rc<()>),
+}
+
+struct LocalOnlyRequestService {
+    deliveries: Arc<AtomicU32>,
+}
+
+#[tina_runtime::isolate(
+    event = SplitEvent,
+    request = LocalOnlyRequest,
+    reply = BootState,
+    shard = TestShard
+)]
+impl LocalOnlyRequestService {
+    fn handle_event(
+        &mut self,
+        event: SplitEvent,
+        _ctx: &mut Context<'_, TestShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match event {
+            SplitEvent::Bootstrap(_authority) => {
+                self.deliveries.fetch_add(1, Ordering::AcqRel);
+                noop()
+            }
+        }
+    }
+
+    fn handle_request(
+        &mut self,
+        request: LocalOnlyRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            LocalOnlyRequest::Inspect(marker) => {
+                drop(marker);
+                call.reply(BootState(true))
+            }
+        }
+    }
+}
+
+#[test]
+fn direct_owners_preserve_split_bootstrap_and_allow_local_only_requests() {
+    let mut runtime = Runtime::new(TestShard(40), DefaultMailboxFactory);
+    let explicit_deliveries = Arc::new(AtomicU32::new(0));
+    runtime
+        .register_split_service_with_bootstrap::<SplitService, _, _, Infallible>(
+            SplitService {
+                booted: false,
+                deliveries: Arc::clone(&explicit_deliveries),
+            },
+            1,
+            SplitEvent::Bootstrap(DropProbe(Arc::new(AtomicU32::new(0)))),
+        )
+        .expect("explicit split bootstrap");
+    while runtime.step() > 0 {}
+    assert_eq!(explicit_deliveries.load(Ordering::Acquire), 1);
+
+    let mut multi = MultiShardRuntime::new([TestShard(41)], DefaultMailboxFactory);
+    let multi_deliveries = Arc::new(AtomicU32::new(0));
+    multi
+        .register_split_service_with_bootstrap_on::<SplitService, _, _, Infallible>(
+            ShardId::new(41),
+            SplitService {
+                booted: false,
+                deliveries: Arc::clone(&multi_deliveries),
+            },
+            1,
+            SplitEvent::Bootstrap(DropProbe(Arc::new(AtomicU32::new(0)))),
+        )
+        .expect("explicit multi-shard split bootstrap");
+    while multi.step() > 0 {}
+    assert_eq!(multi_deliveries.load(Ordering::Acquire), 1);
+
+    let threaded = ThreadedRuntime::new(TestShard(42), DefaultThreadedMailboxFactory);
+    let threaded_deliveries = Arc::new(AtomicU32::new(0));
+    let _service = threaded
+        .register_split_service_with_bootstrap::<LocalOnlyRequestService, _, _, Infallible>(
+            LocalOnlyRequestService {
+                deliveries: Arc::clone(&threaded_deliveries),
+            },
+            1,
+            SplitEvent::Bootstrap(DropProbe(Arc::new(AtomicU32::new(0)))),
+        )
+        .expect("threaded split bootstrap with local-only request lane");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while threaded_deliveries.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(threaded_deliveries.load(Ordering::Acquire), 1);
+    threaded.shutdown().expect("threaded shutdown");
+
+    let threaded_multi =
+        ThreadedMultiShardRuntime::new([TestShard(43)], DefaultThreadedMailboxFactory);
+    let threaded_multi_deliveries = Arc::new(AtomicU32::new(0));
+    let _service = threaded_multi
+        .register_split_service_with_bootstrap_on::<LocalOnlyRequestService, _, _, Infallible>(
+            ShardId::new(43),
+            LocalOnlyRequestService {
+                deliveries: Arc::clone(&threaded_multi_deliveries),
+            },
+            1,
+            SplitEvent::Bootstrap(DropProbe(Arc::new(AtomicU32::new(0)))),
+        )
+        .expect("threaded multi-shard bootstrap with local-only request lane");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while threaded_multi_deliveries.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(threaded_multi_deliveries.load(Ordering::Acquire), 1);
+    threaded_multi.shutdown().expect("threaded multi shutdown");
+
+    let _ = LocalOnlyRequest::Inspect(Rc::new(()));
 }
 
 #[test]

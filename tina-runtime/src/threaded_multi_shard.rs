@@ -27,7 +27,6 @@ use crate::driver::BetelgeuseDriver;
 use crate::errors::{
     SendObservedUntilError, ShutdownWaitError, StartupError, ThreadedRegisterBootstrapError,
     ThreadedRuntimeError, ThreadedSendObservedError, ThreadedTrySendError,
-    map_service_bootstrap_error,
 };
 use crate::host_burst::HostBurstOutcomes;
 use crate::live_report::{
@@ -623,7 +622,7 @@ where
             + Send
             + 'static,
         Event: Send + 'static,
-        Request: Send + 'static,
+        Request: 'static,
         I::Reply: Send + 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
@@ -632,14 +631,45 @@ where
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: Send + 'static,
     {
-        self.register_with_capacity_and_bootstrap_on::<I, Outbound>(
+        match self.call_on_with_input(
             shard,
-            isolate,
-            mailbox_capacity,
-            tina::ServiceMessage::Event(bootstrap),
-        )
-        .map(crate::SplitServiceHandle::from_address)
-        .map_err(map_service_bootstrap_error)
+            (isolate, bootstrap),
+            move |runtime, (isolate, bootstrap)| {
+                runtime.register_split_service_with_bootstrap::<I, Event, Request, Outbound>(
+                    isolate,
+                    mailbox_capacity,
+                    bootstrap,
+                )
+            },
+        ) {
+            Ok(result) => result.map_err(ThreadedRegisterBootstrapError::from_register),
+            Err(RecoverableControlCallError::NotAdmitted {
+                error: ThreadedRuntimeError::CommandFull,
+                input: (_, bootstrap),
+            }) => Err(ThreadedRegisterBootstrapError::CommandFull(bootstrap)),
+            Err(RecoverableControlCallError::NotAdmitted {
+                error: ThreadedRuntimeError::WorkerStopped,
+                input: (_, bootstrap),
+            }) => Err(ThreadedRegisterBootstrapError::CommandClosed(bootstrap)),
+            Err(RecoverableControlCallError::NotAdmitted {
+                error: ThreadedRuntimeError::UnknownShard(shard),
+                input: (_, bootstrap),
+            }) => Err(ThreadedRegisterBootstrapError::UnknownShard(
+                shard, bootstrap,
+            )),
+            Err(RecoverableControlCallError::Accepted(ThreadedRuntimeError::WorkerStopped)) => {
+                Err(ThreadedRegisterBootstrapError::WorkerStopped)
+            }
+            Err(RecoverableControlCallError::Accepted(
+                ThreadedRuntimeError::WorkerUnresponsive,
+            )) => Err(ThreadedRegisterBootstrapError::WorkerUnresponsive),
+            Err(RecoverableControlCallError::Accepted(_)) => {
+                unreachable!("control transport returned an impossible accepted error")
+            }
+            Err(RecoverableControlCallError::NotAdmitted { .. }) => {
+                unreachable!("control transport returned an impossible pre-admission error")
+            }
+        }
     }
 
     /// Registers one event-only service on a chosen shard.

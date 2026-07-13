@@ -1147,7 +1147,7 @@ where
             + Send
             + 'static,
         Event: Send + 'static,
-        Request: Send + 'static,
+        Request: 'static,
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
@@ -2082,7 +2082,7 @@ where
             + Send
             + 'static,
         Event: Send + 'static,
-        Request: Send + 'static,
+        Request: 'static,
         I::Reply: Send + 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,

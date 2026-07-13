@@ -24,7 +24,7 @@ use crate::driver::{self, BetelgeuseDriver};
 use crate::errors::{
     SendObservedUntilError, ShutdownWaitError, StartupError, SuperviseError,
     ThreadedRegisterBootstrapError, ThreadedRuntimeConfigError, ThreadedRuntimeError,
-    ThreadedSendObservedError, ThreadedTrySendError, map_service_bootstrap_error,
+    ThreadedSendObservedError, ThreadedTrySendError,
 };
 use crate::host_burst::HostBurstOutcomes;
 use crate::host_call_dispatcher::{
@@ -1121,7 +1121,7 @@ where
             + Send
             + 'static,
         Event: Send + 'static,
-        Request: Send + 'static,
+        Request: 'static,
         I::Reply: 'static,
         I::Spawn: IntoErasedSpawn<S, F> + 'static,
         I::SpawnObserved: IntoErasedSpawnObserved<S, F, I::Message> + 'static,
@@ -1130,13 +1130,38 @@ where
         I::Fact: crate::fact::IntoRuntimeFact + 'static,
         Outbound: 'static,
     {
-        self.register_with_capacity_and_bootstrap::<I, Outbound>(
-            isolate,
-            mailbox_capacity,
-            tina::ServiceMessage::Event(bootstrap),
-        )
-        .map(crate::SplitServiceHandle::from_address)
-        .map_err(map_service_bootstrap_error)
+        match self.call_with_input(
+            (isolate, bootstrap),
+            move |runtime, (isolate, bootstrap)| {
+                runtime.register_split_service_with_bootstrap::<I, Event, Request, Outbound>(
+                    isolate,
+                    mailbox_capacity,
+                    bootstrap,
+                )
+            },
+        ) {
+            Ok(result) => result.map_err(ThreadedRegisterBootstrapError::from_register),
+            Err(RecoverableControlCallError::NotAdmitted {
+                error: ThreadedRuntimeError::CommandFull,
+                input: (_, bootstrap),
+            }) => Err(ThreadedRegisterBootstrapError::CommandFull(bootstrap)),
+            Err(RecoverableControlCallError::NotAdmitted {
+                error: ThreadedRuntimeError::WorkerStopped,
+                input: (_, bootstrap),
+            }) => Err(ThreadedRegisterBootstrapError::CommandClosed(bootstrap)),
+            Err(RecoverableControlCallError::Accepted(ThreadedRuntimeError::WorkerStopped)) => {
+                Err(ThreadedRegisterBootstrapError::WorkerStopped)
+            }
+            Err(RecoverableControlCallError::Accepted(
+                ThreadedRuntimeError::WorkerUnresponsive,
+            )) => Err(ThreadedRegisterBootstrapError::WorkerUnresponsive),
+            Err(RecoverableControlCallError::Accepted(_)) => {
+                unreachable!("control transport returned an impossible accepted error")
+            }
+            Err(RecoverableControlCallError::NotAdmitted { .. }) => {
+                unreachable!("control transport returned an impossible pre-admission error")
+            }
+        }
     }
 
     /// Threaded mirror of [`crate::Runtime::register_event_service`].
