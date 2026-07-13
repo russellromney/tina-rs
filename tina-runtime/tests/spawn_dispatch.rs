@@ -181,6 +181,8 @@ struct RestartObservedParent {
     child_seen: Rc<RefCell<Vec<u8>>>,
     order_log: Rc<RefCell<Vec<&'static str>>>,
     incarnations: Rc<RefCell<Vec<ChildRef<ChildEvent>>>>,
+    factory_calls: Rc<Cell<usize>>,
+    panic_on_factory_call: Option<usize>,
 }
 
 impl Isolate for RestartObservedParent {
@@ -203,15 +205,28 @@ impl Isolate for RestartObservedParent {
             RestartObservedParentEvent::Start => {
                 let child_seen = Rc::clone(&self.child_seen);
                 let order_log = Rc::clone(&self.order_log);
+                let factory_calls = Rc::clone(&self.factory_calls);
+                let panic_on_factory_call = self.panic_on_factory_call;
                 spawn_observed(tina::RestartableChildDefinition::new(
-                    move || Child {
-                        seen: Rc::clone(&child_seen),
-                        order_log: Rc::clone(&order_log),
+                    move || {
+                        let call = factory_calls.get() + 1;
+                        factory_calls.set(call);
+                        assert_ne!(Some(call), panic_on_factory_call, "factory panic");
+                        Child {
+                            seen: Rc::clone(&child_seen),
+                            order_log: Rc::clone(&order_log),
+                        }
                     },
                     4,
                 ))
                 .then_with_restarts(
-                    RestartObservedParentEvent::ChildStarted,
+                    {
+                        let initial_authority = Box::new(());
+                        move |result| {
+                            drop(initial_authority);
+                            RestartObservedParentEvent::ChildStarted(result)
+                        }
+                    },
                     RestartObservedParentEvent::ChildRestarted,
                 )
             }
@@ -561,6 +576,8 @@ fn observed_restart_delivers_each_typed_replacement_and_stales_old_address() {
             child_seen: Rc::clone(&child_seen),
             order_log: Rc::new(RefCell::new(Vec::new())),
             incarnations: Rc::clone(&incarnations),
+            factory_calls: Rc::new(Cell::new(0)),
+            panic_on_factory_call: None,
         },
         TestMailbox::new(4),
     );
@@ -612,6 +629,8 @@ fn observed_restart_parent_full_rejects_without_hidden_delivery_queue() {
             child_seen: Rc::new(RefCell::new(Vec::new())),
             order_log: Rc::new(RefCell::new(Vec::new())),
             incarnations: Rc::clone(&incarnations),
+            factory_calls: Rc::new(Cell::new(0)),
+            panic_on_factory_call: None,
         },
         TestMailbox::new(1),
     );
@@ -644,6 +663,112 @@ fn observed_restart_parent_full_rejects_without_hidden_delivery_queue() {
         )
     }));
     assert_eq!(runtime.step(), 0, "no hidden replacement delivery remains");
+}
+
+#[test]
+fn observed_restart_parent_closed_rejects_without_hidden_delivery_queue() {
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let incarnations = Rc::new(RefCell::new(Vec::new()));
+    let parent_mailbox = TestMailbox::new(4);
+    let parent = runtime.register(
+        RestartObservedParent {
+            child_seen: Rc::new(RefCell::new(Vec::new())),
+            order_log: Rc::new(RefCell::new(Vec::new())),
+            incarnations: Rc::clone(&incarnations),
+            factory_calls: Rc::new(Cell::new(0)),
+            panic_on_factory_call: None,
+        },
+        parent_mailbox.clone(),
+    );
+
+    assert!(
+        runtime
+            .try_send(parent, RestartObservedParentEvent::Start)
+            .is_ok()
+    );
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 1);
+    let initial = incarnations.borrow()[0];
+
+    assert!(
+        runtime
+            .try_send(parent, RestartObservedParentEvent::Restart)
+            .is_ok()
+    );
+    parent_mailbox.close();
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(incarnations.borrow().as_slice(), &[initial]);
+    assert!(runtime.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::SendRejected {
+                target_isolate,
+                reason: tina_runtime::SendRejectedReason::Closed,
+                ..
+            } if target_isolate == parent.isolate()
+        )
+    }));
+    assert_eq!(runtime.step(), 0, "no hidden replacement delivery remains");
+}
+
+#[test]
+fn observed_restart_factory_panic_skips_callback_and_later_retry_succeeds() {
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let incarnations = Rc::new(RefCell::new(Vec::new()));
+    let factory_calls = Rc::new(Cell::new(0));
+    let parent = runtime.register(
+        RestartObservedParent {
+            child_seen: Rc::new(RefCell::new(Vec::new())),
+            order_log: Rc::new(RefCell::new(Vec::new())),
+            incarnations: Rc::clone(&incarnations),
+            factory_calls: Rc::clone(&factory_calls),
+            panic_on_factory_call: Some(2),
+        },
+        TestMailbox::new(4),
+    );
+
+    assert!(
+        runtime
+            .try_send(parent, RestartObservedParentEvent::Start)
+            .is_ok()
+    );
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 1);
+    let initial = incarnations.borrow()[0];
+
+    assert!(
+        runtime
+            .try_send(parent, RestartObservedParentEvent::Restart)
+            .is_ok()
+    );
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(factory_calls.get(), 2);
+    assert_eq!(incarnations.borrow().as_slice(), &[initial]);
+    assert!(runtime.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::RestartChildSkipped {
+                reason: tina_runtime::RestartSkippedReason::FactoryPanicked,
+                ..
+            }
+        )
+    }));
+    assert_eq!(
+        runtime.step(),
+        0,
+        "failed restart must not queue a callback"
+    );
+
+    assert!(
+        runtime
+            .try_send(parent, RestartObservedParentEvent::Restart)
+            .is_ok()
+    );
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(factory_calls.get(), 3);
+    assert_eq!(incarnations.borrow().len(), 2);
+    assert_ne!(incarnations.borrow()[1].address, initial.address);
 }
 
 #[test]

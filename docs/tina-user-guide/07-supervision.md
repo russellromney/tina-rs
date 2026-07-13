@@ -95,6 +95,10 @@ Both continuations use the parent's ordinary bounded mailbox. Full or stopped
 delivery is traced as the corresponding send rejection, with no hidden retry
 or lifecycle queue.
 
+If a replacement factory panics, Tina records `FactoryPanicked` and does not
+invoke the restart continuation. A later restart attempt may use the retained
+recipe again.
+
 The effect has the same semantics in the live runtime and simulator.
 
 ## Budget
