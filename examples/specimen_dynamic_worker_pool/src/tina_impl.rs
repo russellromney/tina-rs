@@ -5,13 +5,11 @@
 //! to the coordinator's address. The coordinator collects partials
 //! and `stop_with(report)` when every child has replied.
 
-use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tina::ChildDefinition;
 use tina::prelude::*;
-use tina_runtime::{BoundedItems, DefaultThreadedMailboxFactory, ThreadedRuntime, bounded_batch};
+use tina_runtime::{BoundedItems, DefaultThreadedMailboxFactory, LocalSystem, bounded_batch};
 
 use crate::{Report, WORK_VALUES, WORKER_COUNT};
 
@@ -46,7 +44,7 @@ impl Worker {
 pub enum CoordMsg {
     /// Host kicks off the fanout. No `Begin { self_addr }` ceremony:
     /// the coord learns its own address at registration via
-    /// `register_with_capacity_using`.
+    /// `register_root_using`.
     Start,
     /// One child finished. Carries its partial sum.
     WorkerDone(u64),
@@ -100,19 +98,16 @@ impl Coordinator {
 // ---------- Run ----------
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
-    let shutdown = runtime.shutdown_handle();
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
 
     let chunk_size = WORK_VALUES.len() / WORKER_COUNT as usize;
     let chunks: Vec<Vec<u64>> = (0..WORKER_COUNT as usize)
         .map(|i| WORK_VALUES[i * chunk_size..(i + 1) * chunk_size].to_vec())
         .collect();
 
-    let coord_addr = runtime
-        .register_with_capacity_using::<_, Infallible, _>(
+    Ok(app.run_to_shutdown(Duration::from_secs(5), move |app| {
+        let coord_addr = app
+            .register_root_using(
             // Mailbox sized for `Start` + every worker's `WorkerDone`.
             (WORKER_COUNT + 4) as usize,
             move |self_addr| Coordinator {
@@ -126,20 +121,15 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register coordinator: {e:?}"))?;
 
-    let waiter = runtime
-        .observe_result::<Report, _, _>(coord_addr)
-        .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
+        let waiter = app
+            .observe_result::<Report, _, _>(coord_addr)
+            .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
 
-    runtime
-        .try_send(coord_addr, CoordMsg::Start)
-        .map_err(|e| anyhow::anyhow!("send Start: {e:?}"))?;
+        app.try_send(coord_addr, CoordMsg::Start)
+            .map_err(|e| anyhow::anyhow!("send Start: {e:?}"))?;
 
-    let report = waiter
-        .wait(Duration::from_secs(5))
-        .map_err(|e| anyhow::anyhow!("coord did not finish: {e:?}"))?;
-
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
-    Ok(report)
+        waiter
+            .wait(Duration::from_secs(5))
+            .map_err(|e| anyhow::anyhow!("coord did not finish: {e:?}"))
+    })?)
 }

@@ -49,14 +49,14 @@ Each child's `Send` type is `Outbound<CoordMsg>` so it can post its
 partial back to the coordinator.
 
 The children need the coordinator's address so they can send partials
-back. The lower threaded owner supplies that address to an
-address-aware constructor before registration completes:
+back. `LocalSystem` supplies that address to an address-aware root
+constructor before registration completes:
 
 ```rust
-let coord_addr = runtime.register_with_capacity_using(capacity, |self_addr| {
+let coord_addr = app.register_root_using(capacity, |self_addr| {
     Coordinator { self_addr, chunks, /* ... */ }
 })?;
-runtime.try_send(coord_addr, CoordMsg::Start)?;
+app.try_send(coord_addr, CoordMsg::Start)?;
 ```
 
 The coordinator's `Start` arm constructs each child with
@@ -122,15 +122,13 @@ What got better:
 - **Self-address at registration time.** The old chicken-and-egg
   `Begin { self_addr }` bootstrap is gone; the coord now learns
   its own address through the
-  `register_with_capacity_using::<Coordinator, _, _>(cap, |self_addr| ...)`
+  `register_root_using(cap, |self_addr| ...)`
   constructor closure. The host kicks the work with a typed
   `CoordMsg::Start` that carries no address. (FINDINGS finding 3,
   self-address at registration.)
-- **Application-facade parity is still missing.** `LocalSystem` does
-  not yet expose this address-aware constructor, so this specimen
-  cannot honestly migrate its host without restoring the obsolete
-  bootstrap message. The live findings ledger records
-  `register_root_using` / `register_root_using_on` as the prerequisite.
+- **Application-shaped lifetime.** The host uses `LocalSystem` and its
+  consuming `run_to_shutdown` path, so early workload errors cannot bypass
+  typed terminal validation.
 
 ## Partial-failure flavor
 
@@ -147,5 +145,5 @@ future variant of this specimen could:
 - emit a `Report` with `results_collected < expected`.
 
 That requires FINDINGS finding 14 (spawn API surfaces child's
-address); the self-address half of finding 3 already shipped as
-the `register_with_capacity_using` constructor and is used here.
+address); the self-address half of finding 3 is handled by
+the `register_root_using` constructor used here.

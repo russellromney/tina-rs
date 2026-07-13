@@ -180,9 +180,7 @@ fn rate_per_sec() -> u64 {
 
 pub fn run() -> anyhow::Result<Report> {
     let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
-    let result = run_application(&app);
-    let shutdown = app.shutdown().drain().join_report().ensure_clean();
-    finish_after_shutdown(result, shutdown)
+    Ok(app.run_to_shutdown(Duration::from_secs(5), run_application)?)
 }
 
 fn run_application(
@@ -260,18 +258,4 @@ fn run_application(
     };
 
     Ok(final_report)
-}
-
-fn finish_after_shutdown(
-    result: anyhow::Result<Report>,
-    shutdown: Result<(), tina_runtime::UncleanShutdownError>,
-) -> anyhow::Result<Report> {
-    match (result, shutdown) {
-        (Ok(report), Ok(())) => Ok(report),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(error.into()),
-        (Err(error), Err(shutdown_error)) => Err(anyhow::anyhow!(
-            "{error:#}; LocalSystem shutdown also failed: {shutdown_error}"
-        )),
-    }
 }

@@ -122,56 +122,19 @@ not this framework prerequisite.
 ### 2026-07-12 Pure bounded-workload LocalSystem migration
 
 Five bounded-workload specimens were reviewed as one host-authoring cohort.
-Four now use the fallible `LocalSystem` application facade internally, but
-their final canonical form is blocked on a consuming terminal runner that can
-preserve workload and shutdown failures without example-local glue. Their
-isolate state machines and Tokio comparisons are unchanged.
+All five now use the fallible `LocalSystem` application facade and its typed
+consuming terminal runner. The dynamic worker pool also uses address-aware root
+construction directly on the facade. No example-local shutdown combiner or raw
+threaded owner remains; isolate state machines and Tokio comparisons are
+unchanged.
 
 | Example | Current friction | Desired user-facing form | Current API sufficient | Framework prerequisite | Example PR | Tests | Status |
 |---|---|---|---|---|---|---|---|
-| `specimen_backpressure_chain` | raw threaded owner and shutdown handle | `app.run_to_shutdown(\|app\| { ... })` with typed services/result | no | guaranteed terminal runner | blocked on framework PR | Tokio/Tina smoke and exact report; Tina 20x | prerequisite recorded |
-| `specimen_cancellation_chain` | raw threaded owner around an otherwise application-shaped cancellation demo | `app.run_to_shutdown(\|app\| { ... })` retaining typed cancel and late-reply trace truth | no | guaranteed terminal runner | blocked on framework PR | Tokio/Tina smoke, exact cancel/rejection invariants; Tina 20x | prerequisite recorded |
-| `specimen_dynamic_worker_pool` | address-aware root construction exists only on the lower threaded owner | `app.register_root_using(capacity, \|self_addr\| Coordinator { ... })` | no | LocalSystem address-aware root registration parity | blocked on framework PR | existing exact fanout/sum smoke; add owner-parity tests in prerequisite | prerequisite recorded |
-| `specimen_hot_key_fairness` | raw threaded owner for bounded observed bursts and trace queries already exposed by the facade | `app.run_to_shutdown(\|app\| { ... })` with root handles and trace truth | no | guaranteed terminal runner | blocked on framework PR | Tokio/Tina invariant smoke, negative invariant tests; Tina 20x | prerequisite recorded |
-| `specimen_rate_limited_worker` | raw threaded owner for facade-supported bounded burst helpers | `app.run_to_shutdown(\|app\| { ... })` with observed burst/control/result | no | guaranteed terminal runner | blocked on framework PR | Tokio/Tina boundedness/refill invariants; Tina 20x | prerequisite recorded |
-
-### LocalSystem address-aware root registration parity
-
-**Surfaced by:** `specimen_dynamic_worker_pool`.
-
-The canonical coordinator learns its own typed address during registration so
-children can reply directly. The lower runtime exposes
-`register_with_capacity_using`, but `LocalSystem` does not expose the same
-contract. Replacing it with a post-registration `Begin { self_addr }` message
-would restore exactly the bootstrap ceremony this specimen was already
-migrated away from.
-
-**Build:** add typed `LocalSystem::register_root_using` and multi-shard
-`register_root_using_on` facades over the existing runtime registrations.
-Prove constructor failure/registration failure ownership, correct address
-incarnation and authority, single-/multi-owner parity, and bounded shutdown.
-Then migrate `specimen_dynamic_worker_pool` to the application facade and keep
-the existing exact child-fanout result proof.
-
-### LocalSystem guaranteed terminal runner
-
-**Surfaced by:** `specimen_backpressure_chain`,
-`specimen_cancellation_chain`, `specimen_hot_key_fairness`,
-`specimen_rate_limited_worker`.
-
-A production-shaped `LocalSystem` host must not use `?` between construction
-and consuming shutdown: any registration, observation, send, or wait failure
-would otherwise fall back to drop-based teardown. Each migrated specimen now
-captures the workload result, drains and joins unconditionally, and manually
-combines workload and shutdown errors. The same `finish_after_shutdown` match
-is repeated in four standalone examples.
-
-**Build:** add a typed consuming runner such as
-`app.run_to_shutdown(|app| -> Result<T, E> { ... })` that always performs the
-bounded drain/join protocol and returns a typed combined workload/shutdown
-outcome without erasing either failure. Cover workload success/failure,
-shutdown failure, both failures, panic/drop behavior, and single-/multi-owner
-parity. Then remove the four example-local combinators.
+| `specimen_backpressure_chain` | none | typed services inside `run_to_shutdown` | yes | terminal runner merged | this cohort | Tokio/Tina smoke and exact report; Tina 20x | migrated |
+| `specimen_cancellation_chain` | none | typed cancel and late-reply trace truth inside `run_to_shutdown` | yes | terminal runner merged | this cohort | Tokio/Tina smoke, exact cancel/rejection invariants; Tina 20x | migrated |
+| `specimen_dynamic_worker_pool` | none | `register_root_using` plus `run_to_shutdown` | yes | address-aware root parity merged | this cohort | exact fanout/sum smoke and owner-parity framework tests | migrated |
+| `specimen_hot_key_fairness` | none | bounded observed bursts and trace truth inside `run_to_shutdown` | yes | terminal runner merged | this cohort | Tokio/Tina invariant smoke, negative invariant tests; Tina 20x | migrated |
+| `specimen_rate_limited_worker` | none | observed burst/control/result inside `run_to_shutdown` | yes | terminal runner merged | this cohort | Tokio/Tina boundedness/refill invariants; Tina 20x | migrated |
 
 ### 2026-07-12 Copied service path flow migration
 
