@@ -24,8 +24,8 @@
 //!   `WorkerRequest` carries typed `Process` and `Cancel` calls. The
 //!   macro generates both rejection arms, so neither `handle_event` nor
 //!   `handle_request` writes one by hand.
-//! - `LocalSystem::register_root_with_bootstrap` registers the `Queue`
-//!   isolate with its startup `Bootstrap` message prefilled atomically.
+//! - `LocalSystem::register_split_service_with_bootstrap` registers the `Queue`
+//!   isolate with its startup `Bootstrap` event prefilled atomically.
 
 use std::fmt;
 use std::sync::{Arc, Barrier, Mutex};
@@ -45,6 +45,8 @@ const MAX_JOB_SLEEP_MS: u64 = 60_000;
 const MAX_CALL_TIMEOUT_MS: u64 = 120_000;
 const OVERFLOW_EXTRA_CALLERS: usize = 3;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const WORKER_CANCEL_RETRY_DELAY: Duration = Duration::from_millis(1);
+const MAX_WORKER_CANCEL_RETRIES: u8 = 3;
 
 /// Tunables for one specimen run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +206,7 @@ pub struct QueueStats {
     pub workers: usize,
     pub workers_alive: usize,
     pub in_flight: usize,
+    pub pending_callers: usize,
     pub jobs_admitted: u64,
     pub jobs_busy_rejected: u64,
     pub jobs_completed: u64,
@@ -211,6 +214,7 @@ pub struct QueueStats {
     pub jobs_failed: u64,
     pub worker_crashes: u64,
     pub worker_respawns: u64,
+    pub cancel_reconciliation_failures: u64,
 }
 
 /// Replies the queue produces to host callers.
@@ -242,13 +246,21 @@ pub enum QueueEvent {
     WorkerCancelReturned {
         slot: usize,
         id: JobId,
+        attempt: u8,
         outcome: CallOutcome<WorkerReply>,
+    },
+    RetryWorkerCancel {
+        slot: usize,
+        id: JobId,
+        attempt: u8,
+        result: SleepReply,
     },
     /// Continuation from `PendingCancelableCall::cancel`. Carries the parked
     /// caller's request context so we can answer them after the cancel lands.
     ParkedCallerCancelled {
         id: JobId,
         req: tina::RequestContext<QueueReply>,
+        outcome: tina::CancelOutcome,
     },
 }
 
@@ -270,6 +282,7 @@ pub type QueueMsg = tina::ServiceMessage<QueueEvent, QueueRequest>;
 pub enum WorkerReply {
     Completed(u32),
     Cancelled,
+    Failed(String),
     CancelAcknowledged { id: JobId, released: bool },
 }
 
@@ -316,13 +329,19 @@ impl Worker {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match event {
-            WorkerEvent::Wake { id, result: _ } => {
+            WorkerEvent::Wake { id, result } => {
                 let Some(current) = self.current.take() else {
                     return noop();
                 };
                 if current.id != id {
                     self.current = Some(current);
                     return noop();
+                }
+                if let Err(error) = result {
+                    return reply_to::<Self>(
+                        current.slot,
+                        WorkerReply::Failed(format!("worker sleep failed: {error:?}")),
+                    );
                 }
                 match current.payload {
                     Payload::Poison => panic!("worker poisoned by job {id:?}"),
@@ -411,12 +430,20 @@ impl Queue {
                 ticket,
                 outcome,
             } => self.on_worker_call_returned(slot, id, ticket, outcome),
-            QueueEvent::WorkerCancelReturned { slot, id, outcome } => {
-                self.on_worker_cancel_returned(slot, id, outcome)
-            }
-            QueueEvent::ParkedCallerCancelled { id, req } => {
-                self.stats.jobs_cancelled += 1;
-                reply_to::<Self>(req, QueueReply::Done(JobOutcome::Cancelled { id }))
+            QueueEvent::WorkerCancelReturned {
+                slot,
+                id,
+                attempt,
+                outcome,
+            } => self.on_worker_cancel_returned(slot, id, attempt, outcome),
+            QueueEvent::RetryWorkerCancel {
+                slot,
+                id,
+                attempt,
+                result,
+            } => self.retry_worker_cancel(slot, id, attempt, result),
+            QueueEvent::ParkedCallerCancelled { id, req, outcome } => {
+                self.on_parked_caller_cancelled(id, req, outcome)
             }
         }
     }
@@ -446,6 +473,7 @@ impl Queue {
                 workers: config.workers,
                 workers_alive: 0,
                 in_flight: 0,
+                pending_callers: 0,
                 jobs_admitted: 0,
                 jobs_busy_rejected: 0,
                 jobs_completed: 0,
@@ -453,6 +481,7 @@ impl Queue {
                 jobs_failed: 0,
                 worker_crashes: 0,
                 worker_respawns: 0,
+                cancel_reconciliation_failures: 0,
             },
             spawned_workers: 0,
             ready_signal: ready,
@@ -507,7 +536,10 @@ impl Queue {
             return call.reply(QueueReply::Busy);
         };
         let id = JobId(self.next_id);
-        self.next_id += 1;
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("monotonic job id space exhausted");
         let sleep_ms = self.config.job_sleep_ms;
         let dispatch_timeout = self.config.dispatch_timeout();
 
@@ -578,42 +610,147 @@ impl Queue {
         // these follow-up effects run. The cancel continuation still owns and
         // explicitly settles the parked submit caller.
         let mut follow_up: Vec<Effect<Self>> = Vec::with_capacity(2);
-        follow_up.push(token.cancel_service_event(|key, req, _outcome| {
-            QueueEvent::ParkedCallerCancelled { id: key, req }
+        follow_up.push(token.cancel_service_event(|key, req, outcome| {
+            QueueEvent::ParkedCallerCancelled {
+                id: key,
+                req,
+                outcome,
+            }
         }));
         if let Some((slot, worker)) = worker {
-            follow_up.push(
-                call_request(
-                    worker.requests,
-                    WorkerRequest::Cancel(id),
-                    self.config.dispatch_timeout(),
-                )
-                .then_service_event(move |outcome| {
-                    QueueEvent::WorkerCancelReturned { slot, id, outcome }
-                }),
-            );
+            follow_up.push(self.cancel_worker(slot, id, 0, worker));
+        } else {
+            self.stats.cancel_reconciliation_failures += 1;
+            follow_up.push(stop());
         }
         call.reply_and(QueueReply::Cancelled(id), follow_up)
+    }
+
+    fn on_parked_caller_cancelled(
+        &mut self,
+        id: JobId,
+        req: tina::RequestContext<QueueReply>,
+        outcome: tina::CancelOutcome,
+    ) -> Effect<Self> {
+        match outcome {
+            tina::CancelOutcome::Cancelled | tina::CancelOutcome::AlreadyCancelled => {
+                self.stats.jobs_cancelled += 1;
+                reply_to::<Self>(req, QueueReply::Done(JobOutcome::Cancelled { id }))
+            }
+            tina::CancelOutcome::AlreadyCompleted => {
+                self.stats.jobs_failed += 1;
+                reply_to::<Self>(
+                    req,
+                    QueueReply::Done(JobOutcome::Failed {
+                        id,
+                        reason: "cancel raced with an already completed worker call".into(),
+                    }),
+                )
+            }
+            tina::CancelOutcome::NotAdmitted | tina::CancelOutcome::WrongShard => {
+                self.stats.jobs_failed += 1;
+                self.stats.cancel_reconciliation_failures += 1;
+                batch(vec![
+                    reply_to::<Self>(
+                        req,
+                        QueueReply::Done(JobOutcome::Failed {
+                            id,
+                            reason: format!("worker-call cancellation returned {outcome:?}"),
+                        }),
+                    ),
+                    stop(),
+                ])
+            }
+        }
+    }
+
+    fn cancel_worker(
+        &self,
+        slot: usize,
+        id: JobId,
+        attempt: u8,
+        worker: SplitServiceHandle<WorkerEvent, WorkerRequest, WorkerReply>,
+    ) -> Effect<Self> {
+        call_request(
+            worker.requests,
+            WorkerRequest::Cancel(id),
+            self.config.dispatch_timeout(),
+        )
+        .then_service_event(move |outcome| QueueEvent::WorkerCancelReturned {
+            slot,
+            id,
+            attempt,
+            outcome,
+        })
     }
 
     fn on_worker_cancel_returned(
         &mut self,
         slot: usize,
         id: JobId,
+        attempt: u8,
         outcome: CallOutcome<WorkerReply>,
     ) -> Effect<Self> {
-        if matches!(
-            outcome,
-            CallOutcome::Replied(WorkerReply::CancelAcknowledged {
-                id: acknowledged,
-                ..
-            }) if acknowledged == id
-        ) && self.worker_busy[slot] == Some(id)
-        {
-            self.worker_busy[slot] = None;
-            self.stats.in_flight = self.in_flight_count();
+        if self.worker_busy[slot] != Some(id) {
+            return noop();
         }
-        noop()
+
+        match classify_worker_cancel_outcome(id, &outcome) {
+            WorkerCancelDisposition::Released => {
+                self.worker_busy[slot] = None;
+                self.stats.in_flight = self.in_flight_count();
+                noop()
+            }
+            WorkerCancelDisposition::Retry if attempt < MAX_WORKER_CANCEL_RETRIES => {
+                let next_attempt = attempt + 1;
+                sleep(WORKER_CANCEL_RETRY_DELAY).then_service_event(move |result| {
+                    QueueEvent::RetryWorkerCancel {
+                        slot,
+                        id,
+                        attempt: next_attempt,
+                        result,
+                    }
+                })
+            }
+            WorkerCancelDisposition::Retry => self.fail_cancel_reconciliation(),
+            WorkerCancelDisposition::Closed => {
+                self.worker_busy[slot] = None;
+                if self.workers[slot].take().is_some() {
+                    self.stats.workers_alive = self.stats.workers_alive.saturating_sub(1);
+                }
+                self.stats.in_flight = self.in_flight_count();
+                self.stats.worker_crashes += 1;
+                self.stats.worker_respawns += 1;
+                self.spawn_worker(slot)
+            }
+            WorkerCancelDisposition::Fatal => self.fail_cancel_reconciliation(),
+        }
+    }
+
+    fn retry_worker_cancel(
+        &mut self,
+        slot: usize,
+        id: JobId,
+        attempt: u8,
+        result: SleepReply,
+    ) -> Effect<Self> {
+        if result.is_err() {
+            return self.fail_cancel_reconciliation();
+        }
+        if self.worker_busy[slot] != Some(id) {
+            return noop();
+        }
+        let Some(worker) = self.workers[slot] else {
+            return self.fail_cancel_reconciliation();
+        };
+        self.cancel_worker(slot, id, attempt, worker)
+    }
+
+    fn fail_cancel_reconciliation(&mut self) -> Effect<Self> {
+        self.stats.cancel_reconciliation_failures += 1;
+        // Stopping the owner also stops its children, so no uncertain worker
+        // can be reused and no replacement can make the topology unbounded.
+        stop()
     }
 
     fn on_worker_call_returned(
@@ -634,20 +771,54 @@ impl Queue {
             }
         };
 
-        if self.worker_busy[slot] == Some(id) {
-            self.worker_busy[slot] = None;
-            self.stats.in_flight = self.in_flight_count();
-        }
-
+        let disposition = classify_worker_call_outcome(&outcome);
         let req = pending.into_request_context();
         let final_outcome = match outcome {
             CallOutcome::Replied(WorkerReply::Completed(value)) => {
+                self.release_worker_slot(slot, id);
                 self.stats.jobs_completed += 1;
                 JobOutcome::Completed { id, value }
             }
             CallOutcome::Replied(WorkerReply::Cancelled) => {
+                self.release_worker_slot(slot, id);
                 self.stats.jobs_cancelled += 1;
                 JobOutcome::Cancelled { id }
+            }
+            CallOutcome::Replied(WorkerReply::Failed(reason)) => {
+                self.release_worker_slot(slot, id);
+                self.stats.jobs_failed += 1;
+                JobOutcome::Failed { id, reason }
+            }
+            CallOutcome::Full => {
+                self.release_worker_slot(slot, id);
+                self.stats.jobs_failed += 1;
+                JobOutcome::Failed {
+                    id,
+                    reason: "worker process call was not admitted: Full".into(),
+                }
+            }
+            CallOutcome::Closed => {
+                self.stats.worker_crashes += 1;
+                self.stats.jobs_failed += 1;
+                JobOutcome::Failed {
+                    id,
+                    reason: "worker process call returned Closed".into(),
+                }
+            }
+            CallOutcome::Timeout => {
+                self.stats.jobs_failed += 1;
+                JobOutcome::Failed {
+                    id,
+                    reason: "worker process call timed out; cancellation reconciliation started"
+                        .into(),
+                }
+            }
+            CallOutcome::Rejected(reason) => {
+                self.stats.jobs_failed += 1;
+                JobOutcome::Failed {
+                    id,
+                    reason: format!("worker process call was rejected: {reason:?}"),
+                }
             }
             CallOutcome::Replied(WorkerReply::CancelAcknowledged { .. }) => {
                 self.stats.jobs_failed += 1;
@@ -656,38 +827,40 @@ impl Queue {
                     reason: "process call returned a cancel acknowledgement".into(),
                 }
             }
-            CallOutcome::Closed | CallOutcome::Rejected(_) => {
-                self.stats.jobs_failed += 1;
-                self.stats.worker_crashes += 1;
-                if self.workers[slot].is_some() {
-                    self.stats.workers_alive = self.stats.workers_alive.saturating_sub(1);
-                }
-                self.workers[slot] = None;
-                JobOutcome::Failed {
-                    id,
-                    reason: format!("worker call returned {outcome:?}"),
-                }
-            }
-            CallOutcome::Timeout | CallOutcome::Full => {
-                self.stats.jobs_failed += 1;
-                JobOutcome::Failed {
-                    id,
-                    reason: format!("worker call returned {outcome:?}"),
-                }
-            }
         };
 
-        let respawn_effect = if self.workers[slot].is_none() {
-            self.stats.worker_respawns += 1;
-            Some(self.spawn_worker(slot))
-        } else {
-            None
+        let follow_up = match disposition {
+            WorkerCallDisposition::Released => None,
+            WorkerCallDisposition::Reconcile => match self.workers[slot] {
+                Some(worker) => Some(self.cancel_worker(slot, id, 0, worker)),
+                None => Some(stop()),
+            },
+            WorkerCallDisposition::Replace => {
+                self.worker_busy[slot] = None;
+                if self.workers[slot].take().is_some() {
+                    self.stats.workers_alive = self.stats.workers_alive.saturating_sub(1);
+                }
+                self.stats.in_flight = self.in_flight_count();
+                self.stats.worker_respawns += 1;
+                Some(self.spawn_worker(slot))
+            }
+            WorkerCallDisposition::Fatal => {
+                self.stats.cancel_reconciliation_failures += 1;
+                Some(stop())
+            }
         };
 
         let reply = reply_to::<Self>(req, QueueReply::Done(final_outcome));
-        match respawn_effect {
-            Some(spawn) => batch(vec![reply, spawn]),
+        match follow_up {
+            Some(effect) => batch(vec![reply, effect]),
             None => reply,
+        }
+    }
+
+    fn release_worker_slot(&mut self, slot: usize, id: JobId) {
+        if self.worker_busy[slot] == Some(id) {
+            self.worker_busy[slot] = None;
+            self.stats.in_flight = self.in_flight_count();
         }
     }
 
@@ -706,8 +879,234 @@ impl Queue {
     fn snapshot(&self) -> QueueStats {
         let mut s = self.stats.clone();
         s.in_flight = self.in_flight_count();
+        s.pending_callers = self.pending.len();
         s.workers_alive = self.workers.iter().filter(|w| w.is_some()).count();
         s
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerCancelDisposition {
+    Released,
+    Retry,
+    Closed,
+    Fatal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerCallDisposition {
+    Released,
+    Reconcile,
+    Replace,
+    Fatal,
+}
+
+fn classify_worker_call_outcome(outcome: &CallOutcome<WorkerReply>) -> WorkerCallDisposition {
+    match outcome {
+        CallOutcome::Replied(WorkerReply::Completed(_))
+        | CallOutcome::Replied(WorkerReply::Cancelled)
+        | CallOutcome::Replied(WorkerReply::Failed(_))
+        | CallOutcome::Full => WorkerCallDisposition::Released,
+        CallOutcome::Timeout => WorkerCallDisposition::Reconcile,
+        CallOutcome::Closed => WorkerCallDisposition::Replace,
+        CallOutcome::Rejected(_) | CallOutcome::Replied(WorkerReply::CancelAcknowledged { .. }) => {
+            WorkerCallDisposition::Fatal
+        }
+    }
+}
+
+fn classify_worker_cancel_outcome(
+    id: JobId,
+    outcome: &CallOutcome<WorkerReply>,
+) -> WorkerCancelDisposition {
+    match outcome {
+        CallOutcome::Replied(WorkerReply::CancelAcknowledged {
+            id: acknowledged, ..
+        }) if *acknowledged == id => WorkerCancelDisposition::Released,
+        CallOutcome::Full | CallOutcome::Timeout => WorkerCancelDisposition::Retry,
+        CallOutcome::Closed => WorkerCancelDisposition::Closed,
+        CallOutcome::Rejected(_)
+        | CallOutcome::Replied(WorkerReply::Completed(_))
+        | CallOutcome::Replied(WorkerReply::Cancelled)
+        | CallOutcome::Replied(WorkerReply::Failed(_))
+        | CallOutcome::Replied(WorkerReply::CancelAcknowledged { .. }) => {
+            WorkerCancelDisposition::Fatal
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_cancel_classification_is_exhaustive_and_id_sensitive() {
+        let id = JobId(7);
+        for released in [false, true] {
+            assert_eq!(
+                classify_worker_cancel_outcome(
+                    id,
+                    &CallOutcome::Replied(WorkerReply::CancelAcknowledged { id, released }),
+                ),
+                WorkerCancelDisposition::Released,
+            );
+        }
+        for outcome in [CallOutcome::Full, CallOutcome::Timeout] {
+            assert_eq!(
+                classify_worker_cancel_outcome(id, &outcome),
+                WorkerCancelDisposition::Retry,
+            );
+        }
+        assert_eq!(
+            classify_worker_cancel_outcome(id, &CallOutcome::Closed),
+            WorkerCancelDisposition::Closed,
+        );
+        for outcome in [
+            CallOutcome::Rejected(tina::CallRejectedReason::UnsupportedMessage),
+            CallOutcome::Replied(WorkerReply::Completed(14)),
+            CallOutcome::Replied(WorkerReply::Cancelled),
+            CallOutcome::Replied(WorkerReply::Failed("sleep".into())),
+            CallOutcome::Replied(WorkerReply::CancelAcknowledged {
+                id: JobId(8),
+                released: true,
+            }),
+        ] {
+            assert_eq!(
+                classify_worker_cancel_outcome(id, &outcome),
+                WorkerCancelDisposition::Fatal,
+            );
+        }
+    }
+
+    #[test]
+    fn worker_process_classification_never_reuses_an_uncertain_worker() {
+        for outcome in [
+            CallOutcome::Replied(WorkerReply::Completed(14)),
+            CallOutcome::Replied(WorkerReply::Cancelled),
+            CallOutcome::Replied(WorkerReply::Failed("sleep".into())),
+            CallOutcome::Full,
+        ] {
+            assert_eq!(
+                classify_worker_call_outcome(&outcome),
+                WorkerCallDisposition::Released,
+            );
+        }
+        assert_eq!(
+            classify_worker_call_outcome(&CallOutcome::Timeout),
+            WorkerCallDisposition::Reconcile,
+        );
+        assert_eq!(
+            classify_worker_call_outcome(&CallOutcome::Closed),
+            WorkerCallDisposition::Replace,
+        );
+        for outcome in [
+            CallOutcome::Rejected(tina::CallRejectedReason::UnsupportedMessage),
+            CallOutcome::Replied(WorkerReply::CancelAcknowledged {
+                id: JobId(7),
+                released: true,
+            }),
+        ] {
+            assert_eq!(
+                classify_worker_call_outcome(&outcome),
+                WorkerCallDisposition::Fatal,
+            );
+        }
+    }
+
+    fn cancel_queue(id: JobId) -> Queue {
+        let config = RunConfig {
+            workers: 1,
+            queue_mailbox: 4,
+            worker_mailbox: 4,
+            job_sleep_ms: 10,
+            call_timeout_ms: 100,
+        };
+        let mut queue = Queue::new(config, Arc::new(ReadyGate::default()));
+        queue.worker_busy[0] = Some(id);
+        queue.stats.in_flight = 1;
+        queue
+    }
+
+    #[test]
+    fn worker_cancel_state_machine_retries_replaces_and_fails_closed() {
+        let id = JobId(7);
+
+        let mut retry = cancel_queue(id);
+        assert!(matches!(
+            retry.on_worker_cancel_returned(0, id, 0, CallOutcome::Full),
+            Effect::Io(_)
+        ));
+        assert_eq!(retry.worker_busy[0], Some(id));
+        assert_eq!(retry.stats.cancel_reconciliation_failures, 0);
+
+        let mut exhausted = cancel_queue(id);
+        assert!(matches!(
+            exhausted.on_worker_cancel_returned(
+                0,
+                id,
+                MAX_WORKER_CANCEL_RETRIES,
+                CallOutcome::Timeout,
+            ),
+            Effect::Stop
+        ));
+        assert_eq!(exhausted.worker_busy[0], Some(id));
+        assert_eq!(exhausted.stats.cancel_reconciliation_failures, 1);
+
+        let mut closed = cancel_queue(id);
+        assert!(matches!(
+            closed.on_worker_cancel_returned(0, id, 0, CallOutcome::Closed),
+            Effect::SpawnObserved(_)
+        ));
+        assert_eq!(closed.worker_busy[0], None);
+        assert_eq!(closed.stats.in_flight, 0);
+        assert_eq!(closed.stats.worker_crashes, 1);
+        assert_eq!(closed.stats.worker_respawns, 1);
+
+        let mut rejected = cancel_queue(id);
+        assert!(matches!(
+            rejected.on_worker_cancel_returned(
+                0,
+                id,
+                0,
+                CallOutcome::Rejected(tina::CallRejectedReason::UnsupportedMessage),
+            ),
+            Effect::Stop
+        ));
+        assert_eq!(rejected.stats.cancel_reconciliation_failures, 1);
+    }
+
+    #[test]
+    fn worker_cancel_state_machine_releases_only_the_matching_job() {
+        let id = JobId(7);
+        let mut queue = cancel_queue(id);
+        assert!(matches!(
+            queue.on_worker_cancel_returned(
+                0,
+                JobId(8),
+                0,
+                CallOutcome::Replied(WorkerReply::CancelAcknowledged {
+                    id: JobId(8),
+                    released: true,
+                }),
+            ),
+            Effect::Noop
+        ));
+        assert_eq!(queue.worker_busy[0], Some(id));
+
+        assert!(matches!(
+            queue.on_worker_cancel_returned(
+                0,
+                id,
+                0,
+                CallOutcome::Replied(WorkerReply::CancelAcknowledged {
+                    id,
+                    released: false,
+                }),
+            ),
+            Effect::Noop
+        ));
+        assert_eq!(queue.worker_busy[0], None);
+        assert_eq!(queue.stats.in_flight, 0);
     }
 }
 

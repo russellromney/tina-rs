@@ -122,8 +122,12 @@ stale wake could then take and drop a newer job. Cancellation now uses a typed
 worker request and acknowledgement; the queue retains the worker's in-flight
 charge until acknowledgement, and stale wakes preserve newer worker state.
 Repeated tests prove exact cancel settlement followed by immediate refill,
-while a caller-timeout probe proves the parked token drains after the caller
-disappears.
+while a caller-timeout probe proves both the worker charge and parked token
+drain after the caller disappears. Cancel reconciliation is exhaustive:
+bounded Tina-time retries handle `Full` and `Timeout`, `Closed` retires and
+respawns the worker, and
+`Rejected`, malformed acknowledgements, timer failure, or retry exhaustion
+stop the queue instead of silently leaking admission capacity.
 
 `RunConfig::validate` rejects zero or excessive worker, mailbox, sleep, and
 timeout values before startup. Overflow burst size, barrier participants, and

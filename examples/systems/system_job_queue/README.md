@@ -16,7 +16,10 @@ after the parked caller is stored in a `PendingCancelableCallSet`. Cancel uses
 `PendingCancelableCall::cancel` to close the process wait and route the parked
 request context into the cancel continuation. A typed worker cancel request
 then confirms release of the worker's deferred process slot before the queue
-makes that worker available for refill.
+makes that worker available for refill. `Full` and `Timeout` cancel calls retry
+through Tina-owned time with a fixed budget, `Closed` retires and respawns the
+worker, and impossible replies, `Rejected`, or retry exhaustion stop the queue
+instead of silently leaking one unit of admission capacity.
 
 A `Poison` payload panics the worker; the queue sees `CallOutcome::Closed`,
 respawns the worker into the same slot, and replies `Failed` to the parked
@@ -43,6 +46,9 @@ What felt good:
   parked submit caller is replied through the cancel continuation.
 - `RequestCall::reply_and` makes its sequencing contract explicit: the cancel
   API caller is replied before the token-cancel and worker-cancel follow-ups.
+- Worker cancellation remains exhaustive after that reply: `Full`/`Timeout`
+  retry within a fixed budget, `Closed` replaces the worker, and protocol
+  failures stop the queue rather than leaving the slot permanently charged.
 - `LocalSystem` covers the entire application lifecycle without exposing a
   lower threaded owner: atomic root bootstrap, typed host calls, and guaranteed
   terminal observation all remain on one facade.
@@ -68,9 +74,10 @@ What felt rough:
   rejects the worker's late reply before our translator can fire. That is
   the right behavior. The queue therefore uses a separate typed cancel request
   to confirm that the worker released its deferred process slot.
-- A bootstrap message is still required because constructors cannot return
-  effects. `LocalSystem::register_root_with_bootstrap` makes that first-message
-  ordering atomic without exposing the lower threaded owner.
+- A bootstrap event is still required because constructors cannot return
+  effects. `LocalSystem::register_split_service_with_bootstrap` makes that
+  first-message ordering atomic without exposing the private service envelope
+  or lower threaded owner.
 - There is still no in-isolate hook for "my child stopped." The queue
   detects a dead worker through `CallOutcome::Closed` on the in-flight
   call. That works for jobs in flight; a worker that dies *between* jobs
@@ -97,7 +104,7 @@ Tina capability pulled:
 - `PendingCancelableCall::cancel(translator)` for atomic
   cancel-and-answer-original-caller.
 - `spawn_observed(ChildDefinition::new(...))` for typed child refs.
-- `LocalSystem::register_root_with_bootstrap` for atomic startup.
+- `LocalSystem::register_split_service_with_bootstrap` for atomic startup.
 - `LocalSystem::call_blocking_request` and typed service handles for host work.
 - `LocalSystem::run_to_shutdown_reported` for unconditional clean shutdown.
 - Runtime-owned `sleep` as the worker's only async surface.

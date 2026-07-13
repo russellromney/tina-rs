@@ -27,8 +27,10 @@ fn overflow_burst_admits_workers_and_rest_get_busy() {
     assert_eq!(report.stats.jobs_admitted, 2);
     assert_eq!(report.stats.jobs_busy_rejected, 3);
     assert_eq!(report.stats.jobs_completed, 2);
+    assert_eq!(report.stats.pending_callers, 0);
     assert_eq!(report.stats.workers_alive, 2);
     assert_eq!(report.stats.worker_crashes, 0);
+    assert_eq!(report.stats.cancel_reconciliation_failures, 0);
 }
 
 #[test]
@@ -55,7 +57,9 @@ fn cancel_in_flight_replies_immediately_to_parked_caller() {
     assert_eq!(report.stats.jobs_failed, 0);
     assert_eq!(report.stats.jobs_admitted, 2);
     assert_eq!(report.stats.in_flight, 0);
+    assert_eq!(report.stats.pending_callers, 0);
     assert_eq!(report.stats.workers_alive, 2);
+    assert_eq!(report.stats.cancel_reconciliation_failures, 0);
 }
 
 #[test]
@@ -70,6 +74,8 @@ fn caller_timeout_does_not_strand_pending_authority() {
     assert_eq!(report.stats.jobs_cancelled, 0);
     assert_eq!(report.stats.jobs_failed, 0);
     assert_eq!(report.stats.in_flight, 0);
+    assert_eq!(report.stats.pending_callers, 0);
+    assert_eq!(report.stats.cancel_reconciliation_failures, 0);
 }
 
 #[test]
@@ -85,14 +91,16 @@ fn poison_marks_failed_and_respawns_worker() {
     assert_eq!(report.stats.jobs_failed, 1);
     assert_eq!(report.stats.worker_crashes, 1);
     assert_eq!(report.stats.worker_respawns, 1);
+    assert_eq!(report.stats.pending_callers, 0);
     assert_eq!(report.stats.workers_alive, config().workers);
+    assert_eq!(report.stats.cancel_reconciliation_failures, 0);
 }
 
 #[test]
 fn admission_recovers_after_respawn() {
     let report = run_respawn_then_admit(config()).expect("respawn-then-admit run");
     // Poison call fails as expected.
-    matches!(report.poison_outcome, JobOutcome::Failed { .. });
+    assert!(matches!(report.poison_outcome, JobOutcome::Failed { .. }));
     // Follow-up call lands on the respawned worker and completes.
     let JobOutcome::Completed { value, .. } = report.follow_up_outcome else {
         panic!(
@@ -105,7 +113,9 @@ fn admission_recovers_after_respawn() {
     assert_eq!(report.stats.jobs_failed, 1);
     assert_eq!(report.stats.worker_crashes, 1);
     assert_eq!(report.stats.worker_respawns, 1);
+    assert_eq!(report.stats.pending_callers, 0);
     assert_eq!(report.stats.workers_alive, config().workers);
+    assert_eq!(report.stats.cancel_reconciliation_failures, 0);
 }
 
 #[test]
