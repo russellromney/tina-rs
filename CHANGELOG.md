@@ -4,6 +4,12 @@ This file records completed work.
 
 ## Unreleased
 
+### AWS LocalSystem installation
+
+- Add `LocalSystem` installation parity for all five `tina-aws-bridge`
+  workers, including typed bounded-registration failures and deterministic
+  cleanup of fully built workers rejected by the host control plane.
+
 ### Rate-limit API ergonomics
 
 - `RateLimit::try_admit_at` now returns the payload-free

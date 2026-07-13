@@ -229,11 +229,11 @@ a missing column.
 | `tina-reqwest-bridge` | `ReqwestWorker::install(&runtime, cfg)` | `ReqwestWorker::with_supplied_client(cfg, client, handle)` then `runtime.register_with_capacity` | `ReqwestCloser::close()` flags closed; new sends reply `ReqwestError::Closed`. In-flight tasks run to natural completion or per-attempt timeout (`tokio::time::timeout`, then `AbortHandle::abort`). | no bounded drain helper — drop the runtime to force-cancel | no `late_results` counter: the per-attempt timeout aborts the spawned Tokio task. A reply that arrives after the Tina caller's `IsolateCall` deadline shows as `CallReplyRejected` in the runtime trace. | `tina_reqwest.bridge.call`, `tina_reqwest.bridge` |
 | `tina-sqlite-bridge` | `SqliteWorker::install(&runtime, cfg)` | n/a (one in-process connection; no pool/handle to supply) | `SqliteCloser::close()` flags closed; the worker thread always finishes its current SQLite call. Drop the bridge isolate to retire the thread at its next `recv`. | n/a — the worker thread is uncancellable C code | `SqliteMetrics::late_results` — worker-terminal landed after the bridge surfaced `SqliteError::Timeout` (also visible in the trace as `CallReplyRejected`) | `tina_sqlite.bridge.call`, `tina_sqlite.bridge` |
 | `tina-sqlx-bridge` | `PgWorker::install(&runtime, cfg)` builds a `PgPool` and a small Tokio runtime | `PgWorker::install_with_pool(&runtime, cfg, pool, handle)` (SQLx settings on the supplied pool stay caller-owned; the supplied Tokio runtime is never shut down by the bridge) | `PgCloser::close()` flags closed; does **not** close the SQLx pool. Owned pool drops with the bridge; supplied pool stays caller-owned. | no bounded drain helper; SQLx queries keep running until natural completion (or until DB-side cancel fires under `with_cancel_on_timeout`) | `PgMetrics::late_results` — spawned SQLx task completed after the bridge surfaced `PgError::Timeout`. Does **not** count Postgres-side execution that continues past the future drop, nor the caller-observed `CallOutcome::Timeout` path (that lives in the trace as `CallReplyRejected`). | `tina_sqlx.bridge.call`, `tina_sqlx.bridge` |
-| `tina-aws-bridge` (S3) | `install_s3(&runtime, cfg)` builds an SDK client and a small Tokio runtime | `S3Worker::with_supplied_client(cfg, client, handle)` then `runtime.register_with_capacity` (caller-owned client owns SigV4/credentials/HTTP/TLS/SDK retry; `sdk_max_attempts` reports `0`/unknown). Caller's Tokio runtime is never shut down by the bridge. | `S3Closer::close()` flags closed; new admissions reply `S3Error::Closed` | `S3Closer::close_and_drain(timeout)` waits up to `timeout` for already-admitted SDK work to leave the in-flight set; reports `in_flight_remaining` + per-operation `in_flight_kinds` on deadline. Spawned SDK futures are **not aborted**: a bridge timeout means Tina stopped waiting, not that AWS/Hyper cancelled bytes. | `S3Metrics::late_results` — SDK future terminal after the bridge already surfaced `S3Error::Timeout`. Until the SDK future finishes, it keeps occupying `max_in_flight` capacity. | `tina_aws.bridge.call`, `tina_aws.bridge` |
-| `tina-aws-bridge` (SQS) | `install_sqs(&runtime, cfg)` | `SqsWorker::with_supplied_client(cfg, client, handle)` (same ownership split as S3) | `SqsCloser::close()` flags closed | `SqsCloser::close_and_drain(timeout)` mirrors the S3 shape | `SqsMetrics::late_results` mirrors S3 — SDK terminal after bridge timeout. SQS state (sent, visibility extended, deleted) is **not** rolled back when the bridge stops waiting. | `tina_aws.bridge.call`, `tina_aws.bridge` |
-| `tina-aws-bridge` (DynamoDB) | `install_dynamodb(&runtime, cfg)` | `DynamoWorker::with_supplied_client(cfg, client, handle)` (same ownership split as S3) | `DynamoCloser::close()` flags closed | `DynamoCloser::close_and_drain(timeout)` mirrors the S3 shape | `DynamoMetrics::late_results` mirrors S3 — SDK terminal after bridge timeout. DynamoDB mutations (`PutItem`, `UpdateItem`, `DeleteItem`) are **not** rolled back when the bridge stops waiting. | `tina_aws.bridge.call`, `tina_aws.bridge` |
-| `tina-aws-bridge` (SNS) | `install_sns(&runtime, cfg)` | `SnsWorker::with_supplied_client(cfg, client, handle)` (same ownership split as S3) | `SnsCloser::close()` flags closed | `SnsCloser::close_and_drain(timeout)` mirrors the S3 shape | `SnsMetrics::late_results` mirrors S3 — SDK terminal after bridge timeout. A `Publish` already accepted by SNS is not undone when the bridge stops waiting. | `tina_aws.bridge.call`, `tina_aws.bridge` |
-| `tina-aws-bridge` (Secrets) | `install_secrets(&runtime, cfg)` | `SecretsWorker::with_supplied_client(cfg, client, handle)` (same ownership split as S3) | `SecretsCloser::close()` flags closed | `SecretsCloser::close_and_drain(timeout)` mirrors the S3 shape | `SecretsMetrics::late_results` mirrors S3 — SDK terminal after bridge timeout. `GetSecretValue` is read-only so no rollback applies; the bridge cap may still surface as `SecretsError::SecretTooLarge`. | `tina_aws.bridge.call`, `tina_aws.bridge` |
+| `tina-aws-bridge` (S3) | `install_s3_local(&system, cfg)` builds an SDK client and a small Tokio runtime behind `LocalSystem`; `install_s3(&runtime, cfg)` is the lower-level runtime form | `S3Worker::with_supplied_client(cfg, client, handle)` then explicit registration (caller-owned client owns SigV4/credentials/HTTP/TLS/SDK retry; `sdk_max_attempts` reports `0`/unknown). Caller's Tokio runtime is never shut down by the bridge. | `S3Closer::close()` flags closed; new admissions reply `S3Error::Closed` | `S3Closer::close_and_drain(timeout)` waits up to `timeout` for already-admitted SDK work to leave the in-flight set; reports `in_flight_remaining` + per-operation `in_flight_kinds` on deadline. Spawned SDK futures are **not aborted**: a bridge timeout means Tina stopped waiting, not that AWS/Hyper cancelled bytes. | `S3Metrics::late_results` — SDK future terminal after the bridge already surfaced `S3Error::Timeout`. Until the SDK future finishes, it keeps occupying `max_in_flight` capacity. | `tina_aws.bridge.call`, `tina_aws.bridge` |
+| `tina-aws-bridge` (SQS) | `install_sqs_local(&system, cfg)`; `install_sqs(&runtime, cfg)` is the lower-level runtime form | `SqsWorker::with_supplied_client(cfg, client, handle)` (same ownership split as S3) | `SqsCloser::close()` flags closed | `SqsCloser::close_and_drain(timeout)` mirrors the S3 shape | `SqsMetrics::late_results` mirrors S3 — SDK terminal after bridge timeout. SQS state (sent, visibility extended, deleted) is **not** rolled back when the bridge stops waiting. | `tina_aws.bridge.call`, `tina_aws.bridge` |
+| `tina-aws-bridge` (DynamoDB) | `install_dynamodb_local(&system, cfg)`; `install_dynamodb(&runtime, cfg)` is the lower-level runtime form | `DynamoWorker::with_supplied_client(cfg, client, handle)` (same ownership split as S3) | `DynamoCloser::close()` flags closed | `DynamoCloser::close_and_drain(timeout)` mirrors the S3 shape | `DynamoMetrics::late_results` mirrors S3 — SDK terminal after bridge timeout. DynamoDB mutations (`PutItem`, `UpdateItem`, `DeleteItem`) are **not** rolled back when the bridge stops waiting. | `tina_aws.bridge.call`, `tina_aws.bridge` |
+| `tina-aws-bridge` (SNS) | `install_sns_local(&system, cfg)`; `install_sns(&runtime, cfg)` is the lower-level runtime form | `SnsWorker::with_supplied_client(cfg, client, handle)` (same ownership split as S3) | `SnsCloser::close()` flags closed | `SnsCloser::close_and_drain(timeout)` mirrors the S3 shape | `SnsMetrics::late_results` mirrors S3 — SDK terminal after bridge timeout. A `Publish` already accepted by SNS is not undone when the bridge stops waiting. | `tina_aws.bridge.call`, `tina_aws.bridge` |
+| `tina-aws-bridge` (Secrets) | `install_secrets_local(&system, cfg)`; `install_secrets(&runtime, cfg)` is the lower-level runtime form | `SecretsWorker::with_supplied_client(cfg, client, handle)` (same ownership split as S3) | `SecretsCloser::close()` flags closed | `SecretsCloser::close_and_drain(timeout)` mirrors the S3 shape | `SecretsMetrics::late_results` mirrors S3 — SDK terminal after bridge timeout. `GetSecretValue` is read-only so no rollback applies; the bridge cap may still surface as `SecretsError::SecretTooLarge`. | `tina_aws.bridge.call`, `tina_aws.bridge` |
 
 > **Late-result vocabulary.** "Late" means three different things and
 > the bridge can only see two of them. Read the row that fits the
@@ -428,7 +428,7 @@ typed outcomes, and metrics.
 
 ```rust
 use tina_aws_bridge::{
-    S3Config, S3Credentials, S3Request, S3PutObject, install_s3, send_s3,
+    S3Config, S3Credentials, S3Request, S3PutObject, install_s3_local, send_s3,
 };
 
 let cfg = S3Config::new()
@@ -436,7 +436,7 @@ let cfg = S3Config::new()
     .with_credentials(S3Credentials::new("access-key-id", "secret-access-key"))
     .with_max_in_flight(8)
     .with_default_timeout(Duration::from_secs(2));
-let bridge = install_s3(&runtime, cfg)?;
+let bridge = install_s3_local(&system, cfg)?;
 
 // In a handler:
 send_s3(
@@ -527,7 +527,7 @@ SQS follows the same lifecycle vocabulary with SQS-shaped types:
 
 ```rust
 use tina_aws_bridge::{
-    SqsConfig, SqsCredentials, SqsRequest, SqsSendMessage, install_sqs, send_sqs,
+    SqsConfig, SqsCredentials, SqsRequest, SqsSendMessage, install_sqs_local, send_sqs,
 };
 
 let cfg = SqsConfig::new()
@@ -535,7 +535,7 @@ let cfg = SqsConfig::new()
     .with_credentials(SqsCredentials::new("access-key-id", "secret-access-key"))
     .with_message_body_limit(64 * 1024)
     .with_max_receive_messages(10);
-let bridge = install_sqs(&runtime, cfg)?;
+let bridge = install_sqs_local(&system, cfg)?;
 
 send_sqs(
     self.sqs,

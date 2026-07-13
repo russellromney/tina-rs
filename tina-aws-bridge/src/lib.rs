@@ -13,7 +13,7 @@
 //! pressure, classifier, late-result truth — see
 //! `docs/tina-user-guide/30-bridge-author-kit.md`. Each of the five
 //! services in this crate is one specimen of that path: the
-//! per-service `install_xxx`/`with_supplied_client` returns a
+//! per-service `install_xxx[_local]`/`with_supplied_client` returns a
 //! `BridgeInstall` handle, the closer flips admission, `close_and_drain`
 //! reports remaining in-flight kinds, the metrics handle exposes a
 //! typed `BridgePressure` and worker-terminal counts, and
@@ -23,8 +23,9 @@
 //! Each service worker has the same shape:
 //!
 //! - `XxxConfig` + `XxxConfigError` validated up front;
-//! - `XxxWorker::install(&runtime, cfg)` builds an owned Tokio runtime
-//!   and SDK client and registers the worker;
+//! - `XxxWorker::install(&runtime, cfg)` and
+//!   `XxxWorker::install_local(&system, cfg)` build an owned Tokio runtime
+//!   and SDK client and register the worker;
 //! - `XxxWorker::with_supplied_client(cfg, client, runtime)` accepts a
 //!   caller-built SDK client and Tokio runtime handle;
 //! - `send_xxx(addr, request, timeout)` builds the `call(...)` effect;
@@ -233,7 +234,7 @@ pub use dynamodb_types::{
 };
 pub use dynamodb_worker::{
     DynamoCloser, DynamoDrainReport, DynamoInstallError, DynamoMsg, DynamoWorker,
-    InstalledDynamoBridge, install_dynamodb,
+    InstalledDynamoBridge, install_dynamodb, install_dynamodb_local,
 };
 pub use helpers::{
     DynamoAddress, DynamoCallOutcome, S3Address, S3CallOutcome, SecretsAddress, SecretsCallOutcome,
@@ -248,7 +249,7 @@ pub use secrets_types::{
 };
 pub use secrets_worker::{
     InstalledSecretsBridge, SecretsCloser, SecretsDrainReport, SecretsInstallError, SecretsMsg,
-    SecretsWorker, install_secrets,
+    SecretsWorker, install_secrets, install_secrets_local,
 };
 pub use sns_metrics::{SnsMetrics, SnsMetricsHandle, SnsPressureReport};
 pub use sns_types::{
@@ -257,6 +258,7 @@ pub use sns_types::{
 };
 pub use sns_worker::{
     InstalledSnsBridge, SnsCloser, SnsDrainReport, SnsInstallError, SnsMsg, SnsWorker, install_sns,
+    install_sns_local,
 };
 pub use sqs_metrics::{SqsMetrics, SqsMetricsHandle, SqsPressureReport};
 pub use sqs_types::{
@@ -266,6 +268,7 @@ pub use sqs_types::{
 };
 pub use sqs_worker::{
     InstalledSqsBridge, SqsCloser, SqsDrainReport, SqsInstallError, SqsMsg, SqsWorker, install_sqs,
+    install_sqs_local,
 };
 pub use tina_runtime::bridge::{
     BridgeFatal, BridgeOutcomeClass, BridgePressure, BridgeRetryable, BridgeUnavailable,
@@ -277,4 +280,5 @@ pub use types::{
 };
 pub use worker::{
     InstallError, InstalledS3Bridge, S3Closer, S3DrainReport, S3Msg, S3Worker, install_s3,
+    install_s3_local,
 };
