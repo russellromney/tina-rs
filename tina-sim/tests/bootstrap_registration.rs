@@ -267,6 +267,24 @@ fn multi_shard_simulator_has_the_same_bootstrap_shape() {
 }
 
 #[test]
+fn multi_shard_simulator_split_bootstrap_uses_domain_event() {
+    let mut simulator =
+        MultiShardSimulator::new([TestShard(10), TestShard(20)], SimulatorConfig::default());
+    let drops = Rc::new(Cell::new(0));
+    let service = simulator
+        .register_split_service_with_bootstrap_on::<SplitService, _, _, Infallible>(
+            ShardId::new(20),
+            SplitService { booted: false },
+            1,
+            SplitEvent::Bootstrap(DropProbe(Rc::clone(&drops))),
+        )
+        .expect("typed split bootstrap on owned shard");
+    assert_eq!(service.events.address().shard(), ShardId::new(20));
+    simulator.run_until_quiescent();
+    assert_eq!(drops.get(), 1);
+}
+
+#[test]
 fn multi_shard_unknown_shard_panics_and_drops_inputs_without_publication() {
     let mut simulator =
         MultiShardSimulator::new([TestShard(10), TestShard(20)], SimulatorConfig::default());

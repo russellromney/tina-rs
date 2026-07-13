@@ -441,3 +441,56 @@ fn local_multi_shard_bootstrap_routes_and_unknown_shard_returns_authority() {
     app.shutdown().drain().join().expect("clean shutdown");
     assert_eq!(successful_drops.load(Ordering::Acquire), 1);
 }
+
+#[test]
+fn local_multi_split_bootstrap_routes_and_returns_domain_event() {
+    let app = LocalSystem::multi_shard(DefaultThreadedMailboxFactory)
+        .shard(TestShard(30))
+        .try_build()
+        .expect("fallible startup");
+    let deliveries = Arc::new(AtomicU32::new(0));
+    let successful_drops = Arc::new(AtomicU32::new(0));
+    let service = app
+        .register_split_service_with_bootstrap_on::<SplitService, _, _, Infallible>(
+            ShardId::new(30),
+            SplitService {
+                booted: false,
+                deliveries: Arc::clone(&deliveries),
+            },
+            4,
+            SplitEvent::Bootstrap(DropProbe(Arc::clone(&successful_drops))),
+        )
+        .expect("typed split bootstrap on owned shard");
+    assert_eq!(service.requests.address().shard(), ShardId::new(30));
+    assert_eq!(
+        app.call_blocking_request(
+            service.requests,
+            SplitRequest::Inspect,
+            Duration::from_secs(2),
+        )
+        .expect("typed host call"),
+        CallOutcome::Replied(BootState(true)),
+    );
+
+    let refused_drops = Arc::new(AtomicU32::new(0));
+    let error = app
+        .register_split_service_with_bootstrap_on::<SplitService, _, _, Infallible>(
+            ShardId::new(99),
+            SplitService {
+                booted: false,
+                deliveries: Arc::new(AtomicU32::new(0)),
+            },
+            4,
+            SplitEvent::Bootstrap(DropProbe(Arc::clone(&refused_drops))),
+        )
+        .expect_err("unknown shard returns domain event");
+    assert!(matches!(
+        error,
+        ThreadedRegisterBootstrapError::UnknownShard(shard, _) if shard == ShardId::new(99)
+    ));
+    assert_eq!(refused_drops.load(Ordering::Acquire), 0);
+    drop(error);
+    assert_eq!(refused_drops.load(Ordering::Acquire), 1);
+    app.shutdown().drain().join().expect("clean shutdown");
+    assert_eq!(successful_drops.load(Ordering::Acquire), 1);
+}
