@@ -1253,14 +1253,34 @@ meant the parent could not:
   doesn't know which child is missing).
 
 The old supervised-worker workaround had the child send a
-`Boot(self_addr)` message back to a shared `Arc<Mutex<...>>` slot.
-`specimen_supervised_worker` now uses `spawn_observed` for the
-initial address instead.
+`Boot(self_addr)` message back to a shared `Arc<Mutex<...>>` slot. The first
+observed-spawn pass removed that boot message for the initial address but still
+made the host rebuild every replacement address from untyped isolate and
+generation fields.
 
-**Still open:** join/stop child convenience and typed restart
-refresh as parent messages. Existing `observe_child_restarted`
-carries the new isolate id/generation, but it is a host waiter and
-does not yet deliver a typed replacement `ChildRef` to the parent.
+**Closed (2026-07 typed restart continuation):**
+`spawn_observed(restartable).then_with_restarts(initial, restarted)` now maps
+the initial `Result<ChildRef<...>, SpawnObservedError>` and every successful
+replacement `ChildRef` into ordinary parent messages. Both live runtime and
+simulator preserve system/shard/generation provenance, stale-address truth,
+and bounded parent delivery. A full parent mailbox records the normal
+`SendRejected::Full` and does not retain a hidden retry queue.
+
+`specimen_supervised_worker` now stores the current child ref only in its
+parent. Startup carries a typed host request through the initial continuation;
+subsequent work routes through the parent as a typed worker request. Work is
+counted only after the worker replies, poison only after
+`Rejected(HandlerPanicked)`, and every other call terminal remains distinct.
+The parent also names its in-progress startup state so concurrent starts cannot
+create duplicate children. The `WorkerSlot`, `Arc<Mutex>`, polling loop, and
+manual `Address::new_with_generation_in` reconstruction are gone. The host
+restart waiter remains only as a synchronization/reporting fact, not as address
+authority.
+
+**Still open:** join/stop child convenience. Typed restart refresh is closed.
+Existing `observe_child_restarted` remains the appropriate host waiter when
+host code needs to know that a restart completed but does not own the child's
+message type.
 
 A *host-side* alternative —
 `runtime.observe_child_started::<M>(parent).wait(timeout)?` —

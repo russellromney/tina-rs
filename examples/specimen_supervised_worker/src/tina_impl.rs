@@ -1,200 +1,307 @@
-//! Tina: a supervised worker. The `Parent` isolate spawns a
-//! `Worker` as a `RestartableChildDefinition`; the runtime
-//! supervisor restarts it on panic, charged against a typed
-//! `RestartBudget`. Each restart's correctness comes from
-//! `spawn_observed(...).then(ParentMsg::ChildStarted)` for the initial
-//! typed child reference plus
-//! `runtime.observe_child_restarted(parent).wait(...)` for restart
-//! generations — no manual generation counter, no trace polling.
+//! Tina: a supervised worker. The parent owns the current typed child
+//! reference. `spawn_observed(...).then_with_restarts(...)` delivers both the
+//! initial child and every successful replacement as ordinary bounded parent
+//! messages, so neither the host nor application code reconstructs addresses.
 
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use tina::{RestartBudget, RestartPolicy, prelude::*};
-use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime};
+use tina::{
+    CallRejectedReason, RestartBudget, RestartPolicy, ServiceMessage, SpawnObservedResult,
+    prelude::*,
+};
+use tina_runtime::{
+    CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, SplitServiceHandle, call_request,
+};
 use tina_supervisor::SupervisorConfig;
 
 use crate::{Job, Report, job_script};
 
-type WorkerAddr = Address<WorkerMsg>;
+const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Host-visible slot for the worker address used by this comparison harness.
-#[derive(Default)]
-struct WorkerSlot {
-    inner: Mutex<Option<WorkerAddr>>,
-}
-
-impl WorkerSlot {
-    fn current(&self) -> Option<WorkerAddr> {
-        self.inner
-            .lock()
-            .expect("worker slot mutex")
-            .as_ref()
-            .copied()
-    }
-    fn set(&self, addr: WorkerAddr) {
-        *self.inner.lock().expect("worker slot mutex") = Some(addr);
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerRequest {
+    Process(Job),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkerMsg {
-    Process(Job),
+enum WorkerReply {
+    Processed,
 }
 
 struct Worker;
 
-#[tina_runtime::isolate(message = WorkerMsg)]
+#[tina_runtime::isolate(request = WorkerRequest, reply = WorkerReply)]
 impl Worker {
-    fn handle(
+    fn handle_request(
         &mut self,
-        msg: WorkerMsg,
-        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
-    ) -> Effect<Self> {
-        match msg {
-            WorkerMsg::Process(Job::Work(_)) => noop(),
-            WorkerMsg::Process(Job::Poison) => panic!("supervised worker hit a poison job"),
+        request: WorkerRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            WorkerRequest::Process(Job::Work(_)) => call.reply(WorkerReply::Processed),
+            WorkerRequest::Process(Job::Poison) => {
+                panic!("supervised worker hit a poison job")
+            }
         }
     }
 }
 
+#[derive(Debug)]
+enum ParentEvent {
+    WorkerStarted {
+        result: SpawnObservedResult<ServiceMessage<Infallible, WorkerRequest>, WorkerReply>,
+        request: RequestContext<ParentReply>,
+    },
+    WorkerRestarted(ChildRef<ServiceMessage<Infallible, WorkerRequest>, WorkerReply>),
+    WorkerDone(RequestContext<ParentReply>, CallOutcome<WorkerReply>),
+}
+
 #[derive(Debug, Clone, Copy)]
-enum ParentMsg {
-    Spawn,
-    ChildStarted(Result<ChildRef<WorkerMsg>, SpawnObservedError>),
+enum ParentRequest {
+    Start,
+    Process(Job),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentReply {
+    Started,
+    StartInProgress,
+    Processed,
+    WorkerPanicked,
+    WorkerFull,
+    WorkerClosed,
+    WorkerTimeout,
+    WorkerRejected(CallRejectedReason),
+    NotStarted,
+    SpawnRejected(SpawnObservedError),
 }
 
 struct Parent {
-    slot: Arc<WorkerSlot>,
+    worker: Option<ChildRef<ServiceMessage<Infallible, WorkerRequest>, WorkerReply>>,
+    starting: bool,
     worker_capacity: usize,
 }
 
 #[tina_runtime::isolate(
-    message = ParentMsg,
+    event = ParentEvent,
+    request = ParentRequest,
+    reply = ParentReply,
     spawn = RestartableChildDefinition<Worker>,
-    spawn_observed = tina::SpawnObserved<RestartableChildDefinition<Worker>, ParentMsg, WorkerMsg>,
+    spawn_observed = tina::SpawnObserved<
+        RestartableChildDefinition<Worker>,
+        ServiceMessage<ParentEvent, ParentRequest>,
+        ServiceMessage<Infallible, WorkerRequest>,
+        WorkerReply
+    >,
 )]
 impl Parent {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: ParentMsg,
+        event: ParentEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            ParentMsg::Spawn => {
-                let capacity = self.worker_capacity;
-                spawn_observed(RestartableChildDefinition::new(move || Worker, capacity))
-                    .then(ParentMsg::ChildStarted)
+        match event {
+            ParentEvent::WorkerStarted {
+                result: Ok(worker),
+                request,
+            } => {
+                self.starting = false;
+                self.worker = Some(worker);
+                reply_to(request, ParentReply::Started)
             }
-            ParentMsg::ChildStarted(Ok(child)) => {
-                self.slot.set(child.address);
+            ParentEvent::WorkerStarted {
+                result: Err(error),
+                request,
+            } => {
+                self.starting = false;
+                reply_to(request, ParentReply::SpawnRejected(error))
+            }
+            ParentEvent::WorkerRestarted(worker) => {
+                self.worker = Some(worker);
                 noop()
             }
-            ParentMsg::ChildStarted(Err(_)) => {
-                // The parent is still alive if this message was delivered;
-                // keep the example honest and stop instead of hiding failure.
-                stop()
+            ParentEvent::WorkerDone(request, outcome) => {
+                reply_to(request, parent_reply_from_worker(outcome))
             }
         }
+    }
+
+    fn handle_request(
+        &mut self,
+        request: ParentRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            ParentRequest::Start if self.worker.is_some() => call.reply(ParentReply::Started),
+            ParentRequest::Start if self.starting => call.reply(ParentReply::StartInProgress),
+            ParentRequest::Start => {
+                self.starting = true;
+                let capacity = self.worker_capacity;
+                call.capture(|request| {
+                    spawn_observed(RestartableChildDefinition::new(move || Worker, capacity))
+                        .then_with_restarts(
+                            move |result| {
+                                ServiceMessage::Event(ParentEvent::WorkerStarted {
+                                    result,
+                                    request,
+                                })
+                            },
+                            |worker| ServiceMessage::Event(ParentEvent::WorkerRestarted(worker)),
+                        )
+                })
+            }
+            ParentRequest::Process(job) => match self.worker {
+                Some(worker) => {
+                    let requests = SplitServiceHandle::from_address(worker.address).requests;
+                    call.defer(call_request(
+                        requests,
+                        WorkerRequest::Process(job),
+                        CALL_TIMEOUT,
+                    ))
+                    .reply_service_event(ParentEvent::WorkerDone)
+                }
+                None => call.reply(ParentReply::NotStarted),
+            },
+        }
+    }
+}
+
+fn parent_reply_from_worker(outcome: CallOutcome<WorkerReply>) -> ParentReply {
+    match outcome {
+        CallOutcome::Replied(WorkerReply::Processed) => ParentReply::Processed,
+        CallOutcome::Full => ParentReply::WorkerFull,
+        CallOutcome::Closed => ParentReply::WorkerClosed,
+        CallOutcome::Timeout => ParentReply::WorkerTimeout,
+        CallOutcome::Rejected(CallRejectedReason::HandlerPanicked) => ParentReply::WorkerPanicked,
+        CallOutcome::Rejected(reason) => ParentReply::WorkerRejected(reason),
     }
 }
 
 pub fn run() -> anyhow::Result<Report> {
     let script = job_script();
     let poison_count = script.iter().filter(|j| matches!(j, Job::Poison)).count() as u32;
-    let work_count = script.iter().filter(|j| matches!(j, Job::Work(_))).count() as u32;
 
-    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
-    let slot = Arc::new(WorkerSlot::default());
-
-    let parent = runtime
-        .register_with_capacity::<_, Infallible>(
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    let parent = app
+        .register_split_service::<Parent, ParentEvent, ParentRequest, Infallible>(
             Parent {
-                slot: Arc::clone(&slot),
+                worker: None,
+                starting: false,
                 worker_capacity: 8,
             },
             8,
         )
-        .map_err(|e| anyhow::anyhow!("register parent: {e:?}"))?;
+        .map_err(|error| anyhow::anyhow!("register parent: {error:?}"))?;
 
-    runtime
-        .try_supervise(
-            parent,
-            SupervisorConfig::new(
-                RestartPolicy::OneForOne,
-                RestartBudget::new(poison_count + 2),
-            ),
-        )
-        .map_err(|e| anyhow::anyhow!("supervise parent: {e:?}"))?
-        .map_err(|e| anyhow::anyhow!("supervise: {e:?}"))?;
+    app.try_supervise(
+        parent.address(),
+        SupervisorConfig::new(
+            RestartPolicy::OneForOne,
+            RestartBudget::new(poison_count + 2),
+        ),
+    )
+    .map_err(|error| anyhow::anyhow!("supervise parent: {error:?}"))?
+    .map_err(|error| anyhow::anyhow!("supervise: {error:?}"))?;
 
-    runtime
-        .try_send(parent, ParentMsg::Spawn)
-        .map_err(|e| anyhow::anyhow!("send spawn: {e:?}"))?;
+    expect_parent_reply(
+        app.call_blocking_request(parent.requests, ParentRequest::Start, CALL_TIMEOUT)?,
+        ParentReply::Started,
+        "start parent",
+    )?;
 
-    // Wait for the parent's spawn_observed continuation to publish its child ref.
-    wait_until(Duration::from_secs(2), "first worker child ref", || {
-        slot.current().is_some()
-    })?;
-
-    let mut restarts: u32 = 0;
-    for job in &script {
-        let addr = slot
-            .current()
-            .ok_or_else(|| anyhow::anyhow!("worker addr missing"))?;
+    let mut processed = 0;
+    let mut poisoned = 0;
+    let mut restarts = 0;
+    for job in script {
+        let restart_waiter = matches!(job, Job::Poison)
+            .then(|| app.observe_child_restarted(parent.address()))
+            .transpose()?;
+        let expected = match job {
+            Job::Work(_) => ParentReply::Processed,
+            Job::Poison => ParentReply::WorkerPanicked,
+        };
+        expect_parent_reply(
+            app.call_blocking_request(parent.requests, ParentRequest::Process(job), CALL_TIMEOUT)?,
+            expected,
+            "process job",
+        )?;
         match job {
-            Job::Poison => {
-                let restart_waiter = runtime.observe_child_restarted(parent)?;
-                let deadline = Instant::now() + Duration::from_secs(2);
-                runtime
-                    .send_observed_until(addr, deadline, Duration::from_millis(1), || {
-                        WorkerMsg::Process(*job)
-                    })
-                    .map_err(|e| anyhow::anyhow!("send poison job: {e:?}"))?;
-                let restarted = restart_waiter
-                    .wait(Duration::from_secs(2))
-                    .map_err(|e| anyhow::anyhow!("supervisor restart: {e:?}"))?;
-                restarts += 1;
-                slot.set(Address::new_with_generation_in(
-                    parent.system(),
-                    parent.shard(),
-                    restarted.new_isolate,
-                    restarted.new_generation,
-                ));
-            }
-            Job::Work(_) => {
-                let deadline = Instant::now() + Duration::from_secs(2);
-                runtime
-                    .send_observed_until(addr, deadline, Duration::from_millis(1), || {
-                        WorkerMsg::Process(*job)
-                    })
-                    .map_err(|e| anyhow::anyhow!("send work job: {e:?}"))?;
-            }
+            Job::Work(_) => processed += 1,
+            Job::Poison => poisoned += 1,
+        }
+        if let Some(waiter) = restart_waiter {
+            waiter
+                .wait(CALL_TIMEOUT)
+                .map_err(|error| anyhow::anyhow!("supervisor restart: {error:?}"))?;
+            restarts += 1;
         }
     }
 
-    runtime.shutdown_report().ensure_clean()?;
+    app.shutdown().drain().join_report().ensure_clean()?;
 
     Ok(Report {
-        processed: work_count,
-        poisoned: poison_count,
+        processed,
+        poisoned,
         restarts,
         exit_clean: true,
     })
 }
 
-fn wait_until<F>(timeout: Duration, label: &str, mut predicate: F) -> anyhow::Result<()>
-where
-    F: FnMut() -> bool,
-{
-    let deadline = Instant::now() + timeout;
-    while !predicate() {
-        if Instant::now() > deadline {
-            anyhow::bail!("wait_until({label}) timed out");
+fn expect_parent_reply(
+    outcome: CallOutcome<ParentReply>,
+    expected: ParentReply,
+    operation: &str,
+) -> anyhow::Result<()> {
+    match outcome {
+        CallOutcome::Replied(actual) if actual == expected => Ok(()),
+        CallOutcome::Replied(actual) => {
+            anyhow::bail!("{operation} returned {actual:?}, expected {expected:?}")
         }
-        thread::yield_now();
+        CallOutcome::Full => anyhow::bail!("{operation}: parent mailbox full"),
+        CallOutcome::Closed => anyhow::bail!("{operation}: parent closed"),
+        CallOutcome::Timeout => anyhow::bail!("{operation}: timed out"),
+        CallOutcome::Rejected(reason) => anyhow::bail!("{operation}: rejected: {reason:?}"),
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ParentReply, WorkerReply, parent_reply_from_worker};
+    use tina::CallRejectedReason;
+    use tina_runtime::CallOutcome;
+
+    #[test]
+    fn worker_call_terminals_remain_distinct() {
+        assert_eq!(
+            parent_reply_from_worker(CallOutcome::Replied(WorkerReply::Processed)),
+            ParentReply::Processed
+        );
+        assert_eq!(
+            parent_reply_from_worker(CallOutcome::Full),
+            ParentReply::WorkerFull
+        );
+        assert_eq!(
+            parent_reply_from_worker(CallOutcome::Closed),
+            ParentReply::WorkerClosed
+        );
+        assert_eq!(
+            parent_reply_from_worker(CallOutcome::Timeout),
+            ParentReply::WorkerTimeout
+        );
+        assert_eq!(
+            parent_reply_from_worker(CallOutcome::Rejected(CallRejectedReason::HandlerPanicked)),
+            ParentReply::WorkerPanicked
+        );
+        assert_eq!(
+            parent_reply_from_worker(CallOutcome::Rejected(CallRejectedReason::ReplyAbandoned)),
+            ParentReply::WorkerRejected(CallRejectedReason::ReplyAbandoned)
+        );
+        assert_eq!(
+            parent_reply_from_worker(CallOutcome::Rejected(
+                CallRejectedReason::UnsupportedMessage
+            )),
+            ParentReply::WorkerRejected(CallRejectedReason::UnsupportedMessage)
+        );
+    }
 }
