@@ -19,17 +19,29 @@
 //! same shape at SQS through `tina-aws-bridge`.
 
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::error::Error;
+use std::fmt;
 use std::time::Duration;
 
+use tina::CallRejectedReason;
 use tina::prelude::*;
 use tina_aws_bridge::{
     BridgeFatal, BridgeOutcomeClass, BridgeRetryable, BridgeUnavailable, SqsAddress, SqsError,
     SqsRequest, SqsResponse, SqsSendMessage, send_sqs,
 };
-use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, LocalSystem};
+use tina_runtime::{
+    CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, ReportedWorkloadError,
+    RequestServiceHandle, RunToShutdownError, StartupError, ThreadedRuntimeError,
+};
 
 type RelaySystem = LocalSystem<SingleShard, DefaultThreadedMailboxFactory>;
+
+const RELAY_MAILBOX_CAPACITY: usize = 64;
+const FAKE_MAILBOX_CAPACITY: usize = 64;
+const MAX_EVENTS: usize = 4_096;
+const MAX_PROGRAM_ENTRIES: usize = 4_096;
+const MAX_CALL_TIMEOUT_MS: u64 = 60_000;
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Outbound port the relay calls. Mirrors the bridge two-layer shape.
 pub type OutboundOutcome = CallOutcome<Result<OutboundReply, OutboundError>>;
@@ -102,9 +114,8 @@ pub enum DeadLetterReason {
     /// Unavailable classifier — the bridge or resource is closed and a
     /// new handle is required.
     Unavailable(BridgeUnavailable),
-    /// Tina-side `CallError`: target was unknown, full, or closed
-    /// before the call left the relay.
-    CallError(String),
+    /// The runtime rejected the outbound request without a domain reply.
+    Rejected(CallRejectedReason),
 }
 
 /// Final relay outcome for one event (visible to callers).
@@ -182,11 +193,10 @@ pub fn map_sqs_outcome(outcome: CallOutcome<Result<SqsResponse, SqsError>>) -> O
         CallOutcome::Closed => CallOutcome::Closed,
         CallOutcome::Timeout => CallOutcome::Timeout,
         CallOutcome::Rejected(r) => CallOutcome::Rejected(r),
-        CallOutcome::Replied(Ok(SqsResponse::SentMessage(sent))) => {
-            CallOutcome::Replied(Ok(OutboundReply {
-                backend_id: sent.message_id.unwrap_or_default(),
-            }))
-        }
+        CallOutcome::Replied(Ok(SqsResponse::SentMessage(sent))) => match sent.message_id {
+            Some(backend_id) => CallOutcome::Replied(Ok(OutboundReply { backend_id })),
+            None => CallOutcome::Replied(Err(OutboundError::Internal)),
+        },
         CallOutcome::Replied(Ok(_)) => CallOutcome::Replied(Err(OutboundError::InvalidRequest)),
         CallOutcome::Replied(Err(err)) => CallOutcome::Replied(Err(map_sqs_error(err))),
     }
@@ -211,7 +221,7 @@ fn map_sqs_error(err: SqsError) -> OutboundError {
 /// real `tina-aws-bridge` SQS worker.
 pub enum OutboundPort {
     /// In-process fake outbound (the program is a `VecDeque` of replies).
-    Fake(Address<FakeOutboundMsg, Result<OutboundReply, OutboundError>>),
+    Fake(RequestServiceHandle<FakeOutboundRequest, Result<OutboundReply, OutboundError>>),
     /// AWS SQS bridge address + queue URL + per-call timeout.
     Sqs(SqsOutbound),
 }
@@ -273,9 +283,9 @@ impl Relay {
         let timeout = self.timeout;
         match &self.outbound {
             OutboundPort::Fake(addr) => {
-                call.defer(tina_runtime::call(
+                call.defer(tina_runtime::call_request(
                     *addr,
-                    FakeOutboundMsg::Send(event),
+                    FakeOutboundRequest::Send(event),
                     timeout,
                 ))
                 .reply_service_event(|request, outcome| {
@@ -308,60 +318,64 @@ impl Relay {
 
 impl Relay {
     fn classify_and_tally(&mut self, outcome: OutboundOutcome) -> RelayReply {
-        match &outcome {
-            CallOutcome::Replied(Ok(ok)) => {
-                self.stats.delivered += 1;
-                RelayReply::Delivered {
-                    backend_id: ok.backend_id.clone(),
-                }
+        classify_outbound_outcome(&mut self.stats, outcome)
+    }
+}
+
+fn classify_outbound_outcome(stats: &mut RelayStats, outcome: OutboundOutcome) -> RelayReply {
+    match &outcome {
+        CallOutcome::Replied(Ok(ok)) => {
+            stats.delivered += 1;
+            RelayReply::Delivered {
+                backend_id: ok.backend_id.clone(),
             }
-            CallOutcome::Replied(Err(err)) => match err.classify() {
-                BridgeOutcomeClass::Succeeded => {
-                    self.stats.dead_letter += 1;
-                    RelayReply::DeadLetter {
-                        reason: DeadLetterReason::Fatal(BridgeFatal::Internal),
-                    }
-                }
-                BridgeOutcomeClass::Retryable(reason) => {
-                    self.stats.transient += 1;
-                    RelayReply::Retry { reason }
-                }
-                BridgeOutcomeClass::Unavailable(reason) => {
-                    self.stats.dead_letter += 1;
-                    RelayReply::DeadLetter {
-                        reason: DeadLetterReason::Unavailable(reason),
-                    }
-                }
-                BridgeOutcomeClass::Fatal(reason) => {
-                    self.stats.dead_letter += 1;
-                    RelayReply::DeadLetter {
-                        reason: DeadLetterReason::Fatal(reason),
-                    }
-                }
-            },
-            CallOutcome::Full => {
-                self.stats.transient += 1;
-                RelayReply::Retry {
-                    reason: BridgeRetryable::BridgeFull,
-                }
-            }
-            CallOutcome::Closed => {
-                self.stats.dead_letter += 1;
+        }
+        CallOutcome::Replied(Err(err)) => match err.classify() {
+            BridgeOutcomeClass::Succeeded => {
+                stats.dead_letter += 1;
                 RelayReply::DeadLetter {
-                    reason: DeadLetterReason::Unavailable(BridgeUnavailable::BridgeClosed),
+                    reason: DeadLetterReason::Fatal(BridgeFatal::Internal),
                 }
             }
-            CallOutcome::Timeout => {
-                self.stats.transient += 1;
-                RelayReply::Retry {
-                    reason: BridgeRetryable::CallerTimeout,
-                }
+            BridgeOutcomeClass::Retryable(reason) => {
+                stats.transient += 1;
+                RelayReply::Retry { reason }
             }
-            CallOutcome::Rejected(_) => {
-                self.stats.dead_letter += 1;
+            BridgeOutcomeClass::Unavailable(reason) => {
+                stats.dead_letter += 1;
                 RelayReply::DeadLetter {
-                    reason: DeadLetterReason::Fatal(BridgeFatal::InvalidRequest),
+                    reason: DeadLetterReason::Unavailable(reason),
                 }
+            }
+            BridgeOutcomeClass::Fatal(reason) => {
+                stats.dead_letter += 1;
+                RelayReply::DeadLetter {
+                    reason: DeadLetterReason::Fatal(reason),
+                }
+            }
+        },
+        CallOutcome::Full => {
+            stats.transient += 1;
+            RelayReply::Retry {
+                reason: BridgeRetryable::BridgeFull,
+            }
+        }
+        CallOutcome::Closed => {
+            stats.dead_letter += 1;
+            RelayReply::DeadLetter {
+                reason: DeadLetterReason::Unavailable(BridgeUnavailable::BridgeClosed),
+            }
+        }
+        CallOutcome::Timeout => {
+            stats.transient += 1;
+            RelayReply::Retry {
+                reason: BridgeRetryable::CallerTimeout,
+            }
+        }
+        CallOutcome::Rejected(reason) => {
+            stats.dead_letter += 1;
+            RelayReply::DeadLetter {
+                reason: DeadLetterReason::Rejected(*reason),
             }
         }
     }
@@ -376,11 +390,16 @@ pub enum FakeOutboundProgram {
     Deliver(String),
     /// Reply an `OutboundError` (test the classifier branches).
     Fail(OutboundError),
+    /// Reject the request without a domain reply.
+    Reject(CallRejectedReason),
+    /// Reply closed and stop the fake owner. A following request observes
+    /// transport-level `CallOutcome::Closed`.
+    Stop,
 }
 
-/// Messages handled by [`FakeOutbound`].
+/// Requests handled by [`FakeOutbound`].
 #[derive(Debug)]
-pub enum FakeOutboundMsg {
+pub enum FakeOutboundRequest {
     /// Caller asks the fake outbound to deliver one event.
     Send(Event),
 }
@@ -392,28 +411,32 @@ pub struct FakeOutbound {
     program: std::collections::VecDeque<FakeOutboundProgram>,
 }
 
-#[tina_runtime::isolate(message = FakeOutboundMsg, reply = Result<OutboundReply, OutboundError>)]
+#[tina_runtime::isolate(
+    request = FakeOutboundRequest,
+    reply = Result<OutboundReply, OutboundError>
+)]
 impl FakeOutbound {
-    fn handle(
+    fn handle_request(
         &mut self,
-        _msg: FakeOutboundMsg,
-        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
-    ) -> Effect<Self> {
-        noop()
-    }
-
-    fn handle_call(&mut self, msg: FakeOutboundMsg, call: CallContext<'_, Self>) -> Effect<Self> {
-        match msg {
-            FakeOutboundMsg::Send(_event) => {
+        request: FakeOutboundRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            FakeOutboundRequest::Send(_event) => {
                 let next = self
                     .program
                     .pop_front()
                     .unwrap_or(FakeOutboundProgram::Fail(OutboundError::Internal));
-                let reply = match next {
-                    FakeOutboundProgram::Deliver(id) => Ok(OutboundReply { backend_id: id }),
-                    FakeOutboundProgram::Fail(err) => Err(err),
-                };
-                call.reply(reply)
+                match next {
+                    FakeOutboundProgram::Deliver(id) => {
+                        call.reply(Ok(OutboundReply { backend_id: id }))
+                    }
+                    FakeOutboundProgram::Fail(err) => call.reply(Err(err)),
+                    FakeOutboundProgram::Reject(reason) => call.reject(reason),
+                    FakeOutboundProgram::Stop => {
+                        call.reply_and(Err(OutboundError::Closed), vec![stop()])
+                    }
+                }
             }
         }
     }
@@ -424,12 +447,98 @@ impl FakeOutbound {
 /// Configuration for [`run`].
 #[derive(Debug, Clone)]
 pub struct RunConfig {
-    /// Number of events to submit concurrently.
+    /// Number of events to submit sequentially.
     pub events: usize,
-    /// Per-call deadline.
+    /// Per-call deadline. Zero is allowed as an explicit immediate timeout.
     pub call_timeout_ms: u64,
     /// Fake outbound program (one entry per event).
     pub program: Vec<FakeOutboundProgram>,
+}
+
+impl RunConfig {
+    /// Validate all allocation- and wait-sized inputs before startup.
+    pub fn validate(self) -> Result<Self, RunConfigError> {
+        validate_event_count(self.events)?;
+        if self.program.len() > MAX_PROGRAM_ENTRIES {
+            return Err(RunConfigError::TooManyProgramEntries {
+                requested: self.program.len(),
+                max: MAX_PROGRAM_ENTRIES,
+            });
+        }
+        if self.program.len() != self.events {
+            return Err(RunConfigError::ProgramLengthMismatch {
+                events: self.events,
+                entries: self.program.len(),
+            });
+        }
+        validate_timeout_ms("call timeout", self.call_timeout_ms)?;
+        Ok(self)
+    }
+}
+
+/// Invalid bounded-driver configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunConfigError {
+    /// The event count exceeds the public driver cap.
+    TooManyEvents { requested: usize, max: usize },
+    /// The fake script exceeds its cap.
+    TooManyProgramEntries { requested: usize, max: usize },
+    /// The fake script must account for each submitted event exactly.
+    ProgramLengthMismatch { events: usize, entries: usize },
+    /// A millisecond duration exceeds the public cap.
+    DurationTooLarge {
+        field: &'static str,
+        requested_ms: u128,
+        max_ms: u64,
+    },
+    /// The real SQS path requires a concrete queue URL.
+    EmptyQueueUrl,
+}
+
+impl fmt::Display for RunConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooManyEvents { requested, max } => {
+                write!(f, "event count {requested} exceeds maximum {max}")
+            }
+            Self::TooManyProgramEntries { requested, max } => {
+                write!(f, "fake program length {requested} exceeds maximum {max}")
+            }
+            Self::ProgramLengthMismatch { events, entries } => write!(
+                f,
+                "fake program has {entries} entries for {events} requested events"
+            ),
+            Self::DurationTooLarge {
+                field,
+                requested_ms,
+                max_ms,
+            } => write!(f, "{field} {requested_ms}ms exceeds maximum {max_ms}ms"),
+            Self::EmptyQueueUrl => f.write_str("SQS queue URL must not be empty"),
+        }
+    }
+}
+
+impl Error for RunConfigError {}
+
+fn validate_event_count(events: usize) -> Result<(), RunConfigError> {
+    if events > MAX_EVENTS {
+        return Err(RunConfigError::TooManyEvents {
+            requested: events,
+            max: MAX_EVENTS,
+        });
+    }
+    Ok(())
+}
+
+fn validate_timeout_ms(field: &'static str, timeout_ms: u64) -> Result<(), RunConfigError> {
+    if timeout_ms > MAX_CALL_TIMEOUT_MS {
+        return Err(RunConfigError::DurationTooLarge {
+            field,
+            requested_ms: u128::from(timeout_ms),
+            max_ms: MAX_CALL_TIMEOUT_MS,
+        });
+    }
+    Ok(())
 }
 
 /// Driver outcome surface — structured `CallOutcome` and runtime
@@ -439,7 +548,7 @@ pub enum DriverReply {
     /// Relay returned a typed reply.
     Reply(RelayReply),
     /// `call_blocking` returned a runtime-level error.
-    RuntimeError(String),
+    RuntimeError(ThreadedRuntimeError),
     /// Caller-side `CallOutcome::Full` — relay's mailbox was saturated.
     OuterFull,
     /// Caller-side `CallOutcome::Closed` — relay was closed.
@@ -447,7 +556,7 @@ pub enum DriverReply {
     /// Caller-side `CallOutcome::Timeout` — relay did not reply in time.
     OuterTimeout,
     /// Caller-side `CallOutcome::Rejected` — relay rejected the call.
-    OuterRejected(String),
+    OuterRejected(CallRejectedReason),
 }
 
 /// Driver result.
@@ -459,42 +568,143 @@ pub struct RunReport {
     pub stats: RelayStats,
 }
 
+/// A non-reply terminal outcome from the final stats request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatsTerminalOutcome {
+    /// Relay mailbox was full.
+    Full,
+    /// Relay owner was closed.
+    Closed,
+    /// Stats deadline elapsed.
+    Timeout,
+    /// Runtime rejected the request.
+    Rejected(CallRejectedReason),
+}
+
+/// Typed workload failure retained by [`run_to_shutdown_reported`](LocalSystem::run_to_shutdown_reported).
+#[derive(Debug)]
+pub enum RelayWorkloadError {
+    /// A root service could not be registered.
+    Registration {
+        service: &'static str,
+        source: ThreadedRuntimeError,
+    },
+    /// The host control plane failed while collecting stats.
+    StatsHost(ThreadedRuntimeError),
+    /// The stats request ended without an application reply.
+    StatsTerminal(StatsTerminalOutcome),
+    /// The relay answered the stats request with the wrong reply variant.
+    UnexpectedStatsReply(Box<RelayReply>),
+}
+
+impl fmt::Display for RelayWorkloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registration { service, source } => {
+                write!(f, "register {service}: {source}")
+            }
+            Self::StatsHost(source) => write!(f, "stats host call failed: {source}"),
+            Self::StatsTerminal(outcome) => {
+                write!(f, "stats call ended without a reply: {outcome:?}")
+            }
+            Self::UnexpectedStatsReply(reply) => {
+                write!(f, "stats call returned unexpected reply: {reply:?}")
+            }
+        }
+    }
+}
+
+impl Error for RelayWorkloadError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Registration { source, .. } | Self::StatsHost(source) => Some(source),
+            Self::StatsTerminal(_) | Self::UnexpectedStatsReply(_) => None,
+        }
+    }
+}
+
+impl AsRef<dyn Error + Send + Sync + 'static> for RelayWorkloadError {
+    fn as_ref(&self) -> &(dyn Error + Send + Sync + 'static) {
+        self
+    }
+}
+
+/// Terminal runner error preserving workload and shutdown truth.
+pub type RelayTerminalError = RunToShutdownError<ReportedWorkloadError<RelayWorkloadError>>;
+
+/// Complete public run error surface.
+#[derive(Debug)]
+pub enum RunError {
+    /// Inputs were rejected before runtime construction.
+    InvalidConfig(RunConfigError),
+    /// The local runtime could not start.
+    Startup(StartupError),
+    /// Workload failure, shutdown failure, or both.
+    Terminal(Box<RelayTerminalError>),
+}
+
+impl fmt::Display for RunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidConfig(error) => write!(f, "invalid relay configuration: {error}"),
+            Self::Startup(error) => write!(f, "relay startup failed: {error}"),
+            Self::Terminal(error) => write!(f, "relay run failed: {error}"),
+        }
+    }
+}
+
+impl Error for RunError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidConfig(error) => Some(error),
+            Self::Startup(error) => Some(error),
+            Self::Terminal(error) => Some(error.as_ref()),
+        }
+    }
+}
+
 /// Run the hermetic relay with the supplied fake-outbound script.
-pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(
-        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
-    );
-    let shutdown = runtime.shutdown_handle();
+pub fn run(config: RunConfig) -> Result<RunReport, RunError> {
+    let config = config.validate().map_err(RunError::InvalidConfig)?;
+    let runtime = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+        .try_build()
+        .map_err(RunError::Startup)?;
+    runtime
+        .run_to_shutdown_reported(SHUTDOWN_TIMEOUT, |runtime| {
+            let outbound_addr = runtime
+                .register_request_service::<FakeOutbound, FakeOutboundRequest, Infallible>(
+                    FakeOutbound {
+                        program: config.program.into(),
+                    },
+                    FAKE_MAILBOX_CAPACITY,
+                )
+                .map_err(|source| RelayWorkloadError::Registration {
+                    service: "fake outbound",
+                    source,
+                })?;
 
-    let result = (|| {
-        let outbound_addr = runtime
-            .register_root::<_, Infallible>(
-                FakeOutbound {
-                    program: config.program.into(),
-                },
-                64,
+            let relay = runtime
+                .register_split_service::<Relay, RelayEvent, RelayRequest, Infallible>(
+                    Relay {
+                        outbound: OutboundPort::Fake(outbound_addr),
+                        timeout: Duration::from_millis(config.call_timeout_ms),
+                        stats: RelayStats::default(),
+                    },
+                    RELAY_MAILBOX_CAPACITY,
+                )
+                .map_err(|source| RelayWorkloadError::Registration {
+                    service: "relay",
+                    source,
+                })?;
+
+            drive_relay(
+                runtime,
+                relay.requests,
+                config.events,
+                config.call_timeout_ms,
             )
-            .map_err(|e| anyhow::anyhow!("register fake outbound: {e:?}"))?;
-
-        let relay = runtime
-            .register_split_service::<Relay, RelayEvent, RelayRequest, Infallible>(
-                Relay {
-                    outbound: OutboundPort::Fake(outbound_addr),
-                    timeout: Duration::from_millis(config.call_timeout_ms),
-                    stats: RelayStats::default(),
-                },
-                64,
-            )
-            .map_err(|e| anyhow::anyhow!("register relay: {e:?}"))?;
-
-        drive_relay(
-            &runtime,
-            relay.requests,
-            config.events,
-            config.call_timeout_ms,
-        )
-    })();
-    finish_after_shutdown(result, shutdown, runtime)
+        })
+        .map_err(|error| RunError::Terminal(Box::new(error)))
 }
 
 /// Run the relay against a `tina-aws-bridge` SQS worker. The caller
@@ -512,38 +722,54 @@ pub fn run_against_sqs(
     sqs_address: tina_aws_bridge::SqsAddress,
     queue_url: String,
     bridge_timeout: Duration,
-) -> anyhow::Result<RunReport> {
-    let runtime = Arc::new(
-        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?,
-    );
-    let shutdown = runtime.shutdown_handle();
+) -> Result<RunReport, RunError> {
+    validate_event_count(events).map_err(RunError::InvalidConfig)?;
+    validate_timeout_ms("call timeout", call_timeout_ms).map_err(RunError::InvalidConfig)?;
+    if queue_url.trim().is_empty() {
+        return Err(RunError::InvalidConfig(RunConfigError::EmptyQueueUrl));
+    }
+    let bridge_timeout_ms = bridge_timeout.as_millis();
+    if bridge_timeout_ms > u128::from(MAX_CALL_TIMEOUT_MS) {
+        return Err(RunError::InvalidConfig(RunConfigError::DurationTooLarge {
+            field: "bridge timeout",
+            requested_ms: bridge_timeout_ms,
+            max_ms: MAX_CALL_TIMEOUT_MS,
+        }));
+    }
 
-    let result = (|| {
-        let relay = runtime
-            .register_split_service::<Relay, RelayEvent, RelayRequest, Infallible>(
-                Relay::new(
-                    OutboundPort::Sqs(SqsOutbound {
-                        address: sqs_address,
-                        queue_url,
-                        timeout: bridge_timeout,
-                    }),
-                    Duration::from_millis(call_timeout_ms),
-                ),
-                64,
-            )
-            .map_err(|e| anyhow::anyhow!("register relay: {e:?}"))?;
+    let runtime = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+        .try_build()
+        .map_err(RunError::Startup)?;
+    runtime
+        .run_to_shutdown_reported(SHUTDOWN_TIMEOUT, |runtime| {
+            let relay = runtime
+                .register_split_service::<Relay, RelayEvent, RelayRequest, Infallible>(
+                    Relay::new(
+                        OutboundPort::Sqs(SqsOutbound {
+                            address: sqs_address,
+                            queue_url,
+                            timeout: bridge_timeout,
+                        }),
+                        Duration::from_millis(call_timeout_ms),
+                    ),
+                    RELAY_MAILBOX_CAPACITY,
+                )
+                .map_err(|source| RelayWorkloadError::Registration {
+                    service: "relay",
+                    source,
+                })?;
 
-        drive_relay(&runtime, relay.requests, events, call_timeout_ms)
-    })();
-    finish_after_shutdown(result, shutdown, runtime)
+            drive_relay(runtime, relay.requests, events, call_timeout_ms)
+        })
+        .map_err(|error| RunError::Terminal(Box::new(error)))
 }
 
 fn drive_relay(
-    runtime: &Arc<RelaySystem>,
+    runtime: &RelaySystem,
     relay_requests: tina::ServiceRequestAddress<RelayEvent, RelayRequest, RelayReply>,
     events: usize,
     call_timeout_ms: u64,
-) -> anyhow::Result<RunReport> {
+) -> Result<RunReport, RelayWorkloadError> {
     // Submit events sequentially so each event lines up with one
     // outbound reply. The classifier shape is independent of
     // concurrency; serializing keeps the test deterministic.
@@ -558,46 +784,274 @@ fn drive_relay(
             }),
             call_timeout,
         );
-        let reply = match outcome {
-            Ok(CallOutcome::Replied(r)) => DriverReply::Reply(r),
-            Ok(CallOutcome::Full) => DriverReply::OuterFull,
-            Ok(CallOutcome::Closed) => DriverReply::OuterClosed,
-            Ok(CallOutcome::Timeout) => DriverReply::OuterTimeout,
-            Ok(CallOutcome::Rejected(r)) => DriverReply::OuterRejected(format!("{r:?}")),
-            Err(e) => DriverReply::RuntimeError(format!("{e:?}")),
-        };
+        let reply = classify_driver_outcome(outcome);
         replies.push(reply);
     }
 
-    let stats = match runtime
-        .call_blocking_request(relay_requests, RelayRequest::Stats, Duration::from_secs(1))
-        .map_err(|e| anyhow::anyhow!("stats call: {e:?}"))?
-    {
-        CallOutcome::Replied(RelayReply::Stats(stats)) => stats,
-        other => anyhow::bail!("stats call returned unexpected reply: {other:?}"),
+    let stats = match runtime.call_blocking_request(
+        relay_requests,
+        RelayRequest::Stats,
+        Duration::from_secs(1),
+    ) {
+        Ok(CallOutcome::Replied(RelayReply::Stats(stats))) => stats,
+        Ok(CallOutcome::Replied(reply)) => {
+            return Err(RelayWorkloadError::UnexpectedStatsReply(Box::new(reply)));
+        }
+        Ok(CallOutcome::Full) => {
+            return Err(RelayWorkloadError::StatsTerminal(
+                StatsTerminalOutcome::Full,
+            ));
+        }
+        Ok(CallOutcome::Closed) => {
+            return Err(RelayWorkloadError::StatsTerminal(
+                StatsTerminalOutcome::Closed,
+            ));
+        }
+        Ok(CallOutcome::Timeout) => {
+            return Err(RelayWorkloadError::StatsTerminal(
+                StatsTerminalOutcome::Timeout,
+            ));
+        }
+        Ok(CallOutcome::Rejected(reason)) => {
+            return Err(RelayWorkloadError::StatsTerminal(
+                StatsTerminalOutcome::Rejected(reason),
+            ));
+        }
+        Err(error) => return Err(RelayWorkloadError::StatsHost(error)),
     };
 
     Ok(RunReport { replies, stats })
 }
 
-fn finish_after_shutdown<T>(
-    result: anyhow::Result<T>,
-    shutdown: tina_runtime::ThreadedShutdownHandle,
-    runtime: Arc<RelaySystem>,
-) -> anyhow::Result<T> {
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5));
-    drop(runtime);
-    let shutdown_result: anyhow::Result<()> = match terminal {
-        Ok(report) => report.ensure_clean().map_err(Into::into),
-        Err(error) => Err(error.into()),
-    };
+fn classify_driver_outcome(
+    outcome: Result<CallOutcome<RelayReply>, ThreadedRuntimeError>,
+) -> DriverReply {
+    match outcome {
+        Ok(CallOutcome::Replied(r)) => DriverReply::Reply(r),
+        Ok(CallOutcome::Full) => DriverReply::OuterFull,
+        Ok(CallOutcome::Closed) => DriverReply::OuterClosed,
+        Ok(CallOutcome::Timeout) => DriverReply::OuterTimeout,
+        Ok(CallOutcome::Rejected(reason)) => DriverReply::OuterRejected(reason),
+        Err(error) => DriverReply::RuntimeError(error),
+    }
+}
 
-    match (result, shutdown_result) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(error), Err(shutdown_error)) => Err(anyhow::anyhow!(
-            "{error:#}; shutdown also failed: {shutdown_error}"
-        )),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tina_aws_bridge::{SqsReceivedMessages, SqsSentMessage};
+
+    fn classify(stats: &mut RelayStats, outcome: OutboundOutcome) -> RelayReply {
+        classify_outbound_outcome(stats, outcome)
+    }
+
+    #[test]
+    fn every_outbound_transport_and_worker_class_is_preserved() {
+        let mut stats = RelayStats::default();
+
+        assert!(matches!(
+            classify(
+                &mut stats,
+                CallOutcome::Replied(Ok(OutboundReply {
+                    backend_id: "backend".into(),
+                })),
+            ),
+            RelayReply::Delivered { backend_id } if backend_id == "backend"
+        ));
+
+        let retryable = [
+            (OutboundError::Full, BridgeRetryable::BridgeFull),
+            (OutboundError::Timeout, BridgeRetryable::BridgeTimeout),
+            (OutboundError::Throttled, BridgeRetryable::ServiceThrottled),
+            (OutboundError::SdkTransient, BridgeRetryable::SdkRetryable),
+        ];
+        for (error, expected) in retryable {
+            assert_eq!(
+                classify(&mut stats, CallOutcome::Replied(Err(error))),
+                RelayReply::Retry { reason: expected }
+            );
+        }
+
+        assert_eq!(
+            classify(&mut stats, CallOutcome::Replied(Err(OutboundError::Closed))),
+            RelayReply::DeadLetter {
+                reason: DeadLetterReason::Unavailable(BridgeUnavailable::BridgeClosed),
+            }
+        );
+
+        let fatal = [
+            (OutboundError::NotFound, BridgeFatal::NotFound),
+            (
+                OutboundError::InvalidParameter,
+                BridgeFatal::InvalidParameter,
+            ),
+            (OutboundError::AccessDenied, BridgeFatal::AccessDenied),
+            (OutboundError::InvalidRequest, BridgeFatal::InvalidRequest),
+            (OutboundError::Internal, BridgeFatal::Internal),
+        ];
+        for (error, expected) in fatal {
+            assert_eq!(
+                classify(&mut stats, CallOutcome::Replied(Err(error))),
+                RelayReply::DeadLetter {
+                    reason: DeadLetterReason::Fatal(expected),
+                }
+            );
+        }
+
+        assert_eq!(
+            classify(&mut stats, CallOutcome::Full),
+            RelayReply::Retry {
+                reason: BridgeRetryable::BridgeFull,
+            }
+        );
+        assert_eq!(
+            classify(&mut stats, CallOutcome::Closed),
+            RelayReply::DeadLetter {
+                reason: DeadLetterReason::Unavailable(BridgeUnavailable::BridgeClosed),
+            }
+        );
+        assert_eq!(
+            classify(&mut stats, CallOutcome::Timeout),
+            RelayReply::Retry {
+                reason: BridgeRetryable::CallerTimeout,
+            }
+        );
+        assert_eq!(
+            classify(
+                &mut stats,
+                CallOutcome::Rejected(CallRejectedReason::HandlerPanicked),
+            ),
+            RelayReply::DeadLetter {
+                reason: DeadLetterReason::Rejected(CallRejectedReason::HandlerPanicked),
+            }
+        );
+
+        assert_eq!(
+            stats,
+            RelayStats {
+                delivered: 1,
+                transient: 6,
+                dead_letter: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn driver_mapping_retains_each_outer_terminal_value() {
+        let reply = RelayReply::Retry {
+            reason: BridgeRetryable::CallerTimeout,
+        };
+        assert_eq!(
+            classify_driver_outcome(Ok(CallOutcome::Replied(reply.clone()))),
+            DriverReply::Reply(reply)
+        );
+        assert_eq!(
+            classify_driver_outcome(Ok(CallOutcome::Full)),
+            DriverReply::OuterFull
+        );
+        assert_eq!(
+            classify_driver_outcome(Ok(CallOutcome::Closed)),
+            DriverReply::OuterClosed
+        );
+        assert_eq!(
+            classify_driver_outcome(Ok(CallOutcome::Timeout)),
+            DriverReply::OuterTimeout
+        );
+        assert_eq!(
+            classify_driver_outcome(Ok(CallOutcome::Rejected(
+                CallRejectedReason::UnsupportedMessage,
+            ))),
+            DriverReply::OuterRejected(CallRejectedReason::UnsupportedMessage)
+        );
+        assert_eq!(
+            classify_driver_outcome(Err(ThreadedRuntimeError::HostWaitTimeout)),
+            DriverReply::RuntimeError(ThreadedRuntimeError::HostWaitTimeout)
+        );
+    }
+
+    #[test]
+    fn missing_sqs_message_id_is_typed_internal_failure() {
+        let mapped = map_sqs_outcome(CallOutcome::Replied(Ok(SqsResponse::SentMessage(
+            SqsSentMessage {
+                message_id: None,
+                md5_of_body: Some("md5".into()),
+                sequence_number: None,
+            },
+        ))));
+        assert_eq!(mapped, CallOutcome::Replied(Err(OutboundError::Internal)));
+    }
+
+    #[test]
+    fn wrong_sqs_success_shape_is_typed_invalid_request() {
+        let mapped = map_sqs_outcome(CallOutcome::Replied(Ok(SqsResponse::ReceivedMessages(
+            SqsReceivedMessages { messages: vec![] },
+        ))));
+        assert_eq!(
+            mapped,
+            CallOutcome::Replied(Err(OutboundError::InvalidRequest))
+        );
+    }
+
+    #[test]
+    fn config_rejects_every_unbounded_input_before_startup() {
+        assert!(matches!(
+            RunConfig {
+                events: MAX_EVENTS + 1,
+                call_timeout_ms: 1,
+                program: vec![],
+            }
+            .validate(),
+            Err(RunConfigError::TooManyEvents { .. })
+        ));
+        assert!(matches!(
+            RunConfig {
+                events: 0,
+                call_timeout_ms: 1,
+                program: vec![
+                    FakeOutboundProgram::Fail(OutboundError::Internal);
+                    MAX_PROGRAM_ENTRIES + 1
+                ],
+            }
+            .validate(),
+            Err(RunConfigError::TooManyProgramEntries { .. })
+        ));
+        assert!(matches!(
+            RunConfig {
+                events: 1,
+                call_timeout_ms: 1,
+                program: vec![],
+            }
+            .validate(),
+            Err(RunConfigError::ProgramLengthMismatch { .. })
+        ));
+        assert!(matches!(
+            RunConfig {
+                events: 0,
+                call_timeout_ms: MAX_CALL_TIMEOUT_MS + 1,
+                program: vec![],
+            }
+            .validate(),
+            Err(RunConfigError::DurationTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn reported_runner_shuts_down_after_early_workload_error() {
+        let runtime = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+            .try_build()
+            .expect("runtime starts");
+        let result = runtime.run_to_shutdown_reported(SHUTDOWN_TIMEOUT, |_runtime| {
+            Err::<(), _>(RelayWorkloadError::StatsTerminal(
+                StatsTerminalOutcome::Closed,
+            ))
+        });
+
+        let Err(RunToShutdownError::Workload(error)) = result else {
+            panic!("expected workload-only failure after clean shutdown");
+        };
+        assert!(matches!(
+            error.get_ref(),
+            RelayWorkloadError::StatsTerminal(StatsTerminalOutcome::Closed)
+        ));
     }
 }

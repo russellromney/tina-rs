@@ -1,6 +1,8 @@
 use system_webhook_relay::{
-    DeadLetterReason, DriverReply, FakeOutboundProgram, OutboundError, RelayReply, RunConfig, run,
+    DeadLetterReason, DriverReply, FakeOutboundProgram, OutboundError, RelayReply, RunConfig,
+    RunConfigError, RunError, run,
 };
+use tina::CallRejectedReason;
 use tina_aws_bridge::{BridgeFatal, BridgeRetryable, BridgeUnavailable};
 
 fn reply(d: &DriverReply) -> &RelayReply {
@@ -112,15 +114,82 @@ fn invalid_parameter_and_access_denied_are_dead_letter() {
 
 #[test]
 fn caller_timeout_settles_before_bounded_shutdown() {
+    for _ in 0..20 {
+        let report = run(RunConfig {
+            events: 1,
+            call_timeout_ms: 0,
+            program: vec![FakeOutboundProgram::Deliver("too-late".into())],
+        })
+        .expect("caller-gone completion and bounded shutdown must settle");
+
+        assert_eq!(report.replies, vec![DriverReply::OuterTimeout]);
+        assert_eq!(report.stats.delivered, 0);
+        assert_eq!(report.stats.transient, 1);
+        assert_eq!(report.stats.dead_letter, 0);
+    }
+}
+
+#[test]
+fn rejection_reason_survives_the_outbound_classifier() {
     let report = run(RunConfig {
         events: 1,
-        call_timeout_ms: 0,
-        program: vec![FakeOutboundProgram::Deliver("too-late".into())],
+        call_timeout_ms: 2_000,
+        program: vec![FakeOutboundProgram::Reject(
+            CallRejectedReason::UnsupportedMessage,
+        )],
     })
-    .expect("caller-gone completion and shutdown must settle");
+    .expect("rejection and shutdown settle");
 
-    assert_eq!(report.replies, vec![DriverReply::OuterTimeout]);
+    assert_eq!(
+        report.replies,
+        vec![DriverReply::Reply(RelayReply::DeadLetter {
+            reason: DeadLetterReason::Rejected(CallRejectedReason::UnsupportedMessage),
+        })]
+    );
     assert_eq!(report.stats.delivered, 0);
-    assert_eq!(report.stats.transient, 1);
-    assert_eq!(report.stats.dead_letter, 0);
+    assert_eq!(report.stats.transient, 0);
+    assert_eq!(report.stats.dead_letter, 1);
+}
+
+#[test]
+fn stopped_outbound_owner_is_observed_as_closed_and_shutdown_is_clean() {
+    let report = run(RunConfig {
+        events: 2,
+        call_timeout_ms: 2_000,
+        program: vec![
+            FakeOutboundProgram::Stop,
+            FakeOutboundProgram::Deliver("unused".into()),
+        ],
+    })
+    .expect("owner stop and bounded shutdown settle");
+
+    for observed in report.replies {
+        assert_eq!(
+            observed,
+            DriverReply::Reply(RelayReply::DeadLetter {
+                reason: DeadLetterReason::Unavailable(BridgeUnavailable::BridgeClosed),
+            })
+        );
+    }
+    assert_eq!(report.stats.delivered, 0);
+    assert_eq!(report.stats.transient, 0);
+    assert_eq!(report.stats.dead_letter, 2);
+}
+
+#[test]
+fn invalid_configuration_returns_before_runtime_startup() {
+    let error = run(RunConfig {
+        events: 1,
+        call_timeout_ms: 2_000,
+        program: vec![],
+    })
+    .expect_err("mismatched script must fail validation");
+
+    assert!(matches!(
+        error,
+        RunError::InvalidConfig(RunConfigError::ProgramLengthMismatch {
+            events: 1,
+            entries: 0,
+        })
+    ));
 }

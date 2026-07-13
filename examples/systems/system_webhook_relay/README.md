@@ -9,8 +9,10 @@ it (succeeded / transient / fatal), and replies with one of:
   the caller's story);
 - `DeadLetter { reason }` — fatal classifier (no retry without input change).
 
-Hermetic by default: the bundled `FakeOutbound` isolate returns prepared
-`OutboundOutcome` values. No AWS account required.
+Hermetic by default: the bundled request-only `FakeOutbound` service returns
+prepared typed outcomes. It is registered with `register_request_service` and
+called through its request address, so the example carries no dummy event lane
+or raw service envelope. No AWS account required.
 
 The same relay can be wired to the SQS bridge through `SqsOutbound` and the
 `map_sqs_outcome` helper. The mapping into `OutboundError` walks the typed
@@ -27,12 +29,18 @@ cargo test --manifest-path examples/systems/system_webhook_relay/Cargo.toml
 ## What is preserved
 
 - bounded ingress: the relay isolate's mailbox; the outbound's `max_in_flight`;
-- typed visible outcomes: every reply is one of three classifier-shaped
-  variants;
+- bounded host input: event count, fake-program length, and caller/bridge
+  deadlines are validated before runtime startup or result allocation;
+- typed visible outcomes: outer `Full`, `Closed`, `Timeout`, `Rejected`, and
+  `ThreadedRuntimeError` remain distinct from worker-domain classifier results;
 - caller-owned idempotency and retry budget: the relay does not retry, does
   not invent event ids, and does not infer idempotency from event content;
 - two-layer truth: bridge-delivery (`CallOutcome::Full/Closed/Timeout`) and
-  worker-outcome (`OutboundError`) are mapped distinctly into the classifier.
+  worker-outcome (`OutboundError`) are mapped distinctly into the classifier;
+- missing SQS `message_id` is an `OutboundError::Internal`, never a successful
+  empty backend id;
+- `LocalSystem::run_to_shutdown_reported` owns bounded shutdown and retains a
+  workload error alongside any shutdown failure.
 
 ## What is weakened
 
@@ -45,9 +53,19 @@ cargo test --manifest-path examples/systems/system_webhook_relay/Cargo.toml
 
 - multi-turn request/reply (relay defers its call's reply through the
   outbound port);
+- event-only/request-only/split-service authoring and typed service handles;
+- typed request continuations (`RequestCall` and `call_request`);
 - bridge classifier (`BridgeOutcomeClass`, `BridgeRetryable`,
   `BridgeUnavailable`, `BridgeFatal`);
 - typed-error mapping out of `tina-aws-bridge::SqsError`.
+
+## Driver shape
+
+The hermetic driver is intentionally sequential: one scripted outbound result
+is consumed for each event in submit order. The example does not claim or
+simulate concurrent callers. Applications that need a concurrent host wave
+should use scoped caller threads and validate the caller cap before spawning
+them.
 
 ## Suggested follow-up
 
