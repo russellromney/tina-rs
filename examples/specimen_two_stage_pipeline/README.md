@@ -34,7 +34,7 @@ tina::flow! {
         reply PipelineReply;
         step Parsed() -> ParseReply { /* dispatch validate, or reply */ }
         step Validated() -> ValidateReply { /* dispatch execute, or reply */ }
-        step Executed() -> ExecuteReply { /* reply Completed or Failed */ }
+        step Executed() -> ExecuteReply { /* reply Completed or exact terminal */ }
     }
 }
 ```
@@ -57,6 +57,9 @@ What feels good:
 - The generated dispatcher still names each stage as its own variant, and
   every suspension point (`call(...).then_with_request(...)`) stays
   trace-visible — `flow!` only deletes the boilerplate, not the shape.
+- The host fanout is built from `BoundedItems` and `bounded_batch`; every
+  stage and outer `Full`, `Closed`, `Timeout`, and `Rejected(reason)` remains
+  distinct in `PipelineTerminal`.
 
 What still doesn't disappear:
 

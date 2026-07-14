@@ -25,7 +25,14 @@ comparison=specimen_rpc side=tina  burst=4 ok=1 full=3 other=0
 
 `ok` is `Reply` frames received. `full` is server-reported wire
 `Error(Full)` frames. `other` covers anything unexpected so totals
-never silently shrink.
+never silently shrink. The report also retains exact wire error kinds,
+decode failures, unexpected frame shape, client EOF/read terminal, and the
+listener's typed bind/accept/close terminal. The connection's existing
+`CloseReason` watcher is also observed before runtime shutdown, so a clean
+listener result cannot hide a bad-peer, I/O, idle, or encode failure in its
+spawned connection. The whole live application runs through
+`LocalSystem::run_to_shutdown_reported`, so an early client or observer error
+still receives bounded, verified shutdown.
 
 The Tina side grabs the one in-flight slot with the first request
 (`ok=1`) and sheds the rest as wire `Error(Full)` (`full=N-1`).
@@ -79,6 +86,11 @@ read side of the same socket.
 When you run it, `full=N-1` always: the over-cap requests come back
 as `Error(Full)` on the wire. The first request grabs the slot and
 gets a `Reply`, so `ok=1`.
+
+`RunConfig` rejects zero and over-cap bursts before either runtime starts.
+The client encodes frames one at a time and checks the cumulative encoded byte
+budget against `MAX_REQUEST_BYTES` before extending the output buffer; it does
+not reserve `burst * max_frame_size` or construct an unbounded raw batch.
 
 ## Discussion
 

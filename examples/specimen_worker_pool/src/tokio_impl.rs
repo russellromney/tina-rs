@@ -8,6 +8,12 @@ use crate::{CLIENTS, DRIVER_BURST_CAP, Report, WORKERS, expected_for};
 
 type Job = (u64, oneshot::Sender<u64>);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriverTerminal {
+    WorkerChannelClosed,
+    ReplyChannelClosed,
+}
+
 async fn join_workers(mut workers: JoinSet<()>) -> anyhow::Result<()> {
     while let Some(joined) = workers.join_next().await {
         joined.map_err(|error| anyhow::anyhow!("worker task: {error}"))?;
@@ -44,10 +50,12 @@ pub fn run() -> anyhow::Result<Report> {
                 let (reply_tx, reply_rx) = oneshot::channel::<u64>();
                 tx.send((payload, reply_tx))
                     .await
-                    .map_err(|_| anyhow::anyhow!("worker channel closed"))?;
-                let got = reply_rx.await?;
+                    .map_err(|_| DriverTerminal::WorkerChannelClosed)?;
+                let got = reply_rx
+                    .await
+                    .map_err(|_| DriverTerminal::ReplyChannelClosed)?;
                 let want = expected_for(payload, worker_idx as u64);
-                Ok::<_, anyhow::Error>((got, want))
+                Ok::<_, DriverTerminal>((got, want))
             });
         }
 
@@ -59,7 +67,12 @@ pub fn run() -> anyhow::Result<Report> {
             match joined.map_err(|e| anyhow::anyhow!("driver task: {e}"))? {
                 Ok((got, want)) if got == want => report.correct_replies += 1,
                 Ok(_) => report.wrong_replies += 1,
-                Err(_) => report.failed += 1,
+                Err(DriverTerminal::WorkerChannelClosed) => {
+                    report.terminals.tokio_worker_channel_closed += 1;
+                }
+                Err(DriverTerminal::ReplyChannelClosed) => {
+                    report.terminals.tokio_reply_channel_closed += 1;
+                }
             }
         }
         drop(worker_txs);

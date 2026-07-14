@@ -16,7 +16,8 @@ Primitives used:
 - `BoundedItems::try_from_iter` / `bounded_batch` — cap the driver
   burst before per-item call effects exist.
 - `LocalSystem` — own registration, observation, typed ingress, and truthful
-  terminal shutdown through the public application facade.
+  terminal shutdown through `run_to_shutdown_reported` on the public
+  application facade.
 
 ## Run
 
@@ -34,7 +35,8 @@ worker each client mapped to.
   authority carries correlation, not an ID or sidecar map.
 - Every worker terminal outcome remains distinct: `WorkerFull`,
   `WorkerClosed`, `WorkerTimeout`, and `WorkerRejected(reason)` are not
-  coalesced, and timer setup failures retain their typed `CallError`.
+  coalesced, timer setup failures retain their typed `CallError`, and the
+  driver report keeps worker and frontend terminal categories separate.
 - The driver workload passes through a producer-owned cap before it becomes a
   call batch, so this specimen does not teach a raw request-sized
   `Effect::Batch` as the copied path.

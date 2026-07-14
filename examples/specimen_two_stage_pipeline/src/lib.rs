@@ -13,13 +13,36 @@ pub const REQUESTS: usize = 8;
 pub const PARSE_FAILURES: usize = 2;
 pub const VALIDATE_FAILURES: usize = 1;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Report {
     pub requests: usize,
     pub completed: usize,
     pub parse_failed: usize,
     pub validate_failed: usize,
     pub exit_clean: bool,
+    pub tina_terminals: Vec<PipelineTerminal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineTerminal {
+    StageFull(PipelineStage),
+    StageClosed(PipelineStage),
+    StageTimeout(PipelineStage),
+    StageRejected {
+        stage: PipelineStage,
+        reason: tina::CallRejectedReason,
+    },
+    OuterFull,
+    OuterClosed,
+    OuterTimeout,
+    OuterRejected(tina::CallRejectedReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineStage {
+    Parse,
+    Validate,
+    Execute,
 }
 
 /// Inputs labeled by index. Index < `PARSE_FAILURES` parses fail;
@@ -51,4 +74,8 @@ pub fn assert_report_invariants(side: &str, r: &Report) {
         "{side}: {r:?}",
     );
     assert!(r.exit_clean, "{side}: {r:?}");
+    assert!(
+        r.tina_terminals.is_empty(),
+        "{side}: no transport terminal is expected: {r:?}"
+    );
 }

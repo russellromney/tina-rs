@@ -18,7 +18,12 @@ fn main() -> anyhow::Result<()> {
 
 fn print_side(side: &str, r: Report) {
     println!(
-        "comparison=specimen_worker_pool side={} clients={} correct={} wrong={} failed={} exit_clean={}",
-        side, r.clients, r.correct_replies, r.wrong_replies, r.failed, r.exit_clean,
+        "comparison=specimen_worker_pool side={} clients={} correct={} wrong={} terminals={} exit_clean={}",
+        side,
+        r.clients,
+        r.correct_replies,
+        r.wrong_replies,
+        r.terminals.total(),
+        r.exit_clean,
     );
 }

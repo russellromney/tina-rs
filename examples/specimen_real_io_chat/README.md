@@ -58,8 +58,20 @@ Tina uses one isolate per role:
 - **`Connection`** — owns the accepted TCP stream; reads the burst,
   caps fanout with `BroadcastTargets`, fans out via
   `broadcast_observed(...)`, classifies each admission outcome
-  (`Accepted` / `Full` / `Closed`), writes the count back.
+  (`Accepted` / `Full` / `Closed`), retries partial writes, and stops
+  with an exact typed protocol, broadcast construction/tracking,
+  read/write, or close terminal.
 - **`Listener`** — `tcp_bind` → `tcp_accept` → `spawn(Connection)`.
+
+`RunConfig::validate` rejects zero and over-cap burst, target, and mailbox
+values before `LocalSystem` starts. `run_to_shutdown_reported` preserves
+workload and bounded shutdown failures separately, while the listener's typed
+result proves bind/accept/close success.
+
+The decimal request is accumulated across TCP reads until the client's
+write-half EOF, under a 32-byte protocol cap, before parsing. TCP packet
+boundaries are not treated as message boundaries, and an overlong request
+stops with a typed protocol terminal before fanout effects exist.
 
 `broadcast_observed` is the copied path for this shape. It builds on
 `send_observed`, so the producer still learns *at the moment of send*
@@ -101,6 +113,12 @@ What feels worse:
   be `max_broadcast_targets + slack`. This is documented (see
   `docs/mailbox-capacity.md`) but it's still a number you have to size
   correctly per workload.
+- **Spawned multi-outbound result routing is still missing.** The connection
+  already owns `Outbound<DeliverMsg>` for the broadcast. Reporting its typed
+  terminal directly to the listener needs a second outbound type, but root
+  registration currently only erases spawned children with one
+  `Outbound<T>`. The connection result is typed, but the host cannot yet
+  observe that child result without framework support.
 
 What this suggests:
 

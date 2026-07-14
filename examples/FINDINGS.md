@@ -11,6 +11,53 @@ valid; the long-form history lives in
 
 ## Active
 
+### 2026-07-14 Bounded producers and exhaustive specimen terminals
+
+The direct example cohort replaced request-sized raw batches with
+`BoundedItems` plus `bounded_batch`, retained exact `Full`, `Closed`,
+`Timeout`, `Rejected(reason)`, cancellation, timer, protocol, and shutdown
+results, and made completion wait for the resources each report claims have
+settled. Adversarial review exposed and fixed premature stop in graceful pool
+shutdown and cancel/reclaim, silent partial TCP writes, panic-based wire
+parsing, a roughly 4 GiB RPC reservation derived from the maximum frame size,
+public reports that still collapsed exact aggregate and worker failures,
+time-triggered cancellation completion, single-read TCP request parsing, and
+a TCP child that discarded its typed terminal when the parent's mailbox was
+temporarily full. RPC now observes the connection's exact `CloseReason` as
+well as the listener terminal; graceful shutdown scheduling is actor-owned;
+and the live RPC and TCP echo paths use reported `LocalSystem` shutdown so an
+unexpected typed terminal cannot bypass cleanup.
+
+The remaining blocked chat child still preserves exact broadcast construction,
+duplicate/unknown target, report assertion, protocol, and I/O terminal payloads
+internally; only routing that typed result across its second outbound type is
+missing.
+
+The remaining framework finding is concrete: `specimen_real_io_chat`'s
+spawned connection already requires `Outbound<DeliverMsg>` for observed
+broadcast. Returning its typed connection terminal to the parent listener
+requires a second outbound message type, while root registration/spawn
+erasure currently requires the child's `Send` capability to be one
+`Outbound<T>`. The example therefore has typed connection stop results and a
+typed observed listener result, but cannot yet route the child result to the
+host without application glue. Build multi-outbound spawned-child
+registration/result-routing parity in a separate framework prerequisite, then
+finish that final observation path.
+
+| Example | Current friction | Desired user-facing form | Current API sufficient | Framework prerequisite | Example PR | Tests | Status |
+|---|---|---|---|---|---|---|---|
+| `specimen_graceful_pool_shutdown` | none | fixed-cap job state, exact pool/worker/release/close terminals | yes | none | this cohort | exact shutdown, settlement, rejection, bounded-state smoke | migrated |
+| `specimen_request_scope_fanout` | none | bounded fanout/cancel with actor-owned sequencing and exact outcomes | yes | none | this cohort | cancel authority, late-reply trace, exact timers/acks | migrated |
+| `specimen_pool_cancel_reclaim` | none | bounded actor-owned cancel/retry sequence, report only after full settlement | yes | none | this cohort | cancel/refill/release/pressure/timer invariants | migrated |
+| `specimen_scatter_gather` | none | bounded client producer and exact invalid aggregate rows | yes | none | this cohort | success, capacity/refill, reordered/misrouted/terminal rows | migrated |
+| `specimen_two_stage_pipeline` | none | bounded driver and exact per-stage/outer terminals | yes | none | this cohort | Tokio/Tina behavior and empty clean terminal set | migrated |
+| `specimen_webhook_fanout` | none | bounded endpoints and exact classifier reasons | yes | none | this cohort | success/503/timeout reasons and over-cap rejection | migrated |
+| `specimen_tracing_demo` | none | bounded fanout, exact timer failures, observed pressure | yes | none | this cohort | accounting, typed stop, zero/over-cap rejection | migrated |
+| `specimen_rpc` | none | validated count/byte bounds and exhaustive client/listener/connection/wire terminals | yes | none | this cohort | exact clean buckets, connection close reason, and zero/over-cap rejection | migrated |
+| `specimen_tcp_echo` | none | partial-write retry plus child terminal reported to listener under reported LocalSystem shutdown | yes | none | this cohort | live, simulator parity/replay/golden, README sync | migrated |
+| `specimen_real_io_chat` | child result cannot traverse its second outbound type | typed connection result observed by listener and host | no | multi-outbound spawned-child registration/result parity | this cohort plus prerequisite | loopback, pre-shed bound, protocol/config negatives | blocked on prerequisite |
+| `specimen_worker_pool` | none | exact worker/frontend terminals in reported LocalSystem runner | yes | none | this cohort | live terminal branches, authority settlement, bounded driver, smoke | migrated |
+
 ### 2026-07-13 Local I/O terminal observation and framed output closure
 
 `specimen_local_io_codec_ipc` now uses the same typed terminal-result contract

@@ -18,16 +18,23 @@ resources. Each caller does the explicit three-step:
 ```text
 acquire (call WorkerPoolMsg::Acquire)
   -> AcquireOutcome::Acquired(lease) | Full | Closed | Timeout
-work    (call worker, WorkerMsg::Do)
+work    (call worker request lane, WorkerRequest::Do)
 release (release_effect(lease, pool, Reuse|Retire, ...))
   -> ReleaseOutcome::Released | Retired | StaleLease | DoubleRelease | PoolClosed
 ```
 
+The worker uses the canonical split-service form: `WorkerRequest::Do`
+is caller-authority input, while the timer continuation is a private
+`WorkerEvent`. The pool stores the typed request handles, so an event
+address cannot accidentally be used as the callable worker lane.
+
 On `Shutdown` the driver sends one `WorkerPoolMsg::Close(CloseMode::Drain)`.
 The pool replies `Closed` to every parked waiter in one batch and
 acknowledges the close itself. Outstanding leases drain normally; once
-the call-site releases them the pool reports `Retired` (the close
-turns every release into a retire) so capacity is honestly accounted.
+the call site releases them, the pool reports `Released` and leaves
+the resources idle but unavailable to new acquires. The report waits
+for those releases, so close acknowledgement cannot hide an unsettled
+lease.
 
 ## Tokio shape
 
@@ -40,16 +47,13 @@ callers settling.
 
 ## Where Full / Closed / Timeout appear
 
-- `Shutdown` rides the same bounded mailbox as the regular
-  `Submit` traffic. With six in-flight callers and a 64-slot
-  frontend mailbox there is plenty of room; the host calls
-  `runtime.send_observed_until(...)` (the observed-send retry helper) which
-  retries `MailboxFull` / `IngressFull` up to a deadline. The
-  hand-rolled retry loop is gone, but the underlying shape (a
-  control message rides the data mailbox) is the same one in
-  `specimen_hot_key_fairness`'s `Drain(admitted)`. See FINDINGS
-  finding 9 (drain helper for `PendingReplies` at service stop)
-  for the related product gap.
+- `Shutdown` is scheduled by an actor-owned typed timer in the same
+  initial effect turn as the bounded caller fanout. Its `CallError`,
+  if any, remains in the report. The host only starts the scenario;
+  elapsed host time is not used as proof that shutdown began.
+- The resulting close call still rides the pool's bounded mailbox.
+  Its `Full`, `Closed`, `Timeout`, `Rejected(reason)`, wrong-reply,
+  and acknowledged-close outcomes remain distinct.
 
 | outcome     | when                                                          |
 |-------------|---------------------------------------------------------------|
@@ -61,6 +65,11 @@ callers settling.
 
 These four cases are distinct enum variants; nothing collapses them
 into a generic error.
+
+The public Tina report also retains every `CallRejectedReason` from
+the acquire, worker, release, and close calls. A worker timer failure
+is returned as its exact `CallError`; it cannot masquerade as a closed
+worker.
 
 ## Why explicit release is more verbose but safer
 
@@ -89,10 +98,10 @@ deferred reply is rejected, the value drops, and the pool's
 returns the resource to Idle (counted under `dispatch_recovered`). No
 cancel timing leaks a resource.
 
-## Driver shape caveat
+## Bounded driver state
 
-This specimen's `Driver` keeps in-flight per-job state in a
-`HashMap<u32, JobState>` for clarity. A production driver should
-use a fixed-capacity table (slab, ring, or `PendingReplies`) so the
-in-flight set has the same kind of bound the pool itself enforces;
-`HashMap` is unbounded.
+The driver admits exactly `CALLERS` jobs and stores their state in a
+fixed `[Option<JobState>; CALLERS]` table keyed by the bounded job id.
+Both the effect producer and the retained in-flight state therefore
+share the same explicit bound; the example has no sidecar allocation
+that can grow independently of admission.

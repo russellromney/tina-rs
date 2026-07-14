@@ -6,7 +6,7 @@ fn tokio_smoke() {
     assert_eq!(r.clients, CLIENTS);
     assert_eq!(r.correct_replies, CLIENTS);
     assert_eq!(r.wrong_replies, 0);
-    assert_eq!(r.failed, 0);
+    assert!(r.terminals.is_empty());
     assert!(r.exit_clean);
 }
 
@@ -16,6 +16,6 @@ fn tina_smoke() {
     assert_eq!(r.clients, CLIENTS);
     assert_eq!(r.correct_replies, CLIENTS);
     assert_eq!(r.wrong_replies, 0);
-    assert_eq!(r.failed, 0);
+    assert!(r.terminals.is_empty());
     assert!(r.exit_clean);
 }

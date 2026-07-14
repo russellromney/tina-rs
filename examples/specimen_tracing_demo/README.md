@@ -3,8 +3,11 @@
 Smallest end-to-end demo of `tina-tracing`.
 
 Single-shard runtime, one caller isolate, one-slot mailbox. The
-caller fans six zero-duration `sleep` calls. First reply fits; the
-rest hit `MailboxFull` until the slot drains.
+caller fans out a producer-bounded set of zero-duration `sleep`
+calls, retains exact timer errors, and reads the runtime pressure
+summary after every completion has settled. The mailbox is deliberately
+small, but the demo reports observed pressure rather than assuming a
+specific scheduler interleaving.
 
 `TracingObserver` is wired before any event records, so each event
 becomes a structured `tracing::Event` as it happens. Fields

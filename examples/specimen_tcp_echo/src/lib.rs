@@ -9,7 +9,7 @@
 //! The same [`EchoConnection`] source drives two runtimes without
 //! change:
 //!
-//! - live, over a real loopback socket on [`ThreadedRuntime`] (see
+//! - live, over a real loopback socket on [`LocalSystem`] (see
 //!   [`echo_round_trip`]);
 //! - deterministically, inside `tina_sim::Simulator` replayed from a
 //!   seed (see `tests/sim_echo.rs`).
@@ -27,9 +27,10 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    DefaultThreadedMailboxFactory, HostBurstOutcomes, ListenerId, SingleCallGate, SleepReply,
-    StreamId, TcpReadReply, TcpStreamCloseReply, TcpWriteReply, ThreadedRuntime, sleep, tcp_accept,
-    tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
+    CallError, DefaultThreadedMailboxFactory, HostBurstOutcomes, ListenerId, LocalSystem,
+    SendOutcome, SingleCallGate, SleepReply, StreamId, TcpReadReply, TcpStreamCloseReply,
+    TcpWriteReply, ThreadedRuntime, send_observed, sleep, tcp_accept, tcp_bind, tcp_close_listener,
+    tcp_close_stream, tcp_read, tcp_write,
 };
 
 /// Largest chunk a connection reads from the wire in one call.
@@ -60,6 +61,8 @@ pub enum EchoConnectionMsg {
     Wrote(TcpWriteReply),
     /// The stream close completed.
     Closed(TcpStreamCloseReply),
+    /// The listener observed this connection's exact terminal result.
+    TerminalReported(EchoConnectionTerminal, SendOutcome),
 }
 
 /// One accepted TCP stream, echoed back to its peer.
@@ -70,19 +73,30 @@ pub struct EchoConnection {
     /// Bytes read but not yet fully written back. A partial write
     /// leaves the tail here so the echo is never truncated.
     pending: Vec<u8>,
+    listener: Address<EchoListenerMsg>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EchoConnectionTerminal {
+    PeerClosedClean,
+    ReadFailed(CallError),
+    WriteFailed(CallError),
+    CloseFailed(CallError),
+    InvalidWriteCount { reported: usize, pending: usize },
 }
 
 impl EchoConnection {
-    fn new(stream: StreamId, max_chunk: usize) -> Self {
+    fn new(stream: StreamId, max_chunk: usize, listener: Address<EchoListenerMsg>) -> Self {
         Self {
             stream,
             max_chunk,
             pending: Vec::new(),
+            listener,
         }
     }
 }
 
-#[tina_runtime::isolate(message = EchoConnectionMsg)]
+#[tina_runtime::isolate(message = EchoConnectionMsg, send = Outbound<EchoListenerMsg>)]
 impl EchoConnection {
     fn handle(
         &mut self,
@@ -102,6 +116,12 @@ impl EchoConnection {
                 }
             }
             EchoConnectionMsg::Wrote(Ok(count)) => {
+                if count == 0 || count > self.pending.len() {
+                    return self.finish(EchoConnectionTerminal::InvalidWriteCount {
+                        reported: count,
+                        pending: self.pending.len(),
+                    });
+                }
                 self.pending.drain(..count);
                 if self.pending.is_empty() {
                     tcp_read(self.stream, self.max_chunk).then(EchoConnectionMsg::Read)
@@ -109,11 +129,36 @@ impl EchoConnection {
                     tcp_write(self.stream, self.pending.clone()).then(EchoConnectionMsg::Wrote)
                 }
             }
-            EchoConnectionMsg::Closed(Ok(())) => stop(),
-            EchoConnectionMsg::Read(Err(_))
-            | EchoConnectionMsg::Wrote(Err(_))
-            | EchoConnectionMsg::Closed(Err(_)) => stop(),
+            EchoConnectionMsg::Closed(Ok(())) => {
+                self.finish(EchoConnectionTerminal::PeerClosedClean)
+            }
+            EchoConnectionMsg::Read(Err(error)) => {
+                self.finish(EchoConnectionTerminal::ReadFailed(error))
+            }
+            EchoConnectionMsg::Wrote(Err(error)) => {
+                self.finish(EchoConnectionTerminal::WriteFailed(error))
+            }
+            EchoConnectionMsg::Closed(Err(error)) => {
+                self.finish(EchoConnectionTerminal::CloseFailed(error))
+            }
+            EchoConnectionMsg::TerminalReported(terminal, SendOutcome::Accepted) => {
+                stop_with(terminal)
+            }
+            EchoConnectionMsg::TerminalReported(terminal, SendOutcome::Full) => {
+                self.finish(terminal)
+            }
+            EchoConnectionMsg::TerminalReported(
+                terminal,
+                SendOutcome::Closed | SendOutcome::ForeignSystem { .. },
+            ) => stop_with(terminal),
         }
+    }
+}
+
+impl EchoConnection {
+    fn finish(&self, terminal: EchoConnectionTerminal) -> Effect<Self> {
+        send_observed(self.listener, EchoListenerMsg::ConnectionStopped(terminal))
+            .then(move |outcome| EchoConnectionMsg::TerminalReported(terminal, outcome))
     }
 }
 // readme:echo-isolate:end
@@ -136,7 +181,25 @@ pub enum EchoListenerMsg {
     },
     Close,
     Closed,
-    Failed,
+    BindFailed(CallError),
+    AcceptFailed(CallError),
+    CloseFailed(CallError),
+    ConnectionStopped(EchoConnectionTerminal),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EchoListenerTerminal {
+    ClosedClean { accepted: usize },
+    BindFailed(CallError),
+    AcceptFailed(CallError),
+    CloseFailed(CallError),
+    MissingListener,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EchoRunReport {
+    pub listener: EchoListenerTerminal,
+    pub connections: Vec<EchoConnectionTerminal>,
 }
 
 /// Parent that owns the bound listener and spawns one handler per
@@ -151,6 +214,8 @@ pub struct EchoListener {
     target_accepts: Option<usize>,
     accepted: usize,
     listener: Option<ListenerId>,
+    listener_terminal: Option<EchoListenerTerminal>,
+    connection_terminals: Vec<EchoConnectionTerminal>,
 }
 
 impl EchoListener {
@@ -165,6 +230,8 @@ impl EchoListener {
             target_accepts,
             accepted: 0,
             listener: None,
+            listener_terminal: None,
+            connection_terminals: Vec::new(),
         }
     }
 }
@@ -188,7 +255,7 @@ impl EchoListener {
                         listener,
                         addr: local_addr,
                     },
-                    Err(_) => EchoListenerMsg::Failed,
+                    Err(error) => EchoListenerMsg::BindFailed(error),
                 })
             }
             EchoListenerMsg::Bound { listener, .. } => {
@@ -196,7 +263,12 @@ impl EchoListener {
                 accept_next(listener)
             }
             EchoListenerMsg::AcceptNext => {
-                let listener = self.listener.expect("listener stored before re-arm");
+                let Some(listener) = self.listener else {
+                    return stop_with(EchoRunReport {
+                        listener: EchoListenerTerminal::MissingListener,
+                        connections: std::mem::take(&mut self.connection_terminals),
+                    });
+                };
                 accept_next(listener)
             }
             EchoListenerMsg::Accepted { stream } => {
@@ -209,7 +281,7 @@ impl EchoListener {
                 }
                 let child = spawn(
                     ChildDefinition::new(
-                        EchoConnection::new(stream, self.max_chunk),
+                        EchoConnection::new(stream, self.max_chunk, ctx.me()),
                         CONNECTION_CAPACITY,
                     )
                     .with_initial_message(EchoConnectionMsg::Begin),
@@ -221,21 +293,67 @@ impl EchoListener {
                 batch([child, ctx.send_self(follow_up)])
             }
             EchoListenerMsg::Close => {
-                let listener = self.listener.expect("listener stored before close");
+                let Some(listener) = self.listener else {
+                    return stop_with(EchoRunReport {
+                        listener: EchoListenerTerminal::MissingListener,
+                        connections: std::mem::take(&mut self.connection_terminals),
+                    });
+                };
                 tcp_close_listener(listener).then(|result| match result {
                     Ok(()) => EchoListenerMsg::Closed,
-                    Err(_) => EchoListenerMsg::Failed,
+                    Err(error) => EchoListenerMsg::CloseFailed(error),
                 })
             }
-            EchoListenerMsg::Closed | EchoListenerMsg::Failed => stop(),
+            EchoListenerMsg::Closed => {
+                self.listener_terminal = Some(EchoListenerTerminal::ClosedClean {
+                    accepted: self.accepted,
+                });
+                self.finish_if_complete()
+            }
+            EchoListenerMsg::BindFailed(error) => stop_with(EchoRunReport {
+                listener: EchoListenerTerminal::BindFailed(error),
+                connections: std::mem::take(&mut self.connection_terminals),
+            }),
+            EchoListenerMsg::AcceptFailed(error) => stop_with(EchoRunReport {
+                listener: EchoListenerTerminal::AcceptFailed(error),
+                connections: std::mem::take(&mut self.connection_terminals),
+            }),
+            EchoListenerMsg::CloseFailed(error) => {
+                self.listener_terminal = Some(EchoListenerTerminal::CloseFailed(error));
+                self.finish_if_complete()
+            }
+            EchoListenerMsg::ConnectionStopped(terminal) => {
+                if self.target_accepts.is_some() {
+                    self.connection_terminals.push(terminal);
+                }
+                self.finish_if_complete()
+            }
         }
+    }
+}
+
+impl EchoListener {
+    fn finish_if_complete(&mut self) -> Effect<Self> {
+        let Some(target) = self.target_accepts else {
+            return noop();
+        };
+        let Some(listener) = self.listener_terminal else {
+            return noop();
+        };
+        if self.connection_terminals.len() != target {
+            return noop();
+        }
+        stop_with(EchoRunReport {
+            listener,
+            connections: std::mem::take(&mut self.connection_terminals),
+        })
     }
 }
 
 fn accept_next(listener: ListenerId) -> Effect<EchoListener> {
     tcp_accept(listener).then(|result| match result {
         Ok((stream, _peer_addr)) => EchoListenerMsg::Accepted { stream },
-        Err(_) => EchoListenerMsg::Failed,
+        Err(error) => EchoListenerMsg::AcceptFailed(error),
     })
 }
 
@@ -248,25 +366,32 @@ fn accept_next(listener: ListenerId) -> Effect<EchoListener> {
 /// Starts a one-shot echo server, sends `payload` from a std client,
 /// and returns the bytes echoed back.
 pub fn echo_round_trip(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)
-        .map_err(|e| anyhow::anyhow!("runtime startup: {e:?}"))?;
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), |app| {
+        echo_round_trip_application(app, payload)
+    })?)
+}
+
+fn echo_round_trip_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    payload: &[u8],
+) -> anyhow::Result<Vec<u8>> {
     let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
 
-    let listener = runtime
-        .register_with_capacity::<EchoListener, EchoListenerMsg>(
+    let listener = app
+        .register_root::<_, EchoListenerMsg>(
             EchoListener::new(bind_addr, Some(1)),
             LISTENER_CAPACITY,
         )
         .map_err(|e| anyhow::anyhow!("register listener: {e:?}"))?;
 
-    let bound = runtime
+    let bound = app
         .observe_next_bound()
         .map_err(|e| anyhow::anyhow!("register bind observer: {e}"))?;
-    let listener_stopped = runtime
-        .observe_isolate_complete(listener)
-        .map_err(|e| anyhow::anyhow!("register listener observer: {e}"))?;
-    runtime
-        .try_send(listener, EchoListenerMsg::Start)
+    let listener_result = app
+        .observe_result::<EchoRunReport, _, _>(listener)
+        .map_err(|e| anyhow::anyhow!("register listener result observer: {e:?}"))?;
+    app.try_send(listener, EchoListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start listener: {e:?}"))?;
 
     let addr = bound
@@ -275,14 +400,17 @@ pub fn echo_round_trip(payload: &[u8]) -> anyhow::Result<Vec<u8>> {
 
     let echoed = client_round_trip(addr, payload)?;
 
-    listener_stopped
+    let run_report = listener_result
         .wait(Duration::from_secs(5))
         .map_err(|e| anyhow::anyhow!("listener did not stop: {e:?}"))?;
-    runtime
-        .shutdown_report()
-        .ensure_clean()
-        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
-
+    anyhow::ensure!(
+        run_report.listener == (EchoListenerTerminal::ClosedClean { accepted: 1 }),
+        "listener terminated unexpectedly: {run_report:?}"
+    );
+    anyhow::ensure!(
+        run_report.connections == [EchoConnectionTerminal::PeerClosedClean],
+        "connection terminated unexpectedly: {run_report:?}"
+    );
     Ok(echoed)
 }
 

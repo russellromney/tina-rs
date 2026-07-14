@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use crate::{Report, RunConfig};
 
 pub fn run(config: RunConfig) -> anyhow::Result<Report> {
+    let config = config.validate()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()?;
@@ -50,7 +51,9 @@ pub fn run(config: RunConfig) -> anyhow::Result<Report> {
 
         stream.write_all(b"done\n").await?;
         drop(stream);
-        client.join().expect("client thread")?;
+        client
+            .join()
+            .map_err(|_| anyhow::anyhow!("client thread panicked"))??;
 
         Ok(Report {
             accepted,

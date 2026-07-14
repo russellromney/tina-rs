@@ -13,15 +13,22 @@ cargo test --manifest-path examples/specimen_pool_cancel_reclaim/Cargo.toml
 
 ## Tina shape
 
-Driver fans out `WAITERS` parallel `call_cancelable(pool, Acquire,
-...)`, stores each `CallHandle`, then on `CancelAll` emits
-`cancel_call(handle)` for every parked waiter. The pool's lazy sweep
-on the next handler turn reclaims every closed deferred slot. A
-follow-up `PressureSnapshot` reads `cancel_count` so the test asserts
-on the actual reclaim count, not just timing.
+The host sends one `BeginPrime`; the driver owns the rest of the
+control sequence. It fans out `WAITERS` parallel
+`call_cancelable(pool, Acquire, ...)` calls, stores each `CallHandle`
+in a `PendingCallSet` bounded to `WAITERS`, and uses a typed actor-owned
+timer before emitting `cancel_call(handle)` for every parked waiter.
+After every cancellation acknowledgement arrives, the driver requests
+the pool pressure report. Only after that call settles does it launch
+the retry wave, and a second typed timer releases the prime lease.
 
 The retry wave that follows must not see `Full` — proof that the
 sweep actually freed waiter capacity.
+
+The driver reports only after all cancel acknowledgements, the
+pressure snapshot, every retry result, and every lease release have
+settled. Exact cancel, acquire, release, pressure, and control-timer
+terminals remain in the public report; no host sleep is used as proof.
 
 ## Tokio shape
 

@@ -18,6 +18,7 @@ use tina_rpc::{
 use crate::{Report, RunConfig};
 
 pub fn run(config: RunConfig) -> anyhow::Result<Report> {
+    let config = config.validate()?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()

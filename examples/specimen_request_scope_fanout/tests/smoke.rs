@@ -16,15 +16,27 @@ fn one_cancel_closes_every_rail_and_late_replies_are_visible() {
 
     let report = run().expect("specimen run");
 
-    assert_eq!(
-        report.rails_total, FANOUT,
-        "dispatched every fanout rail",
-    );
+    assert_eq!(report.rails_total, FANOUT, "dispatched every fanout rail",);
     assert_eq!(
         report.cause,
         ScopeCancelCause::CallerCancelled,
         "scope cancel cause must propagate to the report",
     );
+    assert_eq!(report.cancel_outcomes.len(), FANOUT as usize);
+    assert!(
+        report
+            .cancel_outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, tina::CancelOutcome::Cancelled)),
+        "every pending child should retain its exact cancellation ack: {report:?}",
+    );
+    assert_eq!(report.child_replied, 0, "fixture cancels before replies");
+    assert_eq!(report.child_full, 0);
+    assert_eq!(report.child_closed, 0);
+    assert_eq!(report.child_timeout, 0);
+    assert!(report.child_rejected.is_empty());
+    assert!(report.child_timer_failed.is_empty());
+    assert!(report.driver_timer_failures.is_empty());
     assert_eq!(
         report.cancel_acks, FANOUT,
         "one cancel ack per rail; got {}",

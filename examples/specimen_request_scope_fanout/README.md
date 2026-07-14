@@ -32,6 +32,12 @@ cargo test --manifest-path examples/specimen_request_scope_fanout/Cargo.toml
 - The synchronous `ScopeCancelReport` from that call names the cause
   and reports `cancelled_count` (waits closed) and
   `already_settled_count` (rails that already replied) separately.
+- Fanout effects are built from `BoundedItems` and `bounded_batch` before any
+  child call exists. Cancellation is bounded by the scope's child cap and
+  emitted by `cancel_into_effect`. Actor-owned cancel/finish timers replace
+  host sleeps and trace polling; the report waits for every expected cancel
+  acknowledgement and retains every child call terminal, timer error, and
+  exact `CancelOutcome`.
 
 ## What it does NOT show
 
