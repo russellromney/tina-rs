@@ -11,6 +11,32 @@ valid; the long-form history lives in
 
 ## Active
 
+### 2026-07-14 Actor-backed typed gRPC routes
+
+`specimen_grpc_counter` exposed three state sidecars in the synchronous route
+closure surface: an `Arc<Mutex<u64>>` counter, mutex-protected request-stream
+handoff slots backed by a one-use source pool, and a preallocated pool of Watch
+responses. The route closures were correct on the wire but taught users to move
+actor state outside actors.
+
+`GrpcRouter::try_unary_actor` and `try_streaming_actor` now register typed
+split-service request addresses. Unary protobuf requests and bidirectional
+`GrpcStreamingCall` authority move into those services atomically. The router
+parks only the explicitly configured `with_actor_route_capacity` total,
+preserves `Full`, `Closed`, `Timeout`, and `Rejected(reason)` as distinct typed
+route failures and wire statuses, rejects duplicate paths, cancels actor calls
+whose HTTP caller disappears, and cancels response sources returned by stale or
+abandoned completions.
+
+The specimen now keeps counter state in a request-only service. Its streaming
+factory receives the owned request stream, observes one child source spawn, and
+returns the typed child address. Watch uses the finite buffered-stream helper.
+No router state mutex, stream slot, source pool, or response pool remains.
+
+| Example | Current friction | Desired user-facing form | Current API sufficient | Framework prerequisite | Example PR | Tests | Status |
+|---|---|---|---|---|---|---|---|
+| `specimen_grpc_counter` | none | typed service addresses for stateful unary/stream routes; child-owned stream authority | yes | actor-backed gRPC route registration | this cohort | route failure taxonomy, capacity, duplicate/stale/caller-gone cleanup, native and tonic h2c smoke | migrated |
+
 ### 2026-07-14 Bounded producers and exhaustive specimen terminals
 
 The direct example cohort replaced request-sized raw batches with
