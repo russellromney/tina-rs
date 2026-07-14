@@ -1379,6 +1379,13 @@ envelope out of application code. `specimen_supervised_worker` is the motivating
 migration and no longer constructs a service envelope in either lifecycle
 continuation.
 
+The adversarial pass also closed an initial/replacement asymmetry: a panic in a
+restartable child's first isolate or bootstrap factory now produces the typed
+initial `SpawnObservedError::FactoryPanicked`, publishes no child, and leaves
+the live runtime or simulator able to continue. Replacement factory panics
+remain `RestartSkippedReason::FactoryPanicked` lifecycle facts and do not invoke
+the replacement continuation.
+
 `specimen_supervised_worker` now stores the current child ref only in its
 parent. Startup carries a typed host request through the initial continuation;
 subsequent work routes through the parent as a typed worker request. Work is

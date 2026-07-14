@@ -79,6 +79,7 @@ struct CrossParent {
 #[derive(Debug)]
 enum RestartParentMsg {
     SpawnRestartableOn(ShardId),
+    SpawnPanickingRestartableOn(ShardId),
     ChildStarted(Result<ChildRef<CrossChildMsg>, SpawnObservedError>),
     RestartChildren,
     StopNow,
@@ -87,6 +88,7 @@ enum RestartParentMsg {
 #[derive(Debug)]
 struct RestartParent {
     learned: Rc<RefCell<Option<ChildRef<CrossChildMsg>>>>,
+    errors: Rc<RefCell<Vec<SpawnObservedError>>>,
 }
 
 #[tina_runtime::isolate(
@@ -107,11 +109,22 @@ impl RestartParent {
                     .on_shard(shard)
                     .then(RestartParentMsg::ChildStarted)
             }
+            RestartParentMsg::SpawnPanickingRestartableOn(shard) => {
+                spawn_observed(CrossShardRestartableChildDefinition::new(
+                    || panic!("initial cross-shard factory panic"),
+                    4,
+                ))
+                .on_shard(shard)
+                .then(RestartParentMsg::ChildStarted)
+            }
             RestartParentMsg::ChildStarted(Ok(child)) => {
                 *self.learned.borrow_mut() = Some(child);
                 noop()
             }
-            RestartParentMsg::ChildStarted(Err(_)) => noop(),
+            RestartParentMsg::ChildStarted(Err(error)) => {
+                self.errors.borrow_mut().push(error);
+                noop()
+            }
             RestartParentMsg::RestartChildren => restart_children(),
             RestartParentMsg::StopNow => stop(),
         }
@@ -535,6 +548,56 @@ fn cross_shard_child_ownership_cancel_pressure_does_not_orphan_admitted_children
 }
 
 #[test]
+fn cross_shard_initial_restartable_factory_panic_returns_typed_error_and_keeps_progressing() {
+    let learned = Rc::new(RefCell::new(None));
+    let errors = Rc::new(RefCell::new(Vec::new()));
+    let mut runtime =
+        MultiShardRuntime::new([CrossShard(11), CrossShard(22)], DefaultMailboxFactory);
+    let parent = runtime.register_with_capacity_on::<RestartParent, CrossChildMsg>(
+        ShardId::new(11),
+        RestartParent {
+            learned: Rc::clone(&learned),
+            errors: Rc::clone(&errors),
+        },
+        8,
+    );
+
+    runtime
+        .try_send(
+            parent,
+            RestartParentMsg::SpawnPanickingRestartableOn(ShardId::new(22)),
+        )
+        .unwrap();
+    for _ in 0..12 {
+        runtime.step();
+    }
+    assert_eq!(
+        errors.borrow().as_slice(),
+        &[SpawnObservedError::FactoryPanicked]
+    );
+    assert!(learned.borrow().is_none());
+    assert!(!runtime.trace().iter().any(|event| {
+        event.shard() == ShardId::new(22)
+            && matches!(event.kind(), RuntimeEventKind::Spawned { .. })
+    }));
+
+    runtime
+        .try_send(
+            parent,
+            RestartParentMsg::SpawnRestartableOn(ShardId::new(22)),
+        )
+        .unwrap();
+    for _ in 0..12 {
+        runtime.step();
+    }
+    assert_eq!(errors.borrow().len(), 1, "panic callback is one-shot");
+    assert!(
+        learned.borrow().is_some(),
+        "later remote spawn must progress"
+    );
+}
+
+#[test]
 fn cross_shard_restartable_child_restarts_on_remote_shard_and_reports_replacement_address() {
     let learned = Rc::new(RefCell::new(None));
     let mut runtime =
@@ -543,6 +606,7 @@ fn cross_shard_restartable_child_restarts_on_remote_shard_and_reports_replacemen
         ShardId::new(11),
         RestartParent {
             learned: Rc::clone(&learned),
+            errors: Rc::new(RefCell::new(Vec::new())),
         },
         8,
     );
@@ -550,6 +614,7 @@ fn cross_shard_restartable_child_restarts_on_remote_shard_and_reports_replacemen
         ShardId::new(22),
         RestartParent {
             learned: Rc::new(RefCell::new(None)),
+            errors: Rc::new(RefCell::new(Vec::new())),
         },
         8,
     );
@@ -720,6 +785,7 @@ fn owner_stop_racing_remote_restart_stops_replacement_child_too() {
         ShardId::new(11),
         RestartParent {
             learned: Rc::clone(&learned),
+            errors: Rc::new(RefCell::new(Vec::new())),
         },
         8,
     );

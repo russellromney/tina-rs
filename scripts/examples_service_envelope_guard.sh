@@ -13,12 +13,12 @@ scan() {
             s{"(?:\\.|[^"\\])*"}{ my $literal = $&; $literal =~ s/[^\n]/ /g; $literal }gse;
             s{//[^\n]*}{ }g;
             s{/\*.*?\*/}{ my $comment = $&; $comment =~ s/[^\n]/ /g; $comment }gse;
-            while (/\bServiceMessage\s*::\s*(?:Event|Request)\s*\(/g) {
+            while (/\bServiceMessage\s*(?:(?:::)?\s*<[^;(){}]*>)?\s*>?\s*::\s*(?:Event|Request)\s*\(/g) {
                 my $prefix = substr($_, 0, $-[0]);
                 my $line = 1 + ($prefix =~ tr/\n//);
                 print "$ARGV:$line: manual split-service envelope\n";
             }
-        ' {} + || true
+        ' {} +
 }
 
 if [[ "${1:-}" == "--self-test" ]]; then
@@ -26,6 +26,12 @@ if [[ "${1:-}" == "--self-test" ]]; then
     trap 'rm -rf "$fixtures"' EXIT
     mkdir -p "$fixtures/src" "$fixtures/tests" "$fixtures/target/generated"
     printf '%s\n' 'fn bad() { ServiceMessage::Event(Event::Start); }' >"$fixtures/src/bad.rs"
+    cat >"$fixtures/src/qualified_bad.rs" <<'EOF'
+fn bad() {
+    ServiceMessage::<Event, Request>::Event(Event::Start);
+    <tina::ServiceMessage<Event, Request>>::Request(Request::Read);
+}
+EOF
     cat >"$fixtures/src/good.rs" <<'EOF'
 fn good(effect: Spawn) -> Effect<App> {
     effect.then_service_event_with_restarts(Event::Started, Event::Restarted)
@@ -36,10 +42,15 @@ EOF
     printf '%s\n' 'fn fixture() { ServiceMessage::Event(Event::Test); }' >"$fixtures/tests/fixture.rs"
     printf '%s\n' 'fn generated() { ServiceMessage::Event(Event::Generated); }' >"$fixtures/target/generated.rs"
     hits="$(scan "$fixtures")"
-    [[ "$(printf '%s\n' "$hits" | grep -c 'bad.rs')" -eq 1 ]]
+    [[ "$(printf '%s\n' "$hits" | grep -c '/bad.rs:')" -eq 1 ]]
+    [[ "$(printf '%s\n' "$hits" | grep -c '/qualified_bad.rs:')" -eq 2 ]]
     [[ "$hits" != *good.rs* ]]
     [[ "$hits" != *fixture.rs* ]]
     [[ "$hits" != *generated.rs* ]]
+    if scan "$fixtures/missing" >/dev/null 2>&1; then
+        echo "examples service envelope guard self-test: scanner failure was ignored" >&2
+        exit 1
+    fi
     echo "examples service envelope guard self-test: ok"
     exit 0
 fi

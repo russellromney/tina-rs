@@ -91,6 +91,11 @@ fresh `ChildRef<WorkerMsg>` after each successful replacement. Store that ref
 in the parent and route work through the parent; do not reconstruct an address
 from untyped isolate/generation fields. The old ref remains honestly stale.
 
+If the restartable child's initial isolate or bootstrap factory panics, no
+child is published and `ChildStarted` receives
+`Err(SpawnObservedError::FactoryPanicked)`. The runtime and simulator remain
+available for later work.
+
 Both continuations use the parent's ordinary bounded mailbox. Full or stopped
 delivery is traced as the corresponding send rejection, with no hidden retry
 or lifecycle queue.

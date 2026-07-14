@@ -615,6 +615,14 @@ pub enum SpawnObservedError {
     /// target shard (its inbound queue was full or the shard had stopped), so
     /// no child was created. Same-shard observed spawn never produces this.
     DestinationUnavailable,
+
+    /// A restartable child's initial isolate or bootstrap factory panicked.
+    ///
+    /// No child is published. The panic is contained and the initial
+    /// continuation receives this error exactly once. Replacement factory
+    /// panics remain restart lifecycle facts reported as
+    /// `RestartSkippedReason::FactoryPanicked` by runtime owners.
+    FactoryPanicked,
 }
 
 /// Type-level child address information carried by supported spawn requests.
@@ -691,10 +699,11 @@ impl<S, M, R> SpawnObservedBuilder<S, M, R> {
     /// into ordinary parent messages.
     ///
     /// The initial continuation can receive `Err` when child construction is
-    /// rejected. The restart continuation only runs after a replacement
-    /// exists, so it receives a `ChildRef` directly. Each message uses the
-    /// parent's bounded mailbox and normal traced send path; a full or stopped
-    /// parent does not gain a hidden lifecycle queue.
+    /// rejected or a restartable child's initial factory panics. The restart
+    /// continuation only runs after a replacement exists, so it receives a
+    /// `ChildRef` directly. Each message uses the parent's bounded mailbox and
+    /// normal traced send path; a full or stopped parent does not gain a hidden
+    /// lifecycle queue.
     pub fn then_with_restarts<I, P, F, G>(self, initial: F, restarted: G) -> Effect<I>
     where
         I: Isolate<Message = P, SpawnObserved = SpawnObserved<S, P, M, R>>,
