@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Keep framework-owned split-service envelopes out of application examples.
+# Keep direct framework-owned split-service constructors out of examples.
+# This lexical guard does not resolve aliases of `ServiceMessage`; the broader
+# examples sweep tracks that existing debt separately.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -57,7 +59,7 @@ fi
 
 hits="$(scan examples)"
 if [[ -n "$hits" ]]; then
-    echo "examples service envelope guard: manual envelope construction found" >&2
+    echo "examples service envelope guard: direct manual envelope construction found" >&2
     printf '%s\n' "$hits" >&2
     echo "Use typed service-event, service-request, or continuation helpers." >&2
     exit 1
