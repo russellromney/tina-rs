@@ -162,6 +162,7 @@ helpers instead of hand-rolling byte counters:
 
 - `TcpWriteAll` / `TcpReadToEof`
 - `UnixWriteAll` / `UnixReadToEof`
+- `UnixFramedWriter::{lines, length_delimited}` for bounded framed batches
 - `FileReadChunks` / `FileWriteAll` / `FileCopyBounded`
 
 Each helper exposes one step at a time. Your message enum still sees
@@ -176,6 +177,10 @@ For an event-only split service, `UnixWriteAll::next_service_event` and
 message isolates continue to use `next_effect` and `advance`. Both Unix and
 TCP write-all helpers reject unarmed or wrong-allocation replies as invariant
 violations; `is_in_flight` distinguishes an armed write from a completed loop.
+For line- or length-delimited Unix protocols, `UnixFramedWriter` adds explicit
+body and whole-batch caps before delegating partial progress to the same
+write-all state machine. Raw `UnixWriteAll` remains the right API for bytes that
+are already encoded.
 
 ## Native gRPC
 

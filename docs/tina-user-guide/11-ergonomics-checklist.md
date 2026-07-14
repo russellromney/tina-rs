@@ -1086,7 +1086,7 @@ as a small method on the sub-struct).
 
 Follow the canonical patterns in
 [`docs/tcp-loops.md`](../tcp-loops.md). Prefer `TcpWriteAll`,
-`TcpReadToEof`, `UnixWriteAll`, `UnixReadToEof`, and the file loop
+`TcpReadToEof`, `UnixWriteAll`, `UnixReadToEof`, `UnixFramedWriter`, and the file loop
 helpers over hand-rolled byte counters. They still expose one effect
 and one continuation per rail step, so partial progress stays visible
 in the trace.

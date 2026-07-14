@@ -11,6 +11,31 @@ valid; the long-form history lives in
 
 ## Active
 
+### 2026-07-13 Local I/O terminal observation and framed output closure
+
+`specimen_local_io_codec_ipc` now uses the same typed terminal-result contract
+on live and simulated owners. Every seeder, ingest, copy, admin, keyspace, and
+live probe actor owns its report, closes every acquired resource, then publishes
+with `stop_with`; hosts claim `observe_result` before start. The result mutexes,
+poll loops, custom live mailbox, and simulator teardown as implicit cleanup are
+gone.
+
+Normal line and length-delimited traffic now uses bounded `UnixFramedWriter`
+batches. Only the two deliberately malformed protocol injectors retain raw
+`UnixWriteAll`, and their early peer-close result remains typed. The migration
+also fixed three latent behavioral defects: coalesced admin shutdown discarded
+already-built replies, the keyspace client treated one arbitrary read as the
+whole response, and file copy stopped after the first of two close callbacks.
+Focused tests force two-byte Unix writes and one-byte file writes, prove exact
+decoded responses and two-file settlement, and cover empty/zero-cap/config and
+bounded refusal paths.
+
+The panic-only zero body-cap constructors remain visible at the framework
+boundary. Public specimen runners validate those values before construction;
+one local validation is smaller than another framework abstraction. Likewise,
+the one two-file owner keeps two named close continuations; there is not yet a
+second motivating consumer for a speculative multi-resource close helper.
+
 ### 2026-07-13 Classified select-race continuation routing
 
 `ergonomics_playground` showed that `CallSelectSet` already owned branch
@@ -893,13 +918,15 @@ What is still active after reading the specimens and systems:
   a cancelable caller after worker crash remains intentionally unsolved.
 - **Cross-isolate setup.** Scatter/gather and paired registration still make
   users write bind/start adapter plumbing for the happy path.
-- **Runtime observation while running.** Several protocol/IPC specimens still
-  want "observe accumulated facts" without `Arc<Mutex<_>>` side channels.
-  Trace projection may be the right blessed path; if not, build a typed
-  observation helper.
-- **Local I/O companions.** Phase 117 shipped the rails; `UnixWriteAll`,
-  `UnixReadToEof`, and the unified `FileCopyBounded` drive path now cover most
-  of the boring companions. Framed writers remain open.
+- **Runtime observation while running.** Closed for the motivating IPC corpus:
+  accumulated protocol facts are terminal actor results, so simulator/live
+  `stop_with` + `observe_result` removes shared mutation without inventing a
+  second mid-run state-inspection model. Trace projection remains appropriate
+  for genuinely intermediate runtime facts.
+- **Local I/O companions.** Closed for the motivating corpus. `UnixWriteAll`,
+  `UnixReadToEof`, `FileCopyBounded`, and bounded `UnixFramedWriter::{lines,
+  length_delimited}` cover the repeated loops while preserving each rail
+  continuation.
 - **Session/control-message lifecycle.** Phase 127 added the native WebSocket
   client session and tightened session protocol facts. Phase 120 added typed
   `WebSocketSessionMsg::AppControl` for app-injected `Start` / `Tick` /
@@ -1544,29 +1571,21 @@ What felt rough — each is a `Build`:
   `UnixReadToEof`, mirroring the TCP helpers and surfacing `Ok(0)` stuck writes
   as `CallError::Io` instead of hot-spinning.
 
-- **The codec owns decode but not encode+write.** `LineFramer` /
-  `LengthDelimitedFramer` parse beautifully, but to *send* a framed reply
-  the specimens manually `encode_into` and then drive the write loop.
-  There is no framed *writer* that turns frames into the write state
-  machine, so the codec is half a round-trip. **Build:** a framed-writer
-  companion (e.g. a `LengthDelimitedWriter` / line writer that produces
-  the bounded write effect), so encode+write reads like decode.
+- **The codec owns decode and bounded encode+write.** Closed by
+  `UnixFramedWriter::{lines, length_delimited}`. Both body and encoded-batch
+  caps refuse before mutation, and the helper delegates partial progress to
+  `UnixWriteAll`. The specimens use raw output only to inject deliberately
+  malformed bytes.
 
 - **`FileCopyBounded`'s two-method API was clunky.** Closed by the unified
   `next_effect(...)` / `advance(FileCopyProgress, ...)` path. The old
   `next_leg` / `record_*` gears remain when a caller wants the mechanism.
 
-- **No blessed way to observe an isolate mid-run.** Every IPC specimen
-  smuggles results out through `Arc<Mutex<Vec<...>>>` because the isolate
-  owns its state and `stop_with` + `observe_result` only cover the
-  *final* value, not the running observations a protocol test wants. This
-  reintroduces the retired Round-1 `Arc<Mutex<...>>` side-channel pattern
-  and produced a real bug: `Arc::try_unwrap` returned `Default` while the
-  isolate still held a reference, making a test pass on empty data. This
-  echoes active finding 6 (bless an observation handle). **Build:** a
-  sim/runtime helper for "observe an isolate's accumulated facts" that is
-  not a shared-mutable side channel — or document the trace-projection
-  path as the sanctioned alternative for protocol assertions.
+- **Terminal protocol facts no longer need mid-run observation.** Closed by
+  simulator result-observation parity. The actors accumulate facts privately,
+  close owned resources, and `stop_with` one typed report. Registering the
+  waiter before start proves authority and avoids the historical
+  `Arc::try_unwrap`/default-data failure entirely.
 
 ## Closed
 
