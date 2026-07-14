@@ -101,6 +101,21 @@ recipe again.
 
 The effect has the same semantics in the live runtime and simulator.
 
+For a split event/request service, keep the routing envelope out of the
+application and map both lifecycle points directly into events:
+
+```rust
+spawn_observed(RestartableChildDefinition::new(|| Worker::default(), 32))
+    .then_service_event_with_restarts(
+        ParentEvent::ChildStarted,
+        ParentEvent::ChildRestarted,
+    )
+```
+
+The result and bounded-delivery semantics are identical to
+`then_with_restarts`; only the framework-owned `ServiceMessage::Event` wrapping
+is hidden.
+
 ## Budget
 
 Restart needs budget.

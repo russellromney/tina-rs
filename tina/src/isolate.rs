@@ -723,6 +723,33 @@ impl<S, M, R> SpawnObservedBuilder<S, M, R> {
     {
         self.then(move |result| ServiceMessage::Event(continuation(result)))
     }
+
+    /// Maps the initial spawn result and every successful replacement child
+    /// into split-service events without exposing the service envelope.
+    ///
+    /// This has the same bounded-delivery semantics as
+    /// [`Self::then_with_restarts`]: both events use the parent's ordinary
+    /// mailbox and traced send path, with no hidden lifecycle queue.
+    pub fn then_service_event_with_restarts<I, Event, Request, F, G>(
+        self,
+        initial: F,
+        restarted: G,
+    ) -> Effect<I>
+    where
+        I: Isolate<
+                Message = ServiceMessage<Event, Request>,
+                SpawnObserved = SpawnObserved<S, ServiceMessage<Event, Request>, M, R>,
+            >,
+        F: FnOnce(SpawnObservedResult<M, R>) -> Event + 'static,
+        G: Fn(ChildRef<M, R>) -> Event + 'static,
+        Event: 'static,
+        Request: 'static,
+    {
+        self.then_with_restarts(
+            move |result| ServiceMessage::Event(initial(result)),
+            move |child| ServiceMessage::Event(restarted(child)),
+        )
+    }
 }
 
 /// Spawn request plus continuation for delivering a typed child reference.
@@ -750,6 +777,114 @@ impl<S, P, M, R> SpawnObserved<S, P, M, R> {
     /// Consumes this request into its spawn payload and continuation.
     pub fn into_parts(self) -> SpawnObservedParts<S, P, M, R> {
         (self.spawn, self.continuation, self.restart_continuation)
+    }
+}
+
+#[cfg(test)]
+mod spawn_observed_service_event_tests {
+    use std::cell::Cell;
+    use std::convert::Infallible;
+
+    use super::*;
+    use crate::Outbound;
+
+    #[derive(Debug)]
+    enum ParentEvent {
+        Started(SpawnObservedResult<u8>),
+        Restarted(ChildRef<u8>),
+    }
+
+    struct Parent;
+
+    impl Isolate for Parent {
+        type Message = ServiceMessage<ParentEvent, Infallible>;
+        type Reply = ();
+        type Send = Outbound<Infallible>;
+        type Spawn = Infallible;
+        type SpawnObserved = SpawnObserved<(), Self::Message, u8>;
+        type Io = Infallible;
+        type Fact = Infallible;
+        type Shard = crate::SingleShard;
+
+        fn handle(
+            &mut self,
+            _message: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            unreachable!("builder contract test does not execute an isolate")
+        }
+    }
+
+    struct DropProbe(std::rc::Rc<Cell<usize>>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    fn service_restart_parts() -> SpawnObservedParts<(), <Parent as Isolate>::Message, u8> {
+        let effect: Effect<Parent> = SpawnObservedBuilder::new(())
+            .then_service_event_with_restarts(ParentEvent::Started, ParentEvent::Restarted);
+        let Effect::SpawnObserved(observed) = effect else {
+            panic!("builder must create SpawnObserved")
+        };
+        observed.into_parts()
+    }
+
+    #[test]
+    fn service_restart_continuations_preserve_initial_and_replacement_types() {
+        let (_, initial, restarted) = service_restart_parts();
+        assert!(matches!(
+            initial(Err(SpawnObservedError::ZeroMailboxCapacity)),
+            ServiceMessage::Event(ParentEvent::Started(Err(
+                SpawnObservedError::ZeroMailboxCapacity
+            )))
+        ));
+
+        let (_, initial, restarted_again) = service_restart_parts();
+        let first = ChildRef::new(Address::new(ShardId::new(3), IsolateId::new(7)));
+        assert!(matches!(
+            initial(Ok(first)),
+            ServiceMessage::Event(ParentEvent::Started(Ok(actual))) if actual == first
+        ));
+
+        let replacement = ChildRef::new(Address::new(ShardId::new(3), IsolateId::new(8)));
+        let restarted = restarted.expect("restart continuation");
+        let restarted_again = restarted_again.expect("restart continuation");
+        assert!(matches!(
+            restarted(replacement),
+            ServiceMessage::Event(ParentEvent::Restarted(actual)) if actual == replacement
+        ));
+        assert!(matches!(
+            restarted_again(replacement),
+            ServiceMessage::Event(ParentEvent::Restarted(actual)) if actual == replacement
+        ));
+        assert_ne!(first.address, replacement.address);
+    }
+
+    #[test]
+    fn dropping_unexecuted_service_restart_effect_settles_captured_authority() {
+        let initial_drops = std::rc::Rc::new(Cell::new(0));
+        let restart_drops = std::rc::Rc::new(Cell::new(0));
+        let initial_probe = DropProbe(std::rc::Rc::clone(&initial_drops));
+        let restart_probe = DropProbe(std::rc::Rc::clone(&restart_drops));
+
+        let effect: Effect<Parent> = SpawnObservedBuilder::new(())
+            .then_service_event_with_restarts(
+                move |result| {
+                    let _authority = initial_probe;
+                    ParentEvent::Started(result)
+                },
+                move |child| {
+                    let _authority = &restart_probe;
+                    ParentEvent::Restarted(child)
+                },
+            );
+        drop(effect);
+
+        assert_eq!(initial_drops.get(), 1);
+        assert_eq!(restart_drops.get(), 1);
     }
 }
 
