@@ -290,7 +290,8 @@ pub use guarded_pending::{
 };
 pub use observation::{
     BoundAddressWaiter, ChildRestarted, ChildRestartedWaiter, IsolateCompleteWaiter,
-    IsolateResultWaiter, OperationDoneWaiter, ResultWaitError, WaitError,
+    IsolateResultObservations, IsolateResultWaiter, OperationDoneWaiter, ResultWaitError,
+    WaitError,
 };
 pub use observer::{
     BufferedTraceDrain, BufferedTraceDrainError, BufferedTraceObserver, TraceObserver,

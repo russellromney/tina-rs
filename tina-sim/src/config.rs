@@ -22,7 +22,7 @@ use crate::MultiShardSimulatorConfig;
 /// (`SimulatorConfig { seed, ..Default::default() }`) so that adding a
 /// new rail config field stays a non-breaking change for callers. New
 /// fields here must carry a `Default`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimulatorConfig {
     /// Address provenance for this simulation. `None` allocates a fresh
     /// incarnation; set `Some` when comparing live and simulated addresses.
@@ -70,6 +70,33 @@ pub struct SimulatorConfig {
     /// Default `0` keeps every existing test unaffected; live-replay
     /// runners set this to `tina_runtime::HOST_CALL_DISPATCHER_POOL_SIZE`.
     pub reserved_system_isolates: usize,
+
+    /// Maximum pending typed isolate-result observations per simulated shard.
+    ///
+    /// This mirrors the live runtime's bounded observation registry. A zero
+    /// cap intentionally disables result observations while leaving isolate
+    /// execution unchanged.
+    pub result_observation_capacity: usize,
+}
+
+impl Default for SimulatorConfig {
+    fn default() -> Self {
+        Self {
+            system_incarnation: None,
+            seed: 0,
+            faults: FaultConfig::default(),
+            tcp: ScriptedTcpConfig::default(),
+            udp: ScriptedUdpConfig::default(),
+            dns: ScriptedDnsConfig::default(),
+            tls: ScriptedTlsConfig::default(),
+            signal: ScriptedSignalConfig::default(),
+            process: ScriptedProcessConfig::default(),
+            storage: ScriptedStorageFaultConfig::default(),
+            unix: UnixSimConfig::default(),
+            reserved_system_isolates: 0,
+            result_observation_capacity: 1024,
+        }
+    }
 }
 
 /// Per-stream caps applied to simulator Unix-domain rails.

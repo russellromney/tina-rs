@@ -383,6 +383,58 @@ impl<T: Send + 'static> std::fmt::Debug for IsolateResultWaiter<T> {
     }
 }
 
+/// Bounded typed result-observation state shared with deterministic owners.
+///
+/// This is an implementation bridge for owner crates that preserve the
+/// runtime's [`IsolateResultWaiter`] contract. Application code should use an
+/// owner's `observe_result` method instead of constructing this registry.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct IsolateResultObservations {
+    registry: ObservationRegistry,
+}
+
+#[doc(hidden)]
+impl IsolateResultObservations {
+    /// Creates a result-only registry with an explicit pending-waiter cap.
+    pub const fn with_max_pending(max_pending: usize) -> Self {
+        Self {
+            registry: ObservationRegistry::with_max_pending(max_pending),
+        }
+    }
+
+    /// Claims the one typed terminal-result slot for an isolate generation.
+    pub fn register<T: Send + 'static>(
+        &mut self,
+        isolate: IsolateId,
+        generation: AddressGeneration,
+    ) -> Result<IsolateResultWaiter<T>, ResultWaitError> {
+        self.registry
+            .register_isolate_result::<T>(isolate, generation)
+    }
+
+    /// Resolves a claimed slot with a typed `stop_with` payload.
+    pub fn notify_result(
+        &mut self,
+        isolate: IsolateId,
+        generation: AddressGeneration,
+        result: StopResult,
+    ) {
+        self.registry
+            .notify_isolate_result(isolate, generation, result);
+    }
+
+    /// Resolves a claimed slot when the isolate stopped without a payload.
+    pub fn notify_stopped_without_result(
+        &mut self,
+        isolate: IsolateId,
+        generation: AddressGeneration,
+    ) {
+        self.registry
+            .notify_isolate_stopped_without_result(isolate, generation);
+    }
+}
+
 /// Type-erased delivery face. Concrete impl owns the typed sender so the
 /// runtime's notify paths do not need to know `T`.
 trait ResultSender: Send {

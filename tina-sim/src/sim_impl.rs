@@ -110,6 +110,39 @@ impl<S> Simulator<S>
 where
     S: Shard,
 {
+    /// Registers a typed waiter for the terminal value produced by
+    /// [`tina::stop_with`] at `address`.
+    ///
+    /// Register before triggering the isolate. The waiter and eager failure
+    /// vocabulary match `tina_runtime::Runtime::observe_result`: one claim is
+    /// allowed per isolate generation, the configured observation cap is
+    /// enforced, and stopped, foreign-system, and foreign-shard addresses are
+    /// rejected without claiming capacity.
+    pub fn observe_result<T: Send + 'static, M: 'static, R: 'static>(
+        &mut self,
+        address: Address<M, R>,
+    ) -> Result<tina_runtime::IsolateResultWaiter<T>, tina_runtime::ResultWaitError> {
+        if address.system() != self.system_incarnation {
+            return Err(tina_runtime::ResultWaitError::ForeignSystem {
+                expected: self.system_incarnation,
+                actual: address.system(),
+            });
+        }
+        if address.shard() != self.shard.id() {
+            return Err(tina_runtime::ResultWaitError::UnknownShard(address.shard()));
+        }
+        let alive = self.entries.iter().any(|entry| {
+            entry.id == address.isolate()
+                && entry.generation == address.generation()
+                && !entry.stopped.get()
+        });
+        if !alive {
+            return Err(tina_runtime::ResultWaitError::AlreadyStopped);
+        }
+        self.result_observations
+            .register::<T>(address.isolate(), address.generation())
+    }
+
     /// Registers one isolate and returns its typed address.
     ///
     /// 016 intentionally requires spawnless isolates that use the current
@@ -901,8 +934,12 @@ where
     {
         let isolate_id = self.entries[index].id;
         match effect {
-            ErasedEffect::Stop | ErasedEffect::StopWith => {
+            ErasedEffect::Stop => {
                 self.stop_entry(index, isolate_id, cause);
+                true
+            }
+            ErasedEffect::StopWith(result) => {
+                self.stop_entry_with_result(index, isolate_id, cause, result);
                 true
             }
             ErasedEffect::Fail => {
@@ -6732,7 +6769,17 @@ where
         isolate_id: IsolateId,
         cause: tina_runtime::CauseId,
     ) -> tina_runtime::EventId {
-        self.stop_entry_with_precollected(index, isolate_id, cause, None)
+        self.stop_entry_with_precollected_and_result(index, isolate_id, cause, None, None)
+    }
+
+    fn stop_entry_with_result(
+        &mut self,
+        index: usize,
+        isolate_id: IsolateId,
+        cause: tina_runtime::CauseId,
+        result: tina::StopResult,
+    ) -> tina_runtime::EventId {
+        self.stop_entry_with_precollected_and_result(index, isolate_id, cause, None, Some(result))
     }
 
     pub(crate) fn stop_entry_with_precollected(
@@ -6741,6 +6788,17 @@ where
         isolate_id: IsolateId,
         cause: tina_runtime::CauseId,
         precollected: Option<DeliveredMessage>,
+    ) -> tina_runtime::EventId {
+        self.stop_entry_with_precollected_and_result(index, isolate_id, cause, precollected, None)
+    }
+
+    fn stop_entry_with_precollected_and_result(
+        &mut self,
+        index: usize,
+        isolate_id: IsolateId,
+        cause: tina_runtime::CauseId,
+        precollected: Option<DeliveredMessage>,
+        result: Option<tina::StopResult>,
     ) -> tina_runtime::EventId {
         if self.entries[index].stopped.get() {
             let stopped = self.entries[index]
@@ -6754,6 +6812,7 @@ where
                     RuntimeEventKind::MessageAbandoned,
                 );
             }
+            drop(result);
             return stopped;
         }
 
@@ -6795,6 +6854,16 @@ where
                 Some(stopped.into()),
                 RuntimeEventKind::MessageAbandoned,
             );
+        }
+        let generation = self.entries[index].generation;
+        match result {
+            Some(result) => {
+                self.result_observations
+                    .notify_result(isolate_id, generation, result);
+            }
+            None => self
+                .result_observations
+                .notify_stopped_without_result(isolate_id, generation),
         }
         stopped
     }

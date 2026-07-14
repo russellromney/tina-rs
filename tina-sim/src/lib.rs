@@ -34,7 +34,7 @@
 //! `tina-sim` intentionally reuses the live runtime's event vocabulary from
 //! `tina-runtime` instead of inventing a second user-visible meaning model.
 //! The simulator is still narrower than the live runtime: it supports local
-//! sends, stop, reply/noop observation, ordered `Batch`, runtime-owned
+//! sends, typed `stop_with` result observation, ordered `Batch`, runtime-owned
 //! `Sleep`, single-shard spawn/supervision, and scripted single-shard TCP
 //! simulation.
 
@@ -169,6 +169,7 @@ where
     /// `NoPendingCall` / `CallerClosed`.
     pub(crate) cancelled_calls: std::collections::VecDeque<(CallId, tina::CancelCause)>,
     pub(crate) cancelled_call_cause_evictions: u64,
+    pub(crate) result_observations: tina_runtime::IsolateResultObservations,
     /// Live trace observer. Fires before in-memory push so DST replay
     /// sees the same stream a live operator does.
     pub(crate) trace_observer: Option<Arc<dyn tina_runtime::TraceObserver>>,
@@ -217,6 +218,7 @@ where
         let next_isolate_id = reserved_system_isolates
             .checked_add(1)
             .expect("reserved system isolate count leaves no user id space");
+        let result_observation_capacity = config.result_observation_capacity;
         Self {
             system_incarnation,
             shard,
@@ -273,6 +275,9 @@ where
                 tina_runtime::CANCELLED_CALL_RING_CAPACITY,
             ),
             cancelled_call_cause_evictions: 0,
+            result_observations: tina_runtime::IsolateResultObservations::with_max_pending(
+                result_observation_capacity,
+            ),
             trace_observer: None,
         }
     }
