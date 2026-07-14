@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use tina::{Effect, Shard, ShardId, stop_with};
-use tina_codec::{DecodeStatus, LengthDelimitedFramer, LengthPrefix, decode_chunk};
+use tina_codec::{DecodeStatus, FrameDecision, LengthDelimitedFramer, LengthPrefix, decode_chunk};
 use tina_runtime::{
     CallError, FramedWriteError, LoopStep, UnixAcceptReply, UnixBindReply, UnixConnectReply,
     UnixFramedWriter, UnixListenerId, UnixReadReply, UnixStreamId, UnixWriteAll,
@@ -187,7 +187,12 @@ impl KeyspaceServer {
                 }
                 self.cleanup()
             }
-            ServerMsg::Read(Ok(bytes)) if bytes.is_empty() => self.begin_finish(),
+            ServerMsg::Read(Ok(bytes)) if bytes.is_empty() => {
+                if !matches!(self.framer.finish(), FrameDecision::NeedMore) {
+                    self.saw_full_or_malformed = true;
+                }
+                self.begin_finish()
+            }
             ServerMsg::Read(Ok(bytes)) => {
                 let stream = self.stream.expect("stream open while decoding");
                 let mut writer = UnixFramedWriter::length_delimited(
@@ -406,6 +411,14 @@ impl KeyspaceClient {
                 }
             }
             ClientMsg::Read(Ok(bytes)) if bytes.is_empty() => {
+                match self.response_framer.finish() {
+                    FrameDecision::Frame(frame) => self.response_frames.push(frame),
+                    FrameDecision::Malformed(_) | FrameDecision::Full => self.issue(
+                        KeyspaceStage::Protocol,
+                        KeyspaceIssueKind::MalformedResponse,
+                    ),
+                    FrameDecision::NeedMore => {}
+                }
                 if !self.wait_for_eof && self.response_frames.len() < self.expected_responses {
                     self.issue(
                         KeyspaceStage::Protocol,
@@ -469,6 +482,11 @@ fn run_exchange(
     if max_body_len == 0 {
         return Err(RunError::InvalidConfig(
             "max_body_len must be greater than zero",
+        ));
+    }
+    if max_body_len > u16::MAX as usize - 4 {
+        return Err(RunError::InvalidConfig(
+            "max_body_len must leave room for the ack: response prefix",
         ));
     }
     let Some(max_response_body_len) = max_body_len.checked_add(4) else {
@@ -682,6 +700,20 @@ mod tests {
     }
 
     #[test]
+    fn body_cap_must_leave_u16_wire_room_for_ack_prefix() {
+        assert_eq!(
+            run_framed_keyspace(
+                PathBuf::from("unused"),
+                Vec::new(),
+                u16::MAX as usize - 3,
+                usize::MAX,
+            )
+            .unwrap_err(),
+            RunError::InvalidConfig("max_body_len must leave room for the ack: response prefix")
+        );
+    }
+
+    #[test]
     fn malformed_raw_injector_preserves_early_peer_close() {
         let mut payload = Vec::with_capacity(18);
         payload.extend_from_slice(&(16u16).to_be_bytes());
@@ -695,5 +727,112 @@ mod tests {
         .expect("server rejection is the expected protocol outcome");
         assert!(result.server_saw_full_or_malformed);
         assert_eq!(result.raw_write_error, Some(CallError::Io));
+    }
+
+    fn client_eof_result(
+        response_framer: LengthDelimitedFramer,
+    ) -> Result<ClientReport, KeyspaceFailure> {
+        let mut sim = Simulator::new(KeyspaceShard, SimulatorConfig::default());
+        let client = sim.register(KeyspaceClient {
+            path: PathBuf::from("unused"),
+            stream: None,
+            payload: Some(KeyspacePayload::Frames(Vec::new())),
+            framed_writer: None,
+            raw_writer: None,
+            response_framer,
+            max_body_len: 8,
+            max_encoded_len: 32,
+            expected_responses: 2,
+            wait_for_eof: false,
+            received_bytes: 0,
+            response_frames: vec![b"ack:first".to_vec()],
+            raw_write_error: None,
+            issues: Vec::new(),
+        });
+        let waiter = sim
+            .observe_result::<Result<ClientReport, KeyspaceFailure>, _, _>(client)
+            .expect("claim client result");
+        sim.try_send(client, ClientMsg::Read(Ok(Vec::new())))
+            .expect("deliver peer EOF");
+        sim.run_until_quiescent();
+        assert!(!sim.has_in_flight_calls());
+        waiter
+            .wait(Duration::ZERO)
+            .expect("client stopped with result")
+    }
+
+    #[test]
+    fn clean_peer_eof_before_expected_response_count_is_typed() {
+        let failure = client_eof_result(LengthDelimitedFramer::new(LengthPrefix::U16, 12))
+            .expect_err("one of two responses is premature EOF");
+        assert_eq!(
+            failure.issues,
+            [KeyspaceIssue {
+                endpoint: KeyspaceEndpoint::Client,
+                stage: KeyspaceStage::Protocol,
+                error: KeyspaceIssueKind::EofBeforeResponses {
+                    expected: 2,
+                    received: 1,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn partial_response_at_peer_eof_is_malformed_and_incomplete() {
+        let mut framer = LengthDelimitedFramer::new(LengthPrefix::U16, 12);
+        assert_eq!(framer.feed([0]), 1);
+        let failure = client_eof_result(framer).expect_err("partial prefix must fail closed");
+        assert_eq!(
+            failure.issues,
+            [
+                KeyspaceIssue {
+                    endpoint: KeyspaceEndpoint::Client,
+                    stage: KeyspaceStage::Protocol,
+                    error: KeyspaceIssueKind::MalformedResponse,
+                },
+                KeyspaceIssue {
+                    endpoint: KeyspaceEndpoint::Client,
+                    stage: KeyspaceStage::Protocol,
+                    error: KeyspaceIssueKind::EofBeforeResponses {
+                        expected: 2,
+                        received: 1,
+                    },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn truncated_request_at_peer_eof_is_not_reported_as_clean() {
+        let mut framer = LengthDelimitedFramer::new(LengthPrefix::U16, 8);
+        assert_eq!(framer.feed([0]), 1);
+        let mut sim = Simulator::new(KeyspaceShard, SimulatorConfig::default());
+        let server = sim.register(KeyspaceServer {
+            path: PathBuf::from("unused"),
+            listener: None,
+            stream: None,
+            framer,
+            writer: None,
+            max_response_body_len: 12,
+            max_encoded_len: 32,
+            frames: Vec::new(),
+            saw_full_or_malformed: false,
+            listener_closing_before_read: false,
+            issues: Vec::new(),
+        });
+        let waiter = sim
+            .observe_result::<Result<ServerReport, KeyspaceFailure>, _, _>(server)
+            .expect("claim server result");
+        sim.try_send(server, ServerMsg::Read(Ok(Vec::new())))
+            .expect("deliver peer EOF");
+        sim.run_until_quiescent();
+
+        let report = waiter
+            .wait(Duration::ZERO)
+            .expect("server stopped with result")
+            .expect("truncated input is a protocol report, not a rail failure");
+        assert!(report.saw_full_or_malformed);
+        assert!(!sim.has_in_flight_calls());
     }
 }

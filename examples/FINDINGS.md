@@ -26,9 +26,14 @@ batches. Only the two deliberately malformed protocol injectors retain raw
 also fixed three latent behavioral defects: coalesced admin shutdown discarded
 already-built replies, the keyspace client treated one arbitrary read as the
 whole response, and file copy stopped after the first of two close callbacks.
+The adversarial pass found three more: codec EOF was not finalized, the U16
+keyspace body cap did not reserve room for the `ack:` response prefix, and the
+live probe used an unbounded join that did not require clean terminal
+accounting. The fixes use `finish`, validate the wire-representable response
+bound, and consume the live owner through bounded `run_to_shutdown`.
 Focused tests force two-byte Unix writes and one-byte file writes, prove exact
-decoded responses and two-file settlement, and cover empty/zero-cap/config and
-bounded refusal paths.
+decoded responses and two-file settlement, and cover empty/zero-cap/config,
+bounded refusal, clean-boundary premature EOF, and truncated EOF paths.
 
 The panic-only zero body-cap constructors remain visible at the framework
 boundary. Public specimen runners validate those values before construction;

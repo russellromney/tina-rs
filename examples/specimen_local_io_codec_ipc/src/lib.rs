@@ -102,7 +102,20 @@ impl<E: std::fmt::Display> std::fmt::Display for RunError<E> {
     }
 }
 
-impl<E> std::error::Error for RunError<E> where E: std::fmt::Debug + std::fmt::Display {}
+impl<E> std::error::Error for RunError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Actor { error, .. } => Some(error),
+            Self::InvalidConfig(_)
+            | Self::Observe { .. }
+            | Self::Start { .. }
+            | Self::InFlightCalls => None,
+        }
+    }
+}
 
 pub(crate) fn map_start<T, E>(
     actor: &'static str,

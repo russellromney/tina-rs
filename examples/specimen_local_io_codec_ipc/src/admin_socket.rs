@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use tina::{Effect, Shard, ShardId, stop_with};
-use tina_codec::{DecodeStatus, LineFramer, decode_chunk};
+use tina_codec::{DecodeStatus, FrameDecision, LineFramer, decode_chunk};
 use tina_runtime::{
     CallError, FramedWriteError, LoopStep, UnixAcceptReply, UnixBindReply, UnixConnectReply,
     UnixFramedWriter, UnixListenerId, UnixReadReply, UnixStreamId, UnixWriteAll,
@@ -197,7 +197,12 @@ impl AdminServer {
                 }
                 self.cleanup()
             }
-            ServerMsg::Read(Ok(bytes)) if bytes.is_empty() => self.begin_finish(),
+            ServerMsg::Read(Ok(bytes)) if bytes.is_empty() => {
+                if !matches!(self.framer.finish(false), FrameDecision::NeedMore) {
+                    self.malformed_or_full = true;
+                }
+                self.begin_finish()
+            }
             ServerMsg::Read(Ok(bytes)) => {
                 let stream = self.stream.expect("stream open while decoding");
                 let mut writer = UnixFramedWriter::lines(
@@ -434,6 +439,9 @@ impl AdminClient {
                 }
             }
             ClientMsg::Read(Ok(bytes)) if bytes.is_empty() => {
+                if !matches!(self.response_framer.finish(false), FrameDecision::NeedMore) {
+                    self.issue(AdminStage::Protocol, AdminIssueKind::MalformedResponse);
+                }
                 if !self.wait_for_eof && self.responses.len() < self.expected_responses {
                     self.issue(
                         AdminStage::Protocol,
@@ -744,5 +752,92 @@ mod tests {
         .expect("server rejection is the expected protocol outcome");
         assert!(result.server_saw_malformed_or_full);
         assert_eq!(result.raw_write_error, Some(CallError::Io));
+    }
+
+    #[test]
+    fn truncated_line_at_peer_eof_is_not_reported_as_clean() {
+        let mut framer = LineFramer::new(8);
+        assert_eq!(framer.feed(b"partial"), 7);
+        let mut sim = Simulator::new(AdminShard, SimulatorConfig::default());
+        let server = sim.register(AdminServer {
+            path: PathBuf::from("unused"),
+            listener: None,
+            stream: None,
+            framer,
+            writer: None,
+            max_response_line_len: 11,
+            max_encoded_len: 16,
+            seen: Vec::new(),
+            malformed_or_full: false,
+            close_after_write: false,
+            listener_closing_before_read: false,
+            issues: Vec::new(),
+        });
+        let waiter = sim
+            .observe_result::<Result<ServerReport, AdminFailure>, _, _>(server)
+            .expect("claim server result");
+        sim.try_send(server, ServerMsg::Read(Ok(Vec::new())))
+            .expect("deliver peer EOF");
+        sim.run_until_quiescent();
+
+        let report = waiter
+            .wait(Duration::ZERO)
+            .expect("server stopped with result")
+            .expect("truncated input is a protocol report, not a rail failure");
+        assert!(report.malformed_or_full);
+        assert!(!sim.has_in_flight_calls());
+    }
+
+    #[test]
+    fn truncated_response_at_peer_eof_is_malformed_and_incomplete() {
+        let mut response_framer = LineFramer::new(11);
+        assert_eq!(response_framer.feed(b"ok partial"), 10);
+        let mut sim = Simulator::new(AdminShard, SimulatorConfig::default());
+        let client = sim.register(AdminClient {
+            path: PathBuf::from("unused"),
+            stream: None,
+            payload: Some(AdminPayload::Frames(Vec::new())),
+            framed_writer: None,
+            raw_writer: None,
+            response_framer,
+            max_line_len: 8,
+            max_encoded_len: 16,
+            expected_responses: 1,
+            wait_for_eof: false,
+            received_bytes: 10,
+            responses: Vec::new(),
+            raw_write_error: None,
+            issues: Vec::new(),
+        });
+        let waiter = sim
+            .observe_result::<Result<ClientReport, AdminFailure>, _, _>(client)
+            .expect("claim client result");
+        sim.try_send(client, ClientMsg::Read(Ok(Vec::new())))
+            .expect("deliver peer EOF");
+        sim.run_until_quiescent();
+
+        let failure = waiter
+            .wait(Duration::ZERO)
+            .expect("client stopped with result")
+            .expect_err("partial response must fail closed");
+        assert_eq!(
+            failure.issues,
+            [
+                AdminIssue {
+                    endpoint: AdminEndpoint::Client,
+                    stage: AdminStage::Protocol,
+                    error: AdminIssueKind::MalformedResponse,
+                },
+                AdminIssue {
+                    endpoint: AdminEndpoint::Client,
+                    stage: AdminStage::Protocol,
+                    error: AdminIssueKind::EofBeforeResponses {
+                        expected: 1,
+                        received: 0,
+                    },
+                },
+            ]
+        );
+        assert!(!sim.has_in_flight_calls());
     }
 }

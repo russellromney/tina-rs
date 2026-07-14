@@ -17,12 +17,13 @@ The binary exposes four flows:
   stream, and returns complete decoded response frames.
 - `framed-keyspace` uses `LengthDelimitedFramer` and bounded
   `UnixFramedWriter::length_delimited` batches. The client reads until every
-  expected acknowledgement frame is decoded rather than treating one socket
-  read as one protocol response.
+  expected acknowledgement frame is decoded, finalizes the codec on EOF, and
+  validates that the configured U16 body cap leaves room for the `ack:` prefix.
 - `live-unix` uses fallible `LocalSystem` startup with
-  `DefaultThreadedMailboxFactory`, then waits directly on the probe's typed
-  stop result. Unix platforms must bind and close successfully; other
-  platforms must return `CallError::Unsupported`.
+  `DefaultThreadedMailboxFactory`, waits directly on the probe's typed stop
+  result, and consumes the owner through bounded `run_to_shutdown` with clean
+  terminal accounting. Unix platforms must bind and close successfully;
+  other platforms must return `CallError::Unsupported`.
 
 The two bad-input proofs intentionally bypass `UnixFramedWriter` with
 `UnixWriteAll` so they can inject malformed wire bytes. Normal application
@@ -50,5 +51,5 @@ cargo test -p specimen-local-io-codec-ipc --all-targets
 
 The suite covers EOF, honest cap exhaustion, zero caps, empty payloads,
 partial writes, bounded frame refusal, malformed raw injection, response
-completion, exact two-file cleanup, repeated live bind/close, and terminal
-result observation.
+completion, clean-boundary and truncated premature EOF, exact two-file cleanup,
+repeated live bind/close, and terminal result observation.
