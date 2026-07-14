@@ -10,7 +10,8 @@ scan() {
     find "$@" -type f -name '*.rs' \
         ! -path '*/target/*' ! -path '*/tests/*' ! -path '*/benches/*' \
         ! -name 'tokio_impl.rs' \
-        -exec perl -0777 -ne '
+        -print0 \
+        | xargs -0 perl -0777 -ne '
             s{r(\#*)".*?"\1}{ my $literal = $&; $literal =~ s/[^\n]/ /g; $literal }gse;
             s{"(?:\\.|[^"\\])*"}{ my $literal = $&; $literal =~ s/[^\n]/ /g; $literal }gse;
             s{//[^\n]*}{ }g;
@@ -20,7 +21,7 @@ scan() {
                 my $line = 1 + ($prefix =~ tr/\n//);
                 print "$ARGV:$line: manual split-service envelope\n";
             }
-        ' {} +
+        '
 }
 
 if [[ "${1:-}" == "--self-test" ]]; then
