@@ -45,6 +45,38 @@ pub enum FramedWriteError {
     AlreadyStarted,
 }
 
+impl std::fmt::Display for FramedWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BodyFull {
+                body_len,
+                max_body_len,
+            } => write!(
+                formatter,
+                "frame body is {body_len} bytes; maximum is {max_body_len}"
+            ),
+            Self::LineContainsNewline => {
+                formatter.write_str("line frame body contains a newline delimiter")
+            }
+            Self::LineEndsWithCarriageReturn => {
+                formatter.write_str("line frame body ends with a stripped carriage return")
+            }
+            Self::BatchFull {
+                encoded_len,
+                frame_len,
+                max_encoded_len,
+            } => write!(
+                formatter,
+                "encoded batch has {encoded_len} bytes and the frame needs {frame_len} more; \
+                 maximum is {max_encoded_len}"
+            ),
+            Self::AlreadyStarted => formatter.write_str("framed write batch has already started"),
+        }
+    }
+}
+
+impl std::error::Error for FramedWriteError {}
+
 /// Bounded frame encoder plus partial-progress Unix write state machine.
 ///
 /// Frames are encoded into one explicitly capped batch. Calling
@@ -446,6 +478,23 @@ mod tests {
     }
 
     #[test]
+    fn frame_refusals_are_propagatable_standard_errors() {
+        fn standard_error(error: &(dyn std::error::Error + 'static)) -> String {
+            error.to_string()
+        }
+
+        let error = FramedWriteError::BatchFull {
+            encoded_len: 4,
+            frame_len: 5,
+            max_encoded_len: 8,
+        };
+        assert_eq!(
+            standard_error(&error),
+            "encoded batch has 4 bytes and the frame needs 5 more; maximum is 8"
+        );
+    }
+
+    #[test]
     fn zero_batch_cap_refuses_without_mutation() {
         let mut line = UnixFramedWriter::lines(stream(), 8, 0);
         assert_eq!(
@@ -583,6 +632,30 @@ mod tests {
 
         let step: LoopStep<Dummy, usize> = writer.advance(reply, Msg::Wrote);
         assert!(matches!(step, LoopStep::Failed(CallError::Io)));
+    }
+
+    #[test]
+    fn split_service_failure_matches_raw_authoring_and_preserves_the_allocation() {
+        let mut writer = UnixFramedWriter::length_delimited(stream(), LengthPrefix::U8, 8, 16);
+        writer.push_frame(b"ping").unwrap();
+        let effect = writer
+            .next_service_event::<DummyService, _, _, _>(ServiceEvent::Wrote)
+            .expect("non-empty batch arms");
+        let (bytes, _) = take_write(effect);
+        let allocation = bytes.as_ptr();
+        let reply = Err(WriteOwnedError {
+            error: CallError::InvalidResource,
+            bytes,
+        });
+        assert_eq!(
+            reply.as_ref().unwrap_err().bytes.as_ptr(),
+            allocation,
+            "the split-service path returns the exact caller-owned allocation"
+        );
+
+        let step: LoopStep<DummyService, usize> =
+            writer.advance_service_event(reply, ServiceEvent::Wrote);
+        assert!(matches!(step, LoopStep::Failed(CallError::InvalidResource)));
     }
 
     #[test]
