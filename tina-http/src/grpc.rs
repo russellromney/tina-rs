@@ -292,7 +292,7 @@ trait ErasedStreamingRaw: Send + Sync {
 }
 
 trait ErasedActorCancel<S: Shard + 'static>: Send {
-    fn cancel(self: Box<Self>, id: u64) -> Effect<GrpcRouter<S>>;
+    fn cancel(self: Box<Self>) -> Effect<GrpcRouter<S>>;
 }
 
 struct ActorCancel<R> {
@@ -304,9 +304,8 @@ where
     S: Shard + 'static,
     R: Send + 'static,
 {
-    fn cancel(self: Box<Self>, id: u64) -> Effect<GrpcRouter<S>> {
-        cancel_call(self.handle)
-            .then(move |outcome| GrpcRouterMsg::ActorRouteCancelled { id, outcome })
+    fn cancel(self: Box<Self>) -> Effect<GrpcRouter<S>> {
+        cancel_call(self.handle).then(|_outcome| GrpcRouterMsg::ActorRouteMaintenance)
     }
 }
 
@@ -1108,7 +1107,15 @@ where
         + 'static,
 {
     fn call(&self, request: HttpRequest, limits: GrpcLimits) -> HttpResponse {
-        let HttpRequest { path, body, .. } = request;
+        let HttpRequest {
+            path,
+            headers,
+            body,
+            ..
+        } = request;
+        if let Err(error) = validate_grpc_request_headers(&headers) {
+            return grpc_http_response(Vec::new(), status_for_error(error));
+        }
         let path: Arc<str> = Arc::from(path);
         let HttpRequestBody::Http2Stream(stream) = body else {
             return grpc_http_response(
@@ -1130,7 +1137,16 @@ where
         // Take the HTTP/2 request body stream straight from the compact request
         // — no public `HttpRequest`/`HeaderMap` rebuild. The handler only needs
         // the method path and the request stream.
-        let GrpcHttp2Request { path, body, .. } = request;
+        let GrpcHttp2Request {
+            path,
+            body,
+            content_type_ok,
+            unsupported_encoding,
+            ..
+        } = request;
+        if let Err(error) = validate_grpc_header_flags(content_type_ok, unsupported_encoding) {
+            return grpc_http_response(Vec::new(), status_for_error(error));
+        }
         let GrpcHttp2Body::Http2Stream(stream) = body else {
             return grpc_http_response(
                 Vec::new(),
@@ -1157,7 +1173,15 @@ where
         + 'static,
 {
     fn call(&self, request: HttpRequest, _limits: GrpcLimits) -> HttpResponse {
-        let HttpRequest { path, body, .. } = request;
+        let HttpRequest {
+            path,
+            headers,
+            body,
+            ..
+        } = request;
+        if let Err(error) = validate_grpc_request_headers(&headers) {
+            return grpc_http_response(Vec::new(), status_for_error(error));
+        }
         let path: Arc<str> = Arc::from(path);
         let HttpRequestBody::Http2Stream(stream) = body else {
             return grpc_http_response(
@@ -1178,7 +1202,16 @@ where
     fn call_http2(&self, request: GrpcHttp2Request, _limits: GrpcLimits) -> HttpResponse {
         // Compact entry point: hand the raw HTTP/2 request stream to the handler
         // without building a public `HttpRequest`.
-        let GrpcHttp2Request { path, body, .. } = request;
+        let GrpcHttp2Request {
+            path,
+            body,
+            content_type_ok,
+            unsupported_encoding,
+            ..
+        } = request;
+        if let Err(error) = validate_grpc_header_flags(content_type_ok, unsupported_encoding) {
+            return grpc_http_response(Vec::new(), status_for_error(error));
+        }
         let GrpcHttp2Body::Http2Stream(stream) = body else {
             return grpc_http_response(
                 Vec::new(),
@@ -1283,10 +1316,10 @@ where
     S: Shard + 'static,
 {
     let (effect, handle) = call_cancelable_request(target, request, timeout).then(move |outcome| {
-        GrpcRouterMsg::ActorRouteReturned {
+        GrpcRouterMsg::ActorRouteReturned(GrpcActorRouteCompletion {
             id,
             result: actor_unary_result(outcome, limits),
-        }
+        })
     });
     ActorRouteDispatch {
         effect,
@@ -1336,7 +1369,14 @@ where
         limits: GrpcLimits,
         id: u64,
     ) -> ActorRouteDispatchResult<S> {
-        let HttpRequest { path, body, .. } = request;
+        let HttpRequest {
+            path,
+            headers,
+            body,
+            ..
+        } = request;
+        validate_grpc_request_headers(&headers)
+            .map_err(|error| Box::new(grpc_http_response(Vec::new(), status_for_error(error))))?;
         let HttpRequestBody::Http2Stream(stream) = body else {
             return Err(Box::new(grpc_http_response(
                 Vec::new(),
@@ -1361,7 +1401,15 @@ where
         limits: GrpcLimits,
         id: u64,
     ) -> ActorRouteDispatchResult<S> {
-        let GrpcHttp2Request { path, body, .. } = request;
+        let GrpcHttp2Request {
+            path,
+            body,
+            content_type_ok,
+            unsupported_encoding,
+            ..
+        } = request;
+        validate_grpc_header_flags(content_type_ok, unsupported_encoding)
+            .map_err(|error| Box::new(grpc_http_response(Vec::new(), status_for_error(error))))?;
         let GrpcHttp2Body::Http2Stream(stream) = body else {
             return Err(Box::new(grpc_http_response(
                 Vec::new(),
@@ -1412,7 +1460,7 @@ where
                 ActorRouteResult::Failure(GrpcActorRouteFailure::Rejected(reason))
             }
         };
-        GrpcRouterMsg::ActorRouteReturned { id, result }
+        GrpcRouterMsg::ActorRouteReturned(GrpcActorRouteCompletion { id, result })
     });
     ActorRouteDispatch {
         effect,
@@ -1451,15 +1499,9 @@ pub enum GrpcRouterMsg {
         outcome: CallOutcome<Http2ConnectionReply>,
     },
     #[doc(hidden)]
-    ActorRouteReturned {
-        id: u64,
-        result: ActorRouteResult,
-    },
+    ActorRouteReturned(GrpcActorRouteCompletion),
     #[doc(hidden)]
-    ActorRouteCancelled {
-        id: u64,
-        outcome: tina::CancelOutcome,
-    },
+    ActorRouteMaintenance,
 }
 
 /// Why an actor-backed gRPC route could not produce its typed reply.
@@ -1510,11 +1552,21 @@ impl std::fmt::Display for GrpcActorRouteRegistrationError {
 
 impl std::error::Error for GrpcActorRouteRegistrationError {}
 
-#[doc(hidden)]
 #[derive(Debug)]
-pub enum ActorRouteResult {
+enum ActorRouteResult {
     Response(HttpResponse),
     Failure(GrpcActorRouteFailure),
+}
+
+/// Opaque runtime-owned completion for an actor-backed gRPC route.
+///
+/// Its fields are private so application code cannot forge completion
+/// authority for another caller parked in the router.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct GrpcActorRouteCompletion {
+    id: u64,
+    result: ActorRouteResult,
 }
 
 struct PendingActorRoute<S: Shard> {
@@ -1895,7 +1947,7 @@ impl<S: Shard + 'static> GrpcRouter<S> {
                 grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Unimplemented)),
             );
         }
-        if self.actor_pending.len() >= self.actor_route_capacity {
+        if self.actor_route_inflight() >= self.actor_route_capacity {
             return reply_to(
                 call,
                 grpc_http_response(Vec::new(), GrpcActorRouteFailure::Full.status()),
@@ -1926,7 +1978,7 @@ impl<S: Shard + 'static> GrpcRouter<S> {
                 grpc_http_response(Vec::new(), GrpcStatus::new(GrpcStatusCode::Unimplemented)),
             );
         }
-        if self.actor_pending.len() >= self.actor_route_capacity {
+        if self.actor_route_inflight() >= self.actor_route_capacity {
             return reply_to(
                 call,
                 grpc_http_response(Vec::new(), GrpcActorRouteFailure::Full.status()),
@@ -1992,9 +2044,18 @@ impl<S: Shard + 'static> GrpcRouter<S> {
         let effects = abandoned.into_iter().filter_map(|id| {
             self.actor_pending
                 .remove(&id)
-                .map(|pending| pending.cancel.cancel(id))
+                .map(|pending| pending.cancel.cancel())
         });
         batch(effects)
+    }
+
+    fn actor_route_inflight(&self) -> usize {
+        self.actor_pending.len()
+            + self
+                .pending
+                .values()
+                .filter(|pending| self.actor_unary.contains_key(pending.path()))
+                .count()
     }
 
     fn start_or_reply_request(
@@ -2021,6 +2082,14 @@ impl<S: Shard + 'static> GrpcRouter<S> {
                     || self.streaming_raw.contains_key(&request.path)
                 {
                     return call_ctx.reply(self.response_for(request));
+                }
+                if self.actor_unary.contains_key(&request.path)
+                    && self.actor_route_inflight() >= self.actor_route_capacity
+                {
+                    return call_ctx.reply(grpc_http_response(
+                        Vec::new(),
+                        GrpcActorRouteFailure::Full.status(),
+                    ));
                 }
                 let id = self.next_pending_id;
                 self.next_pending_id = self.next_pending_id.saturating_add(1);
@@ -2073,6 +2142,14 @@ impl<S: Shard + 'static> GrpcRouter<S> {
                     || self.streaming_raw.contains_key(&*request.path)
                 {
                     return call_ctx.reply(self.response_for_http2(request));
+                }
+                if self.actor_unary.contains_key(&*request.path)
+                    && self.actor_route_inflight() >= self.actor_route_capacity
+                {
+                    return call_ctx.reply(grpc_http_response(
+                        Vec::new(),
+                        GrpcActorRouteFailure::Full.status(),
+                    ));
                 }
                 // Other routes over a streamed body (e.g. client-streaming)
                 // accumulate the framed body, then dispatch buffered. Keep the
@@ -2130,61 +2207,77 @@ impl<S: Shard + 'static> GrpcRouter<S> {
         // body-pull contract (more bytes, clean EOF, or a failure mapped to a
         // gRPC status).
         match classify_request_chunk(outcome) {
-            RequestChunkAction::More(bytes) => match pending {
-                PendingGrpcRequest::Public {
-                    request,
-                    mut body,
-                    call,
-                } => {
-                    let HttpRequestBody::Http2Stream(stream) = &request.body else {
-                        return reply_to(
-                            call,
-                            grpc_http_response(
-                                Vec::new(),
-                                GrpcStatus::new(GrpcStatusCode::Internal),
-                            ),
+            RequestChunkAction::More(bytes) => {
+                if self.actor_unary.contains_key(pending.path())
+                    && pending
+                        .body_len()
+                        .checked_add(bytes.len())
+                        .is_none_or(|len| len > self.limits.max_message_bytes.saturating_add(5))
+                {
+                    return reply_to(
+                        pending.into_call(),
+                        grpc_http_response(
+                            Vec::new(),
+                            GrpcStatus::new(GrpcStatusCode::ResourceExhausted),
+                        ),
+                    );
+                }
+                match pending {
+                    PendingGrpcRequest::Public {
+                        request,
+                        mut body,
+                        call,
+                    } => {
+                        let HttpRequestBody::Http2Stream(stream) = &request.body else {
+                            return reply_to(
+                                call,
+                                grpc_http_response(
+                                    Vec::new(),
+                                    GrpcStatus::new(GrpcStatusCode::Internal),
+                                ),
+                            );
+                        };
+                        let source = stream.source;
+                        let stream_id = stream.stream_id;
+                        body.extend_from_slice(&bytes);
+                        self.pending.insert(
+                            id,
+                            PendingGrpcRequest::Public {
+                                request,
+                                body,
+                                call,
+                            },
                         );
-                    };
-                    let source = stream.source;
-                    let stream_id = stream.stream_id;
-                    body.extend_from_slice(&bytes);
-                    self.pending.insert(
-                        id,
-                        PendingGrpcRequest::Public {
-                            request,
-                            body,
-                            call,
-                        },
-                    );
-                    self.pull_next_chunk(id, source, stream_id)
+                        self.pull_next_chunk(id, source, stream_id)
+                    }
+                    PendingGrpcRequest::Http2 {
+                        method,
+                        path,
+                        content_type_ok,
+                        unsupported_encoding,
+                        stream,
+                        mut body,
+                        call,
+                    } => {
+                        let source = stream.source;
+                        let stream_id = stream.stream_id;
+                        body.extend_from_slice(&bytes);
+                        self.pending.insert(
+                            id,
+                            PendingGrpcRequest::Http2 {
+                                method,
+                                path,
+                                content_type_ok,
+                                unsupported_encoding,
+                                stream,
+                                body,
+                                call,
+                            },
+                        );
+                        self.pull_next_chunk(id, source, stream_id)
+                    }
                 }
-                PendingGrpcRequest::Http2 {
-                    method,
-                    path,
-                    content_type_ok,
-                    unsupported_encoding,
-                    stream,
-                    mut body,
-                    call,
-                } => {
-                    let source = stream.source;
-                    let stream_id = stream.stream_id;
-                    body.extend_from_slice(&bytes);
-                    self.pending.insert(
-                        id,
-                        PendingGrpcRequest::Http2 {
-                            method,
-                            path,
-                            content_type_ok,
-                            unsupported_encoding,
-                            stream,
-                            body,
-                            call,
-                        },
-                    );
-                    self.pull_next_chunk(id, source, stream_id)
-                }
-            },
+            }
             RequestChunkAction::Eof => match pending {
                 PendingGrpcRequest::Public {
                     mut request,
@@ -2260,6 +2353,19 @@ fn cancel_actor_stream_response<S: Shard + 'static>(
 }
 
 impl PendingGrpcRequest {
+    fn path(&self) -> &str {
+        match self {
+            Self::Public { request, .. } => &request.path,
+            Self::Http2 { path, .. } => path,
+        }
+    }
+
+    fn body_len(&self) -> usize {
+        match self {
+            Self::Public { body, .. } | Self::Http2 { body, .. } => body.len(),
+        }
+    }
+
     /// The reply obligation, regardless of which entry path produced it.
     fn into_call(self) -> tina::RequestContext<HttpResponse> {
         match self {
@@ -2329,10 +2435,10 @@ impl<S: Shard + 'static> Isolate for GrpcRouter<S> {
             GrpcRouterMsg::RequestBodyChunk { id, outcome } => {
                 self.handle_request_chunk(id, outcome)
             }
-            GrpcRouterMsg::ActorRouteReturned { id, result } => {
-                self.complete_actor_route(id, result)
+            GrpcRouterMsg::ActorRouteReturned(completion) => {
+                self.complete_actor_route(completion.id, completion.result)
             }
-            GrpcRouterMsg::ActorRouteCancelled { id: _, outcome: _ } => noop(),
+            GrpcRouterMsg::ActorRouteMaintenance => noop(),
         };
         batch([cleanup, current])
     }
@@ -2349,8 +2455,8 @@ impl<S: Shard + 'static> Isolate for GrpcRouter<S> {
                 self.start_or_reply_http2_request(request, call)
             }
             GrpcRouterMsg::RequestBodyChunk { .. }
-            | GrpcRouterMsg::ActorRouteReturned { .. }
-            | GrpcRouterMsg::ActorRouteCancelled { .. } => {
+            | GrpcRouterMsg::ActorRouteReturned(_)
+            | GrpcRouterMsg::ActorRouteMaintenance => {
                 call.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
         };
@@ -3030,7 +3136,9 @@ fn hpack_integer(input: &[u8]) -> Result<(usize, usize), GrpcError> {
 mod tests {
     use super::*;
 
+    use std::cell::RefCell;
     use std::convert::Infallible;
+    use std::rc::Rc;
 
     use tina_runtime::{DefaultMailboxFactory, Runtime};
 
@@ -3053,6 +3161,55 @@ mod tests {
             call: RequestCall<'_, Self>,
         ) -> RequestEffect<Self> {
             call.reply(Ok(GrpcResponse::new(request.message)))
+        }
+    }
+
+    #[derive(Debug)]
+    enum RouterCallerMsg {
+        Start(HttpRequest),
+        Returned(CallOutcome<HttpResponse>),
+    }
+
+    struct RouterCaller {
+        router: tina::Address<GrpcRouterMsg, HttpResponse>,
+        outcomes: Rc<RefCell<Vec<CallOutcome<HttpResponse>>>>,
+    }
+
+    #[tina_runtime::isolate(message = RouterCallerMsg)]
+    impl RouterCaller {
+        fn handle(
+            &mut self,
+            message: RouterCallerMsg,
+            _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+        ) -> Effect<Self> {
+            match message {
+                RouterCallerMsg::Start(request) => call(
+                    self.router,
+                    GrpcRouterMsg::Request(request),
+                    Duration::from_secs(1),
+                )
+                .then(RouterCallerMsg::Returned),
+                RouterCallerMsg::Returned(outcome) => {
+                    self.outcomes.borrow_mut().push(outcome);
+                    noop()
+                }
+            }
+        }
+    }
+
+    struct PingStreamActor;
+
+    #[tina_runtime::isolate(
+        request = GrpcStreamingCall<Ping, Ping>,
+        reply = Result<GrpcStreamingResponse<Ping>, GrpcStatus>
+    )]
+    impl PingStreamActor {
+        fn handle_request(
+            &mut self,
+            _request: GrpcStreamingCall<Ping, Ping>,
+            call: RequestCall<'_, Self>,
+        ) -> RequestEffect<Self> {
+            call.reply(Err(GrpcStatus::new(GrpcStatusCode::Unimplemented)))
         }
     }
 
@@ -3183,6 +3340,159 @@ mod tests {
                 ActorRouteResult::Failure(actual) if actual == expected
             ));
         }
+    }
+
+    #[test]
+    fn actor_unary_route_executes_end_to_end_in_simulator_runtime() {
+        let limits = GrpcLimits::default();
+        let mut runtime = Runtime::new(SingleShard, DefaultMailboxFactory);
+        let target = runtime
+            .register_request_service::<PingActor, GrpcRequest<Ping>, Infallible>(PingActor, 4);
+        let router = GrpcRouter::<SingleShard>::new(limits)
+            .with_actor_route_capacity(1)
+            .unwrap()
+            .try_unary_actor("/pkg.Ping/Get", target, Duration::from_secs(1))
+            .unwrap();
+        let router =
+            runtime.register_with_capacity::<GrpcRouter<SingleShard>, ResponseChunkMsg>(router, 4);
+        let outcomes = Rc::new(RefCell::new(Vec::new()));
+        let caller = runtime.register_with_capacity::<RouterCaller, Infallible>(
+            RouterCaller {
+                router,
+                outcomes: Rc::clone(&outcomes),
+            },
+            4,
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/grpc"),
+        );
+        let request = HttpRequest {
+            method: Method::POST,
+            path: "/pkg.Ping/Get".to_owned(),
+            version: http::Version::HTTP_2,
+            headers,
+            body: HttpRequestBody::Buffered(
+                encode_grpc_message(&Ping { value: 17 }, limits).unwrap(),
+            ),
+        };
+        runtime
+            .try_send(caller, RouterCallerMsg::Start(request))
+            .unwrap();
+        for _ in 0..8 {
+            runtime.step();
+            if !outcomes.borrow().is_empty() {
+                break;
+            }
+        }
+
+        let outcome = outcomes
+            .borrow_mut()
+            .pop()
+            .expect("router call must settle");
+        let CallOutcome::Replied(response) = outcome else {
+            panic!("actor route must reply, got {outcome:?}");
+        };
+        assert_eq!(
+            grpc_status_from_header_map(&response.headers).unwrap().code,
+            GrpcStatusCode::Ok
+        );
+        let HttpResponseBody::Buffered(body) = response.body else {
+            panic!("unary actor response must be buffered");
+        };
+        assert_eq!(decode_unary_body::<Ping>(&body, limits).unwrap().value, 17);
+    }
+
+    #[test]
+    fn actor_streaming_rejects_bad_content_type_before_dispatch() {
+        let mut runtime = Runtime::new(SingleShard, DefaultMailboxFactory);
+        let target = runtime
+            .register_request_service::<PingStreamActor, GrpcStreamingCall<Ping, Ping>, Infallible>(
+                PingStreamActor,
+                4,
+            );
+        let handler = ActorStreamingHandler::<_, Ping, Ping, SingleShard> {
+            target,
+            timeout: Duration::from_secs(1),
+            _shard: PhantomData,
+        };
+        let request = HttpRequest {
+            method: Method::POST,
+            path: "/pkg.Ping/Stream".to_owned(),
+            version: http::Version::HTTP_2,
+            headers: HeaderMap::new(),
+            body: HttpRequestBody::Buffered(Vec::new()),
+        };
+        let Err(response) = handler.call(request, GrpcLimits::default(), 1) else {
+            panic!("bad content type must fail before actor dispatch");
+        };
+        assert_eq!(
+            grpc_status_from_header_map(&response.headers).unwrap().code,
+            GrpcStatusCode::InvalidArgument
+        );
+
+        let request = GrpcHttp2Request {
+            method: Method::POST,
+            path: Arc::from("/pkg.Ping/Stream"),
+            body: GrpcHttp2Body::Unsupported,
+            content_type_ok: true,
+            unsupported_encoding: true,
+        };
+        let Err(response) = handler.call_http2(request, GrpcLimits::default(), 2) else {
+            panic!("unsupported encoding must fail before actor dispatch");
+        };
+        assert_eq!(
+            grpc_status_from_header_map(&response.headers).unwrap().code,
+            GrpcStatusCode::Unimplemented
+        );
+    }
+
+    #[test]
+    fn actor_unary_body_pull_is_capacity_charged_and_byte_bounded() {
+        let limits = GrpcLimits {
+            max_message_bytes: 4,
+            max_messages: 1,
+        };
+        let mut runtime = Runtime::new(SingleShard, DefaultMailboxFactory);
+        let target = runtime
+            .register_request_service::<PingActor, GrpcRequest<Ping>, Infallible>(PingActor, 4);
+        let mut router = GrpcRouter::<SingleShard>::new(limits)
+            .with_actor_route_capacity(1)
+            .unwrap()
+            .try_unary_actor("/pkg.Ping/Get", target, Duration::from_secs(1))
+            .unwrap();
+        router.pending.insert(
+            7,
+            PendingGrpcRequest::Public {
+                request: HttpRequest {
+                    method: Method::POST,
+                    path: "/pkg.Ping/Get".to_owned(),
+                    version: http::Version::HTTP_2,
+                    headers: HeaderMap::new(),
+                    body: HttpRequestBody::Buffered(Vec::new()),
+                },
+                body: vec![0; limits.max_message_bytes + GRPC_FRAME_HEADER_LEN],
+                call: open_request_context(7),
+            },
+        );
+        assert_eq!(router.actor_route_inflight(), 1);
+
+        let effect = router.handle_request_chunk(
+            7,
+            CallOutcome::Replied(Http2ConnectionReply::RequestChunk(
+                RequestChunkReply::Chunk(vec![0]),
+            )),
+        );
+        let Effect::ReplyTo(_, response) = effect else {
+            panic!("oversized actor unary body must settle immediately");
+        };
+        assert_eq!(
+            grpc_status_from_header_map(&response.headers).unwrap().code,
+            GrpcStatusCode::ResourceExhausted
+        );
+        assert!(router.pending.is_empty());
+        assert_eq!(router.actor_route_inflight(), 0);
     }
 
     #[test]
