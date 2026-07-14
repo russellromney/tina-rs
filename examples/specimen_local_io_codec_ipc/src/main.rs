@@ -6,27 +6,27 @@ fn main() -> anyhow::Result<()> {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "all".to_string());
     let reports: Vec<SpecimenReport> = match mode.as_str() {
         "file-ingest" => vec![
-            file_ingest::smoke(),
-            file_ingest::bad_input_cap_reached(),
-            file_ingest::copy_smoke(),
+            file_ingest::smoke()?,
+            file_ingest::bad_input_cap_reached()?,
+            file_ingest::copy_smoke()?,
         ],
         "admin-socket" => vec![
-            admin_socket::smoke(),
-            admin_socket::bad_input_line_too_long(),
+            admin_socket::smoke()?,
+            admin_socket::bad_input_line_too_long()?,
         ],
         "framed-keyspace" => vec![
-            framed_keyspace::smoke(),
-            framed_keyspace::bad_input_frame_too_large(),
+            framed_keyspace::smoke()?,
+            framed_keyspace::bad_input_frame_too_large()?,
         ],
         "live-unix" => vec![live_unix_smoke::smoke()?],
         "all" => vec![
-            file_ingest::smoke(),
-            file_ingest::bad_input_cap_reached(),
-            file_ingest::copy_smoke(),
-            admin_socket::smoke(),
-            admin_socket::bad_input_line_too_long(),
-            framed_keyspace::smoke(),
-            framed_keyspace::bad_input_frame_too_large(),
+            file_ingest::smoke()?,
+            file_ingest::bad_input_cap_reached()?,
+            file_ingest::copy_smoke()?,
+            admin_socket::smoke()?,
+            admin_socket::bad_input_line_too_long()?,
+            framed_keyspace::smoke()?,
+            framed_keyspace::bad_input_frame_too_large()?,
             live_unix_smoke::smoke()?,
         ],
         other => anyhow::bail!(

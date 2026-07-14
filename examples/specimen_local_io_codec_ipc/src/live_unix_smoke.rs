@@ -1,26 +1,19 @@
-//! Live Unix-domain rail smoke. Drives the **live** runtime (not the
-//! simulator) through one `unix_bind` / `unix_close_listener` cycle and
-//! reports what the live driver does:
-//!
-//! - On Unix platforms the live OS-backed lane binds a real socket and
-//!   the smoke reports success.
-//! - On non-Unix platforms there is no backend; `unix_bind` completes
-//!   with typed `CallError::Unsupported`, and the smoke reports that the
-//!   capability is honestly named (still `ok`, because the typed answer
-//!   is the contract on that platform).
+//! Live Unix-domain bind/close proof through [`tina_runtime::LocalSystem`].
 
-use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
-use tina::{Mailbox, Shard, ShardId, TrySendError, noop};
+use tina::{Shard, ShardId, stop_with};
 use tina_runtime::{
-    CallError, LocalSystem, MailboxFactory, UnixBindReply, UnixListenerId, unix_bind,
+    CallError, DefaultThreadedMailboxFactory, LocalSystem, ResultWaitError, RunToShutdownError,
+    StartupError, ThreadedRuntimeError, ThreadedTrySendError, UnixBindReply, unix_bind,
     unix_close_listener,
 };
 
 use crate::SpecimenReport;
+
+static SOCKET_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct ProbeShard;
@@ -31,55 +24,6 @@ impl Shard for ProbeShard {
     }
 }
 
-struct ProbeMailbox<T> {
-    capacity: usize,
-    queue: Mutex<VecDeque<T>>,
-    closed: Mutex<bool>,
-}
-
-impl<T> Mailbox<T> for ProbeMailbox<T> {
-    fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
-        if *self.closed.lock().expect("closed lock") {
-            return Err(TrySendError::Closed(message));
-        }
-        let mut queue = self.queue.lock().expect("queue lock");
-        if queue.len() >= self.capacity {
-            return Err(TrySendError::Full(message));
-        }
-        queue.push_back(message);
-        Ok(())
-    }
-
-    fn recv(&self) -> Option<T> {
-        self.queue.lock().expect("queue lock").pop_front()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.queue.lock().expect("queue lock").is_empty()
-    }
-
-    fn close(&self) {
-        *self.closed.lock().expect("closed lock") = true;
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ProbeMailboxFactory;
-
-impl MailboxFactory for ProbeMailboxFactory {
-    fn create<T: 'static>(&self, capacity: usize) -> Box<dyn Mailbox<T>> {
-        Box::new(ProbeMailbox {
-            capacity,
-            queue: Mutex::new(VecDeque::new()),
-            closed: Mutex::new(false),
-        })
-    }
-}
-
 #[derive(Debug)]
 enum Msg {
     Start,
@@ -87,14 +31,8 @@ enum Msg {
     Closed(Result<(), CallError>),
 }
 
-/// Outcome the probe records: the bind result mapped to keep just the
-/// success/error shape, and whether close succeeded (Unix only).
-type Observed = Arc<Mutex<Option<Result<(), CallError>>>>;
-
 struct Probe {
     path: std::path::PathBuf,
-    listener: Option<UnixListenerId>,
-    observed: Observed,
 }
 
 #[tina_runtime::isolate(message = Msg, shard = ProbeShard)]
@@ -106,64 +44,105 @@ impl Probe {
     ) -> Effect<Self> {
         match msg {
             Msg::Start => unix_bind(self.path.clone()).then(Msg::Bound),
-            Msg::Bound(Ok((listener, _path))) => {
-                self.listener = Some(listener);
-                unix_close_listener(listener).then(Msg::Closed)
-            }
-            Msg::Bound(Err(error)) => {
-                *self.observed.lock().expect("observed lock") = Some(Err(error));
-                noop()
-            }
-            Msg::Closed(result) => {
-                *self.observed.lock().expect("observed lock") = Some(result);
-                noop()
-            }
+            Msg::Bound(Ok((listener, _path))) => unix_close_listener(listener).then(Msg::Closed),
+            Msg::Bound(Err(error)) => stop_with(Err::<(), CallError>(error)),
+            Msg::Closed(result) => stop_with(result),
         }
     }
 }
 
-/// Drives the live runtime and reports the live Unix rail behavior.
-pub fn smoke() -> anyhow::Result<SpecimenReport> {
-    let path = std::env::temp_dir().join(format!("specimen-live-unix-{}.sock", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    let observed: Observed = Arc::new(Mutex::new(None));
-    let app = LocalSystem::single_shard(ProbeShard, ProbeMailboxFactory).try_build()?;
-    let address = app
-        .register_root::<Probe, Infallible>(
-            Probe {
-                path: path.clone(),
-                listener: None,
-                observed: Arc::clone(&observed),
-            },
-            8,
-        )
-        .map_err(|error| anyhow::anyhow!("register probe: {error:?}"))?;
-    app.try_send(address, Msg::Start)
-        .map_err(|error| anyhow::anyhow!("start probe: {error:?}"))?;
+/// Typed workload failure from the live Unix proof.
+#[derive(Debug)]
+pub enum LiveUnixWorkloadError {
+    Register(ThreadedRuntimeError),
+    Observe(ResultWaitError),
+    Start(ThreadedTrySendError),
+    Wait(ResultWaitError),
+}
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while observed.lock().expect("observed lock").is_none() {
-        if Instant::now() > deadline {
-            break;
+impl std::fmt::Display for LiveUnixWorkloadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Register(error) => write!(formatter, "register live probe: {error}"),
+            Self::Observe(error) => write!(formatter, "observe live probe: {error:?}"),
+            Self::Start(error) => write!(formatter, "start live probe: {error}"),
+            Self::Wait(error) => write!(formatter, "wait for live probe: {error:?}"),
         }
-        std::thread::sleep(Duration::from_millis(5));
     }
-    let result = *observed.lock().expect("observed lock");
-    let shutdown = app.shutdown().drain().join();
-    let _ = std::fs::remove_file(&path);
-    shutdown.map_err(|error| anyhow::anyhow!("join live Unix runtime: {error:?}"))?;
+}
 
-    // On Unix the live lane must bind+close cleanly. On non-Unix the
-    // contract is typed `Unsupported`. Either is a passing smoke for
-    // the platform it runs on.
+impl std::error::Error for LiveUnixWorkloadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Register(error) => Some(error),
+            Self::Start(error) => Some(error),
+            Self::Observe(_) | Self::Wait(_) => None,
+        }
+    }
+}
+
+/// Typed startup, workload, or bounded terminal-shutdown failure.
+#[derive(Debug)]
+pub enum LiveUnixError {
+    Startup(StartupError),
+    Run(Box<RunToShutdownError<LiveUnixWorkloadError>>),
+}
+
+impl std::fmt::Display for LiveUnixError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Startup(error) => write!(formatter, "start live runtime: {error}"),
+            Self::Run(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for LiveUnixError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Startup(error) => Some(error),
+            Self::Run(error) => Some(error),
+        }
+    }
+}
+
+/// Drives the live runtime and reports the platform's Unix-rail behavior.
+pub fn smoke() -> Result<SpecimenReport, LiveUnixError> {
+    let nonce = SOCKET_NONCE.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "specimen-live-unix-{}-{nonce}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let app = LocalSystem::single_shard(ProbeShard, DefaultThreadedMailboxFactory)
+        .try_build()
+        .map_err(LiveUnixError::Startup)?;
+
+    let outcome = app.run_to_shutdown(Duration::from_secs(5), |app| {
+        let address = app
+            .register_root::<Probe, Infallible>(Probe { path: path.clone() }, 8)
+            .map_err(LiveUnixWorkloadError::Register)?;
+        let waiter = app
+            .observe_result::<Result<(), CallError>, _, _>(address)
+            .map_err(LiveUnixWorkloadError::Observe)?;
+        app.try_send(address, Msg::Start)
+            .map_err(LiveUnixWorkloadError::Start)?;
+        waiter
+            .wait(Duration::from_secs(5))
+            .map_err(LiveUnixWorkloadError::Wait)
+    });
+
+    let _ = std::fs::remove_file(&path);
+    let result = outcome.map_err(|error| LiveUnixError::Run(Box::new(error)))?;
+
     let (ok, note) = if cfg!(unix) {
         (
-            result == Some(Ok(())),
+            result == Ok(()),
             format!("live unix bind+close returned {result:?} (expected Ok on Unix)"),
         )
     } else {
         (
-            result == Some(Err(CallError::Unsupported)),
+            result == Err(CallError::Unsupported),
             format!("live unix_bind returned {result:?} (expected Unsupported off Unix)"),
         )
     };
@@ -174,4 +153,17 @@ pub fn smoke() -> anyhow::Result<SpecimenReport> {
         ok,
         note,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_live_probes_use_typed_results_and_unique_paths() {
+        for _ in 0..3 {
+            let report = smoke().expect("live probe completes");
+            assert!(report.ok, "{report:?}");
+        }
+    }
 }

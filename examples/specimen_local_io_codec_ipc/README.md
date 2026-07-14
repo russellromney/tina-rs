@@ -1,35 +1,37 @@
 # specimen-local-io-codec-ipc
 
-Specimen for the local I/O, codec, and IPC parity specimen (Local I/O, Codec, and IPC Parity).
+Canonical local I/O, codec, and IPC specimens. Every actor owns its terminal
+report, releases its files, streams, and listeners, then publishes the typed
+result with `stop_with`. Simulator and live hosts register `observe_result`
+before starting the actor; no result crosses an `Arc<Mutex<_>>` side channel.
 
-Flows, one binary:
+The binary exposes four flows:
 
-- `file-ingest` — bounded file streaming via
-  `tina_runtime::FileReadChunks`, plus a bounded `FileCopyBounded`
-  pump that owns the read/write alternation while still surfacing one
-  continuation per rail completion. The smoke reads a small payload
-  and copies one; the bad-input proof exercises a cap shorter than the
-  file and asserts `FileLoopEnd::CapReached` instead of a silent
-  truncation.
-- `admin-socket` — local admin sidecar over a simulator Unix-domain
-  socket pair with line-delimited commands from
-  `tina_codec::LineFramer` and the `UnixReadToEof` / `UnixWriteAll`
-  loop shape. Smoke run sends three commands; the bad-input proof
-  feeds an over-long line and asserts the framer surfaces `Full` and
-  the connection is torn down.
-- `framed-keyspace` — mini-keyspace protocol with length-prefixed
-  frames using `tina_codec::LengthDelimitedFramer`. Smoke run does
-  `set`/`get`; the bad-input proof feeds a frame whose declared
-  length exceeds the configured cap and asserts the framer rejects
-  before allocation.
-- `live-unix` — drives the **live** runtime through one
-  `unix_bind` / `unix_close_listener` cycle. On Unix the live
-  OS-backed lane binds a real socket; off Unix the call returns typed
-  `CallError::Unsupported`. Either is a pass for its platform.
+- `file-ingest` uses `FileReadChunks` and `FileCopyBounded`. The ingest reports
+  EOF and cap exhaustion separately. The copy waits for both file-close
+  continuations before returning its destination contents and loop report.
+  The simulator seeder is also observed, so setup failures cannot disappear.
+- `admin-socket` uses `LineFramer` for decode and bounded
+  `UnixFramedWriter::lines` batches for normal commands and responses. It
+  flushes responses preceding `shutdown`, closes the one-shot listener and
+  stream, and returns complete decoded response frames.
+- `framed-keyspace` uses `LengthDelimitedFramer` and bounded
+  `UnixFramedWriter::length_delimited` batches. The client reads until every
+  expected acknowledgement frame is decoded, finalizes the codec on EOF, and
+  validates that the configured U16 body cap leaves room for the `ack:` prefix.
+- `live-unix` uses fallible `LocalSystem` startup with
+  `DefaultThreadedMailboxFactory`, waits directly on the probe's typed stop
+  result, and consumes the owner through bounded `run_to_shutdown` with clean
+  terminal accounting. Unix platforms must bind and close successfully;
+  other platforms must return `CallError::Unsupported`.
 
-The IPC flows run on the deterministic simulator so the framed
-protocol logic is replayable; `live-unix` exercises the real
-OS-backed rail.
+The two bad-input proofs intentionally bypass `UnixFramedWriter` with
+`UnixWriteAll` so they can inject malformed wire bytes. Normal application
+traffic never constructs a service envelope or manually encodes a frame.
+
+All public run and smoke functions are fallible. Invalid zero chunk/body
+configuration, bounded frame refusal, host admission, observation, rail,
+protocol, and cleanup outcomes remain distinct typed errors.
 
 ## Run
 
@@ -43,5 +45,11 @@ cargo run -p specimen-local-io-codec-ipc -- all
 
 ## Acceptance tests
 
-`cargo test -p specimen-local-io-codec-ipc` runs every smoke flow and
-every bad-input proof.
+```sh
+cargo test -p specimen-local-io-codec-ipc --all-targets
+```
+
+The suite covers EOF, honest cap exhaustion, zero caps, empty payloads,
+partial writes, bounded frame refusal, malformed raw injection, response
+completion, clean-boundary and truncated premature EOF, exact two-file cleanup,
+repeated live bind/close, and terminal result observation.

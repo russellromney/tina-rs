@@ -11,6 +11,8 @@ For normal service code, use the small loop helpers:
 - `TcpReadToEof` — keep reading until EOF, while enforcing a total cap.
 - `UnixWriteAll` — same shape for Unix-domain sockets.
 - `UnixReadToEof` — same shape for Unix-domain sockets.
+- `UnixFramedWriter` — bounded line or length-delimited encoding plus the
+  `UnixWriteAll` partial-progress state machine.
 
 The helper does not hide runtime work. Each step still returns one
 effect and later one continuation message.
@@ -84,6 +86,26 @@ match msg {
 
 `UnixWriteAll` and `UnixReadToEof` use the same shape with Unix socket
 IDs.
+
+## Framed Unix Writes
+
+Use `UnixFramedWriter` when application code owns frame bodies rather than an
+already encoded wire buffer. The writer enforces a per-body cap and a total
+encoded-batch cap before mutation:
+
+```rust,ignore
+let mut writer = UnixFramedWriter::lines(stream, 4096, 64 * 1024);
+writer.push_frame(b"status")?;
+writer.push_frame(b"shutdown")?;
+let effect = writer.next_effect(Msg::Wrote).expect("non-empty batch");
+self.writer = Some(writer);
+effect
+```
+
+Route `Msg::Wrote(reply)` through `advance` exactly like `UnixWriteAll`.
+`length_delimited` accepts an explicit `LengthPrefix` and body cap. Use raw
+`UnixWriteAll` only when bytes are already encoded or a test deliberately
+injects an invalid wire representation.
 
 ## File Copy
 
