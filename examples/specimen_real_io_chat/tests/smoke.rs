@@ -2,7 +2,9 @@
 //! fanout attempt. Exact wire-shape invariants live in
 //! `tina-runtime`'s own tests.
 
-use specimen_real_io_chat::{RunConfig, tina_impl, tokio_impl};
+use specimen_real_io_chat::{
+    MAX_BROADCAST_TARGETS, MAX_BURST, MAX_SLOW_CONSUMER_CAPACITY, RunConfig, tina_impl, tokio_impl,
+};
 
 #[test]
 fn tokio_smoke() {
@@ -45,4 +47,40 @@ fn tina_caps_request_sized_fanout_before_effects() {
         "three admitted targets hit mailbox Full and twelve targets are shed before effects exist",
     );
     assert_eq!(report.buffered, 0);
+}
+
+#[test]
+fn invalid_workload_bounds_fail_before_startup() {
+    for config in [
+        RunConfig {
+            burst: 0,
+            ..RunConfig::default()
+        },
+        RunConfig {
+            burst: MAX_BURST + 1,
+            ..RunConfig::default()
+        },
+        RunConfig {
+            max_broadcast_targets: 0,
+            ..RunConfig::default()
+        },
+        RunConfig {
+            max_broadcast_targets: MAX_BROADCAST_TARGETS + 1,
+            ..RunConfig::default()
+        },
+        RunConfig {
+            slow_consumer_capacity: 0,
+            ..RunConfig::default()
+        },
+        RunConfig {
+            slow_consumer_capacity: MAX_SLOW_CONSUMER_CAPACITY + 1,
+            ..RunConfig::default()
+        },
+    ] {
+        assert!(tina_impl::run(config).is_err(), "Tina accepted {config:?}");
+        assert!(
+            tokio_impl::run(config).is_err(),
+            "Tokio accepted {config:?}"
+        );
+    }
 }

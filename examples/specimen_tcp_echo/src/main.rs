@@ -23,9 +23,7 @@ use std::io::BufRead;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use specimen_tcp_echo::{
-    EchoListener, EchoListenerMsg, LISTENER_CAPACITY, run_load_shed,
-};
+use specimen_tcp_echo::{EchoListener, EchoListenerMsg, LISTENER_CAPACITY, run_load_shed};
 use tina::prelude::SingleShard;
 use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime};
 
@@ -37,9 +35,7 @@ fn main() -> anyhow::Result<()> {
         None => serve(),
         Some("load-shed") => load_shed(),
         Some(other) => {
-            eprintln!(
-                "unknown argument {other:?}; usage: specimen-tcp-echo [load-shed]"
-            );
+            eprintln!("unknown argument {other:?}; usage: specimen-tcp-echo [load-shed]");
             std::process::exit(2);
         }
     }

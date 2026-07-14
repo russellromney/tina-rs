@@ -19,11 +19,46 @@ pub fn expected_for(payload: u64, worker_id: u64) -> u64 {
     payload.wrapping_add(worker_id)
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TerminalReport {
+    pub worker_timer_failed: Vec<tina_runtime::CallError>,
+    pub worker_full: usize,
+    pub worker_closed: usize,
+    pub worker_timeout: usize,
+    pub worker_rejected: Vec<tina::CallRejectedReason>,
+    pub frontend_full: usize,
+    pub frontend_closed: usize,
+    pub frontend_timeout: usize,
+    pub frontend_rejected: Vec<tina::CallRejectedReason>,
+    pub tokio_worker_channel_closed: usize,
+    pub tokio_reply_channel_closed: usize,
+}
+
+impl TerminalReport {
+    pub fn total(&self) -> usize {
+        self.worker_timer_failed.len()
+            + self.worker_full
+            + self.worker_closed
+            + self.worker_timeout
+            + self.worker_rejected.len()
+            + self.frontend_full
+            + self.frontend_closed
+            + self.frontend_timeout
+            + self.frontend_rejected.len()
+            + self.tokio_worker_channel_closed
+            + self.tokio_reply_channel_closed
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Report {
     pub clients: usize,
     pub correct_replies: usize,
     pub wrong_replies: usize,
-    pub failed: usize,
+    pub terminals: TerminalReport,
     pub exit_clean: bool,
 }

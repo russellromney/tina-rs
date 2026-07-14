@@ -73,7 +73,13 @@ caller and becomes `AggregateReply::Full`.
 
 The completed report keeps `Replied`, `Full`, `Closed`, `Timeout`, `Rejected`,
 `AggregateTimeout`, and `MissingShard` distinct. Only the driver decides
-whether those exhaustive rows form a successful aggregate.
+whether those exhaustive rows form a successful aggregate. If validation
+fails, the public `IncorrectAggregate` retains target order, actual target,
+reply worker/value, expected value, and every exact terminal reason; it is not
+collapsed into the display-oriented `wrong` counter.
+
+The client workload is also producer-bounded: `BoundedItems` owns the payload
+set before `bounded_batch` constructs any request effect.
 
 ## Discussion
 

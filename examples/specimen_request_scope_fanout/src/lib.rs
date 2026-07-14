@@ -28,9 +28,9 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, CallReplyRejectedReason, DefaultThreadedMailboxFactory,
+    BoundedItems, CallOutcome, CallReplyRejectedReason, DefaultThreadedMailboxFactory,
     DeferredReplyRejectedReason, RequestScope, RequestScopeId, RuntimeEventKind, ScopeCancelCause,
-    SleepReply, ThreadedRuntime, call_cancelable_request, sleep,
+    SleepReply, ThreadedRuntime, bounded_batch, call_cancelable_request, sleep,
 };
 
 /// Number of child rails the driver dispatches per request.
@@ -43,7 +43,7 @@ pub const CANCEL_AFTER_MS: u64 = 15;
 const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What the run produces for the host to assert against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
     /// Rails dispatched in total.
     pub rails_total: u32,
@@ -60,6 +60,18 @@ pub struct Report {
     /// Number of cancel-ack messages the driver received from the
     /// scope's cancel translator.
     pub cancel_acks: u32,
+    /// Exact outcomes delivered before the scope closed their waits.
+    pub child_replied: u32,
+    pub child_full: u32,
+    pub child_closed: u32,
+    pub child_timeout: u32,
+    pub child_rejected: Vec<tina::CallRejectedReason>,
+    /// Worker timer failures that arrived as domain replies.
+    pub child_timer_failed: Vec<tina_runtime::CallError>,
+    /// Exact cancellation acknowledgements, one per scope child.
+    pub cancel_outcomes: Vec<tina::CancelOutcome>,
+    /// Driver timer failures; empty on a clean run.
+    pub driver_timer_failures: Vec<tina_runtime::CallError>,
 }
 
 // --- Worker: holds the slot, replies after a sleep ------------------------
@@ -80,7 +92,10 @@ enum WorkerEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WorkerReply;
+pub enum WorkerReply {
+    Completed,
+    TimerFailed(tina_runtime::CallError),
+}
 
 struct Worker {
     work: Duration,
@@ -95,9 +110,15 @@ impl Worker {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match event {
-            WorkerEvent::Wake(_) => {
+            WorkerEvent::Wake(outcome) => {
                 if let Some(slot) = self.held.take() {
-                    tina::reply_to(slot, WorkerReply)
+                    tina::reply_to(
+                        slot,
+                        match outcome {
+                            Ok(()) => WorkerReply::Completed,
+                            Err(error) => WorkerReply::TimerFailed(error),
+                        },
+                    )
                 } else {
                     noop()
                 }
@@ -122,12 +143,10 @@ impl Worker {
 #[derive(Debug)]
 enum DriverMsg {
     Begin,
-    Cancel,
-    Finish,
+    Cancel(SleepReply),
+    Finish(SleepReply),
     Returned(CallOutcome<WorkerReply>),
-    /// Cancel ack from one rail. The fields are routed through this
-    /// continuation so a richer report could distinguish per-rail
-    /// outcomes; the smoke test only asserts on the *count* of acks.
+    /// Cancel ack from one rail. The exact outcome is retained in the report.
     #[allow(dead_code)]
     ChildCancelled {
         scope: RequestScopeId,
@@ -144,6 +163,15 @@ struct Driver {
     rails_pending_at_cancel: u32,
     cancel_cause: Option<ScopeCancelCause>,
     cancel_acks: u32,
+    child_replied: u32,
+    child_full: u32,
+    child_closed: u32,
+    child_timeout: u32,
+    child_rejected: Vec<tina::CallRejectedReason>,
+    child_timer_failed: Vec<tina_runtime::CallError>,
+    cancel_outcomes: Vec<CancelOutcome>,
+    driver_timer_failures: Vec<tina_runtime::CallError>,
+    finish_timer_settled: bool,
     /// Latched after Cancel so post-cancel replies do not inflate the
     /// "settled before cancel" counter — those should be impossible
     /// (the cancel closed the wait), but if anything sneaks through
@@ -159,37 +187,93 @@ impl Driver {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            DriverMsg::Begin => self.dispatch_fanout(),
-            DriverMsg::Cancel => self.cancel_scope(),
+            DriverMsg::Begin => batch(vec![
+                self.dispatch_fanout(),
+                sleep(Duration::from_millis(CANCEL_AFTER_MS)).then(DriverMsg::Cancel),
+            ]),
+            DriverMsg::Cancel(outcome) => {
+                if let Err(error) = outcome {
+                    self.driver_timer_failures.push(error);
+                }
+                self.cancel_scope()
+            }
             DriverMsg::Returned(outcome) => {
-                if matches!(outcome, CallOutcome::Replied(_)) && !self.cancel_fired {
+                if !self.cancel_fired {
                     self.rails_settled_before_cancel += 1;
+                }
+                match outcome {
+                    CallOutcome::Replied(WorkerReply::Completed) => self.child_replied += 1,
+                    CallOutcome::Replied(WorkerReply::TimerFailed(error)) => {
+                        self.child_timer_failed.push(error)
+                    }
+                    CallOutcome::Full => self.child_full += 1,
+                    CallOutcome::Closed => self.child_closed += 1,
+                    CallOutcome::Timeout => self.child_timeout += 1,
+                    CallOutcome::Rejected(reason) => self.child_rejected.push(reason),
                 }
                 noop()
             }
-            DriverMsg::ChildCancelled { .. } => {
+            DriverMsg::ChildCancelled { outcome, .. } => {
                 self.cancel_acks += 1;
-                noop()
+                self.cancel_outcomes.push(outcome);
+                self.maybe_finish()
             }
-            DriverMsg::Finish => stop_with(Report {
-                rails_total: self.rails_total,
-                rails_settled_before_cancel: self.rails_settled_before_cancel,
-                rails_pending_at_cancel: self.rails_pending_at_cancel,
-                cause: self.cancel_cause.expect("cancel must fire before Finish"),
-                late_rejected_in_trace: 0, // host fills this from the trace
-                cancel_acks: self.cancel_acks,
-            }),
+            DriverMsg::Finish(outcome) => {
+                if let Err(error) = outcome {
+                    self.driver_timer_failures.push(error);
+                }
+                self.finish_timer_settled = true;
+                self.maybe_finish()
+            }
         }
     }
 }
 
 impl Driver {
+    fn maybe_finish(&mut self) -> Effect<Self> {
+        if cancel_settlement_complete(
+            self.finish_timer_settled,
+            self.cancel_outcomes.len(),
+            self.rails_pending_at_cancel,
+        ) {
+            stop_with(Report {
+                rails_total: self.rails_total,
+                rails_settled_before_cancel: self.rails_settled_before_cancel,
+                rails_pending_at_cancel: self.rails_pending_at_cancel,
+                cause: self.cancel_cause.expect("cancel must fire before Finish"),
+                late_rejected_in_trace: 0,
+                cancel_acks: self.cancel_acks,
+                child_replied: self.child_replied,
+                child_full: self.child_full,
+                child_closed: self.child_closed,
+                child_timeout: self.child_timeout,
+                child_rejected: std::mem::take(&mut self.child_rejected),
+                child_timer_failed: std::mem::take(&mut self.child_timer_failed),
+                cancel_outcomes: std::mem::take(&mut self.cancel_outcomes),
+                driver_timer_failures: std::mem::take(&mut self.driver_timer_failures),
+            })
+        } else {
+            noop()
+        }
+    }
+}
+
+fn cancel_settlement_complete(
+    finish_timer_settled: bool,
+    cancel_outcomes: usize,
+    rails_pending_at_cancel: u32,
+) -> bool {
+    finish_timer_settled && cancel_outcomes >= rails_pending_at_cancel as usize
+}
+
+impl Driver {
     fn dispatch_fanout(&mut self) -> Effect<Self> {
         let scope = RequestScope::with_child_cap(RequestScopeId::alloc(), FANOUT as usize);
-        let mut effects = Vec::with_capacity(self.workers.len());
-        for worker in &self.workers {
+        let workers = BoundedItems::try_from_iter(FANOUT as usize, self.workers.iter().copied())
+            .expect("the worker registry is bounded by FANOUT");
+        let effects = workers.map_effects(|worker| {
             let (effect, handle) =
-                call_cancelable_request(*worker, WorkerRequest::Run, CALL_TIMEOUT)
+                call_cancelable_request(worker, WorkerRequest::Run, CALL_TIMEOUT)
                     .then(DriverMsg::Returned);
             // Scope is sole canceller for these rails; the worker-return
             // continuation still delivers `Returned` normally for any
@@ -198,10 +282,10 @@ impl Driver {
                 .register("worker", handle)
                 .expect("scope cap matches fanout");
             self.rails_total += 1;
-            effects.push(effect);
-        }
+            effect
+        });
         self.scope = Some(scope);
-        Effect::Batch(effects)
+        bounded_batch(effects)
     }
 
     fn cancel_scope(&mut self) -> Effect<Self> {
@@ -217,7 +301,10 @@ impl Driver {
         self.rails_pending_at_cancel = report.cancelled_count() as u32;
         self.cancel_cause = Some(report.cause);
         self.cancel_fired = true;
-        effect
+        batch(vec![
+            effect,
+            sleep(Duration::from_millis(WORK_MS + 60)).then(DriverMsg::Finish),
+        ])
     }
 }
 
@@ -257,6 +344,15 @@ pub fn run() -> anyhow::Result<Report> {
                 rails_pending_at_cancel: 0,
                 cancel_cause: None,
                 cancel_acks: 0,
+                child_replied: 0,
+                child_full: 0,
+                child_closed: 0,
+                child_timeout: 0,
+                child_rejected: Vec::new(),
+                child_timer_failed: Vec::new(),
+                cancel_outcomes: Vec::with_capacity(FANOUT as usize),
+                driver_timer_failures: Vec::new(),
+                finish_timer_settled: false,
                 cancel_fired: false,
             },
             64,
@@ -271,27 +367,10 @@ pub fn run() -> anyhow::Result<Report> {
         .try_send(driver, DriverMsg::Begin)
         .map_err(|e| anyhow::anyhow!("send Begin: {e:?}"))?;
 
-    std::thread::sleep(Duration::from_millis(CANCEL_AFTER_MS));
-
-    runtime
-        .try_send(driver, DriverMsg::Cancel)
-        .map_err(|e| anyhow::anyhow!("send Cancel: {e:?}"))?;
-
-    // Wait long enough that any late worker reply has fired and the
-    // runtime has had time to record the typed rejection trace fact.
-    std::thread::sleep(Duration::from_millis(WORK_MS + 60));
-
-    runtime
-        .try_send(driver, DriverMsg::Finish)
-        .map_err(|e| anyhow::anyhow!("send Finish: {e:?}"))?;
-
     let mut report = result
         .wait(Duration::from_secs(5))
         .map_err(|e| anyhow::anyhow!("driver did not produce a report: {e:?}"))?;
 
-    // Drain a little longer for trace events that fire after the
-    // driver stops. The driver lifecycle and the worker timer fire
-    // are independent threads.
     fn count_rejected(snapshot: &tina_runtime::TraceSnapshot) -> u32 {
         snapshot
             .events()
@@ -310,16 +389,6 @@ pub fn run() -> anyhow::Result<Report> {
             })
             .count() as u32
     }
-    let target = report
-        .rails_total
-        .saturating_sub(report.rails_settled_before_cancel);
-    let drain_deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while std::time::Instant::now() < drain_deadline {
-        if count_rejected(&runtime.trace()) >= target {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
     report.late_rejected_in_trace = count_rejected(&runtime.trace());
 
     let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
@@ -327,4 +396,18 @@ pub fn run() -> anyhow::Result<Report> {
     terminal.ensure_clean()?;
 
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cancel_settlement_complete;
+
+    #[test]
+    fn finish_requires_timer_and_every_expected_cancel_ack() {
+        assert!(!cancel_settlement_complete(false, 4, 4));
+        assert!(!cancel_settlement_complete(true, 3, 4));
+        assert!(cancel_settlement_complete(true, 4, 4));
+        assert!(cancel_settlement_complete(true, 5, 4));
+        assert!(cancel_settlement_complete(true, 0, 0));
+    }
 }

@@ -8,7 +8,7 @@ use tina_runtime::{
     bounded_batch, call_request, sleep,
 };
 
-use crate::{CLIENTS, DRIVER_BURST_CAP, Report, WORKERS, expected_for};
+use crate::{CLIENTS, DRIVER_BURST_CAP, Report, TerminalReport, WORKERS, expected_for};
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -151,11 +151,11 @@ fn frontend_reply_from_worker(outcome: CallOutcome<WorkerReply>) -> FrontendRepl
 
 // --- Driver -------------------------------------------------------------
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct DriverOutcome {
     correct: usize,
     wrong: usize,
-    failed: usize,
+    terminals: TerminalReport,
 }
 
 #[derive(Debug)]
@@ -200,7 +200,7 @@ impl Driver {
                 record_driver_outcome(&mut self.outcome, want, outcome);
                 self.remaining -= 1;
                 if self.remaining == 0 {
-                    stop_with(self.outcome)
+                    stop_with(std::mem::take(&mut self.outcome))
                 } else {
                     noop()
                 }
@@ -219,23 +219,33 @@ fn record_driver_outcome(
             outcome.correct += 1;
         }
         CallOutcome::Replied(FrontendReply::Result(_)) => outcome.wrong += 1,
-        CallOutcome::Replied(
-            FrontendReply::WorkerTimerFailed(_)
-            | FrontendReply::WorkerFull
-            | FrontendReply::WorkerClosed
-            | FrontendReply::WorkerTimeout
-            | FrontendReply::WorkerRejected(_),
-        )
-        | CallOutcome::Full
-        | CallOutcome::Closed
-        | CallOutcome::Timeout
-        | CallOutcome::Rejected(_) => outcome.failed += 1,
+        CallOutcome::Replied(FrontendReply::WorkerTimerFailed(error)) => {
+            outcome.terminals.worker_timer_failed.push(error);
+        }
+        CallOutcome::Replied(FrontendReply::WorkerFull) => outcome.terminals.worker_full += 1,
+        CallOutcome::Replied(FrontendReply::WorkerClosed) => outcome.terminals.worker_closed += 1,
+        CallOutcome::Replied(FrontendReply::WorkerTimeout) => {
+            outcome.terminals.worker_timeout += 1;
+        }
+        CallOutcome::Replied(FrontendReply::WorkerRejected(reason)) => {
+            outcome.terminals.worker_rejected.push(reason);
+        }
+        CallOutcome::Full => outcome.terminals.frontend_full += 1,
+        CallOutcome::Closed => outcome.terminals.frontend_closed += 1,
+        CallOutcome::Timeout => outcome.terminals.frontend_timeout += 1,
+        CallOutcome::Rejected(reason) => outcome.terminals.frontend_rejected.push(reason),
     }
 }
 
 pub fn run() -> anyhow::Result<Report> {
     let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
 
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), run_application)?)
+}
+
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+) -> anyhow::Result<Report> {
     let mut workers = Vec::with_capacity(WORKERS);
     for w in 0..WORKERS as u64 {
         // Vary work time so replies are out of order.
@@ -286,13 +296,11 @@ pub fn run() -> anyhow::Result<Report> {
         .wait(Duration::from_secs(10))
         .map_err(|e| anyhow::anyhow!("driver finishes: {e:?}"))?;
 
-    app.shutdown().drain().join_report().ensure_clean()?;
-
     Ok(Report {
         clients: CLIENTS,
         correct_replies: outcome.correct,
         wrong_replies: outcome.wrong,
-        failed: outcome.failed,
+        terminals: outcome.terminals,
         exit_clean: true,
     })
 }
@@ -638,7 +646,36 @@ mod tests {
         }
         assert_eq!(outcome.correct, CLIENTS);
         assert_eq!(outcome.wrong, 0);
-        assert_eq!(outcome.failed, 0);
+        assert!(outcome.terminals.is_empty());
+    }
+
+    #[test]
+    fn driver_preserves_every_terminal_category_and_rejection_reason() {
+        let mut outcome = DriverOutcome::default();
+        let reason = CallRejectedReason::UnsupportedMessage;
+        for terminal in [
+            CallOutcome::Replied(FrontendReply::WorkerTimerFailed(CallError::Io)),
+            CallOutcome::Replied(FrontendReply::WorkerFull),
+            CallOutcome::Replied(FrontendReply::WorkerClosed),
+            CallOutcome::Replied(FrontendReply::WorkerTimeout),
+            CallOutcome::Replied(FrontendReply::WorkerRejected(reason)),
+            CallOutcome::Full,
+            CallOutcome::Closed,
+            CallOutcome::Timeout,
+            CallOutcome::Rejected(reason),
+        ] {
+            record_driver_outcome(&mut outcome, 0, terminal);
+        }
+        assert_eq!(outcome.terminals.total(), 9);
+        assert_eq!(outcome.terminals.worker_timer_failed, [CallError::Io]);
+        assert_eq!(outcome.terminals.worker_full, 1);
+        assert_eq!(outcome.terminals.worker_closed, 1);
+        assert_eq!(outcome.terminals.worker_timeout, 1);
+        assert_eq!(outcome.terminals.worker_rejected, [reason]);
+        assert_eq!(outcome.terminals.frontend_full, 1);
+        assert_eq!(outcome.terminals.frontend_closed, 1);
+        assert_eq!(outcome.terminals.frontend_timeout, 1);
+        assert_eq!(outcome.terminals.frontend_rejected, [reason]);
     }
 
     #[test]

@@ -21,18 +21,17 @@ Both sides produce `delivered=2 unavailable=1 timed_out=1 other=0`.
   still name *which* layer failed. The dispatcher's bucketer is
   five short arms.
 - One `send_request(http, req, timeout).then(ctor)` per endpoint,
-  `Effect::Batch(...)` to ship them all. The dispatcher's full
-  fanout is six lines.
+  produced through `BoundedItems` and shipped with `bounded_batch`.
+  Endpoint count is rejected before upstream threads or call effects exist.
 - The `503` and the timeout produce trace events the Tokio side
   cannot recover (Tokio's `reqwest::Error::is_timeout` is the only
   hook).
 
 ## What feels worse
 
-- The dispatcher tracks its own `pending` counter to know when to
-  stop. A "fanout helper that returns N call effects and resolves
-  when all are done" would replace the bookkeeping; in the meantime
-  this is the canonical shape.
+- The dispatcher tracks its own bounded `pending` counter to know when to
+  stop. Every transient or fatal classifier reason is retained in the typed
+  report rather than disappearing into the display-oriented `other` count.
 
 ## Shape note
 

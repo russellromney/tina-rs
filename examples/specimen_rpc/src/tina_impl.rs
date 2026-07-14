@@ -14,16 +14,21 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_rpc::{
-    Connection, ConnectionConfig, ConnectionInit, ConnectionMsg, Encoding, Frame, FrameError,
-    FrameKind, FrameLimits, Json, LENGTH_PREFIX_SIZE, PayloadLimits, Registry, RegistryMsg,
-    RouterReply, SingleService, decode_body, encode, parse_length_prefix, service,
+    CloseReason, Connection, ConnectionConfig, ConnectionInit, ConnectionMsg, Encoding, Frame,
+    FrameError, FrameKind, FrameLimits, Json, LENGTH_PREFIX_SIZE, PayloadLimits, Registry,
+    RegistryMsg, RouterReply, SingleService, decode_body, encode, parse_length_prefix, service,
 };
 use tina_runtime::{
-    DefaultThreadedMailboxFactory, ListenerId, TcpAcceptReply, TcpBindReply, TcpListenerCloseReply,
-    ThreadedRuntime, tcp_accept, tcp_bind, tcp_close_listener,
+    DefaultThreadedMailboxFactory, ListenerId, LocalSystem, TcpAcceptReply, TcpBindReply,
+    TcpListenerCloseReply, tcp_accept, tcp_bind, tcp_close_listener,
 };
 
-use crate::{Report, RunConfig};
+use crate::{
+    ClientTerminal, ListenerTerminal, MAX_BURST, MAX_REQUEST_BYTES, Report, RunConfig,
+    UnexpectedFrame,
+};
+
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 // -------------------------------------------------------------------
 // Typed echo service. The `#[service]` macro emits a dispatcher and
@@ -62,6 +67,7 @@ enum ListenerMsg {
 struct Listener {
     bind_addr: SocketAddr,
     router: Address<RegistryMsg, RouterReply>,
+    watcher: Address<CloseReason>,
     listener_id: Option<ListenerId>,
 }
 
@@ -82,10 +88,13 @@ impl Listener {
                 tcp_accept(listener).then(ListenerMsg::Accepted)
             }
             ListenerMsg::Accepted(Ok((stream, _peer_addr))) => {
-                let listener = self.listener_id.expect("listener set after bind");
+                let Some(listener) = self.listener_id else {
+                    return stop_with(ListenerTerminal::MissingListener);
+                };
                 let connection = Connection::<SingleShard>::new(
                     ConnectionInit::new(stream, self.router)
-                        .with_config(ConnectionConfig::tiny_pressure()),
+                        .with_config(ConnectionConfig::tiny_pressure())
+                        .with_watcher(self.watcher),
                 );
                 batch(vec![
                     spawn(
@@ -95,11 +104,26 @@ impl Listener {
                     tcp_close_listener(listener).then(ListenerMsg::ListenerClosed),
                 ])
             }
-            ListenerMsg::ListenerClosed(Ok(())) => stop(),
-            ListenerMsg::Bound(Err(_))
-            | ListenerMsg::Accepted(Err(_))
-            | ListenerMsg::ListenerClosed(Err(_)) => stop(),
+            ListenerMsg::ListenerClosed(Ok(())) => stop_with(ListenerTerminal::ClosedClean),
+            ListenerMsg::Bound(Err(error)) => stop_with(ListenerTerminal::BindFailed(error)),
+            ListenerMsg::Accepted(Err(error)) => stop_with(ListenerTerminal::AcceptFailed(error)),
+            ListenerMsg::ListenerClosed(Err(error)) => {
+                stop_with(ListenerTerminal::CloseFailed(error))
+            }
         }
+    }
+}
+
+struct ConnectionWatcher;
+
+#[tina_runtime::isolate(message = CloseReason)]
+impl ConnectionWatcher {
+    fn handle(
+        &mut self,
+        reason: CloseReason,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        stop_with(reason)
     }
 }
 
@@ -108,33 +132,48 @@ impl Listener {
 // -------------------------------------------------------------------
 
 pub fn run(config: RunConfig) -> anyhow::Result<Report> {
-    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
+    let config = config.validate()?;
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    Ok(app.run_to_shutdown_reported(SHUTDOWN_TIMEOUT, move |app| run_application(app, config))?)
+}
 
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    config: RunConfig,
+) -> anyhow::Result<Report> {
     // 1. Typed dispatch: the `#[service]` macro emits `EchoService`
     //    with a JSON-tuple decoder for each method's args and a JSON
     //    encoder for each return type.
     let dispatch =
         EchoService::dispatch::<EchoState, SingleShard>(EchoState, PayloadLimits::default());
-    let service = runtime
-        .register_with_capacity::<_, Infallible>(SingleService::new(dispatch), 16)
+    let service = app
+        .register_root::<_, Infallible>(SingleService::new(dispatch), 16)
         .map_err(|e| anyhow::anyhow!("register service: {e:?}"))?;
 
     // 2. Registry mapping wire service name to the dispatch isolate.
     let registry_state = Registry::<SingleShard>::builder()
         .service("echo", service)
         .build();
-    let registry = runtime
-        .register_with_capacity::<_, Infallible>(registry_state, 16)
+    let registry = app
+        .register_root::<_, Infallible>(registry_state, 16)
         .map_err(|e| anyhow::anyhow!("register registry: {e:?}"))?;
+
+    let watcher = app
+        .register_root::<_, Infallible>(ConnectionWatcher, 1)
+        .map_err(|e| anyhow::anyhow!("register connection watcher: {e:?}"))?;
+    let connection_result = app
+        .observe_result::<CloseReason, _, _>(watcher)
+        .map_err(|error| anyhow::anyhow!("observe connection result: {error:?}"))?;
 
     // 3. Listener that binds, accepts once, and spawns the Connection
     //    isolate that enforces the in-flight cap on the wire.
     let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
-    let listener = runtime
-        .register_with_capacity::<_, Infallible>(
+    let listener = app
+        .register_root::<_, Infallible>(
             Listener {
                 bind_addr,
                 router: registry,
+                watcher,
                 listener_id: None,
             },
             8,
@@ -144,9 +183,11 @@ pub fn run(config: RunConfig) -> anyhow::Result<Report> {
     // Register the bound-address waiter *before* triggering the bind so
     // the registration lands in the runtime's command queue ahead of
     // the bind completion.
-    let bound = runtime.observe_next_bound()?;
-    runtime
-        .try_send(listener, ListenerMsg::Start)
+    let bound = app.observe_next_bound()?;
+    let listener_result = app
+        .observe_result::<ListenerTerminal, _, _>(listener)
+        .map_err(|error| anyhow::anyhow!("observe listener result: {error:?}"))?;
+    app.try_send(listener, ListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start listener: {e:?}"))?;
     let addr = bound
         .wait(Duration::from_secs(3))
@@ -156,17 +197,29 @@ pub fn run(config: RunConfig) -> anyhow::Result<Report> {
     //    encodes args as a JSON tuple `[<payload_bytes>]` to match the
     //    macro's decoder.
     let burst = config.burst;
-    let report = thread::spawn(move || drive_client(addr, burst))
+    let mut report = thread::spawn(move || drive_client(addr, burst))
         .join()
         .map_err(|_| anyhow::anyhow!("client thread panicked"))??;
 
-    runtime.shutdown_report().ensure_clean()?;
+    report.listener_terminal = Some(
+        listener_result
+            .wait(Duration::from_secs(3))
+            .map_err(|error| anyhow::anyhow!("listener result: {error:?}"))?,
+    );
+    report.connection_terminal = Some(
+        connection_result
+            .wait(Duration::from_secs(3))
+            .map_err(|error| anyhow::anyhow!("connection result: {error:?}"))?,
+    );
     Ok(report)
 }
 
 /// Open one TCP connection, write the whole burst, read replies,
 /// classify into a `Report`.
 fn drive_client(addr: SocketAddr, burst: usize) -> anyhow::Result<Report> {
+    if burst == 0 || burst > MAX_BURST {
+        anyhow::bail!("burst {burst} is outside 1..={MAX_BURST}");
+    }
     let mut stream = TcpStream::connect(addr)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -181,7 +234,16 @@ fn drive_client(addr: SocketAddr, burst: usize) -> anyhow::Result<Report> {
     let mut request_bytes = Vec::new();
     for id in 1..=burst as u64 {
         let frame = Frame::request(id, "echo", "ping", payload.clone());
-        request_bytes.extend(encode(&frame, &limits)?);
+        let encoded = encode(&frame, &limits)?;
+        let next_len = request_bytes
+            .len()
+            .checked_add(encoded.len())
+            .ok_or_else(|| anyhow::anyhow!("request burst byte length overflow"))?;
+        anyhow::ensure!(
+            next_len <= MAX_REQUEST_BYTES,
+            "encoded request burst exceeds {MAX_REQUEST_BYTES} bytes"
+        );
+        request_bytes.extend(encoded);
     }
     stream.write_all(&request_bytes)?;
 
@@ -190,7 +252,13 @@ fn drive_client(addr: SocketAddr, burst: usize) -> anyhow::Result<Report> {
     let mut chunk = [0u8; 4096];
     while report.total() < burst {
         match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => {
+            Ok(0) => {
+                report.client_terminal = Some(ClientTerminal::Eof);
+                report.other += burst - report.total();
+                return Ok(report);
+            }
+            Err(error) => {
+                report.client_terminal = Some(ClientTerminal::Read(error.kind()));
                 report.other += burst - report.total();
                 return Ok(report);
             }
@@ -204,8 +272,9 @@ fn drive_client(addr: SocketAddr, burst: usize) -> anyhow::Result<Report> {
             prefix.copy_from_slice(&buf[..LENGTH_PREFIX_SIZE]);
             let body_len = match parse_length_prefix(prefix, &limits) {
                 Ok(len) => len,
-                Err(_) => {
-                    report.other += 1;
+                Err(error) => {
+                    report.decode_errors.push(error);
+                    report.other += burst - report.total();
                     return Ok(report);
                 }
             };
@@ -218,10 +287,41 @@ fn drive_client(addr: SocketAddr, burst: usize) -> anyhow::Result<Report> {
             match decode_body(&body) {
                 Ok(frame) => match (frame.kind, frame.error) {
                     (FrameKind::Reply, _) => report.ok += 1,
-                    (FrameKind::Error, Some(FrameError::Full)) => report.full += 1,
-                    _ => report.other += 1,
+                    (FrameKind::Error, Some(FrameError::Full)) => {
+                        report.full += 1;
+                        report.wire_errors.full += 1;
+                    }
+                    (FrameKind::Error, Some(FrameError::UnknownService)) => {
+                        report.other += 1;
+                        report.wire_errors.unknown_service += 1;
+                    }
+                    (FrameKind::Error, Some(FrameError::UnknownMethod)) => {
+                        report.other += 1;
+                        report.wire_errors.unknown_method += 1;
+                    }
+                    (FrameKind::Error, Some(FrameError::Decode)) => {
+                        report.other += 1;
+                        report.wire_errors.decode += 1;
+                    }
+                    (FrameKind::Error, Some(FrameError::Protocol)) => {
+                        report.other += 1;
+                        report.wire_errors.protocol += 1;
+                    }
+                    (FrameKind::Error, Some(FrameError::Internal)) => {
+                        report.other += 1;
+                        report.wire_errors.internal += 1;
+                    }
+                    (kind, error) => {
+                        report.other += 1;
+                        report
+                            .unexpected_frames
+                            .push(UnexpectedFrame { kind, error });
+                    }
                 },
-                Err(_) => report.other += 1,
+                Err(error) => {
+                    report.decode_errors.push(error);
+                    report.other += 1;
+                }
             }
         }
     }

@@ -4,13 +4,13 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_reqwest_bridge::{
-    ReqwestAddress, ReqwestCallOutcome, ReqwestConfig, ReqwestFatalReason, ReqwestOutcomeClass,
-    ReqwestOutcomeExt, ReqwestRequest, ReqwestTransientReason, ReqwestWorker, send_request,
+    ReqwestAddress, ReqwestCallOutcome, ReqwestConfig, ReqwestOutcomeClass, ReqwestOutcomeExt,
+    ReqwestRequest, ReqwestTransientReason, ReqwestWorker, send_request,
 };
-use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime};
+use tina_runtime::{BoundedItems, DefaultThreadedMailboxFactory, ThreadedRuntime, bounded_batch};
 
-use crate::Report;
 use crate::upstream::{self, Upstream};
+use crate::{MAX_ENDPOINTS, Report, WebhookTerminal};
 
 const PER_CALL_TIMEOUT: Duration = Duration::from_millis(150);
 
@@ -20,17 +20,18 @@ enum DispatcherMsg {
     HookReturned(ReqwestCallOutcome),
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct Counts {
     delivered: u32,
     server_unavailable: u32,
     timed_out: u32,
     other: u32,
+    terminals: Vec<WebhookTerminal>,
 }
 
 struct Dispatcher {
     http: ReqwestAddress,
-    urls: Vec<String>,
+    urls: BoundedItems<String>,
     pending: u32,
     counts: Counts,
 }
@@ -44,35 +45,42 @@ impl Dispatcher {
     ) -> Effect<Self> {
         match msg {
             DispatcherMsg::Begin => {
-                let calls: Vec<_> = self
-                    .urls
-                    .iter()
-                    .map(|url| {
-                        send_request(self.http, ReqwestRequest::get(url), PER_CALL_TIMEOUT)
-                            .then(DispatcherMsg::HookReturned)
-                    })
-                    .collect();
-                Effect::Batch(calls)
+                if self.pending == 0 {
+                    return stop_with(std::mem::take(&mut self.counts));
+                }
+                let urls = self.urls.clone();
+                bounded_batch(urls.map_effects(|url| {
+                    send_request(self.http, ReqwestRequest::get(&url), PER_CALL_TIMEOUT)
+                        .then(DispatcherMsg::HookReturned)
+                }))
             }
             DispatcherMsg::HookReturned(outcome) => {
                 match outcome.classify() {
                     ReqwestOutcomeClass::Succeeded(_) => self.counts.delivered += 1,
-                    ReqwestOutcomeClass::Transient(ReqwestTransientReason::UpstreamServer {
-                        status,
-                    }) if status.as_u16() == 503 => self.counts.server_unavailable += 1,
-                    ReqwestOutcomeClass::Transient(
-                        ReqwestTransientReason::BridgeTimeout
-                        | ReqwestTransientReason::WorkerTimeout,
-                    ) => self.counts.timed_out += 1,
-                    ReqwestOutcomeClass::Transient(_) => self.counts.other += 1,
-                    ReqwestOutcomeClass::Fatal(ReqwestFatalReason::UpstreamClient { .. }) => {
-                        self.counts.other += 1
+                    ReqwestOutcomeClass::Transient(reason) => {
+                        match &reason {
+                            ReqwestTransientReason::UpstreamServer { status }
+                                if status.as_u16() == 503 =>
+                            {
+                                self.counts.server_unavailable += 1
+                            }
+                            ReqwestTransientReason::BridgeTimeout
+                            | ReqwestTransientReason::WorkerTimeout => self.counts.timed_out += 1,
+                            ReqwestTransientReason::UpstreamServer { .. }
+                            | ReqwestTransientReason::WorkerTransport(_) => self.counts.other += 1,
+                        }
+                        self.counts
+                            .terminals
+                            .push(WebhookTerminal::Transient(reason));
                     }
-                    ReqwestOutcomeClass::Fatal(_) => self.counts.other += 1,
+                    ReqwestOutcomeClass::Fatal(reason) => {
+                        self.counts.other += 1;
+                        self.counts.terminals.push(WebhookTerminal::Fatal(reason));
+                    }
                 }
                 self.pending -= 1;
                 if self.pending == 0 {
-                    stop_with(self.counts)
+                    stop_with(self.counts.clone())
                 } else {
                     noop()
                 }
@@ -105,11 +113,16 @@ fn run_inner(upstream: &Upstream) -> anyhow::Result<Report> {
     let bridge = ReqwestWorker::<SingleShard>::install(&runtime, ReqwestConfig::default())
         .map_err(|e| anyhow::anyhow!("install reqwest bridge: {e}"))?;
 
-    let urls: Vec<String> = upstream
-        .addrs
-        .iter()
-        .map(|a| format!("http://{a}/hook"))
-        .collect();
+    let addrs = BoundedItems::try_from_iter(MAX_ENDPOINTS, upstream.addrs.iter().copied())
+        .map_err(|error| anyhow::anyhow!("bound webhook endpoints: {error}"))?;
+    let urls = BoundedItems::try_from_iter(
+        MAX_ENDPOINTS,
+        addrs
+            .into_vec()
+            .into_iter()
+            .map(|addr| format!("http://{addr}/hook")),
+    )
+    .map_err(|error| anyhow::anyhow!("bound webhook URLs: {error}"))?;
     let pending = urls.len() as u32;
 
     let dispatcher = runtime
@@ -145,5 +158,6 @@ fn run_inner(upstream: &Upstream) -> anyhow::Result<Report> {
         timed_out: counts.timed_out,
         other: counts.other,
         exit_clean: true,
+        tina_terminals: counts.terminals,
     })
 }

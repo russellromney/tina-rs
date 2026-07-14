@@ -78,7 +78,7 @@ pub fn run() -> anyhow::Result<Report> {
             });
         }
 
-        let retried_admitted = WAITERS;
+        let retried_dispatched = WAITERS;
 
         tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -97,7 +97,7 @@ pub fn run() -> anyhow::Result<Report> {
 
         Report {
             cancelled: cancelled_signal,
-            retried_admitted,
+            retried_dispatched,
             retried_full,
             retried_resourced,
             // Tokio's `Semaphore` exposes neither live waiters nor
@@ -108,6 +108,7 @@ pub fn run() -> anyhow::Result<Report> {
             waiters_max: 0,
             discovery_line: String::new(),
             exit_clean: true,
+            ..Report::default()
         }
     });
 

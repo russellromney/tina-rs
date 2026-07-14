@@ -31,7 +31,7 @@ pub fn expected_aggregate(payload: u64) -> u64 {
 
 /// Per-side report. Both sides drive the same shape: every client
 /// query must return the same aggregate the lib expects.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Report {
     pub clients: usize,
     pub workers: usize,
@@ -43,4 +43,45 @@ pub struct Report {
     pub failed: usize,
     /// True when the run drained cleanly with no leaked tasks/isolates.
     pub exit_clean: bool,
+    /// Tina-only outer coordinator and start-admission terminals.
+    pub tina_terminals: TinaTerminalReport,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TinaTerminalReport {
+    pub coordinator_full: usize,
+    pub coordinator_mailbox_full: usize,
+    pub coordinator_closed: usize,
+    pub coordinator_timeout: usize,
+    pub coordinator_rejected: Vec<tina::CallRejectedReason>,
+    pub start_rejected: Vec<tina_runtime::ScatterGatherStartError<usize>>,
+    pub incorrect_aggregates: Vec<IncorrectAggregate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncorrectAggregate {
+    pub expected_targets: usize,
+    pub targets: Vec<TargetResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetResult {
+    pub expected_target: usize,
+    pub actual_target: usize,
+    pub outcome: TargetOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TargetOutcome {
+    Replied {
+        worker: usize,
+        value: u64,
+        expected_value: u64,
+    },
+    Full,
+    Closed,
+    Timeout,
+    Rejected(tina::CallRejectedReason),
+    AggregateTimeout,
+    MissingShard,
 }

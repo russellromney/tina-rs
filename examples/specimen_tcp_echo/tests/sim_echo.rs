@@ -20,7 +20,10 @@ use specimen_tcp_echo::{EchoListener, EchoListenerMsg, MAX_CHUNK};
 // Saved golden. Refresh only after a conscious trace-shape review (a
 // new RuntimeEventKind variant, or an intentional isolate-logic
 // change). A silent drift here is a real defect.
-const SAVED_TRACE_HASH: u64 = 0x5ea0_694c_5c3f_7682;
+// Updated when the connection began stopping with a typed terminal result;
+// the byte output and I/O call counts remain unchanged.
+// Includes the observed connection-terminal report sent to the listener.
+const SAVED_TRACE_HASH: u64 = 0xbc48_2f2b_a124_3a3e;
 const SEED: u64 = 7;
 
 fn bind_addr() -> SocketAddr {

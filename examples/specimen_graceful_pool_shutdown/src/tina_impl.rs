@@ -8,64 +8,88 @@
 //! caller gets a typed `Closed` reply, and outstanding leases drain
 //! normally.
 
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tina::pool::{AcquireFailure, CloseMode, PoolConfig, PoolLease, ReleaseDisposition};
+use tina::pool::{
+    AcquireFailure, CloseMode, PoolConfig, PoolLease, ReleaseDisposition, ReleaseFailure,
+};
 use tina::prelude::*;
 use tina_runtime::pool::{
     WorkerPool, WorkerPoolMsg, WorkerPoolReply, acquire_result_effect, close_effect,
     release_result_effect,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, sleep,
+    BoundedItems, CallError, CallOutcome, DefaultThreadedMailboxFactory, SleepReply,
+    ThreadedRuntime, bounded_batch, call_request, sleep,
 };
 
-use crate::{CALLERS, Report, SHUTDOWN_AFTER_MS, WORK_MS, WORKERS};
+use crate::{CALLERS, Report, SHUTDOWN_AFTER_MS, TinaTerminalCounts, WORK_MS, WORKERS};
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 // --- Worker --------------------------------------------------------------
 
 #[derive(Debug)]
-enum WorkerMsg {
+enum WorkerRequest {
     Do,
-    Done(SleepReply),
+}
+
+#[derive(Debug)]
+enum WorkerEvent {
+    Done(RequestContext<WorkerReply>, SleepReply),
 }
 
 #[derive(Debug, Clone, Copy)]
-struct WorkerReply;
+enum WorkerReply {
+    Completed,
+    TimerFailed(CallError),
+}
 
 struct Worker {
     work: Duration,
 }
 
-#[tina_runtime::isolate(message = WorkerMsg, reply = WorkerReply)]
+#[tina_runtime::isolate(event = WorkerEvent, request = WorkerRequest, reply = WorkerReply)]
 impl Worker {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: WorkerMsg,
+        event: WorkerEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            WorkerMsg::Do => sleep(self.work).then(WorkerMsg::Done),
-            WorkerMsg::Done(Ok(())) => reply(WorkerReply),
-            WorkerMsg::Done(Err(_)) => stop(),
+        match event {
+            WorkerEvent::Done(request, Ok(())) => reply_to(request, WorkerReply::Completed),
+            WorkerEvent::Done(request, Err(error)) => {
+                reply_to(request, WorkerReply::TimerFailed(error))
+            }
+        }
+    }
+
+    fn handle_request(
+        &mut self,
+        request: WorkerRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            WorkerRequest::Do => call
+                .defer(sleep(self.work))
+                .reply_service_event(WorkerEvent::Done),
         }
     }
 }
 
 // --- Driver --------------------------------------------------------------
 
-type WorkerHandle = Address<WorkerMsg, WorkerReply>;
+type WorkerHandle = tina::ServiceRequestAddress<WorkerEvent, WorkerRequest, WorkerReply>;
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct DriverOutcome {
     completed: usize,
     closed: usize,
     failed: usize,
+    terminals: TinaTerminalCounts,
+    shutdown_close_observed: bool,
 }
 
 enum JobState {
@@ -87,17 +111,19 @@ enum DriverMsg {
     },
     ReleaseReturned {
         job: u32,
+        result: Result<(), ReleaseFailure>,
     },
     CloseReturned(CallOutcome<WorkerPoolReply<WorkerHandle>>),
-    Shutdown,
+    Shutdown(SleepReply),
 }
 
 struct Driver {
     pool: Address<WorkerPoolMsg<WorkerHandle>, WorkerPoolReply<WorkerHandle>>,
     outcome: DriverOutcome,
-    jobs: HashMap<u32, JobState>,
+    jobs: [Option<JobState>; CALLERS],
     expected: usize,
     shutdown_close_observed: bool,
+    shutdown_close_settled: bool,
 }
 
 #[tina_runtime::isolate(message = DriverMsg)]
@@ -109,70 +135,161 @@ impl Driver {
     ) -> Effect<Self> {
         match msg {
             DriverMsg::Begin => {
-                let mut effects = Vec::with_capacity(CALLERS);
-                for j in 0..CALLERS as u32 {
-                    self.jobs.insert(j, JobState::Acquiring);
-                    effects.push(acquire_result_effect(
-                        self.pool,
-                        CALL_TIMEOUT,
-                        move |result| DriverMsg::AcquireReturned { job: j, result },
-                    ));
-                }
-                Effect::Batch(effects)
+                let jobs = BoundedItems::try_from_iter(CALLERS, 0..CALLERS as u32)
+                    .expect("CALLERS is the driver-owned fanout bound");
+                batch(vec![
+                    bounded_batch(jobs.map_effects(|j| {
+                        self.jobs[j as usize] = Some(JobState::Acquiring);
+                        acquire_result_effect(self.pool, CALL_TIMEOUT, move |result| {
+                            DriverMsg::AcquireReturned { job: j, result }
+                        })
+                    })),
+                    sleep(Duration::from_millis(SHUTDOWN_AFTER_MS)).then(DriverMsg::Shutdown),
+                ])
             }
             DriverMsg::AcquireReturned { job, result } => match result {
                 Ok(lease) => {
                     let worker = *lease.handle();
-                    self.jobs.insert(job, JobState::Working { lease });
-                    tina_runtime::call(worker, WorkerMsg::Do, CALL_TIMEOUT)
+                    self.jobs[job as usize] = Some(JobState::Working { lease });
+                    call_request(worker, WorkerRequest::Do, CALL_TIMEOUT)
                         .then(move |outcome| DriverMsg::WorkerReturned { job, outcome })
                 }
-                Err(AcquireFailure::Closed) | Err(AcquireFailure::Full) => {
-                    self.jobs.remove(&job);
-                    self.outcome.closed += 1;
-                    self.maybe_finish()
-                }
-                Err(_) => {
-                    self.jobs.remove(&job);
-                    self.outcome.failed += 1;
+                Err(failure) => {
+                    self.jobs[job as usize] = None;
+                    match failure {
+                        AcquireFailure::Full => {
+                            self.outcome.terminals.acquire_full += 1;
+                            self.outcome.failed += 1;
+                        }
+                        AcquireFailure::Closed => {
+                            self.outcome.terminals.acquire_closed += 1;
+                            self.outcome.closed += 1;
+                        }
+                        AcquireFailure::WrongShard => {
+                            self.outcome.terminals.acquire_wrong_shard += 1;
+                            self.outcome.failed += 1;
+                        }
+                        AcquireFailure::CallTimeout => {
+                            self.outcome.terminals.acquire_call_timeout += 1;
+                            self.outcome.failed += 1;
+                        }
+                        AcquireFailure::CallFull => {
+                            self.outcome.terminals.acquire_call_full += 1;
+                            self.outcome.failed += 1;
+                        }
+                        AcquireFailure::CallClosed => {
+                            self.outcome.terminals.acquire_call_closed += 1;
+                            self.outcome.failed += 1;
+                        }
+                        AcquireFailure::CallRejected(reason) => {
+                            self.outcome.terminals.acquire_call_rejections.push(reason);
+                            self.outcome.failed += 1;
+                        }
+                        AcquireFailure::WrongReply => {
+                            self.outcome.terminals.acquire_wrong_reply += 1;
+                            self.outcome.failed += 1;
+                        }
+                    }
                     self.maybe_finish()
                 }
             },
             DriverMsg::WorkerReturned { job, outcome } => {
-                let Some(state) = self.jobs.remove(&job) else {
+                let Some(state) = self.jobs[job as usize].take() else {
                     return noop();
                 };
                 let JobState::Working { lease } = state else {
                     return noop();
                 };
-                let succeeded = matches!(outcome, CallOutcome::Replied(_));
+                let succeeded = matches!(outcome, CallOutcome::Replied(WorkerReply::Completed));
+                match outcome {
+                    CallOutcome::Replied(WorkerReply::Completed) => self.outcome.completed += 1,
+                    CallOutcome::Replied(WorkerReply::TimerFailed(error)) => {
+                        self.outcome.terminals.worker_timer_failures.push(error);
+                        self.outcome.failed += 1;
+                    }
+                    CallOutcome::Full => {
+                        self.outcome.terminals.worker_full += 1;
+                        self.outcome.failed += 1;
+                    }
+                    CallOutcome::Closed => {
+                        self.outcome.terminals.worker_closed += 1;
+                        self.outcome.failed += 1;
+                    }
+                    CallOutcome::Timeout => {
+                        self.outcome.terminals.worker_timeout += 1;
+                        self.outcome.failed += 1;
+                    }
+                    CallOutcome::Rejected(reason) => {
+                        self.outcome.terminals.worker_rejections.push(reason);
+                        self.outcome.failed += 1;
+                    }
+                }
                 let disposition = if succeeded {
                     ReleaseDisposition::Reuse
                 } else {
                     ReleaseDisposition::Retire
                 };
-                self.jobs.insert(job, JobState::Releasing);
-                if succeeded {
-                    self.outcome.completed += 1;
-                } else {
-                    self.outcome.failed += 1;
-                }
-                release_result_effect(lease, self.pool, disposition, CALL_TIMEOUT, move |_| {
-                    DriverMsg::ReleaseReturned { job }
+                self.jobs[job as usize] = Some(JobState::Releasing);
+                release_result_effect(lease, self.pool, disposition, CALL_TIMEOUT, move |result| {
+                    DriverMsg::ReleaseReturned { job, result }
                 })
             }
-            DriverMsg::ReleaseReturned { job } => {
-                self.jobs.remove(&job);
+            DriverMsg::ReleaseReturned { job, result } => {
+                if let Err(failure) = result {
+                    match failure {
+                        ReleaseFailure::Retired => self.outcome.terminals.release_retired += 1,
+                        ReleaseFailure::StaleLease => {
+                            self.outcome.terminals.release_stale_lease += 1
+                        }
+                        ReleaseFailure::DoubleRelease => {
+                            self.outcome.terminals.release_double_release += 1
+                        }
+                        ReleaseFailure::PoolClosed => {
+                            self.outcome.terminals.release_pool_closed += 1
+                        }
+                        ReleaseFailure::CallTimeout => {
+                            self.outcome.terminals.release_call_timeout += 1
+                        }
+                        ReleaseFailure::CallFull => self.outcome.terminals.release_call_full += 1,
+                        ReleaseFailure::CallClosed => {
+                            self.outcome.terminals.release_call_closed += 1
+                        }
+                        ReleaseFailure::CallRejected(reason) => {
+                            self.outcome.terminals.release_call_rejections.push(reason)
+                        }
+                        ReleaseFailure::WrongReply => {
+                            self.outcome.terminals.release_wrong_reply += 1
+                        }
+                    }
+                }
+                self.jobs[job as usize] = None;
                 self.maybe_finish()
             }
-            DriverMsg::Shutdown => close_effect(
-                self.pool,
-                CloseMode::Drain,
-                CALL_TIMEOUT,
-                DriverMsg::CloseReturned,
-            ),
+            DriverMsg::Shutdown(result) => {
+                if let Err(error) = result {
+                    self.outcome.terminals.shutdown_timer_failures.push(error);
+                }
+                close_effect(
+                    self.pool,
+                    CloseMode::Drain,
+                    CALL_TIMEOUT,
+                    DriverMsg::CloseReturned,
+                )
+            }
             DriverMsg::CloseReturned(outcome) => {
                 self.shutdown_close_observed = close_was_observed(&outcome);
+                self.outcome.shutdown_close_observed = self.shutdown_close_observed;
+                self.shutdown_close_settled = true;
+                match outcome {
+                    CallOutcome::Replied(WorkerPoolReply::Closed) => {}
+                    CallOutcome::Replied(_) => self.outcome.terminals.close_wrong_reply += 1,
+                    CallOutcome::Full => self.outcome.terminals.close_full += 1,
+                    CallOutcome::Closed => self.outcome.terminals.close_closed += 1,
+                    CallOutcome::Timeout => self.outcome.terminals.close_timeout += 1,
+                    CallOutcome::Rejected(reason) => {
+                        self.outcome.terminals.close_rejections.push(reason)
+                    }
+                }
                 self.maybe_finish()
             }
         }
@@ -182,8 +299,11 @@ impl Driver {
 impl Driver {
     fn maybe_finish(&mut self) -> Effect<Self> {
         let total = self.outcome.completed + self.outcome.closed + self.outcome.failed;
-        if total >= self.expected && self.shutdown_close_observed {
-            stop_with(self.outcome)
+        if total >= self.expected
+            && self.jobs.iter().all(Option::is_none)
+            && self.shutdown_close_settled
+        {
+            stop_with(self.outcome.clone())
         } else {
             noop()
         }
@@ -205,13 +325,14 @@ pub fn run() -> anyhow::Result<Report> {
     for _ in 0..WORKERS {
         workers.push(
             runtime
-                .register_with_capacity::<_, Infallible>(
+                .register_split_service::<Worker, WorkerEvent, WorkerRequest, Infallible>(
                     Worker {
                         work: Duration::from_millis(WORK_MS),
                     },
                     16,
                 )
-                .map_err(|e| anyhow::anyhow!("register worker: {e:?}"))?,
+                .map_err(|e| anyhow::anyhow!("register worker: {e:?}"))?
+                .requests,
         );
     }
 
@@ -226,9 +347,10 @@ pub fn run() -> anyhow::Result<Report> {
             Driver {
                 pool: pool_addr,
                 outcome: DriverOutcome::default(),
-                jobs: HashMap::new(),
+                jobs: std::array::from_fn(|_| None),
                 expected: CALLERS,
                 shutdown_close_observed: false,
+                shutdown_close_settled: false,
             },
             64,
         )
@@ -241,12 +363,6 @@ pub fn run() -> anyhow::Result<Report> {
     runtime
         .try_send(driver, DriverMsg::Begin)
         .map_err(|e| anyhow::anyhow!("send Begin: {e:?}"))?;
-
-    std::thread::sleep(Duration::from_millis(SHUTDOWN_AFTER_MS));
-
-    runtime
-        .try_send(driver, DriverMsg::Shutdown)
-        .map_err(|e| anyhow::anyhow!("send Shutdown: {e:?}"))?;
 
     let outcome = result
         .wait(Duration::from_secs(10))
@@ -261,8 +377,9 @@ pub fn run() -> anyhow::Result<Report> {
         completed: outcome.completed,
         closed: outcome.closed,
         failed: outcome.failed,
-        shutdown_close_observed: true,
+        shutdown_close_observed: outcome.shutdown_close_observed,
         exit_clean: true,
+        tina_terminals: outcome.terminals,
     })
 }
 

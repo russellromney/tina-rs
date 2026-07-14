@@ -6,7 +6,12 @@ fn main() -> anyhow::Result<()> {
     let mode = args.next().unwrap_or_else(|| "both".to_string());
     let burst = args
         .next()
-        .map(|v| v.parse::<usize>().expect("burst must be usize"))
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|error| anyhow::anyhow!("invalid burst {value:?}: {error}"))
+        })
+        .transpose()?
         .unwrap_or(RunConfig::default().burst);
     let config = RunConfig {
         burst,

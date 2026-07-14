@@ -12,13 +12,17 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    BroadcastReport, BroadcastTargets, BroadcastTracker, DefaultThreadedMailboxFactory, ListenerId,
-    SendOutcome, StreamId, TcpAcceptReply, TcpBindReply, TcpListenerCloseReply, TcpReadReply,
-    TcpStreamCloseReply, TcpWriteReply, ThreadedRuntime, broadcast_observed, tcp_accept, tcp_bind,
+    BroadcastAssertError, BroadcastRecordError, BroadcastReport, BroadcastTargets,
+    BroadcastTargetsError, BroadcastTracker, DefaultThreadedMailboxFactory, ListenerId,
+    LocalSystem, SendOutcome, StreamId, TcpAcceptReply, TcpBindReply, TcpListenerCloseReply,
+    TcpReadReply, TcpStreamCloseReply, TcpWriteReply, broadcast_observed, tcp_accept, tcp_bind,
     tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
 };
 
-use crate::{Report, RunConfig};
+use crate::{MAX_BURST, Report, RunConfig};
+
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_BURST_REQUEST_BYTES: usize = 32;
 
 // -------------------------------------------------------------------
 // Slow consumer: bounded mailbox; just records that a message
@@ -71,7 +75,7 @@ impl FanoutState {
         requested_burst: usize,
         max_targets: usize,
         slow_client: Address<M>,
-    ) -> anyhow::Result<BroadcastTargets<usize, M>>
+    ) -> Result<BroadcastTargets<usize, M>, BroadcastTargetsError>
     where
         M: 'static,
     {
@@ -90,15 +94,20 @@ impl FanoutState {
         &mut self,
         key: usize,
         outcome: SendOutcome,
-    ) -> anyhow::Result<Option<(usize, usize, usize)>> {
+    ) -> Result<Option<(usize, usize, usize)>, FanoutProtocolError> {
         let tracker = self
             .tracker
             .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("broadcast outcome without tracker"))?;
-        let Some(report) = tracker.record(key, outcome)? else {
+            .ok_or(FanoutProtocolError::MissingTracker)?;
+        let Some(report) = tracker
+            .record(key, outcome)
+            .map_err(FanoutProtocolError::Record)?
+        else {
             return Ok(None);
         };
-        report.assert_all_accounted_for(report.outcomes().len())?;
+        report
+            .assert_all_accounted_for(report.outcomes().len())
+            .map_err(FanoutProtocolError::Assert)?;
         let (accepted, full, closed) = counts_from_report(&report, self.pre_shed_full);
         debug_assert_eq!(
             accepted + full + closed,
@@ -114,6 +123,37 @@ struct Connection {
     slow_client: Address<DeliverMsg>,
     max_broadcast_targets: usize,
     fanout: FanoutState,
+    request_bytes: Vec<u8>,
+    pending_write: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BurstProtocolError {
+    InvalidUtf8,
+    Empty,
+    InvalidInteger,
+    Zero,
+    TooLarge,
+    RequestTooLong,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConnectionTerminal {
+    ClosedClean,
+    Protocol(BurstProtocolError),
+    FanoutSetup(BroadcastTargetsError),
+    FanoutProtocol(FanoutProtocolError),
+    ReadFailed(tina_runtime::CallError),
+    WriteFailed(tina_runtime::CallError),
+    InvalidWriteCount { pending: usize, written: usize },
+    CloseFailed(tina_runtime::CallError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FanoutProtocolError {
+    MissingTracker,
+    Record(BroadcastRecordError<usize>),
+    Assert(BroadcastAssertError),
 }
 
 #[tina_runtime::isolate(
@@ -128,18 +168,27 @@ impl Connection {
     ) -> Effect<Self> {
         match msg {
             ConnectionMsg::Begin => tcp_read(self.stream, 32).then(ConnectionMsg::Read),
-            ConnectionMsg::Read(Ok(bytes)) => {
-                let requested_burst = parse_burst(&bytes);
+            ConnectionMsg::Read(Ok(bytes)) if !bytes.is_empty() => {
+                if let Err(error) = append_request_bytes(&mut self.request_bytes, &bytes) {
+                    return stop_with(ConnectionTerminal::Protocol(error));
+                }
+                tcp_read(self.stream, MAX_BURST_REQUEST_BYTES).then(ConnectionMsg::Read)
+            }
+            ConnectionMsg::Read(Ok(_)) => {
+                let requested_burst = match parse_burst(&self.request_bytes) {
+                    Ok(burst) => burst,
+                    Err(error) => return stop_with(ConnectionTerminal::Protocol(error)),
+                };
                 let targets = match self.fanout.start(
                     requested_burst,
                     self.max_broadcast_targets,
                     self.slow_client,
                 ) {
                     Ok(targets) => targets,
-                    Err(_) => return stop(),
+                    Err(error) => return stop_with(ConnectionTerminal::FanoutSetup(error)),
                 };
                 if targets.is_empty() {
-                    return write_counts(self.stream, 0, self.fanout.pre_shed_full, 0);
+                    return self.write_counts(0, self.fanout.pre_shed_full, 0);
                 }
                 broadcast_observed(targets, |index| DeliverMsg(*index), ConnectionMsg::Observed)
             }
@@ -147,18 +196,39 @@ impl Connection {
                 let counts = match self.fanout.record(key, outcome) {
                     Ok(Some(counts)) => counts,
                     Ok(None) => return noop(),
-                    Err(_) => return stop(),
+                    Err(error) => return stop_with(ConnectionTerminal::FanoutProtocol(error)),
                 };
-                write_counts(self.stream, counts.0, counts.1, counts.2)
+                self.write_counts(counts.0, counts.1, counts.2)
             }
-            ConnectionMsg::Wrote(Ok(_)) => {
-                tcp_close_stream(self.stream).then(ConnectionMsg::Closed)
+            ConnectionMsg::Wrote(Ok(written)) => {
+                let pending = self.pending_write.len();
+                if written == 0 || written > pending {
+                    return stop_with(ConnectionTerminal::InvalidWriteCount { pending, written });
+                }
+                self.pending_write.drain(..written);
+                if self.pending_write.is_empty() {
+                    tcp_close_stream(self.stream).then(ConnectionMsg::Closed)
+                } else {
+                    self.write_pending()
+                }
             }
-            ConnectionMsg::Closed(Ok(())) => stop(),
-            ConnectionMsg::Read(Err(_))
-            | ConnectionMsg::Wrote(Err(_))
-            | ConnectionMsg::Closed(Err(_)) => stop(),
+            ConnectionMsg::Closed(Ok(())) => stop_with(ConnectionTerminal::ClosedClean),
+            ConnectionMsg::Read(Err(error)) => stop_with(ConnectionTerminal::ReadFailed(error)),
+            ConnectionMsg::Wrote(Err(error)) => stop_with(ConnectionTerminal::WriteFailed(error)),
+            ConnectionMsg::Closed(Err(error)) => stop_with(ConnectionTerminal::CloseFailed(error)),
         }
+    }
+}
+
+impl Connection {
+    fn write_counts(&mut self, accepted: usize, full: usize, closed: usize) -> Effect<Self> {
+        self.pending_write =
+            format!("accepted={accepted} full={full} closed={closed}\n").into_bytes();
+        self.write_pending()
+    }
+
+    fn write_pending(&self) -> Effect<Self> {
+        tcp_write(self.stream, self.pending_write.clone()).then(ConnectionMsg::Wrote)
     }
 }
 
@@ -182,6 +252,15 @@ struct Listener {
     listener: Option<ListenerId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenerTerminal {
+    ClosedClean,
+    BindFailed(tina_runtime::CallError),
+    AcceptFailed(tina_runtime::CallError),
+    CloseFailed(tina_runtime::CallError),
+    MissingListener,
+}
+
 #[tina_runtime::isolate(
     message = ListenerMsg,
     spawn = ChildDefinition<Connection>,
@@ -199,7 +278,9 @@ impl Listener {
                 tcp_accept(listener).then(ListenerMsg::Accepted)
             }
             ListenerMsg::Accepted(Ok((stream, _peer_addr))) => {
-                let listener = self.listener.expect("listener set after bind");
+                let Some(listener) = self.listener else {
+                    return stop_with(ListenerTerminal::MissingListener);
+                };
                 batch(vec![
                     spawn(
                         ChildDefinition::new(
@@ -208,6 +289,8 @@ impl Listener {
                                 slow_client: self.slow_client,
                                 max_broadcast_targets: self.max_broadcast_targets,
                                 fanout: FanoutState::default(),
+                                request_bytes: Vec::with_capacity(MAX_BURST_REQUEST_BYTES),
+                                pending_write: Vec::new(),
                             },
                             self.connection_capacity,
                         )
@@ -216,10 +299,12 @@ impl Listener {
                     tcp_close_listener(listener).then(ListenerMsg::ListenerClosed),
                 ])
             }
-            ListenerMsg::ListenerClosed(Ok(())) => stop(),
-            ListenerMsg::Bound(Err(_))
-            | ListenerMsg::Accepted(Err(_))
-            | ListenerMsg::ListenerClosed(Err(_)) => stop(),
+            ListenerMsg::ListenerClosed(Ok(())) => stop_with(ListenerTerminal::ClosedClean),
+            ListenerMsg::Bound(Err(error)) => stop_with(ListenerTerminal::BindFailed(error)),
+            ListenerMsg::Accepted(Err(error)) => stop_with(ListenerTerminal::AcceptFailed(error)),
+            ListenerMsg::ListenerClosed(Err(error)) => {
+                stop_with(ListenerTerminal::CloseFailed(error))
+            }
         }
     }
 }
@@ -229,21 +314,31 @@ impl Listener {
 // -------------------------------------------------------------------
 
 pub fn run(config: RunConfig) -> anyhow::Result<Report> {
-    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
+    let config = config.validate()?;
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    Ok(app.run_to_shutdown_reported(SHUTDOWN_TIMEOUT, move |app| run_application(app, config))?)
+}
 
-    let slow_client = runtime
-        .register_with_capacity::<_, Infallible>(SlowClient, config.slow_consumer_capacity)
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    config: RunConfig,
+) -> anyhow::Result<Report> {
+    let slow_client = app
+        .register_root::<_, Infallible>(SlowClient, config.slow_consumer_capacity)
         .map_err(|e| anyhow::anyhow!("register slow client: {e:?}"))?;
 
     // The connection mailbox absorbs one observed-reply per admitted
     // broadcast target plus a small slack for ordinary connection
     // messages. The request can ask for more; those excess targets
     // are counted as visible Full before they become effects.
-    let connection_capacity = config.max_broadcast_targets.saturating_add(16);
+    let connection_capacity = config
+        .max_broadcast_targets
+        .checked_add(16)
+        .ok_or_else(|| anyhow::anyhow!("connection mailbox capacity overflow"))?;
 
     let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
-    let listener = runtime
-        .register_with_capacity::<_, Infallible>(
+    let listener = app
+        .register_root::<_, Infallible>(
             Listener {
                 bind_addr,
                 slow_client,
@@ -255,9 +350,11 @@ pub fn run(config: RunConfig) -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register listener: {e:?}"))?;
 
-    let bound = runtime.observe_next_bound()?;
-    runtime
-        .try_send(listener, ListenerMsg::Start)
+    let listener_result = app
+        .observe_result::<ListenerTerminal, _, _>(listener)
+        .map_err(|error| anyhow::anyhow!("observe listener result: {error:?}"))?;
+    let bound = app.observe_next_bound()?;
+    app.try_send(listener, ListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start listener: {e:?}"))?;
     let addr = bound
         .wait(Duration::from_secs(3))
@@ -267,8 +364,13 @@ pub fn run(config: RunConfig) -> anyhow::Result<Report> {
     let response = thread::spawn(move || drive_client(addr, burst))
         .join()
         .map_err(|_| anyhow::anyhow!("client thread panicked"))??;
-
-    runtime.shutdown_report().ensure_clean()?;
+    let listener_terminal = listener_result
+        .wait(Duration::from_secs(3))
+        .map_err(|error| anyhow::anyhow!("listener terminal: {error:?}"))?;
+    anyhow::ensure!(
+        listener_terminal == ListenerTerminal::ClosedClean,
+        "listener did not close cleanly: {listener_terminal:?}"
+    );
 
     let (accepted, full, closed) = parse_response(&response)?;
     Ok(Report {
@@ -305,12 +407,34 @@ fn drive_client(addr: SocketAddr, burst: usize) -> anyhow::Result<Vec<u8>> {
     Ok(response)
 }
 
-fn parse_burst(bytes: &[u8]) -> usize {
-    std::str::from_utf8(bytes)
-        .expect("burst utf8")
-        .trim()
+fn parse_burst(bytes: &[u8]) -> Result<usize, BurstProtocolError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| BurstProtocolError::InvalidUtf8)?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(BurstProtocolError::Empty);
+    }
+    let burst = text
         .parse::<usize>()
-        .expect("burst usize")
+        .map_err(|_| BurstProtocolError::InvalidInteger)?;
+    if burst == 0 {
+        return Err(BurstProtocolError::Zero);
+    }
+    if burst > MAX_BURST {
+        return Err(BurstProtocolError::TooLarge);
+    }
+    Ok(burst)
+}
+
+fn append_request_bytes(request: &mut Vec<u8>, chunk: &[u8]) -> Result<(), BurstProtocolError> {
+    let next_len = request
+        .len()
+        .checked_add(chunk.len())
+        .ok_or(BurstProtocolError::RequestTooLong)?;
+    if next_len > MAX_BURST_REQUEST_BYTES {
+        return Err(BurstProtocolError::RequestTooLong);
+    }
+    request.extend_from_slice(chunk);
+    Ok(())
 }
 
 fn parse_response(bytes: &[u8]) -> anyhow::Result<(usize, usize, usize)> {
@@ -348,12 +472,31 @@ fn counts_from_report(
     )
 }
 
-fn write_counts(
-    stream: StreamId,
-    accepted: usize,
-    full: usize,
-    closed: usize,
-) -> Effect<Connection> {
-    let response = format!("accepted={accepted} full={full} closed={closed}\n").into_bytes();
-    tcp_write(stream, response).then(ConnectionMsg::Wrote)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn burst_protocol_is_exhaustive_and_bounded() {
+        assert_eq!(parse_burst(b"7"), Ok(7));
+        assert_eq!(parse_burst(b"\xff"), Err(BurstProtocolError::InvalidUtf8));
+        assert_eq!(parse_burst(b"  "), Err(BurstProtocolError::Empty));
+        assert_eq!(
+            parse_burst(b"nope"),
+            Err(BurstProtocolError::InvalidInteger)
+        );
+        assert_eq!(parse_burst(b"0"), Err(BurstProtocolError::Zero));
+        assert_eq!(
+            parse_burst((MAX_BURST + 1).to_string().as_bytes()),
+            Err(BurstProtocolError::TooLarge)
+        );
+        let mut fragmented = Vec::new();
+        append_request_bytes(&mut fragmented, b"12").expect("first fragment");
+        append_request_bytes(&mut fragmented, b"34").expect("second fragment");
+        assert_eq!(parse_burst(&fragmented), Ok(1234));
+        assert_eq!(
+            append_request_bytes(&mut fragmented, &[b'1'; MAX_BURST_REQUEST_BYTES]),
+            Err(BurstProtocolError::RequestTooLong)
+        );
+    }
 }

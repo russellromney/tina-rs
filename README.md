@@ -244,6 +244,8 @@ pub enum EchoConnectionMsg {
     Wrote(TcpWriteReply),
     /// The stream close completed.
     Closed(TcpStreamCloseReply),
+    /// The listener observed this connection's exact terminal result.
+    TerminalReported(EchoConnectionTerminal, SendOutcome),
 }
 
 /// One accepted TCP stream, echoed back to its peer.
@@ -254,19 +256,30 @@ pub struct EchoConnection {
     /// Bytes read but not yet fully written back. A partial write
     /// leaves the tail here so the echo is never truncated.
     pending: Vec<u8>,
+    listener: Address<EchoListenerMsg>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EchoConnectionTerminal {
+    PeerClosedClean,
+    ReadFailed(CallError),
+    WriteFailed(CallError),
+    CloseFailed(CallError),
+    InvalidWriteCount { reported: usize, pending: usize },
 }
 
 impl EchoConnection {
-    fn new(stream: StreamId, max_chunk: usize) -> Self {
+    fn new(stream: StreamId, max_chunk: usize, listener: Address<EchoListenerMsg>) -> Self {
         Self {
             stream,
             max_chunk,
             pending: Vec::new(),
+            listener,
         }
     }
 }
 
-#[tina_runtime::isolate(message = EchoConnectionMsg)]
+#[tina_runtime::isolate(message = EchoConnectionMsg, send = Outbound<EchoListenerMsg>)]
 impl EchoConnection {
     fn handle(
         &mut self,
@@ -286,6 +299,12 @@ impl EchoConnection {
                 }
             }
             EchoConnectionMsg::Wrote(Ok(count)) => {
+                if count == 0 || count > self.pending.len() {
+                    return self.finish(EchoConnectionTerminal::InvalidWriteCount {
+                        reported: count,
+                        pending: self.pending.len(),
+                    });
+                }
                 self.pending.drain(..count);
                 if self.pending.is_empty() {
                     tcp_read(self.stream, self.max_chunk).then(EchoConnectionMsg::Read)
@@ -293,11 +312,36 @@ impl EchoConnection {
                     tcp_write(self.stream, self.pending.clone()).then(EchoConnectionMsg::Wrote)
                 }
             }
-            EchoConnectionMsg::Closed(Ok(())) => stop(),
-            EchoConnectionMsg::Read(Err(_))
-            | EchoConnectionMsg::Wrote(Err(_))
-            | EchoConnectionMsg::Closed(Err(_)) => stop(),
+            EchoConnectionMsg::Closed(Ok(())) => {
+                self.finish(EchoConnectionTerminal::PeerClosedClean)
+            }
+            EchoConnectionMsg::Read(Err(error)) => {
+                self.finish(EchoConnectionTerminal::ReadFailed(error))
+            }
+            EchoConnectionMsg::Wrote(Err(error)) => {
+                self.finish(EchoConnectionTerminal::WriteFailed(error))
+            }
+            EchoConnectionMsg::Closed(Err(error)) => {
+                self.finish(EchoConnectionTerminal::CloseFailed(error))
+            }
+            EchoConnectionMsg::TerminalReported(terminal, SendOutcome::Accepted) => {
+                stop_with(terminal)
+            }
+            EchoConnectionMsg::TerminalReported(terminal, SendOutcome::Full) => {
+                self.finish(terminal)
+            }
+            EchoConnectionMsg::TerminalReported(
+                terminal,
+                SendOutcome::Closed | SendOutcome::ForeignSystem { .. },
+            ) => stop_with(terminal),
         }
+    }
+}
+
+impl EchoConnection {
+    fn finish(&self, terminal: EchoConnectionTerminal) -> Effect<Self> {
+        send_observed(self.listener, EchoListenerMsg::ConnectionStopped(terminal))
+            .then(move |outcome| EchoConnectionMsg::TerminalReported(terminal, outcome))
     }
 }
 ```
@@ -305,7 +349,7 @@ impl EchoConnection {
 The honest part is what runs this code. The *same* `EchoConnection` source — not
 a reimplementation — drives two runtimes unchanged:
 
-- live, over a real loopback socket on `ThreadedRuntime`
+- live, over a real loopback socket through `LocalSystem`
   ([`tests/live_echo.rs`](examples/specimen_tcp_echo/tests/live_echo.rs));
 - deterministically, inside `tina-sim`'s `Simulator` driven by a scripted peer
   and replayed byte-for-byte from a fixed seed to a saved trace hash

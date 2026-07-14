@@ -3,10 +3,11 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, call, call_request,
+    BoundedItems, CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, bounded_batch, call,
+    call_request,
 };
 
-use crate::{REQUESTS, Report, Stage, classify};
+use crate::{PipelineStage, PipelineTerminal, REQUESTS, Report, Stage, classify};
 
 const STAGE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -125,7 +126,7 @@ pub enum PipelineReply {
     Completed,
     ParseFailed,
     ValidateFailed,
-    Failed,
+    Terminal(PipelineTerminal),
 }
 
 /// Caller-authority request: the only thing an outside caller can ask.
@@ -167,7 +168,25 @@ tina::flow! {
                 CallOutcome::Replied(ParseReply::Failed) => {
                     reply_to(req, PipelineReply::ParseFailed)
                 }
-                _ => reply_to(req, PipelineReply::Failed),
+                CallOutcome::Full => reply_to(
+                    req,
+                    PipelineReply::Terminal(PipelineTerminal::StageFull(PipelineStage::Parse)),
+                ),
+                CallOutcome::Closed => reply_to(
+                    req,
+                    PipelineReply::Terminal(PipelineTerminal::StageClosed(PipelineStage::Parse)),
+                ),
+                CallOutcome::Timeout => reply_to(
+                    req,
+                    PipelineReply::Terminal(PipelineTerminal::StageTimeout(PipelineStage::Parse)),
+                ),
+                CallOutcome::Rejected(reason) => reply_to(
+                    req,
+                    PipelineReply::Terminal(PipelineTerminal::StageRejected {
+                        stage: PipelineStage::Parse,
+                        reason,
+                    }),
+                ),
             }
         }
 
@@ -182,14 +201,50 @@ tina::flow! {
                 CallOutcome::Replied(ValidateReply::Failed) => {
                     reply_to(req, PipelineReply::ValidateFailed)
                 }
-                _ => reply_to(req, PipelineReply::Failed),
+                CallOutcome::Full => reply_to(
+                    req,
+                    PipelineReply::Terminal(PipelineTerminal::StageFull(PipelineStage::Validate)),
+                ),
+                CallOutcome::Closed => reply_to(
+                    req,
+                    PipelineReply::Terminal(PipelineTerminal::StageClosed(PipelineStage::Validate)),
+                ),
+                CallOutcome::Timeout => reply_to(
+                    req,
+                    PipelineReply::Terminal(PipelineTerminal::StageTimeout(PipelineStage::Validate)),
+                ),
+                CallOutcome::Rejected(reason) => reply_to(
+                    req,
+                    PipelineReply::Terminal(PipelineTerminal::StageRejected {
+                        stage: PipelineStage::Validate,
+                        reason,
+                    }),
+                ),
             }
         }
 
         step Executed() -> ExecuteReply {
             match outcome {
                 CallOutcome::Replied(ExecuteReply) => reply_to(req, PipelineReply::Completed),
-                _ => reply_to(req, PipelineReply::Failed),
+                CallOutcome::Full => reply_to(
+                    req,
+                    PipelineReply::Terminal(PipelineTerminal::StageFull(PipelineStage::Execute)),
+                ),
+                CallOutcome::Closed => reply_to(
+                    req,
+                    PipelineReply::Terminal(PipelineTerminal::StageClosed(PipelineStage::Execute)),
+                ),
+                CallOutcome::Timeout => reply_to(
+                    req,
+                    PipelineReply::Terminal(PipelineTerminal::StageTimeout(PipelineStage::Execute)),
+                ),
+                CallOutcome::Rejected(reason) => reply_to(
+                    req,
+                    PipelineReply::Terminal(PipelineTerminal::StageRejected {
+                        stage: PipelineStage::Execute,
+                        reason,
+                    }),
+                ),
             }
         }
     }
@@ -245,12 +300,12 @@ impl Pipeline {
 
 // --- Driver ---------------------------------------------------------
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct DriverOutcome {
     completed: usize,
     parse_failed: usize,
     validate_failed: usize,
-    other: usize,
+    terminals: Vec<PipelineTerminal>,
 }
 
 #[derive(Debug)]
@@ -275,33 +330,38 @@ impl Driver {
         match msg {
             DriverMsg::Begin => {
                 let pipeline = self.pipeline;
-                let calls: Vec<_> = (0..REQUESTS)
-                    .map(|i| {
-                        call_request(pipeline, PipelineRequest::Submit(i), STAGE_TIMEOUT)
-                            .then(DriverMsg::Returned)
-                    })
-                    .collect();
-                Effect::Batch(calls)
+                let inputs = BoundedItems::try_from_iter(REQUESTS, 0..REQUESTS)
+                    .expect("REQUESTS is the driver-owned producer bound");
+                bounded_batch(inputs.map_effects(|i| {
+                    call_request(pipeline, PipelineRequest::Submit(i), STAGE_TIMEOUT)
+                        .then(DriverMsg::Returned)
+                }))
             }
             DriverMsg::Returned(outcome) => {
-                match outcome {
-                    CallOutcome::Replied(PipelineReply::Completed) => self.outcome.completed += 1,
-                    CallOutcome::Replied(PipelineReply::ParseFailed) => {
-                        self.outcome.parse_failed += 1
-                    }
-                    CallOutcome::Replied(PipelineReply::ValidateFailed) => {
-                        self.outcome.validate_failed += 1
-                    }
-                    _ => self.outcome.other += 1,
-                }
+                record_driver_outcome(&mut self.outcome, outcome);
                 self.remaining -= 1;
                 if self.remaining == 0 {
-                    stop_with(self.outcome)
+                    stop_with(std::mem::take(&mut self.outcome))
                 } else {
                     noop()
                 }
             }
         }
+    }
+}
+
+fn record_driver_outcome(outcome: &mut DriverOutcome, returned: CallOutcome<PipelineReply>) {
+    match returned {
+        CallOutcome::Replied(PipelineReply::Completed) => outcome.completed += 1,
+        CallOutcome::Replied(PipelineReply::ParseFailed) => outcome.parse_failed += 1,
+        CallOutcome::Replied(PipelineReply::ValidateFailed) => outcome.validate_failed += 1,
+        CallOutcome::Replied(PipelineReply::Terminal(terminal)) => outcome.terminals.push(terminal),
+        CallOutcome::Full => outcome.terminals.push(PipelineTerminal::OuterFull),
+        CallOutcome::Closed => outcome.terminals.push(PipelineTerminal::OuterClosed),
+        CallOutcome::Timeout => outcome.terminals.push(PipelineTerminal::OuterTimeout),
+        CallOutcome::Rejected(reason) => outcome
+            .terminals
+            .push(PipelineTerminal::OuterRejected(reason)),
     }
 }
 
@@ -357,5 +417,45 @@ pub fn run() -> anyhow::Result<Report> {
         parse_failed: outcome.parse_failed,
         validate_failed: outcome.validate_failed,
         exit_clean: true,
+        tina_terminals: outcome.terminals,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tina::CallRejectedReason;
+
+    #[test]
+    fn driver_preserves_domain_and_every_outer_terminal() {
+        let reason = CallRejectedReason::UnsupportedMessage;
+        let mut outcome = DriverOutcome::default();
+        for returned in [
+            CallOutcome::Replied(PipelineReply::Completed),
+            CallOutcome::Replied(PipelineReply::ParseFailed),
+            CallOutcome::Replied(PipelineReply::ValidateFailed),
+            CallOutcome::Replied(PipelineReply::Terminal(PipelineTerminal::StageTimeout(
+                PipelineStage::Validate,
+            ))),
+            CallOutcome::Full,
+            CallOutcome::Closed,
+            CallOutcome::Timeout,
+            CallOutcome::Rejected(reason),
+        ] {
+            record_driver_outcome(&mut outcome, returned);
+        }
+        assert_eq!(outcome.completed, 1);
+        assert_eq!(outcome.parse_failed, 1);
+        assert_eq!(outcome.validate_failed, 1);
+        assert_eq!(
+            outcome.terminals,
+            [
+                PipelineTerminal::StageTimeout(PipelineStage::Validate),
+                PipelineTerminal::OuterFull,
+                PipelineTerminal::OuterClosed,
+                PipelineTerminal::OuterTimeout,
+                PipelineTerminal::OuterRejected(reason),
+            ]
+        );
+    }
 }

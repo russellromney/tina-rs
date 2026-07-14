@@ -8,6 +8,7 @@ fn assert_all_correct(report: Report) {
     assert_eq!(report.aggregates_correct, CLIENTS);
     assert_eq!(report.aggregates_wrong, 0);
     assert_eq!(report.failed, 0);
+    assert_eq!(report.tina_terminals, Default::default());
     assert!(report.exit_clean);
 }
 

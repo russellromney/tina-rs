@@ -11,9 +11,12 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
+use tina_runtime::BoundedItems;
 use tokio::net::TcpListener;
 use tokio::runtime::Builder;
 use tokio::sync::oneshot;
+
+use crate::MAX_ENDPOINTS;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Behavior {
@@ -28,53 +31,64 @@ pub enum Behavior {
 pub struct Upstream {
     pub addrs: Vec<SocketAddr>,
     shutdown: Vec<oneshot::Sender<()>>,
-    threads: Vec<thread::JoinHandle<()>>,
+    threads: Vec<thread::JoinHandle<anyhow::Result<()>>>,
 }
 
 impl Upstream {
     pub fn stop(mut self) -> anyhow::Result<()> {
-        let mut closed_receivers = 0usize;
-        for tx in self.shutdown.drain(..) {
-            closed_receivers += usize::from(tx.send(()).is_err());
+        let mut closed_receivers = Vec::new();
+        for (index, tx) in self.shutdown.drain(..).enumerate() {
+            if tx.send(()).is_err() {
+                closed_receivers.push(index);
+            }
         }
-        let mut panicked_threads = 0usize;
-        for t in self.threads.drain(..) {
-            panicked_threads += usize::from(t.join().is_err());
+        let mut failed_threads = Vec::new();
+        for (index, thread) in self.threads.drain(..).enumerate() {
+            match thread.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failed_threads.push((index, error.to_string())),
+                Err(_) => failed_threads.push((index, "thread panicked".to_string())),
+            }
         }
-        if closed_receivers == 0 && panicked_threads == 0 {
+        if closed_receivers.is_empty() && failed_threads.is_empty() {
             Ok(())
         } else {
             anyhow::bail!(
-                "upstream shutdown failed: closed_receivers={closed_receivers} panicked_threads={panicked_threads}"
+                "upstream shutdown failed: closed_receiver_indexes={closed_receivers:?} \
+                 failed_threads={failed_threads:?}"
             )
         }
     }
 }
 
 pub fn spawn(behaviors: &[Behavior]) -> anyhow::Result<Upstream> {
+    let behaviors = BoundedItems::try_from_iter(MAX_ENDPOINTS, behaviors.iter().copied())
+        .map_err(|error| anyhow::anyhow!("bound upstream endpoints: {error}"))?;
     let mut addrs = Vec::with_capacity(behaviors.len());
     let mut shutdowns = Vec::with_capacity(behaviors.len());
     let mut threads = Vec::with_capacity(behaviors.len());
 
-    for behavior in behaviors.iter().copied() {
+    for behavior in behaviors.into_vec() {
         let runtime = Builder::new_current_thread().enable_all().build()?;
         let (addr_tx, addr_rx) = std::sync::mpsc::channel::<SocketAddr>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-        let handle = thread::spawn(move || {
+        let handle = thread::spawn(move || -> anyhow::Result<()> {
             runtime.block_on(async move {
                 let state = Arc::new(behavior);
                 let app = Router::new().route("/hook", get(handler)).with_state(state);
-                let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-                let local = listener.local_addr().expect("local addr");
-                addr_tx.send(local).expect("publish addr");
+                let listener = TcpListener::bind("127.0.0.1:0").await?;
+                let local = listener.local_addr()?;
+                addr_tx
+                    .send(local)
+                    .map_err(|_| anyhow::anyhow!("publish address receiver closed"))?;
                 axum::serve(listener, app)
                     .with_graceful_shutdown(async move {
                         let _ = shutdown_rx.await;
                     })
-                    .await
-                    .expect("serve");
-            });
+                    .await?;
+                Ok(())
+            })
         });
 
         let addr = addr_rx.recv_timeout(Duration::from_secs(2))?;

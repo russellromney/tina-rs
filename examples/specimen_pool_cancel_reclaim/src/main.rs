@@ -19,11 +19,11 @@ fn main() -> anyhow::Result<()> {
 fn print_side(side: &str, r: Report) {
     println!(
         "comparison=specimen_pool_cancel_reclaim side={} cancelled={} \
-         retried_admitted={} retried_full={} retried_resourced={} \
+         retried_dispatched={} retried_full={} retried_resourced={} \
          waiters_high_water={} waiters_max={} exit_clean={}",
         side,
         r.cancelled,
-        r.retried_admitted,
+        r.retried_dispatched,
         r.retried_full,
         r.retried_resourced,
         r.waiters_high_water,
