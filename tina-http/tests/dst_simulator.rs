@@ -425,19 +425,14 @@ fn saved_seed_interleaving_fingerprint_is_stable() {
     const SAVED_SEED: u64 = 0xBEEF_C0DE;
     /// Pinned trace fingerprint for `SAVED_SEED` + the config below.
     /// Bump only after reviewing why the trace shape changed.
-    /// Last update: the terminal close-after-write completion now uses the
-    /// `StopRequester` action, so each `Connection: close` path records a
-    /// `CallCompletionAction` + ordinary `IsolateStopped` instead of
-    /// delivering a close-completion message the connection isolate then
-    /// processes in a separate handler turn. Both peers close, so len drops
-    /// by the two removed close-handling turns and gains two
-    /// `CallCompletionAction` facts (85 -> 81). Completion, terminal-action,
-    /// and stop facts are all still recorded; the terminal-action semantics
-    /// are proven directly by `runtime_terminal_completion_action` and
-    /// `timer_semantics`.
-    const EXPECTED_HASH: u64 = 3_203_362_481_028_129_978;
+    /// Last update: each fully buffered plain-TCP service call now spawns one
+    /// observed peer monitor. The two peers add their bounded child lifecycle,
+    /// terminal reservation, one-byte read, settlement, and disposal facts
+    /// (81 -> 121). The monitor terminates once, and the same-seed rerun below
+    /// still proves byte-identical replay.
+    const EXPECTED_HASH: u64 = 10_434_183_390_251_076_748;
     /// Pinned trace event count for `SAVED_SEED` + the config below.
-    const EXPECTED_LEN: usize = 81;
+    const EXPECTED_LEN: usize = 121;
 
     let bind: SocketAddr = "127.0.0.1:9007".parse().unwrap();
     let peer_a: SocketAddr = "10.0.0.1:55008".parse().unwrap();
@@ -462,7 +457,6 @@ fn saved_seed_interleaving_fingerprint_is_stable() {
     };
 
     let (hash, len) = run_pass(bind, make_cfg(), 16);
-
     // Pin against the saved fingerprint — this is what catches drift.
     assert_eq!(
         hash, EXPECTED_HASH,
