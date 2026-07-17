@@ -5,7 +5,8 @@
 //! Direct proof matrix:
 //! - event-only admission → 202
 //! - request-only and split request lanes → typed reply
-//! - Full → 429 (unit + host-fill), Closed → 503, timeout → 504, malformed → 400
+//! - Full → 429 (unit projection + zero-capacity wire for call and event
+//!   lanes), Closed → 503 (wire), timeout → 504, malformed → 400
 //! - peer close and listener shutdown remain clean
 //! - compile_fail doctests on the constructors prove lane confusion is
 //!   rejected at compile time
@@ -320,11 +321,8 @@ fn closed_service_returns_503() {
         )
         .callable(),
     );
-    let listener = HttpListener::<TestShard, _>::for_requests(
-        "127.0.0.1:0".parse().unwrap(),
-        stale,
-        config(),
-    );
+    let listener =
+        HttpListener::<TestShard, _>::for_requests("127.0.0.1:0".parse().unwrap(), stale, config());
     let (addr, listener_addr) = start_listener(&runtime, listener, 8);
 
     let response = scripted(addr, b"GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
@@ -360,6 +358,73 @@ fn event_closed_service_returns_503() {
     assert!(
         status_line(&response).starts_with("HTTP/1.1 503"),
         "closed event service must answer 503, got {response}"
+    );
+
+    let _ = runtime.try_send(listener_addr, HttpListenerMsg::Stop);
+    let _ = runtime.shutdown();
+}
+
+/// Zero-capacity request mailbox: every inbound call observes `Full` and
+/// must answer **429**, not 503. Wire pin for the settled Full mapping.
+#[test]
+fn full_service_mailbox_returns_429() {
+    let runtime = make_runtime();
+    let requests = runtime
+        .register_request_service::<EchoService, EchoRequest, Infallible>(EchoService, 0)
+        .expect("register zero-capacity request service");
+    let listener = HttpListener::<TestShard, _>::for_request_service(
+        "127.0.0.1:0".parse().unwrap(),
+        requests,
+        config(),
+    );
+    let (addr, listener_addr) = start_listener(&runtime, listener, 8);
+
+    let response = scripted(addr, b"GET /busy HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(
+        status_line(&response).starts_with("HTTP/1.1 429"),
+        "Full request mailbox must answer 429 (not 503), got {response}"
+    );
+    assert!(
+        !status_line(&response).starts_with("HTTP/1.1 503"),
+        "Full must not be mis-mapped to 503, got {response}"
+    );
+
+    let _ = runtime.try_send(listener_addr, HttpListenerMsg::Stop);
+    let _ = runtime.shutdown();
+}
+
+/// Zero-capacity event mailbox: observed send is `Full` → wire **429**.
+#[test]
+fn full_event_mailbox_returns_429() {
+    let runtime = make_runtime();
+    let admitted = Arc::new(AtomicU64::new(0));
+    let events = runtime
+        .register_event_service::<NotifyService, NotifyEvent, Infallible>(
+            NotifyService {
+                admitted: Arc::clone(&admitted),
+            },
+            0,
+        )
+        .expect("register zero-capacity event service");
+    let listener = HttpListener::<TestShard, _>::for_event_service(
+        "127.0.0.1:0".parse().unwrap(),
+        events,
+        config(),
+    );
+    let (addr, listener_addr) = start_listener(&runtime, listener, 8);
+
+    let response = scripted(
+        addr,
+        b"POST /n HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n",
+    );
+    assert!(
+        status_line(&response).starts_with("HTTP/1.1 429"),
+        "Full event mailbox must answer 429 (not 503), got {response}"
+    );
+    assert_eq!(
+        admitted.load(Ordering::SeqCst),
+        0,
+        "Full admission must not deliver the event"
     );
 
     let _ = runtime.try_send(listener_addr, HttpListenerMsg::Stop);
@@ -506,17 +571,24 @@ fn listener_shutdown_stops_accept_loop() {
 
     let _ = runtime.try_send(listener_addr, HttpListenerMsg::Stop);
     std::thread::sleep(Duration::from_millis(100));
-    drop(TcpStream::connect_timeout(&addr, Duration::from_millis(200)));
+    drop(TcpStream::connect_timeout(
+        &addr,
+        Duration::from_millis(200),
+    ));
     let _ = runtime.shutdown();
 }
 
 #[test]
 fn terminal_status_table_is_settled() {
-    // Full → 429, Closed → 503, Timeout → 504, Accepted → 202.
-    assert_eq!(
-        response_for_send_outcome(SendOutcome::Full).status,
-        http::StatusCode::TOO_MANY_REQUESTS
+    // Full → 429 (never 503), Closed → 503, Timeout → 504, Accepted → 202.
+    let full_send = response_for_send_outcome(SendOutcome::Full);
+    assert_eq!(full_send.status, http::StatusCode::TOO_MANY_REQUESTS);
+    assert_ne!(
+        full_send.status,
+        http::StatusCode::SERVICE_UNAVAILABLE,
+        "Full must not regress to 503"
     );
+
     assert_eq!(
         response_for_send_outcome(SendOutcome::Closed).status,
         http::StatusCode::SERVICE_UNAVAILABLE
@@ -525,12 +597,15 @@ fn terminal_status_table_is_settled() {
         response_for_send_outcome(SendOutcome::Accepted).status,
         http::StatusCode::ACCEPTED
     );
-    assert_eq!(
-        response_for_call_outcome(&CallOutcome::<HttpResponse>::Full)
-            .expect("full")
-            .status,
-        http::StatusCode::TOO_MANY_REQUESTS
+
+    let full_call = response_for_call_outcome(&CallOutcome::<HttpResponse>::Full).expect("full");
+    assert_eq!(full_call.status, http::StatusCode::TOO_MANY_REQUESTS);
+    assert_ne!(
+        full_call.status,
+        http::StatusCode::SERVICE_UNAVAILABLE,
+        "Full must not regress to 503"
     );
+
     assert_eq!(
         response_for_call_outcome(&CallOutcome::<HttpResponse>::Closed)
             .expect("closed")
@@ -542,6 +617,16 @@ fn terminal_status_table_is_settled() {
             .expect("timeout")
             .status,
         http::StatusCode::GATEWAY_TIMEOUT
+    );
+
+    // Convenience helper is Closed/shutdown-shaped only — not Full.
+    assert_eq!(
+        HttpResponse::service_unavailable().status,
+        http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_ne!(
+        HttpResponse::service_unavailable().status,
+        http::StatusCode::TOO_MANY_REQUESTS
     );
 }
 

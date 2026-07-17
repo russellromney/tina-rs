@@ -79,7 +79,10 @@ where
 
 impl<M> ServiceDelivery<M> {
     /// Call-lane delivery with an explicit payload converter.
-    pub(crate) fn call(address: Address<M, HttpResponse>, to_message: fn(HttpRequest) -> M) -> Self {
+    pub(crate) fn call(
+        address: Address<M, HttpResponse>,
+        to_message: fn(HttpRequest) -> M,
+    ) -> Self {
         Self::Call {
             address,
             to_message,
@@ -171,7 +174,9 @@ pub fn response_for_send_outcome(outcome: SendOutcome) -> HttpResponse {
     }
 }
 
-fn wrap_service_request<Event, Request>(request: HttpRequest) -> tina::ServiceMessage<Event, Request>
+fn wrap_service_request<Event, Request>(
+    request: HttpRequest,
+) -> tina::ServiceMessage<Event, Request>
 where
     Request: FromHttpRequest,
 {

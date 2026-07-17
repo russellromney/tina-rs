@@ -242,11 +242,10 @@ fn service_call_timeout_returns_504_on_the_wire() {
     // the connection writes `504 Gateway Timeout` to the wire before
     // closing.
     //
-    // Deterministic alternative to the harder-to-construct "service
-    // mailbox full -> 503" path. The Full path requires concurrent
-    // timing the single-shard runtime does not naturally produce, and
-    // is tested at the unit-test level in
-    // `connection::tests::full_call_error_maps_to_503`.
+    // Deterministic alternative to a concurrent overload path. Mailbox
+    // Full → 429 is proven at unit level in `delivery::tests` and on the
+    // wire by `typed_service_delivery::full_service_mailbox_returns_429`
+    // (zero-capacity request service). Closed / shutdown → 503.
     use std::convert::Infallible;
 
     use http::StatusCode;

@@ -47,8 +47,8 @@ use tina::{CallContext, RequestContext, reply_to};
 use tina_runtime::{
     CallError, CallInput, CallOutcome, CallOutput, RuntimeCall, RuntimeCallCompletion, SendOutcome,
     TcpReadBufReply, TcpWriteOwnedCloseReply, TcpWriteOwnedReply, TlsReadBufReply,
-    TlsWriteOwnedReply, call, send_observed, sleep, tcp_close_stream, tcp_read_buf, tcp_write_owned,
-    tls_close, tls_read_buf, tls_write_owned,
+    TlsWriteOwnedReply, call, send_observed, sleep, tcp_close_stream, tcp_read_buf,
+    tcp_write_owned, tls_close, tls_read_buf, tls_write_owned,
 };
 
 use crate::body_metrics::BodyMetrics;
@@ -951,12 +951,10 @@ impl<S: Shard + 'static, M: Send + 'static> HttpConnection<S, M> {
         };
         let message = self.delivery.to_message(request);
         match self.delivery {
-            ServiceDelivery::Call { address, .. } => call(
-                address,
-                message,
-                self.service_call_timeout,
-            )
-            .then(HttpConnectionMsg::ServiceReturned),
+            ServiceDelivery::Call { address, .. } => {
+                call(address, message, self.service_call_timeout)
+                    .then(HttpConnectionMsg::ServiceReturned)
+            }
             ServiceDelivery::Admit { address, .. } => {
                 send_observed(address, message).then(HttpConnectionMsg::EventAdmitted)
             }
@@ -2497,5 +2495,3 @@ impl<S: Shard, M: Send + 'static> Drop for HttpConnection<S, M> {
         self.metrics_response_charge = 0;
     }
 }
-
-
