@@ -570,8 +570,10 @@ impl RoomServer {
             ..Default::default()
         };
 
-        let mut stats = RoomStats::default();
-        stats.member_capacity = config.member_capacity;
+        let stats = RoomStats {
+            member_capacity: config.member_capacity,
+            ..Default::default()
+        };
 
         let room = app
             .register_split_service_with_bootstrap::<
