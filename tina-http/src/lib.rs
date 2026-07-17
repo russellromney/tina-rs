@@ -173,6 +173,7 @@ pub mod grpc;
 pub mod grpc_client;
 pub mod http2;
 pub mod keepalive;
+pub mod keepalive_install;
 pub mod listener;
 pub mod listener_tls;
 pub mod parse;
@@ -234,6 +235,13 @@ pub use keepalive::{
     KeepaliveConnectionStopOutcome, KeepaliveOutcome, KeepalivePoolCloseOutcome,
     KeepalivePoolDrainOutcome, KeepalivePoolHandles, KeepalivePoolShutdownReport, OriginKey,
     build_keepalive_pool, shutdown_keepalive_pool,
+};
+pub use keepalive_install::{
+    InstallKeepalivePool, InstalledKeepalivePool, KeepaliveCloseAndDrain,
+    KeepaliveInstallRollbackReport, KeepaliveInstallStep, KeepalivePendingCounts,
+    KeepalivePoolConfigError, KeepalivePoolInstallConfig, KeepalivePoolInstallError,
+    KeepalivePoolSettledReport, KeepaliveShutdownSettlement, install_keepalive_pool_fail_after,
+    install_keepalive_pool_on_runtime,
 };
 pub use listener::{
     HttpListener, HttpListenerAddress, HttpListenerMsg, HttpReady, HttpStartupError,

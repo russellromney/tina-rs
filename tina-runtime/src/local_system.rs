@@ -971,6 +971,15 @@ where
         self.runtime().system_incarnation()
     }
 
+    /// Non-owning host-control view of the underlying threaded runtime.
+    ///
+    /// The returned handle can register isolates and issue host calls, but does
+    /// not own shutdown. Resource install facades use this so an owned install
+    /// handle can settle without consuming the [`LocalSystem`] owner.
+    pub fn host_control(&self) -> ThreadedRuntime<S, F> {
+        self.runtime().host_control()
+    }
+
     /// Starts configuring one single-shard local app.
     pub fn single_shard(shard: S, mailbox_factory: F) -> LocalSystemSingleShardBuilder<S, F> {
         LocalSystemSingleShardBuilder {

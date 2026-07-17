@@ -726,6 +726,25 @@ where
         self.system_incarnation
     }
 
+    /// Non-owning host-control view of this runtime.
+    ///
+    /// The returned handle can register isolates and issue host calls, but its
+    /// destructor never starts shutdown. Resource install facades hold this so
+    /// an owned install handle can `close_and_drain` without a second runtime
+    /// argument and without racing the true owner's drop path.
+    pub fn host_control(&self) -> Self {
+        Self {
+            commands: self.commands.clone(),
+            dispatchers: Arc::clone(&self.dispatchers),
+            dispatcher_next: Arc::clone(&self.dispatcher_next),
+            metrics: Arc::clone(&self.metrics),
+            shutdown: Arc::clone(&self.shutdown),
+            control_call_timeout: self.control_call_timeout,
+            system_incarnation: self.system_incarnation,
+            owner_drop_armed: false,
+        }
+    }
+
     /// Starts one worker thread for one shard runtime.
     pub fn new(shard: S, mailbox_factory: F) -> Self {
         Self::try_new(shard, mailbox_factory).expect("failed to start Tina threaded runtime")
