@@ -240,11 +240,13 @@ pub use keepalive::{
     build_keepalive_pool, shutdown_keepalive_pool,
 };
 pub use keepalive_install::{
-    InstallKeepalivePool, InstalledKeepalivePool, KeepaliveCloseAndDrain,
+    InstallKeepalivePool, InstalledKeepalivePool, KeepaliveCloseAndDrain, KeepaliveInstallRecovery,
     KeepaliveInstallRollbackReport, KeepaliveInstallStep, KeepalivePendingCounts,
     KeepalivePoolConfigError, KeepalivePoolInstallConfig, KeepalivePoolInstallError,
-    KeepalivePoolSettledReport, KeepaliveShutdownSettlement, install_keepalive_pool_fail_after,
-    install_keepalive_pool_on_runtime,
+    KeepalivePoolInstallResult, KeepalivePoolSettledReport, KeepaliveRollbackResult,
+    KeepaliveShutdownSettlement, MAX_KEEPALIVE_MAILBOX_CAPACITY, MAX_KEEPALIVE_POOL_CAPACITY,
+    MAX_KEEPALIVE_POOL_WAITERS, install_keepalive_pool_fail_after,
+    install_keepalive_pool_fail_after_with_rollback_failure, install_keepalive_pool_on_runtime,
 };
 pub use listener::{
     HttpListener, HttpListenerAddress, HttpListenerMsg, HttpReady, HttpStartupError,
