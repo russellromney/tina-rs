@@ -1,16 +1,16 @@
 //! Wire-level overload behaviour.
 //!
 //! Fires many concurrent inbound TCP requests at the native server
-//! and asserts every response is well-formed — `200` or
-//! `503 Service Unavailable`, never truncated or hung. Exercises the
-//! multi-connection accept/dispatch path under load.
+//! and asserts every response is well-formed — `200`, `429 Too Many
+//! Requests`, or `503 Service Unavailable`, never truncated or hung.
+//! Exercises the multi-connection accept/dispatch path under load.
 //!
-//! The fully deterministic "service mailbox full -> 503 over TCP" test
+//! The fully deterministic "service mailbox full -> 429 over TCP" test
 //! needs either a service that holds its mailbox slot across many
 //! runtime turns (which the current `Address<HttpRequest,
 //! HttpResponse>` service shape can't express) or multi-shard
-//! execution. The 503 mapping itself is proven by the connection-
-//! isolate unit tests, and `pool_smoke` shows real overload becomes
+//! execution. The Full→429 mapping itself is proven by the delivery
+//! unit tests, and `pool_smoke` shows real overload becomes
 //! observable as `PoolFull` at the call boundary.
 
 mod common;
@@ -60,7 +60,7 @@ fn concurrent_burst_produces_well_formed_responses() {
             let text = String::from_utf8_lossy(&buf);
             if text.starts_with("HTTP/1.1 200") {
                 success.fetch_add(1, Ordering::Relaxed);
-            } else if text.starts_with("HTTP/1.1 503") {
+            } else if text.starts_with("HTTP/1.1 429") || text.starts_with("HTTP/1.1 503") {
                 unavailable.fetch_add(1, Ordering::Relaxed);
             } else {
                 other.fetch_add(1, Ordering::Relaxed);

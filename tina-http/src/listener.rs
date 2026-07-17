@@ -2,8 +2,8 @@
 //!
 //! [`HttpListener`] binds to an address, accepts inbound TCP connections,
 //! and spawns one [`HttpConnection`] per accepted socket. Each connection
-//! handles one request, calls the user's service isolate, writes the
-//! response, and closes.
+//! delivers the parsed request into a typed service handle (request call,
+//! event admission, or raw address adapter), writes the response, and closes.
 //!
 use std::marker::PhantomData;
 use std::net::SocketAddr;
@@ -17,6 +17,7 @@ use tina_runtime::{
 
 use crate::body_metrics::BodyMetrics;
 use crate::connection::{HttpConnection, HttpConnectionMsg};
+use crate::delivery::ServiceDelivery;
 use crate::transport::HttpTransport;
 use crate::types::{FromHttpRequest, HttpLimits, HttpRequest, HttpResponse, HttpServerConfig};
 
@@ -66,34 +67,27 @@ pub enum HttpStartupError {
 
 /// Listener isolate.
 ///
-/// Generic over the user's `Shard` and the service's message type `M`,
-/// which must implement [`FromHttpRequest`]. `M` defaults to `HttpRequest`
-/// for sync-reply services (covered via `HttpRequest: From<HttpRequest>`,
-/// the standard reflexive impl). Multi-turn services declare their own
-/// enum and implement `From<HttpRequest>` on it; a blanket impl in this
-/// crate lifts that into `FromHttpRequest` automatically.
+/// Generic over the user's `Shard` and the service's message type `M`
+/// (default [`HttpRequest`]). Prefer the typed constructors:
 ///
-/// Split-service isolates (`#[isolate(event = .., request = ..)]`) use
-/// `M = tina::ServiceMessage<Event, Request>`. Implement plain
-/// `From<HttpRequest>` on your own `Request` type; this crate provides
-/// `ServiceMessage<Event, Request>: FromHttpRequest` whenever `Request:
-/// From<HttpRequest>` holds. Callers cannot write that impl themselves —
-/// `impl From<HttpRequest> for ServiceMessage<Event, Request>` is
-/// orphan-illegal in any downstream crate, since neither `HttpRequest` nor
-/// `ServiceMessage` is local to it. `FromHttpRequest` exists (instead of
-/// requiring plain `From<HttpRequest>` on `M` directly) so this crate,
-/// which is the one place that can name both types, can supply that
-/// blanket without colliding with `core`'s reflexive `From<T> for T`.
-pub struct HttpListener<S: Shard + 'static, M: FromHttpRequest + Send + 'static = HttpRequest> {
-    bind_addr: SocketAddr,
-    service: Address<M, HttpResponse>,
-    limits: HttpLimits,
-    service_call_timeout: Duration,
-    connection_mailbox_capacity: usize,
+/// - [`HttpListener::for_requests`] / [`HttpListener::for_request_service`]
+/// - [`HttpListener::for_events`] / [`HttpListener::for_event_service`]
+/// - [`HttpListener::for_split_service`]
+///
+/// The raw [`HttpListener::new`] / [`HttpListener::with_config`] path remains
+/// for ordinary address adapters and multi-turn services that still own a
+/// callable address. Split-service installs should not name
+/// `tina::ServiceMessage` at the call site — use the typed constructors.
+pub struct HttpListener<S: Shard + 'static, M: Send + 'static = HttpRequest> {
+    pub(crate) bind_addr: SocketAddr,
+    pub(crate) delivery: ServiceDelivery<M>,
+    pub(crate) limits: HttpLimits,
+    pub(crate) service_call_timeout: Duration,
+    pub(crate) connection_mailbox_capacity: usize,
     /// Optional shared body-pressure counters threaded into every
     /// connection child. `None` means no metrics — same default
     /// behaviour as before.
-    metrics: Option<BodyMetrics>,
+    pub(crate) metrics: Option<BodyMetrics>,
     listener: Option<ListenerId>,
     pending_start_reply: Option<RequestContext<Result<HttpReady, HttpStartupError>>>,
     /// Set on the first `Start`. Second Start is a no-op.
@@ -102,30 +96,19 @@ pub struct HttpListener<S: Shard + 'static, M: FromHttpRequest + Send + 'static 
     _shard: PhantomData<S>,
 }
 
-impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> HttpListener<S, M> {
-    /// Builds a listener that will bind to `bind_addr`, dispatch every
-    /// parsed request to `service`, and spawn one connection isolate
-    /// per accept.
-    ///
-    /// `connection_mailbox_capacity` is the bounded mailbox size for
-    /// each [`HttpConnection`] child. A small number (16-32) is plenty.
-    ///
-    /// `service_call_timeout` is the timeout passed to every
-    /// [`tina_runtime::call`] into the service isolate. It is the
-    /// upstream-side analogue of an HTTP request deadline.
-    pub fn new(
+impl<S: Shard + 'static, M: Send + 'static> HttpListener<S, M> {
+    /// Internal constructor shared by raw and typed install paths.
+    pub(crate) fn from_delivery(
         bind_addr: SocketAddr,
-        service: Address<M, HttpResponse>,
-        limits: HttpLimits,
-        service_call_timeout: Duration,
-        connection_mailbox_capacity: usize,
+        delivery: ServiceDelivery<M>,
+        config: HttpServerConfig,
     ) -> Self {
         Self {
             bind_addr,
-            service,
-            limits,
-            service_call_timeout,
-            connection_mailbox_capacity,
+            delivery,
+            limits: config.limits,
+            service_call_timeout: config.service_call_timeout,
+            connection_mailbox_capacity: config.connection_mailbox_capacity,
             metrics: None,
             listener: None,
             pending_start_reply: None,
@@ -141,6 +124,44 @@ impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> HttpListener<S, M>
     pub fn with_metrics(mut self, metrics: BodyMetrics) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+}
+
+impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> HttpListener<S, M> {
+    /// Builds a listener that will bind to `bind_addr`, dispatch every
+    /// parsed request to `service`, and spawn one connection isolate
+    /// per accept.
+    ///
+    /// `connection_mailbox_capacity` is the bounded mailbox size for
+    /// each [`HttpConnection`] child. A small number (16-32) is plenty.
+    ///
+    /// `service_call_timeout` is the timeout passed to every
+    /// [`tina_runtime::call`] into the service isolate. It is the
+    /// upstream-side analogue of an HTTP request deadline.
+    ///
+    /// For capability-typed services prefer
+    /// [`HttpListener::for_requests`], [`HttpListener::for_events`], or
+    /// [`HttpListener::for_split_service`].
+    pub fn new(
+        bind_addr: SocketAddr,
+        service: Address<M, HttpResponse>,
+        limits: HttpLimits,
+        service_call_timeout: Duration,
+        connection_mailbox_capacity: usize,
+    ) -> Self {
+        Self {
+            bind_addr,
+            delivery: ServiceDelivery::call_from_http(service),
+            limits,
+            service_call_timeout,
+            connection_mailbox_capacity,
+            metrics: None,
+            listener: None,
+            pending_start_reply: None,
+            started: false,
+            stopping: false,
+            _shard: PhantomData,
+        }
     }
 
     /// Convenience constructor that absorbs an [`HttpServerConfig`].
@@ -165,7 +186,7 @@ impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> HttpListener<S, M>
 
 // Hand-rolled `Isolate` impl: the macro requires a concrete shard type;
 // we want this generic so callers can pick their own shard.
-impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> Isolate for HttpListener<S, M> {
+impl<S: Shard + 'static, M: Send + 'static> Isolate for HttpListener<S, M> {
     tina::isolate_types! {
         message: HttpListenerMsg,
         reply: Result<HttpReady, HttpStartupError>,
@@ -316,12 +337,12 @@ impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> Isolate for HttpLi
     }
 }
 
-impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> HttpListener<S, M> {
+impl<S: Shard + 'static, M: Send + 'static> HttpListener<S, M> {
     fn build_connection_child(&self, stream: StreamId) -> ChildDefinition<HttpConnection<S, M>> {
         ChildDefinition::new(
-            HttpConnection::<S, M>::with_transport_and_metrics(
+            HttpConnection::<S, M>::with_delivery_and_metrics(
                 HttpTransport::Tcp(stream),
-                self.service,
+                self.delivery,
                 self.limits,
                 self.service_call_timeout,
                 Duration::ZERO,

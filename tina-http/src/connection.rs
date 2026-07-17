@@ -29,11 +29,12 @@
 //!
 //! Backpressure mapping at the service boundary:
 //!
-//! | Service `CallOutcome`            | Wire response                |
+//! | Service outcome                  | Wire response                |
 //! |----------------------------------|------------------------------|
 //! | `Replied(HttpResponse)`          | The response itself          |
-//! | `Full`                           | `503 Service Unavailable`    |
-//! | `Closed`                         | `500 Internal Server Error`  |
+//! | event `Accepted`                 | `202 Accepted` (empty body)  |
+//! | `Full`                           | `429 Too Many Requests`      |
+//! | `Closed` / shutdown              | `503 Service Unavailable`    |
 //! | `Timeout`                        | `504 Gateway Timeout`        |
 //!
 //! Parser failures map per [`crate::types::RequestParseError::status`].
@@ -41,17 +42,19 @@
 use std::io::Write as _;
 use std::time::Duration;
 
-use http::StatusCode;
 use tina::prelude::*;
 use tina::{CallContext, RequestContext, reply_to};
 use tina_runtime::{
-    CallError, CallInput, CallOutcome, CallOutput, RuntimeCall, RuntimeCallCompletion,
+    CallError, CallInput, CallOutcome, CallOutput, RuntimeCall, RuntimeCallCompletion, SendOutcome,
     TcpReadBufReply, TcpWriteOwnedCloseReply, TcpWriteOwnedReply, TlsReadBufReply,
-    TlsWriteOwnedReply, call, sleep, tcp_close_stream, tcp_read_buf, tcp_write_owned, tls_close,
-    tls_read_buf, tls_write_owned,
+    TlsWriteOwnedReply, call, send_observed, sleep, tcp_close_stream, tcp_read_buf, tcp_write_owned,
+    tls_close, tls_read_buf, tls_write_owned,
 };
 
 use crate::body_metrics::BodyMetrics;
+use crate::delivery::ServiceDelivery;
+// Status projection helpers: defined in delivery, re-exported below for crate root.
+use crate::delivery::{response_for_call_error, response_for_send_outcome};
 use crate::parse::{
     HttpRequestHead, ParseProgress, encode_response_head, encode_response_head_with_extra_capacity,
     parse_request_head,
@@ -213,6 +216,8 @@ pub enum HttpConnectionMsg {
     /// propagates through this continuation, so `Effect::Reply` here
     /// answers the service.
     BodyChunkRead(Result<TcpReadBufReply, CallError>),
+    /// Event-only admission: observed send into the service event lane.
+    EventAdmitted(SendOutcome),
 }
 
 impl HttpConnectionMsg {
@@ -226,16 +231,16 @@ impl HttpConnectionMsg {
 /// Per-connection isolate.
 ///
 /// Generic over the user's `Shard` type and the service's message type
-/// `M`, which must implement [`FromHttpRequest`] — see
-/// [`crate::HttpListener`] for how that bound is satisfied, including for
-/// split-service `ServiceMessage<Event, Request>` message types.
-pub struct HttpConnection<S: Shard, M: FromHttpRequest + Send + 'static = HttpRequest> {
+/// `M`. Delivery is owned by [`ServiceDelivery`]: call-lane for request
+/// / split-request handles, admit-lane for event-only handles. See
+/// [`crate::HttpListener`] for the public install shapes.
+pub struct HttpConnection<S: Shard, M: Send + 'static = HttpRequest> {
     transport: HttpTransport,
     /// Per-call deadline passed to TLS lane reads/writes/closes. Ignored
     /// on the TCP transport (TCP reads/writes have no per-call deadline
     /// today).
     tls_io_timeout: Duration,
-    service: Address<M, HttpResponse>,
+    delivery: ServiceDelivery<M>,
     limits: HttpLimits,
     service_call_timeout: Duration,
     /// Optional body-pressure counters. When `Some`, the connection
@@ -404,10 +409,31 @@ impl<S: Shard, M: FromHttpRequest + Send + 'static> HttpConnection<S, M> {
         tls_io_timeout: Duration,
         metrics: Option<BodyMetrics>,
     ) -> Self {
+        Self::with_delivery_and_metrics(
+            transport,
+            ServiceDelivery::call_from_http(service),
+            limits,
+            service_call_timeout,
+            tls_io_timeout,
+            metrics,
+        )
+    }
+}
+
+impl<S: Shard, M: Send + 'static> HttpConnection<S, M> {
+    /// Builds a connection from an explicit [`ServiceDelivery`] plan.
+    pub(crate) fn with_delivery_and_metrics(
+        transport: HttpTransport,
+        delivery: ServiceDelivery<M>,
+        limits: HttpLimits,
+        service_call_timeout: Duration,
+        tls_io_timeout: Duration,
+        metrics: Option<BodyMetrics>,
+    ) -> Self {
         Self {
             transport,
             tls_io_timeout,
-            service,
+            delivery,
             limits,
             service_call_timeout,
             metrics,
@@ -450,7 +476,7 @@ impl<S: Shard, M: FromHttpRequest + Send + 'static> HttpConnection<S, M> {
 // The `#[tina_runtime::isolate]` macro requires a concrete shard type; we
 // write the `Isolate` impl by hand so a single `HttpConnection`
 // implementation works for any user-chosen shard.
-impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> Isolate for HttpConnection<S, M> {
+impl<S: Shard + 'static, M: Send + 'static> Isolate for HttpConnection<S, M> {
     tina::isolate_types! {
         message: HttpConnectionMsg,
         reply: RequestChunkReply,
@@ -501,6 +527,7 @@ impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> Isolate for HttpCo
             }
 
             HttpConnectionMsg::ServiceReturned(outcome) => self.handle_service_outcome(outcome),
+            HttpConnectionMsg::EventAdmitted(outcome) => self.handle_event_admitted(outcome),
 
             HttpConnectionMsg::Wrote(Ok(reply)) => self.handle_wrote(reply),
             HttpConnectionMsg::Wrote(Err(_)) => {
@@ -602,7 +629,7 @@ impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> Isolate for HttpCo
     }
 }
 
-impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> HttpConnection<S, M> {
+impl<S: Shard + 'static, M: Send + 'static> HttpConnection<S, M> {
     /// First-effect hook. Issues both the initial `tcp_read` and the
     /// slow-loris deadline `sleep` in one batch so they race the
     /// client's bytes against the configured timeout.
@@ -922,12 +949,18 @@ impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> HttpConnection<S, 
                 head.into_request(buf)
             }
         };
-        call(
-            self.service,
-            M::from_http_request(request),
-            self.service_call_timeout,
-        )
-        .then(HttpConnectionMsg::ServiceReturned)
+        let message = self.delivery.to_message(request);
+        match self.delivery {
+            ServiceDelivery::Call { address, .. } => call(
+                address,
+                message,
+                self.service_call_timeout,
+            )
+            .then(HttpConnectionMsg::ServiceReturned),
+            ServiceDelivery::Admit { address, .. } => {
+                send_observed(address, message).then(HttpConnectionMsg::EventAdmitted)
+            }
+        }
     }
 
     /// Returns the shard id for self. The dispatch path needs this to
@@ -1163,6 +1196,13 @@ impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> HttpConnection<S, 
             }
         };
         self.start_writing(response)
+    }
+
+    fn handle_event_admitted(&mut self, outcome: SendOutcome) -> Effect<Self> {
+        if !matches!(outcome, SendOutcome::Accepted) {
+            self.will_close = true;
+        }
+        self.start_writing(response_for_send_outcome(outcome))
     }
 
     fn send_parse_error(&mut self, error: RequestParseError) -> Effect<Self> {
@@ -2443,7 +2483,7 @@ impl<S: Shard + 'static, M: FromHttpRequest + Send + 'static> HttpConnection<S, 
 // (panic, runtime stop, force-close). Without this, an isolate
 // dropped mid-body would leave its charge resident in the shared
 // metrics forever, breaking the "drained()" terminal assertion.
-impl<S: Shard, M: FromHttpRequest + Send + 'static> Drop for HttpConnection<S, M> {
+impl<S: Shard, M: Send + 'static> Drop for HttpConnection<S, M> {
     fn drop(&mut self) {
         if let Some(metrics) = &self.metrics {
             if self.metrics_request_charge > 0 {
@@ -2458,149 +2498,4 @@ impl<S: Shard, M: FromHttpRequest + Send + 'static> Drop for HttpConnection<S, M
     }
 }
 
-/// Maps a runtime `CallError` from the service call into a synthetic HTTP
-/// response.
-///
-/// Every variant of [`CallError`] is matched explicitly: adding a new
-/// variant in `tina-runtime` causes a compile error here, forcing an
-/// intentional decision rather than a silent default to `500`.
-///
-/// | `CallError`           | Status                       |
-/// |-----------------------|------------------------------|
-/// | `TargetFull`          | `503 Service Unavailable`    |
-/// | `Timeout`             | `504 Gateway Timeout`        |
-/// | `TargetClosed`        | `500 Internal Server Error`  |
-/// | `InvariantViolation`  | `500 Internal Server Error`  |
-/// | `InvalidResource`     | `500 Internal Server Error`  |
-/// | `Io`                  | `500 Internal Server Error`  |
-/// | `Unsupported`         | `500 Internal Server Error`  |
-/// | `ResourceBusy`        | `500 Internal Server Error`  |
-/// | `NotFound`            | `500 Internal Server Error`  |
-/// | persistence variants  | `500 Internal Server Error`  |
-/// | DNS/TLS/process/signal variants | `500 Internal Server Error` |
-fn response_for_call_error(error: &CallError) -> HttpResponse {
-    let status = match error {
-        // Backpressure: service mailbox was full. Standard HTTP shape
-        // for "try again later" is 503.
-        CallError::TargetFull => StatusCode::SERVICE_UNAVAILABLE,
-        // The service did not reply before our call timeout elapsed.
-        CallError::Timeout => StatusCode::GATEWAY_TIMEOUT,
-        // Service address became unavailable (panicked, stopped,
-        // stale). From the client's perspective this is a server-side
-        // fault.
-        CallError::TargetClosed => StatusCode::INTERNAL_SERVER_ERROR,
-        // The remaining variants describe runtime-level faults that do
-        // not have a clean HTTP-shaped equivalent. We collapse them all
-        // to 500 so the wire response is still well-formed; the trace
-        // carries the precise reason. Listed exhaustively so a future
-        // CallError variant in tina-runtime forces a compile error here
-        // rather than silently routing through a default.
-        CallError::InvariantViolation
-        | CallError::InvalidResource
-        | CallError::NotFound
-        | CallError::Io
-        | CallError::Unsupported
-        | CallError::ResourceBusy
-        | CallError::CorruptRecord
-        | CallError::CommitUncertain
-        | CallError::StorageFull
-        | CallError::StorageClosed
-        | CallError::DnsFull
-        | CallError::DnsClosed
-        | CallError::TlsFull
-        | CallError::TlsClosed
-        | CallError::TlsCertificate
-        | CallError::TlsName
-        | CallError::TlsHandshake
-        | CallError::TlsAlpnMismatch
-        | CallError::SignalFull
-        | CallError::SignalClosed
-        | CallError::ProcessFull
-        | CallError::ProcessClosed
-        | CallError::KillUncertain
-        | CallError::TimerFull
-        | CallError::Rejected(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    HttpResponse::with_status(status)
-}
 
-/// Projects a [`CallOutcome`] into an HTTP response when it is *not* a
-/// successful reply.
-///
-/// Returns `None` when the outcome carries a real reply; the caller is
-/// expected to use that reply directly. Returns `Some(response)` for
-/// `Full`, `Closed`, and `Timeout`, with the same status mapping used by
-/// the connection isolate's runtime-call error path.
-///
-/// Exposed publicly so service-side code can build the same mapping
-/// when wrapping a downstream call into its own response shape.
-pub fn response_for_call_outcome(outcome: &CallOutcome<HttpResponse>) -> Option<HttpResponse> {
-    match outcome {
-        CallOutcome::Replied(_) => None,
-        CallOutcome::Full => Some(HttpResponse::with_status(StatusCode::SERVICE_UNAVAILABLE)),
-        CallOutcome::Closed => Some(HttpResponse::with_status(StatusCode::INTERNAL_SERVER_ERROR)),
-        CallOutcome::Timeout => Some(HttpResponse::with_status(StatusCode::GATEWAY_TIMEOUT)),
-        CallOutcome::Rejected(_) => {
-            Some(HttpResponse::with_status(StatusCode::INTERNAL_SERVER_ERROR))
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn full_call_error_maps_to_503() {
-        assert_eq!(
-            response_for_call_error(&CallError::TargetFull).status,
-            StatusCode::SERVICE_UNAVAILABLE,
-        );
-    }
-
-    #[test]
-    fn closed_call_error_maps_to_500() {
-        assert_eq!(
-            response_for_call_error(&CallError::TargetClosed).status,
-            StatusCode::INTERNAL_SERVER_ERROR,
-        );
-    }
-
-    #[test]
-    fn timeout_call_error_maps_to_504() {
-        assert_eq!(
-            response_for_call_error(&CallError::Timeout).status,
-            StatusCode::GATEWAY_TIMEOUT,
-        );
-    }
-
-    #[test]
-    fn full_outcome_projects_to_503() {
-        let response = response_for_call_outcome(&CallOutcome::<HttpResponse>::Full)
-            .expect("Full projects to a response");
-        assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    #[test]
-    fn closed_outcome_projects_to_500() {
-        let response = response_for_call_outcome(&CallOutcome::<HttpResponse>::Closed)
-            .expect("Closed projects to a response");
-        assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[test]
-    fn timeout_outcome_projects_to_504() {
-        let response = response_for_call_outcome(&CallOutcome::<HttpResponse>::Timeout)
-            .expect("Timeout projects to a response");
-        assert_eq!(response.status, StatusCode::GATEWAY_TIMEOUT);
-    }
-
-    #[test]
-    fn replied_outcome_projects_to_none() {
-        let response = response_for_call_outcome(&CallOutcome::Replied(HttpResponse::ok()));
-        assert!(
-            response.is_none(),
-            "successful replies do not project to a synthetic response"
-        );
-    }
-}
