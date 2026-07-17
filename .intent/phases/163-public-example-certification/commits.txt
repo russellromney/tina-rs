@@ -112,3 +112,44 @@ blast-radius proof, and post-merge workflow result here.
 - Adversarial review: in progress
 - CI: run 29554363635 in progress
 - Note: macro ServiceMessage synthesis deferred; same-shard terminal observation only
+
+## Merged progress (checkpoint)
+
+### I0A #364
+- Reviewed: e4d38cbe APPROVE
+- Merge: 96383353
+- Post-merge CI: 29552464602 SUCCESS
+
+### I0B #366
+- Reviewed: 63d34b5b APPROVE; rebased head 5f8a6915
+- Merge: 69ff461a
+- Post-merge CI: 29553076469 SUCCESS
+
+### M3 #369
+- Reviewed: 68383634 APPROVE
+- Merge: bf2e915a
+- Post-merge CI: 29555662696 SUCCESS
+- Owns: specimen_sqlite_counter
+
+### M2 #370
+- Reviewed: 944a4bf9 APPROVE; rebased head 77e11909
+- Merge: 30500ff9
+- Post-merge CI: 29556054740 (awaiting)
+- Owns: graceful_shutdown, persistent_counter, ergonomics_playground, live_replay_bugbox, metrics_shipper
+
+### D1 #367
+- Reviewed APPROVE after fixes; rebased after M2/M3 to f44405b5
+- Replacement CI pending then merge
+- Owns: perf_native, bounded_object_lane, cache_with_fill, copied_service_path, lock_manager, soak_http_db
+
+### F1 #368
+- Reviewed APPROVE at 03cb9167 after multi-round fixes
+- CI pending then rebase/merge
+- Framework terminal observation; M1 unblocked after merge
+
+### Next
+- After F1: M1 (real_io_chat + job_queue)
+- F2 keepalive, F3 HTTP, F4 WebSocket (then M4)
+- M5 session auth independent
+- M6 residual hosts after migrations
+- C1 final certification
