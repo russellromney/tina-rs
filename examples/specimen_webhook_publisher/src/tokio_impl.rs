@@ -41,10 +41,6 @@ pub fn run() -> anyhow::Result<Report> {
         }
     });
 
-    // Give the server's writes a moment to land in the bodies vector.
-    std::thread::sleep(Duration::from_millis(20));
-
-    let bodies = webhook.snapshot();
-    webhook.stop()?;
+    let bodies = webhook.stop_and_snapshot()?;
     Ok(Report { bodies })
 }

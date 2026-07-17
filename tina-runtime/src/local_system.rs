@@ -1293,6 +1293,25 @@ where
         self.runtime().call_blocking(address, message, timeout)
     }
 
+    /// Capability-typed [`call_blocking`](Self::call_blocking) that accepts
+    /// only a [`tina::CallAddress`].
+    ///
+    /// This keeps typed bridge and service calls on the `LocalSystem` facade;
+    /// callers do not need to obtain a lower-level host-control handle.
+    pub fn call_blocking_typed<M, R>(
+        &self,
+        address: tina::CallAddress<M, R>,
+        message: M,
+        timeout: Duration,
+    ) -> Result<crate::CallOutcome<R>, ThreadedRuntimeError>
+    where
+        M: Send + 'static,
+        R: Send + 'static,
+    {
+        self.runtime()
+            .call_blocking(address.address(), message, timeout)
+    }
+
     /// Like [`call_blocking`](Self::call_blocking), but separates the target
     /// call deadline from the host-side wait budget.
     ///
@@ -2346,6 +2365,25 @@ where
         R: Send + 'static,
     {
         self.runtime().call_blocking(address, message, timeout)
+    }
+
+    /// Capability-typed [`call_blocking`](Self::call_blocking) that accepts
+    /// only a [`tina::CallAddress`] and routes it to its owning shard.
+    ///
+    /// Foreign-system and unowned-shard failures remain typed and are rejected
+    /// before host work is admitted.
+    pub fn call_blocking_typed<M, R>(
+        &self,
+        address: tina::CallAddress<M, R>,
+        message: M,
+        timeout: Duration,
+    ) -> Result<crate::CallOutcome<R>, ThreadedRuntimeError>
+    where
+        M: Send + 'static,
+        R: Send + 'static,
+    {
+        self.runtime()
+            .call_blocking(address.address(), message, timeout)
     }
 
     /// Like [`call_blocking`](Self::call_blocking), but separates the target

@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, ThreadedRuntime};
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, LocalSystem};
 use tina_sqlx_bridge::{PgConfig, PgMsg, PgPoolConfig, PgRequest, PgResponse, PgWorker};
 
 use crate::{INCREMENTS, Report, unique_table};
@@ -23,9 +23,6 @@ fn run_application(
     app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
     url: &str,
 ) -> anyhow::Result<Report> {
-    // The bridge helpers keep the capability-typed host call form through
-    // the lower host-control handle.
-    let host = app.host_control();
     let cfg = PgConfig::new()
         .with_pool(
             PgPoolConfig::new(url)
@@ -39,18 +36,8 @@ fn run_application(
         .map_err(|e| anyhow::anyhow!("install pg bridge: {e}"))?;
 
     let table = unique_table("tina_counter");
-    let mut report = Report::default();
-    let run_result = run_counter_script(&host, bridge.address, &table);
-    match run_result {
-        Ok(final_value) => {
-            report.final_value = final_value;
-            report.exit_clean = true;
-        }
-        Err(error) => {
-            eprintln!("specimen_postgres_counter (tina): {error:#}");
-        }
-    }
-    let _ = execute(&host, bridge.address, drop_sql(&table));
+    let run_result = run_counter_script(app, bridge.address, &table);
+    let cleanup_result = execute(app, bridge.address, drop_sql(&table));
     bridge.closer.close();
 
     let snap = bridge.metrics.snapshot();
@@ -69,24 +56,24 @@ fn run_application(
         snap.in_flight_high_water,
     );
 
-    Ok(report)
+    finish_counter_run(run_result, cleanup_result)
 }
 
 fn run_counter_script(
-    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
     db: tina_sqlx_bridge::PgAddress,
     table: &str,
 ) -> anyhow::Result<u64> {
-    execute(runtime, db, create_sql(table))?;
-    execute(runtime, db, seed_sql(table))?;
+    execute(app, db, create_sql(table))?;
+    execute(app, db, seed_sql(table))?;
     for _ in 0..INCREMENTS {
-        let rows = execute(runtime, db, step_sql(table))?;
+        let rows = execute(app, db, step_sql(table))?;
         if rows != 1 {
             anyhow::bail!("step affected {rows} rows, expected 1");
         }
     }
 
-    let outcome = runtime.call_blocking_typed(
+    let outcome = app.call_blocking_typed(
         db,
         PgMsg::Send(PgRequest::fetch_one(finalize_sql(table))),
         SQL_TIMEOUT,
@@ -101,15 +88,31 @@ fn run_counter_script(
 }
 
 fn execute(
-    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
     db: tina_sqlx_bridge::PgAddress,
     sql: String,
 ) -> anyhow::Result<u64> {
-    let outcome =
-        runtime.call_blocking_typed(db, PgMsg::Send(PgRequest::execute(sql)), SQL_TIMEOUT)?;
+    let outcome = app.call_blocking_typed(db, PgMsg::Send(PgRequest::execute(sql)), SQL_TIMEOUT)?;
     match outcome {
         CallOutcome::Replied(Ok(PgResponse::Executed { rows_affected })) => Ok(rows_affected),
         other => anyhow::bail!("unexpected execute outcome {other:?}"),
+    }
+}
+
+fn finish_counter_run(
+    run_result: anyhow::Result<u64>,
+    cleanup_result: anyhow::Result<u64>,
+) -> anyhow::Result<Report> {
+    match (run_result, cleanup_result) {
+        (Ok(final_value), Ok(_)) => Ok(Report {
+            final_value,
+            exit_clean: true,
+        }),
+        (Err(run), Ok(_)) => Err(run.context("counter script failed")),
+        (Ok(_), Err(cleanup)) => Err(cleanup.context("counter table cleanup failed")),
+        (Err(run), Err(cleanup)) => Err(anyhow::anyhow!(
+            "counter script failed: {run:#}; counter table cleanup also failed: {cleanup:#}"
+        )),
     }
 }
 
@@ -131,4 +134,29 @@ fn finalize_sql(table: &str) -> String {
 
 fn drop_sql(table: &str) -> String {
     format!("DROP TABLE {table}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_and_cleanup_failures_are_never_collapsed_into_a_success_report() {
+        let run_only = finish_counter_run(Err(anyhow::anyhow!("query failed")), Ok(0))
+            .expect_err("script failure propagates");
+        assert!(run_only.to_string().contains("counter script failed"));
+
+        let cleanup_only = finish_counter_run(Ok(INCREMENTS as u64), Err(anyhow::anyhow!("drop failed")))
+            .expect_err("cleanup failure propagates");
+        assert!(cleanup_only.to_string().contains("counter table cleanup failed"));
+
+        let both = finish_counter_run(
+            Err(anyhow::anyhow!("query failed")),
+            Err(anyhow::anyhow!("drop failed")),
+        )
+        .expect_err("dual failure propagates");
+        let message = both.to_string();
+        assert!(message.contains("counter script failed: query failed"));
+        assert!(message.contains("cleanup also failed: drop failed"));
+    }
 }

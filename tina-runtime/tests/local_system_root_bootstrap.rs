@@ -369,9 +369,20 @@ fn local_system_bootstrap_is_first_and_supports_typed_host_calls() {
     assert_eq!(address.system(), app.system_incarnation());
 
     let outcome = app
-        .call_blocking(address, Msg::Inspect, Duration::from_secs(2))
+        .call_blocking_typed(address.callable(), Msg::Inspect, Duration::from_secs(2))
         .expect("host call admitted");
     assert_eq!(outcome, CallOutcome::Replied(BootState(true)));
+    let rejected_drops = Arc::new(AtomicU32::new(0));
+    assert_eq!(
+        app.call_blocking_typed(
+            address.callable(),
+            Msg::Bootstrap(DropProbe(Arc::clone(&rejected_drops))),
+            Duration::from_secs(2),
+        )
+        .expect("typed rejected call admitted"),
+        CallOutcome::Rejected(CallRejectedReason::UnsupportedMessage),
+    );
+    assert_eq!(rejected_drops.load(Ordering::Acquire), 1);
     assert_eq!(deliveries.load(Ordering::Acquire), 1);
     assert_eq!(message_drops.load(Ordering::Acquire), 1);
 
@@ -532,6 +543,22 @@ fn local_multi_shard_bootstrap_routes_and_unknown_shard_returns_authority() {
         .expect("bootstrap on owned shard");
     assert_eq!(address.system(), app.system_incarnation());
     assert_eq!(address.shard(), ShardId::new(20));
+    assert_eq!(
+        app.call_blocking_typed(address.callable(), Msg::Inspect, Duration::from_secs(2))
+            .expect("typed multi-shard host call admitted"),
+        CallOutcome::Replied(BootState(true)),
+    );
+    let rejected_drops = Arc::new(AtomicU32::new(0));
+    assert_eq!(
+        app.call_blocking_typed(
+            address.callable(),
+            Msg::Bootstrap(DropProbe(Arc::clone(&rejected_drops))),
+            Duration::from_secs(2),
+        )
+        .expect("typed multi-shard rejected call admitted"),
+        CallOutcome::Rejected(CallRejectedReason::UnsupportedMessage),
+    );
+    assert_eq!(rejected_drops.load(Ordering::Acquire), 1);
     let deadline = Instant::now() + Duration::from_secs(2);
     while deliveries.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
         std::thread::yield_now();

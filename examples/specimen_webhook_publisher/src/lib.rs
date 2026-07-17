@@ -75,23 +75,24 @@ impl WebhookServer {
         let bodies_for_task = Arc::clone(&bodies);
         let (addr_tx, addr_rx) = oneshot::channel::<SocketAddr>();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-        let runtime_for_spawn = Arc::clone(&runtime);
         let join = runtime.spawn(async move {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("webhook listener bind");
             let addr = listener.local_addr().expect("webhook local addr");
             addr_tx.send(addr).expect("webhook send addr");
+            let mut connections = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
+                    Some(_) = connections.join_next(), if !connections.is_empty() => {}
                     accept = listener.accept() => {
                         let (stream, _peer) = match accept {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
                         let bodies = Arc::clone(&bodies_for_task);
-                        runtime_for_spawn.spawn(async move {
+                        connections.spawn(async move {
                             let io = TokioIo::new(stream);
                             let svc = service_fn(move |req: HyperRequest<Incoming>| {
                                 let bodies = Arc::clone(&bodies);
@@ -145,6 +146,11 @@ impl WebhookServer {
                     }
                 }
             }
+            // Completed responses have already committed their body before
+            // the client observes success. Abort any idle keepalive tasks,
+            // then join them so snapshotting has a deterministic edge.
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
         });
         let addr = addr_rx.blocking_recv().expect("webhook bound address");
         Self {
@@ -165,6 +171,18 @@ impl WebhookServer {
     }
 
     pub fn stop(mut self) -> anyhow::Result<()> {
+        self.settle()
+    }
+
+    /// Stops the listener, joins every accepted connection, then returns the
+    /// recorded bodies. The join is the deterministic visibility edge for the
+    /// server's writes; callers do not need a timing sleep before snapshotting.
+    pub fn stop_and_snapshot(mut self) -> anyhow::Result<Vec<String>> {
+        self.settle()?;
+        Ok(self.snapshot())
+    }
+
+    fn settle(&mut self) -> anyhow::Result<()> {
         let send_failed = self.shutdown.take().is_some_and(|tx| tx.send(()).is_err());
         let join = self.join.take().map(|join| {
             self.runtime

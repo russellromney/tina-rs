@@ -166,17 +166,24 @@ pub fn run() -> anyhow::Result<Report> {
     let url = webhook.url();
     let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
     let runtime_result =
-        app.run_to_shutdown_reported(Duration::from_secs(5), move |app| run_application(app, url));
-    // Let the webhook server's writer task land before snapshotting.
-    std::thread::sleep(Duration::from_millis(20));
-    let bodies = webhook.snapshot();
-    let webhook_shutdown = webhook.stop();
-    match (runtime_result, webhook_shutdown) {
-        (Ok(()), Ok(())) => Ok(Report { bodies }),
-        (Err(runtime), Ok(())) => Err(runtime.into()),
-        (Ok(()), Err(webhook)) => Err(webhook),
-        (Err(runtime), Err(webhook)) => Err(anyhow::anyhow!(
-            "Tina runtime shutdown failed: {runtime:#}; webhook shutdown also failed: {webhook:#}"
+        app.run_to_shutdown_reported(Duration::from_secs(5), move |app| run_application(app, url))
+            .map_err(anyhow::Error::from);
+    let webhook_result = webhook.stop_and_snapshot();
+    finish_run(webhook_result, runtime_result)
+}
+
+fn finish_run(
+    webhook_result: anyhow::Result<Vec<String>>,
+    runtime_result: anyhow::Result<()>,
+) -> anyhow::Result<Report> {
+    // Preserve the specimen's established external-server-first error
+    // precedence while still naming both failures when both sides fail.
+    match (webhook_result, runtime_result) {
+        (Ok(bodies), Ok(())) => Ok(Report { bodies }),
+        (Err(webhook), Ok(())) => Err(webhook),
+        (Ok(_), Err(runtime)) => Err(runtime),
+        (Err(webhook), Err(runtime)) => Err(anyhow::anyhow!(
+            "webhook shutdown failed: {webhook:#}; Tina runtime shutdown also failed: {runtime:#}"
         )),
     }
 }
@@ -215,4 +222,30 @@ fn run_application(
 
     bridge.closer.close();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn webhook_error_precedence_is_stable_and_dual_failures_name_both() {
+        let webhook_only = finish_run(Err(anyhow::anyhow!("webhook")), Ok(()))
+            .expect_err("webhook failure propagates");
+        assert_eq!(webhook_only.to_string(), "webhook");
+
+        let runtime_only = finish_run(Ok(Vec::new()), Err(anyhow::anyhow!("runtime")))
+            .expect_err("runtime failure propagates");
+        assert_eq!(runtime_only.to_string(), "runtime");
+
+        let both = finish_run(
+            Err(anyhow::anyhow!("webhook")),
+            Err(anyhow::anyhow!("runtime")),
+        )
+        .expect_err("dual failure propagates");
+        assert_eq!(
+            both.to_string(),
+            "webhook shutdown failed: webhook; Tina runtime shutdown also failed: runtime"
+        );
+    }
 }
