@@ -231,7 +231,7 @@ impl HttpConnectionMsg {
 /// Per-connection isolate.
 ///
 /// Generic over the user's `Shard` type and the service's message type
-/// `M`. Delivery is owned by [`ServiceDelivery`]: call-lane for request
+/// `M`. Delivery is owned by a private service-delivery plan: call-lane for request
 /// / split-request handles, admit-lane for event-only handles. See
 /// [`crate::HttpListener`] for the public install shapes.
 pub struct HttpConnection<S: Shard, M: Send + 'static = HttpRequest> {
@@ -421,7 +421,7 @@ impl<S: Shard, M: FromHttpRequest + Send + 'static> HttpConnection<S, M> {
 }
 
 impl<S: Shard, M: Send + 'static> HttpConnection<S, M> {
-    /// Builds a connection from an explicit [`ServiceDelivery`] plan.
+    /// Builds a connection from an explicit a private `ServiceDelivery` plan plan.
     pub(crate) fn with_delivery_and_metrics(
         transport: HttpTransport,
         delivery: ServiceDelivery<M>,
