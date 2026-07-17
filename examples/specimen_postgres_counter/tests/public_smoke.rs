@@ -5,7 +5,7 @@
 //! Without `DATABASE_URL` both tests print the specimen's skip
 //! notice and pass, matching the `src/main.rs` skip path.
 
-use specimen_postgres_counter::{INCREMENTS, Report, database_url, tina_impl};
+use specimen_postgres_counter::{INCREMENTS, Report, database_url, tina_impl, tokio_impl};
 
 fn assert_incremented(report: Report) {
     assert_eq!(report.final_value, INCREMENTS as u64);
@@ -30,7 +30,16 @@ fn run_public() -> anyhow::Result<()> {
 /// Pins increment arithmetic before/after host-result migration.
 #[test]
 fn public_characterization() -> anyhow::Result<()> {
-    run_public()
+    let Some(url) = database_url() else {
+        println!(
+            "specimen_postgres_counter: skipped (DATABASE_URL not set; \
+             see README for the expected env var)"
+        );
+        return Ok(());
+    };
+    assert_incremented(tokio_impl::run(&url)?);
+    assert_incremented(tina_impl::run(&url)?);
+    Ok(())
 }
 
 /// Documented public runner path: `tina_impl::run(&url)`.

@@ -278,6 +278,26 @@ impl<S: Shard + 'static> IterBodySource<S> {
             mailbox_capacity,
         )
     }
+
+    /// Registers an iterator-backed chunk source on a [`tina_runtime::LocalSystem`].
+    ///
+    /// This is the canonical local-application companion to [`Self::register`]
+    /// and keeps callers on the owning facade without exposing host control.
+    pub fn register_local<F, I>(
+        app: &tina_runtime::LocalSystem<S, F>,
+        iter: I,
+        mailbox_capacity: usize,
+    ) -> Result<Address<ResponseChunkMsg, ResponseChunkReply>, tina_runtime::ThreadedRuntimeError>
+    where
+        S: Send + Sync,
+        F: tina_runtime::MailboxFactory + Send + 'static,
+        I: Iterator<Item = Vec<u8>> + Send + 'static,
+    {
+        app.register_root::<IterBodySource<S>, Infallible>(
+            IterBodySource::new(iter),
+            mailbox_capacity,
+        )
+    }
 }
 
 impl<S: Shard + 'static> Isolate for IterBodySource<S> {

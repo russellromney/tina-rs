@@ -452,9 +452,9 @@ jobs:
   # they run against a real PostgreSQL — a green skip with DATABASE_URL
   # unset is not evidence. This job starts PostgreSQL 16, points
   # DATABASE_URL at it, and runs the exact public proof commands plus the
-  # tokio control path (`-- both`). The specimen creates per-process unique
-  # tables and drops them on exit, and the service container is fresh per
-  # job, so no schema cleanup step is needed.
+  # asserted Tokio control path plus the documented runner (`-- both`). The
+  # specimen creates per-process unique tables and drops them on exit, and the
+  # service container is fresh per job, so no schema cleanup step is needed.
   postgres-example:
     name: postgres example (specimen_postgres_counter vs PostgreSQL 16)
     if: github.event_name == 'pull_request' || github.event_name == 'push'

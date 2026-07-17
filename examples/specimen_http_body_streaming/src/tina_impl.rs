@@ -122,15 +122,12 @@ fn run_application(
     app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
     metrics: BodyMetrics,
 ) -> anyhow::Result<PartialRun> {
-    // `IterBodySource::register` still takes the lower host-control handle.
-    let host = app.host_control();
-
-    // `IterBodySource::register` wraps the iterator and registers
+    // `IterBodySource::register_local` wraps the iterator and registers
     // the source isolate in one step — no turbofish, no
     // `Infallible` placeholder.
-    let known_source = IterBodySource::<SingleShard>::register(&host, body_chunks(), 16)
+    let known_source = IterBodySource::<SingleShard>::register_local(app, body_chunks(), 16)
         .map_err(|e| anyhow::anyhow!("register known source: {e:?}"))?;
-    let chunked_source = IterBodySource::<SingleShard>::register(&host, body_chunks(), 16)
+    let chunked_source = IterBodySource::<SingleShard>::register_local(app, body_chunks(), 16)
         .map_err(|e| anyhow::anyhow!("register chunked source: {e:?}"))?;
     let service = app
         .register_root::<_, Infallible>(
