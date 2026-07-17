@@ -18,16 +18,19 @@ fn main() -> anyhow::Result<()> {
             tina_demo::demo_closed()?;
             tina_demo::demo_invalid()?;
             tina_demo::demo_retry()?;
+            tina_demo::demo_point_in_time_query()?;
         }
         "demo-constraint" => tina_demo::demo_constraint()?,
         "demo-timeout" => tina_demo::demo_timeout()?,
         "demo-closed" => tina_demo::demo_closed()?,
         "demo-invalid" => tina_demo::demo_invalid()?,
         "demo-retry" => tina_demo::demo_retry()?,
+        "demo-point-in-time" => tina_demo::demo_point_in_time_query()?,
         other => {
             anyhow::bail!(
                 "unknown mode {other:?}; expected tokio | tina | both | demo \
-                 | demo-constraint | demo-timeout | demo-closed | demo-invalid | demo-retry"
+                 | demo-constraint | demo-timeout | demo-closed | demo-invalid \
+                 | demo-retry | demo-point-in-time"
             );
         }
     }
@@ -36,7 +39,13 @@ fn main() -> anyhow::Result<()> {
 
 fn print_side(side: &str, report: Report) {
     println!(
-        "comparison=specimen_sqlite_counter side={} final_value={} exit_clean={}",
-        side, report.final_value, report.exit_clean,
+        "comparison=specimen_sqlite_counter side={} final_value={} updates_ok={} \
+         queries_ok={} rows_changed={} exit_clean={}",
+        side,
+        report.final_value,
+        report.updates_ok,
+        report.queries_ok,
+        report.rows_changed,
+        report.exit_clean,
     );
 }
