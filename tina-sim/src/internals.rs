@@ -576,6 +576,26 @@ impl LocalInbox {
         Ok(())
     }
 
+    /// Admits one typed admission-failure continuation even when capacity is
+    /// exhausted by reserved terminal slots or ordinary messages. Bounded to
+    /// the failed spawn itself (one message), matching the live runtime's
+    /// priority overflow for the same path.
+    pub(crate) fn push_admission_error(
+        &self,
+        message: Box<dyn Any>,
+        visible_at_step: u64,
+    ) -> Result<(), TrySendError<Box<dyn Any>>> {
+        if self.closed.get() {
+            return Err(TrySendError::Closed(message));
+        }
+        self.queue.borrow_mut().push_front(QueuedMessage {
+            message,
+            visible_at_step,
+            call_context: None,
+        });
+        Ok(())
+    }
+
     pub(crate) fn release_reserved_slot(&self) {
         let reserved = self.reserved.get();
         if reserved == 0 {
@@ -1247,6 +1267,7 @@ where
     pub(crate) terminal_continuation: Option<ErasedTerminalContinuation>,
     pub(crate) terminal_slot_reserved: bool,
     pub(crate) terminal_settled_generation: Option<AddressGeneration>,
+    pub(crate) previous_child: Option<RegisteredAddress>,
 }
 
 pub(crate) type ErasedRestartContinuation = Rc<dyn Fn(RegisteredAddress) -> Box<dyn Any>>;

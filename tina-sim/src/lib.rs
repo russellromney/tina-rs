@@ -188,7 +188,21 @@ where
     pub fn new(shard: S, config: SimulatorConfig) -> Self {
         Self::with_ids(shard, config, IdSource::new())
     }
+}
 
+impl<S> Drop for Simulator<S>
+where
+    S: Shard,
+{
+    fn drop(&mut self) {
+        self.dispose_all_terminal_reservations_on_shutdown();
+    }
+}
+
+impl<S> Simulator<S>
+where
+    S: Shard,
+{
     pub(crate) fn with_ids(shard: S, config: SimulatorConfig, ids: IdSource) -> Self {
         assert!(
             !config

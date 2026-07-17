@@ -79,6 +79,12 @@ pub struct ChildSupervision {
     pub skipped_not_restartable: u64,
     /// Restart attempts skipped because the replacement factory panicked.
     pub skipped_factory_panicked: u64,
+    /// Restart attempts skipped because the parent mailbox could not reserve a
+    /// terminal-delivery slot (`Full`).
+    pub skipped_parent_mailbox_full: u64,
+    /// Restart attempts skipped because the parent mailbox was closed for
+    /// terminal-delivery reservation.
+    pub skipped_parent_mailbox_closed: u64,
     /// The owner stopped this child via supervised shutdown
     /// ([`tina::Effect::StopChildren`]).
     pub stopped_by_owner: bool,
@@ -94,6 +100,8 @@ impl ChildSupervision {
             restarts_completed: 0,
             skipped_not_restartable: 0,
             skipped_factory_panicked: 0,
+            skipped_parent_mailbox_full: 0,
+            skipped_parent_mailbox_closed: 0,
             stopped_by_owner: false,
         }
     }
@@ -121,6 +129,10 @@ pub struct SupervisorReport {
     pub skipped_not_restartable: u64,
     /// Restart attempts skipped: replacement factory panicked.
     pub skipped_factory_panicked: u64,
+    /// Restart attempts skipped: parent mailbox Full for terminal reservation.
+    pub skipped_parent_mailbox_full: u64,
+    /// Restart attempts skipped: parent mailbox Closed for terminal reservation.
+    pub skipped_parent_mailbox_closed: u64,
     /// Failures rejected because the restart budget was exhausted.
     pub rejected_budget_exceeded: u64,
     /// Failures rejected because the supervisor parent had stopped.
@@ -149,6 +161,8 @@ impl SupervisorReport {
         let mut restarts_completed = 0u64;
         let mut skipped_not_restartable = 0u64;
         let mut skipped_factory_panicked = 0u64;
+        let mut skipped_parent_mailbox_full = 0u64;
+        let mut skipped_parent_mailbox_closed = 0u64;
         let mut rejected_budget_exceeded = 0u64;
         let mut rejected_supervisor_stopped = 0u64;
         let mut children_stopped = 0u64;
@@ -227,12 +241,13 @@ impl SupervisorReport {
                             skipped_not_restartable += 1;
                             child.skipped_not_restartable += 1;
                         }
-                        RestartSkippedReason::ParentMailboxFull
-                        | RestartSkippedReason::ParentMailboxClosed => {
-                            // Admission rejection for terminal reservation is a
-                            // restart skip with no replacement child.
-                            skipped_not_restartable += 1;
-                            child.skipped_not_restartable += 1;
+                        RestartSkippedReason::ParentMailboxFull => {
+                            skipped_parent_mailbox_full += 1;
+                            child.skipped_parent_mailbox_full += 1;
+                        }
+                        RestartSkippedReason::ParentMailboxClosed => {
+                            skipped_parent_mailbox_closed += 1;
+                            child.skipped_parent_mailbox_closed += 1;
                         }
                     }
                 }
@@ -261,6 +276,8 @@ impl SupervisorReport {
             restarts_completed,
             skipped_not_restartable,
             skipped_factory_panicked,
+            skipped_parent_mailbox_full,
+            skipped_parent_mailbox_closed,
             rejected_budget_exceeded,
             rejected_supervisor_stopped,
             children_stopped,
@@ -277,6 +294,8 @@ impl SupervisorReport {
             || self.restarts_completed > 0
             || self.skipped_not_restartable > 0
             || self.skipped_factory_panicked > 0
+            || self.skipped_parent_mailbox_full > 0
+            || self.skipped_parent_mailbox_closed > 0
             || self.rejected_budget_exceeded > 0
             || self.rejected_supervisor_stopped > 0
             || self.children_stopped > 0
@@ -293,7 +312,7 @@ impl fmt::Display for SupervisorReport {
         write!(
             formatter,
             "supervisor parent={} spawned={} restarts[triggered={} attempted={} completed={}] \
-             skipped[not_restartable={} factory_panicked={}] \
+             skipped[not_restartable={} factory_panicked={} parent_mailbox_full={} parent_mailbox_closed={}] \
              rejected[budget={} supervisor_stopped={}] stopped_by_owner={} halt={}",
             self.parent.get(),
             self.children_spawned,
@@ -302,6 +321,8 @@ impl fmt::Display for SupervisorReport {
             self.restarts_completed,
             self.skipped_not_restartable,
             self.skipped_factory_panicked,
+            self.skipped_parent_mailbox_full,
+            self.skipped_parent_mailbox_closed,
             self.rejected_budget_exceeded,
             self.rejected_supervisor_stopped,
             self.children_stopped,
@@ -510,7 +531,7 @@ mod tests {
         assert_eq!(
             report.to_string(),
             "supervisor parent=7 spawned=0 restarts[triggered=0 attempted=0 completed=0] \
-             skipped[not_restartable=0 factory_panicked=0] \
+             skipped[not_restartable=0 factory_panicked=0 parent_mailbox_full=0 parent_mailbox_closed=0] \
              rejected[budget=1 supervisor_stopped=0] stopped_by_owner=0 halt=budget_exhausted(4/3)"
         );
     }

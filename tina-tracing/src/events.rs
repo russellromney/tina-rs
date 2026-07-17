@@ -891,6 +891,9 @@ pub fn child_terminal_disposed_reason_name(
         R::ParentMailboxClosed => "ParentMailboxClosed",
         R::ParentStopped => "ParentStopped",
         R::Shutdown => "Shutdown",
+        // `#[non_exhaustive]`: new dispose reasons must name themselves until
+        // this table is extended.
+        _ => "Unknown",
     }
 }
 

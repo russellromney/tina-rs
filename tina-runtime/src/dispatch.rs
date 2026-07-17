@@ -666,6 +666,7 @@ where
             ErasedEffect::SpawnObserved(spawn) => {
                 let mut outcome = spawn.spawn_observed(self, isolate_id);
                 let continuation = outcome.continuation.take();
+                let admitted = outcome.spawn.is_some();
                 let continuation_cause = if let Some(mut spawn_outcome) = outcome.spawn.take() {
                     let child_isolate = spawn_outcome.child.isolate;
                     let child = spawn_outcome.child;
@@ -684,23 +685,28 @@ where
                     cause
                 };
                 if let Some(message) = continuation {
-                    let send = ErasedSend {
-                        target_system: self.system_incarnation,
-                        target_shard: self.shard.id(),
-                        target_isolate: isolate_id,
-                        target_generation: self.entries[index].generation,
-                        message,
-                    };
                     let attempted = self.push_event(
                         isolate_id,
                         Some(continuation_cause),
                         RuntimeEventKind::SendDispatchAttempted {
-                            target_shard: send.target_shard,
-                            target_isolate: send.target_isolate,
-                            target_generation: send.target_generation,
+                            target_shard: self.shard.id(),
+                            target_isolate: isolate_id,
+                            target_generation: self.entries[index].generation,
                         },
                     );
-                    match self.dispatch_local_send(send) {
+                    // Observed-spawn continuations (initial success and typed
+                    // admission failure) use the priority overflow lane when the
+                    // ordinary mailbox is full so reservation pressure cannot
+                    // silence lifecycle truth. `admitted` is retained for
+                    // future differentiated tracing.
+                    let _ = admitted;
+                    let delivery =
+                        match self.enqueue_call_continuation(index, message.into_any(), None) {
+                            Ok(_) => Ok(()),
+                            Err(TrySendError::Full(_)) => Err(SendRejectedReason::Full),
+                            Err(TrySendError::Closed(_)) => Err(SendRejectedReason::Closed),
+                        };
+                    match delivery {
                         Ok(()) => {
                             self.push_event(
                                 isolate_id,
@@ -2468,7 +2474,29 @@ where
             self.dispose_child_terminal_reservation(
                 index,
                 ChildTerminalDisposedReason::ParentStopped,
-                cause,
+                Some(cause),
+            );
+        }
+    }
+
+    /// Disposes every unsettled terminal reservation when the runtime itself
+    /// is shutting down or being dropped.
+    pub(crate) fn dispose_all_terminal_reservations_on_shutdown(&mut self) {
+        let indexes: Vec<usize> = self
+            .child_records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                (record.terminal_slot_reserved || record.terminal_continuation.is_some())
+                    && record.terminal_settled_generation != Some(record.child.generation)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in indexes {
+            self.dispose_child_terminal_reservation(
+                index,
+                ChildTerminalDisposedReason::Shutdown,
+                None,
             );
         }
     }
@@ -3021,37 +3049,41 @@ where
         result: Option<StopResult>,
         cause: CauseId,
     ) -> Option<StopResult> {
-        let Some(record_index) = self.child_record_index_by_child(child) else {
+        let Some(record_index) = self.child_record_index_for_terminal(child) else {
             return result;
         };
 
         let record = &self.child_records[record_index];
-        if record.terminal_continuation.is_none() && !record.terminal_slot_reserved {
+        if record.terminal_continuation.is_none()
+            && !record.terminal_slot_reserved
+            && record.previous_child.is_none()
+            && record.terminal_settled_generation.is_none()
+        {
             return result;
         }
 
-        if record.terminal_settled_generation == Some(child.generation) {
-            self.push_event(
-                record.parent,
-                Some(cause),
-                RuntimeEventKind::ChildTerminalDisposed {
-                    child_ordinal: record.child_ordinal,
-                    child_isolate: child.isolate,
-                    child_generation: child.generation,
-                    reason: ChildTerminalDisposedReason::Duplicate,
-                },
-            );
-            drop(result);
-            return None;
-        }
+        let parent = record.parent;
+        let child_ordinal = record.child_ordinal;
+        let current = record.child;
+        let previous = record.previous_child;
+        let settled_generation = record.terminal_settled_generation;
 
-        // Stale generation: record already points at a newer incarnation.
-        if record.child.generation != child.generation {
+        // Prior restart incarnation: always stale relative to the live slot.
+        let is_previous = previous.is_some_and(|prior| {
+            prior.system == child.system
+                && prior.shard == child.shard
+                && prior.isolate == child.isolate
+        });
+        let is_current_isolate = current.system == child.system
+            && current.shard == child.shard
+            && current.isolate == child.isolate;
+
+        if is_previous && !is_current_isolate {
             self.push_event(
-                record.parent,
+                parent,
                 Some(cause),
                 RuntimeEventKind::ChildTerminalDisposed {
-                    child_ordinal: record.child_ordinal,
+                    child_ordinal,
                     child_isolate: child.isolate,
                     child_generation: child.generation,
                     reason: ChildTerminalDisposedReason::StaleGeneration,
@@ -3061,8 +3093,42 @@ where
             return None;
         }
 
-        let parent = record.parent;
-        let child_ordinal = record.child_ordinal;
+        if settled_generation == Some(child.generation) {
+            self.push_event(
+                parent,
+                Some(cause),
+                RuntimeEventKind::ChildTerminalDisposed {
+                    child_ordinal,
+                    child_isolate: child.isolate,
+                    child_generation: child.generation,
+                    reason: ChildTerminalDisposedReason::Duplicate,
+                },
+            );
+            drop(result);
+            return None;
+        }
+
+        // Same isolate id, older generation than the live record.
+        if is_current_isolate && current.generation != child.generation {
+            self.push_event(
+                parent,
+                Some(cause),
+                RuntimeEventKind::ChildTerminalDisposed {
+                    child_ordinal,
+                    child_isolate: child.isolate,
+                    child_generation: child.generation,
+                    reason: ChildTerminalDisposedReason::StaleGeneration,
+                },
+            );
+            drop(result);
+            return None;
+        }
+
+        // Not the live child incarnation and not a recognized previous one.
+        if !is_current_isolate {
+            return result;
+        }
+
         let had_reservation = record.terminal_slot_reserved;
         let mapper = record.terminal_continuation.clone();
 
@@ -3236,7 +3302,7 @@ where
         &mut self,
         record_index: usize,
         reason: ChildTerminalDisposedReason,
-        cause: CauseId,
+        cause: Option<CauseId>,
     ) {
         let record = &self.child_records[record_index];
         if !record.terminal_slot_reserved && record.terminal_continuation.is_none() {
@@ -3257,7 +3323,7 @@ where
         }
         self.push_event(
             parent,
-            Some(cause),
+            cause,
             RuntimeEventKind::ChildTerminalDisposed {
                 child_ordinal,
                 child_isolate,
@@ -3464,6 +3530,8 @@ where
         };
         let new_child = outcome.child;
         let bootstrap_message = outcome.bootstrap_message;
+        self.child_records[child_record_index].previous_child =
+            Some(self.child_records[child_record_index].child);
         self.child_records[child_record_index].child = new_child;
         self.child_records[child_record_index].mailbox_capacity = outcome.mailbox_capacity;
         self.child_records[child_record_index].terminal = false;
@@ -3760,12 +3828,11 @@ where
     }
 
     fn try_reserve_slot(&self) -> Result<(), SendRejectedReason> {
-        if self.closed.get() {
+        if self.closed.get() || self.mailbox.is_closed() {
+            self.closed.set(true);
             return Err(SendRejectedReason::Closed);
         }
         if !self.has_free_slot() {
-            // Confirm closed vs full against the underlying mailbox when the
-            // adapter believes capacity is gone.
             return Err(SendRejectedReason::Full);
         }
         self.reserved.set(self.reserved.get() + 1);
@@ -3792,7 +3859,8 @@ where
         let message = message.downcast::<Msg>().unwrap_or_else(|_| {
             panic!("runtime attempted to deliver a message to a mailbox with the wrong type")
         });
-        if self.closed.get() {
+        if self.closed.get() || self.mailbox.is_closed() {
+            self.closed.set(true);
             return Err(TrySendError::Closed(Box::new(*message) as Box<dyn Any>));
         }
         match self.mailbox.try_send(*message) {
@@ -3887,7 +3955,8 @@ impl ErasedMailbox for AnyMailboxAdapter {
     }
 
     fn try_reserve_slot(&self) -> Result<(), SendRejectedReason> {
-        if self.closed.get() {
+        if self.closed.get() || self.mailbox.is_closed() {
+            self.closed.set(true);
             return Err(SendRejectedReason::Closed);
         }
         if !self.has_free_slot() {
@@ -3914,7 +3983,8 @@ impl ErasedMailbox for AnyMailboxAdapter {
             panic!("try_send_reserved_boxed without a reservation");
         }
         self.reserved.set(reserved - 1);
-        if self.closed.get() {
+        if self.closed.get() || self.mailbox.is_closed() {
+            self.closed.set(true);
             return Err(TrySendError::Closed(message));
         }
         match self.mailbox.try_send(message) {
@@ -3987,6 +4057,8 @@ where
     pub(crate) terminal_slot_reserved: bool,
     /// Generation for which the terminal continuation has already settled.
     pub(crate) terminal_settled_generation: Option<AddressGeneration>,
+    /// Prior child incarnation replaced by restart, used for stale rejection.
+    pub(crate) previous_child: Option<RegisteredAddress>,
     pub(crate) remote_request_id: Option<CallId>,
     pub(crate) remote_owner: Option<RegisteredAddress>,
     pub(crate) remote_restartable: bool,

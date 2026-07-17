@@ -1042,6 +1042,7 @@ where
             ErasedEffect::SpawnObserved(spawn) => {
                 let mut outcome = spawn.spawn_observed(self, isolate_id);
                 let continuation = outcome.continuation.take();
+                let admitted = outcome.spawn.is_some();
                 let continuation_cause = if let Some(mut spawn_outcome) = outcome.spawn.take() {
                     let child_isolate = spawn_outcome.child.isolate;
                     let child = spawn_outcome.child;
@@ -1060,23 +1061,33 @@ where
                     cause
                 };
                 if let Some(message) = continuation {
-                    let send = ErasedSend {
-                        target_system: self.system_incarnation,
-                        target_shard: self.shard.id(),
-                        target_isolate: isolate_id,
-                        target_generation: self.entries[index].generation,
-                        message,
-                    };
                     let attempted = self.push_event(
                         isolate_id,
                         Some(continuation_cause),
                         RuntimeEventKind::SendDispatchAttempted {
-                            target_shard: send.target_shard,
-                            target_isolate: send.target_isolate,
-                            target_generation: send.target_generation,
+                            target_shard: self.shard.id(),
+                            target_isolate: isolate_id,
+                            target_generation: self.entries[index].generation,
                         },
                     );
-                    match self.dispatch_local_send(send) {
+                    let delivery = if admitted {
+                        self.dispatch_local_send(ErasedSend {
+                            target_system: self.system_incarnation,
+                            target_shard: self.shard.id(),
+                            target_isolate: isolate_id,
+                            target_generation: self.entries[index].generation,
+                            message,
+                        })
+                    } else {
+                        self.entries[index]
+                            .inbox
+                            .push_admission_error(message, self.step_ordinal)
+                            .map_err(|err| match err {
+                                TrySendError::Full(_) => SendRejectedReason::Full,
+                                TrySendError::Closed(_) => SendRejectedReason::Closed,
+                            })
+                    };
+                    match delivery {
                         Ok(()) => {
                             self.push_event(
                                 isolate_id,
@@ -1646,6 +1657,7 @@ where
                     terminal_continuation: None,
                     terminal_slot_reserved: false,
                     terminal_settled_generation: None,
+                    previous_child: None,
                 });
                 parent
             }
@@ -1715,6 +1727,7 @@ where
             terminal_continuation: outcome.terminal_continuation,
             terminal_slot_reserved: outcome.terminal_slot_reserved,
             terminal_settled_generation: None,
+            previous_child: None,
         });
     }
 
@@ -1879,33 +1892,39 @@ where
     ) -> Option<tina::StopResult> {
         use tina_runtime::ChildTerminalDisposedReason;
 
-        let Some(record_index) = self.child_record_index_by_child(child) else {
+        let Some(record_index) = self.child_record_index_for_terminal(child) else {
             return result;
         };
         let record = &self.child_records[record_index];
-        if record.terminal_continuation.is_none() && !record.terminal_slot_reserved {
+        if record.terminal_continuation.is_none()
+            && !record.terminal_slot_reserved
+            && record.previous_child.is_none()
+            && record.terminal_settled_generation.is_none()
+        {
             return result;
         }
-        if record.terminal_settled_generation == Some(child.generation) {
+
+        let parent = record.parent;
+        let child_ordinal = record.child_ordinal;
+        let current = record.child;
+        let previous = record.previous_child;
+        let settled_generation = record.terminal_settled_generation;
+
+        let is_previous = previous.is_some_and(|prior| {
+            prior.system == child.system
+                && prior.shard == child.shard
+                && prior.isolate == child.isolate
+        });
+        let is_current_isolate = current.system == child.system
+            && current.shard == child.shard
+            && current.isolate == child.isolate;
+
+        if is_previous && !is_current_isolate {
             self.push_event(
-                record.parent,
+                parent,
                 Some(cause),
                 RuntimeEventKind::ChildTerminalDisposed {
-                    child_ordinal: record.child_ordinal,
-                    child_isolate: child.isolate,
-                    child_generation: child.generation,
-                    reason: ChildTerminalDisposedReason::Duplicate,
-                },
-            );
-            drop(result);
-            return None;
-        }
-        if record.child.generation != child.generation {
-            self.push_event(
-                record.parent,
-                Some(cause),
-                RuntimeEventKind::ChildTerminalDisposed {
-                    child_ordinal: record.child_ordinal,
+                    child_ordinal,
                     child_isolate: child.isolate,
                     child_generation: child.generation,
                     reason: ChildTerminalDisposedReason::StaleGeneration,
@@ -1914,9 +1933,38 @@ where
             drop(result);
             return None;
         }
+        if settled_generation == Some(child.generation) {
+            self.push_event(
+                parent,
+                Some(cause),
+                RuntimeEventKind::ChildTerminalDisposed {
+                    child_ordinal,
+                    child_isolate: child.isolate,
+                    child_generation: child.generation,
+                    reason: ChildTerminalDisposedReason::Duplicate,
+                },
+            );
+            drop(result);
+            return None;
+        }
+        if is_current_isolate && current.generation != child.generation {
+            self.push_event(
+                parent,
+                Some(cause),
+                RuntimeEventKind::ChildTerminalDisposed {
+                    child_ordinal,
+                    child_isolate: child.isolate,
+                    child_generation: child.generation,
+                    reason: ChildTerminalDisposedReason::StaleGeneration,
+                },
+            );
+            drop(result);
+            return None;
+        }
+        if !is_current_isolate {
+            return result;
+        }
 
-        let parent = record.parent;
-        let child_ordinal = record.child_ordinal;
         let had_reservation = record.terminal_slot_reserved;
         let mapper = record.terminal_continuation.clone();
         self.child_records[record_index].terminal_settled_generation = Some(child.generation);
@@ -2083,7 +2131,7 @@ where
         &mut self,
         record_index: usize,
         reason: tina_runtime::ChildTerminalDisposedReason,
-        cause: tina_runtime::CauseId,
+        cause: Option<tina_runtime::CauseId>,
     ) {
         let record = &self.child_records[record_index];
         if !record.terminal_slot_reserved && record.terminal_continuation.is_none() {
@@ -2104,7 +2152,7 @@ where
         }
         self.push_event(
             parent,
-            Some(cause),
+            cause,
             RuntimeEventKind::ChildTerminalDisposed {
                 child_ordinal,
                 child_isolate,
@@ -2134,7 +2182,27 @@ where
             self.dispose_child_terminal_reservation(
                 index,
                 tina_runtime::ChildTerminalDisposedReason::ParentStopped,
-                cause,
+                Some(cause),
+            );
+        }
+    }
+
+    pub(crate) fn dispose_all_terminal_reservations_on_shutdown(&mut self) {
+        let indexes: Vec<usize> = self
+            .child_records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                (record.terminal_slot_reserved || record.terminal_continuation.is_some())
+                    && record.terminal_settled_generation != Some(record.child.generation)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in indexes {
+            self.dispose_child_terminal_reservation(
+                index,
+                tina_runtime::ChildTerminalDisposedReason::Shutdown,
+                None,
             );
         }
     }
@@ -2335,6 +2403,8 @@ where
         };
         let new_child = outcome.child;
         let bootstrap_message = outcome.bootstrap_message;
+        self.child_records[child_record_index].previous_child =
+            Some(self.child_records[child_record_index].child);
         self.child_records[child_record_index].child = new_child;
         self.child_records[child_record_index].mailbox_capacity = outcome.mailbox_capacity;
         self.child_records[child_record_index].restart_recipe = Some(recipe);
@@ -2434,6 +2504,23 @@ where
         self.child_records
             .iter()
             .position(|record| record.child == child)
+    }
+
+    pub(crate) fn child_record_index_for_terminal(
+        &self,
+        child: RegisteredAddress,
+    ) -> Option<usize> {
+        if let Some(index) = self.child_record_index_by_child(child) {
+            return Some(index);
+        }
+        self.child_records.iter().position(|record| {
+            let same_isolate = |address: RegisteredAddress| {
+                address.system == child.system
+                    && address.shard == child.shard
+                    && address.isolate == child.isolate
+            };
+            same_isolate(record.child) || record.previous_child.is_some_and(same_isolate)
+        })
     }
 
     pub(crate) fn supervisor_index(&self, parent: IsolateId) -> Option<usize> {

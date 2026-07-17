@@ -85,6 +85,10 @@ impl<T> Mailbox<T> for DefaultMailbox<T> {
     fn close(&self) {
         self.closed.set(true);
     }
+
+    fn is_closed(&self) -> bool {
+        self.closed.get()
+    }
 }
 
 /// Blessed in-process bounded mailbox factory for `Send + 'static` runtimes.
@@ -172,5 +176,12 @@ impl<T> Mailbox<T> for DefaultThreadedMailbox<T> {
             .lock()
             .expect("DefaultThreadedMailbox mutex poisoned");
         state.closed = true;
+    }
+
+    fn is_closed(&self) -> bool {
+        self.state
+            .lock()
+            .expect("DefaultThreadedMailbox mutex poisoned")
+            .closed
     }
 }

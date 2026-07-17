@@ -773,3 +773,127 @@ fn supervise_panics_for_unknown_stale_or_cross_shard_parent_addresses() {
         .is_err()
     );
 }
+
+#[test]
+fn child_terminal_duplicate_settlement_is_rejected_once() {
+    use tina::{
+        ChildRef, RestartableChildDefinition, SpawnObservedError, spawn_observed, stop_with,
+    };
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Term(u32);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CMsg {
+        Done(u32),
+    }
+
+    struct C;
+    impl Isolate for C {
+        type Message = CMsg;
+        type Reply = ();
+        type Send = Outbound<NeverOutbound>;
+        type Spawn = std::convert::Infallible;
+        type SpawnObserved = std::convert::Infallible;
+        type Io = std::convert::Infallible;
+        type Fact = ::std::convert::Infallible;
+        type Shard = TestShard;
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                CMsg::Done(v) => stop_with(Term(v)),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    enum PMsg {
+        Start,
+        Started(Result<ChildRef<CMsg>, SpawnObservedError>),
+        Restarted(ChildRef<CMsg>),
+        ChildDone(Term),
+    }
+
+    struct P {
+        child: Rc<RefCell<Option<ChildRef<CMsg>>>>,
+        done: Rc<Cell<u32>>,
+    }
+
+    impl Isolate for P {
+        type Message = PMsg;
+        type Reply = ();
+        type Send = Outbound<NeverOutbound>;
+        type Spawn = RestartableChildDefinition<C>;
+        type SpawnObserved = tina::SpawnObserved<RestartableChildDefinition<C>, PMsg, CMsg>;
+        type Io = std::convert::Infallible;
+        type Fact = ::std::convert::Infallible;
+        type Shard = TestShard;
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                PMsg::Start => spawn_observed(RestartableChildDefinition::new(|| C, 4))
+                    .then_result(PMsg::ChildDone)
+                    .then_with_restarts(PMsg::Started, PMsg::Restarted),
+                PMsg::Started(Ok(c)) | PMsg::Restarted(c) => {
+                    *self.child.borrow_mut() = Some(c);
+                    Effect::Noop
+                }
+                PMsg::Started(Err(_)) => Effect::Noop,
+                PMsg::ChildDone(Term(v)) => {
+                    self.done.set(self.done.get().saturating_add(v));
+                    Effect::Noop
+                }
+            }
+        }
+    }
+
+    let done = Rc::new(Cell::new(0));
+    let child_slot = Rc::new(RefCell::new(None));
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let parent = runtime.register(
+        P {
+            child: Rc::clone(&child_slot),
+            done: Rc::clone(&done),
+        },
+        TestMailbox::new(8),
+    );
+    assert!(runtime.try_send(parent, PMsg::Start).is_ok());
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 1);
+    let child = (*child_slot.borrow()).expect("child");
+    assert!(runtime.try_send(child.address, CMsg::Done(5)).is_ok());
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(done.get(), 5);
+
+    // Restartable records are retained after terminal stop. A second settle for
+    // the same generation is Duplicate and must not deliver again.
+    let child_addr = crate::RegisteredAddress {
+        system: runtime.system_incarnation(),
+        shard: parent.shard(),
+        isolate: child.address.isolate(),
+        generation: child.generation,
+    };
+    let leftover = runtime.settle_child_terminal_observation(
+        child_addr,
+        Some(tina::StopResult::new(Term(99))),
+        CauseId::new(EventId::new(1)),
+    );
+    assert!(leftover.is_none(), "duplicate consumes the payload");
+    assert_eq!(done.get(), 5, "no second parent delivery");
+    assert!(runtime.trace().iter().any(|e| {
+        matches!(
+            e.kind(),
+            RuntimeEventKind::ChildTerminalDisposed {
+                reason: crate::ChildTerminalDisposedReason::Duplicate,
+                ..
+            }
+        )
+    }));
+}

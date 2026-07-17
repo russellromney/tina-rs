@@ -1058,6 +1058,25 @@ where
         }
         Ok(self.trace())
     }
+
+    /// Disposes every unsettled child terminal reservation as on system
+    /// shutdown. Emits [`ChildTerminalDisposedReason::Shutdown`] and releases
+    /// parent mailbox slots. Called automatically when the runtime is dropped.
+    pub fn settle_terminal_reservations_on_shutdown(&mut self) {
+        self.dispose_all_terminal_reservations_on_shutdown();
+    }
+}
+
+impl<S, F> Drop for Runtime<S, F>
+where
+    S: Shard,
+    F: MailboxFactory,
+{
+    fn drop(&mut self) {
+        // Unsettled terminal reservations release their parent mailbox slots
+        // and emit Shutdown dispose facts so result authority never leaks.
+        self.dispose_all_terminal_reservations_on_shutdown();
+    }
 }
 
 /// The retention policy dropped trace events, so the in-memory trace is a

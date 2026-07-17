@@ -169,6 +169,15 @@ pub trait Mailbox<T> {
     /// [`TrySendError::Closed`]. Idempotent. Already-buffered messages
     /// remain visible to `recv` until drained.
     fn close(&self);
+
+    /// Whether subsequent `try_send` calls return [`TrySendError::Closed`].
+    ///
+    /// Default is `false`. Runtime-owned adapters call this when reserving a
+    /// terminal-delivery slot so a closed shared mailbox is not treated as
+    /// free capacity.
+    fn is_closed(&self) -> bool {
+        false
+    }
 }
 
 impl<T> Mailbox<T> for Box<dyn Mailbox<T>> {
@@ -190,6 +199,10 @@ impl<T> Mailbox<T> for Box<dyn Mailbox<T>> {
 
     fn close(&self) {
         (**self).close()
+    }
+
+    fn is_closed(&self) -> bool {
+        (**self).is_closed()
     }
 }
 

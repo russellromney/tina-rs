@@ -700,6 +700,31 @@ where
             .position(|record| record.child == child && record.remote_owner.is_none())
     }
 
+    /// Locates the local child record that may settle a terminal observation for
+    /// `child`, matching the current or previous incarnation by isolate id.
+    pub(crate) fn child_record_index_for_terminal(
+        &self,
+        child: RegisteredAddress,
+    ) -> Option<usize> {
+        // Prefer an exact current-generation match.
+        if let Some(index) = self.child_record_index_by_child(child) {
+            return Some(index);
+        }
+        // Same isolate, possibly a different generation (or a prior restart
+        // incarnation retained for stale rejection).
+        self.child_records.iter().position(|record| {
+            if record.remote_owner.is_some() {
+                return false;
+            }
+            let same_isolate = |address: RegisteredAddress| {
+                address.system == child.system
+                    && address.shard == child.shard
+                    && address.isolate == child.isolate
+            };
+            same_isolate(record.child) || record.previous_child.is_some_and(same_isolate)
+        })
+    }
+
     pub(crate) fn supervisor_index(&self, parent: IsolateId) -> Option<usize> {
         self.supervisors
             .iter()
@@ -859,6 +884,7 @@ where
                     terminal_continuation: None,
                     terminal_slot_reserved: false,
                     terminal_settled_generation: None,
+                    previous_child: None,
                     remote_request_id: None,
                     remote_owner: None,
                     remote_restartable: false,
@@ -877,6 +903,7 @@ where
                     terminal_continuation: None,
                     terminal_slot_reserved: false,
                     terminal_settled_generation: None,
+                    previous_child: None,
                     remote_request_id,
                     remote_owner,
                     remote_restartable: false,
@@ -1159,6 +1186,7 @@ where
             terminal_continuation: outcome.terminal_continuation,
             terminal_slot_reserved: outcome.terminal_slot_reserved,
             terminal_settled_generation: None,
+            previous_child: None,
             remote_request_id: None,
             remote_owner: None,
             remote_restartable: false,
@@ -1191,6 +1219,7 @@ where
             terminal_continuation: None,
             terminal_slot_reserved: false,
             terminal_settled_generation: None,
+            previous_child: None,
             remote_request_id: None,
             remote_owner: None,
             remote_restartable,
