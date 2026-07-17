@@ -75,10 +75,16 @@ impl fmt::Display for KeepalivePoolConfigError {
         match self {
             Self::ZeroCapacity => write!(f, "keepalive pool capacity must be greater than zero"),
             Self::ZeroConnectionMailbox => {
-                write!(f, "keepalive connection mailbox capacity must be greater than zero")
+                write!(
+                    f,
+                    "keepalive connection mailbox capacity must be greater than zero"
+                )
             }
             Self::ZeroPoolMailbox => {
-                write!(f, "keepalive pool mailbox capacity must be greater than zero")
+                write!(
+                    f,
+                    "keepalive pool mailbox capacity must be greater than zero"
+                )
             }
         }
     }
@@ -172,7 +178,10 @@ impl fmt::Display for KeepalivePoolInstallError {
         match self {
             Self::InvalidConfig(error) => write!(f, "keepalive pool install: {error}"),
             Self::Conflict { origin } => {
-                write!(f, "keepalive pool install: origin already installed ({origin:?})")
+                write!(
+                    f,
+                    "keepalive pool install: origin already installed ({origin:?})"
+                )
             }
             Self::Register {
                 failed_at,
@@ -553,12 +562,12 @@ where
             Vec::with_capacity(config.pool_config.capacity);
 
         for index in 0..config.pool_config.capacity {
-            let conn =
-                KeepaliveConnection::<S>::new(config.target.clone(), config.client_config);
+            let conn = KeepaliveConnection::<S>::new(config.target.clone(), config.client_config);
             match self.register_root::<_, Infallible>(conn, config.connection_mailbox_capacity) {
                 Ok(address) => connections.push(address),
                 Err(source) => {
-                    let rollback = rollback_connections(&host, &connections, Duration::from_secs(2));
+                    let rollback =
+                        rollback_connections(&host, &connections, Duration::from_secs(2));
                     claim.release();
                     return Err(KeepalivePoolInstallError::Register {
                         failed_at: KeepaliveInstallStep::Connection { index },
@@ -620,9 +629,9 @@ where
     let mut connections: Vec<KeepaliveConnAddr> = Vec::with_capacity(config.pool_config.capacity);
 
     for index in 0..config.pool_config.capacity {
-        let conn =
-            KeepaliveConnection::<S>::new(config.target.clone(), config.client_config);
-        match runtime.register_with_capacity::<_, Infallible>(conn, config.connection_mailbox_capacity)
+        let conn = KeepaliveConnection::<S>::new(config.target.clone(), config.client_config);
+        match runtime
+            .register_with_capacity::<_, Infallible>(conn, config.connection_mailbox_capacity)
         {
             Ok(address) => connections.push(address),
             Err(source) => {
@@ -639,20 +648,19 @@ where
 
     let pool: WorkerPool<KeepaliveConnAddr, S> =
         WorkerPool::new(config.pool_config, connections.clone());
-    let pool_address = match runtime
-        .register_with_capacity::<_, Infallible>(pool, config.pool_mailbox_capacity)
-    {
-        Ok(address) => address,
-        Err(source) => {
-            let rollback = rollback_connections(&host, &connections, Duration::from_secs(2));
-            claim.release();
-            return Err(KeepalivePoolInstallError::Register {
-                failed_at: KeepaliveInstallStep::Pool,
-                source,
-                rollback,
-            });
-        }
-    };
+    let pool_address =
+        match runtime.register_with_capacity::<_, Infallible>(pool, config.pool_mailbox_capacity) {
+            Ok(address) => address,
+            Err(source) => {
+                let rollback = rollback_connections(&host, &connections, Duration::from_secs(2));
+                claim.release();
+                return Err(KeepalivePoolInstallError::Register {
+                    failed_at: KeepaliveInstallStep::Pool,
+                    source,
+                    rollback,
+                });
+            }
+        };
 
     Ok(InstalledKeepalivePool {
         handles: KeepalivePoolHandles {
@@ -690,7 +698,9 @@ impl InstallClaim {
             system: system.get(),
             origin: origin.clone(),
         };
-        let mut set = installed_origins().lock().unwrap_or_else(|e| e.into_inner());
+        let mut set = installed_origins()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if !set.insert(key.clone()) {
             return Err(KeepalivePoolInstallError::Conflict { origin });
         }
@@ -699,7 +709,9 @@ impl InstallClaim {
 
     fn release(&mut self) {
         if let Some(key) = self.key.take() {
-            let mut set = installed_origins().lock().unwrap_or_else(|e| e.into_inner());
+            let mut set = installed_origins()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             set.remove(&key);
         }
     }
@@ -755,10 +767,12 @@ where
             KeepaliveConnectionStopOutcome::AlreadyClosed => {
                 report.connections_already_closed += 1;
             }
-            other => report.connection_stop_failures.push(KeepaliveConnectionStopFailure {
-                index,
-                outcome: other,
-            }),
+            other => report
+                .connection_stop_failures
+                .push(KeepaliveConnectionStopFailure {
+                    index,
+                    outcome: other,
+                }),
         }
     }
 
@@ -818,14 +832,14 @@ where
             return Ok(drain_timeout_outcome(last_leased));
         }
 
-        let pressure = match host.call_blocking(handles.pool, WorkerPoolMsg::PressureReport, remaining)
-        {
-            Ok(outcome) => outcome,
-            Err(ThreadedRuntimeError::HostWaitTimeout) => {
-                return Ok(drain_timeout_outcome(last_leased));
-            }
-            Err(error) => return Err(error),
-        };
+        let pressure =
+            match host.call_blocking(handles.pool, WorkerPoolMsg::PressureReport, remaining) {
+                Ok(outcome) => outcome,
+                Err(ThreadedRuntimeError::HostWaitTimeout) => {
+                    return Ok(drain_timeout_outcome(last_leased));
+                }
+                Err(error) => return Err(error),
+            };
 
         match pressure {
             CallOutcome::Replied(WorkerPoolReply::Pressure(report)) => {
@@ -926,8 +940,7 @@ where
                 rollback,
             });
         }
-        let conn =
-            KeepaliveConnection::<S>::new(config.target.clone(), config.client_config);
+        let conn = KeepaliveConnection::<S>::new(config.target.clone(), config.client_config);
         match system.register_root::<_, Infallible>(conn, config.connection_mailbox_capacity) {
             Ok(address) => {
                 connections.push(address);

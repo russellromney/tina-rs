@@ -163,7 +163,10 @@ fn complete_install_returns_usable_pool_and_drains_cleanly() {
         .expect("install keepalive pool");
 
     assert_eq!(pool.connections().len(), 2);
-    assert_eq!(pool.origin(), &OriginKey::from_target(&HttpTarget::http(server.addr)));
+    assert_eq!(
+        pool.origin(),
+        &OriginKey::from_target(&HttpTarget::http(server.addr))
+    );
 
     let lease = match app
         .call_blocking(pool.pool(), WorkerPoolMsg::Acquire, Duration::from_secs(2))
@@ -603,9 +606,7 @@ fn owner_failure_is_distinct_from_drain_and_shutdown() {
                 break;
             }
             KeepaliveCloseAndDrain::OwnerFailed {
-                pool: again,
-                error,
-                ..
+                pool: again, error, ..
             } if matches!(error, ThreadedRuntimeError::CommandFull)
                 && std::time::Instant::now() < deadline =>
             {
@@ -711,13 +712,9 @@ fn raw_threaded_build_and_shutdown_apis_still_work() {
         16,
     )
     .expect("build raw pool");
-    let report = shutdown_keepalive_pool(
-        &runtime,
-        &handles,
-        CloseMode::Drain,
-        Duration::from_secs(2),
-    )
-    .expect("raw shutdown");
+    let report =
+        shutdown_keepalive_pool(&runtime, &handles, CloseMode::Drain, Duration::from_secs(2))
+            .expect("raw shutdown");
     assert_eq!(report.drain, KeepalivePoolDrainOutcome::Drained);
     assert_eq!(report.stopped, 1);
     let _ = runtime.shutdown();
