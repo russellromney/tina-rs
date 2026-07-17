@@ -109,6 +109,9 @@ fn host_mailbox_full_is_an_exact_put_terminal() {
     assert_eq!(report.closed, 0, "report={report:?}");
     assert_eq!(report.timeout, 0, "report={report:?}");
     assert_eq!(report.rejected, 0, "report={report:?}");
+    // Stats were not observed on this path — agreement flags stay false.
+    assert!(!report.stats.counts_agree, "report={report:?}");
+    assert!(!report.stats.settlements_agree, "report={report:?}");
 }
 
 #[test]

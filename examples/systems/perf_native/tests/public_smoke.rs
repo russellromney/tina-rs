@@ -1,22 +1,26 @@
-use perf_native::{WorkloadConfig, WorkloadConfigError, host_call_compare};
+use perf_native::{WorkloadConfig, WorkloadConfigError, host_call_compare_with};
 
-/// Public comparison entry path.
+/// Public comparison entry path: validate config, then drive a row from it.
 #[test]
 fn public_smoke() {
     let config = WorkloadConfig::default()
         .validate()
         .expect("accepted default workload");
     assert_eq!(config.ops, 120);
+    assert_eq!(config.http_ops, 32);
     assert_eq!(config.workers, 4);
     assert_eq!(config.samples, 5);
     assert_eq!(config.capacity, 184);
 
-    let report = host_call_compare().expect("host call comparison");
+    // Pass the same validated config into the comparison row so ops/workers
+    // actually gate construction rather than being ignored after validate().
+    let report = host_call_compare_with(config).expect("host call comparison");
     assert_eq!(report.label, "host_request_reply");
     assert_eq!(
         report.tina.load.ops_attempted,
         report.baseline.load.ops_attempted
     );
+    assert_eq!(report.tina.load.ops_attempted, config.ops);
     assert!(report.tina.load.ops_ok > 0);
     assert_eq!(report.tina.load.ops_err, 0);
     assert_eq!(report.tina.load.ops_timeout, 0);
@@ -27,6 +31,7 @@ fn public_smoke() {
 fn public_characterization() {
     let config = WorkloadConfig::default();
     assert_eq!(config.ops, 120);
+    assert_eq!(config.http_ops, 32);
     assert_eq!(config.workers, 4);
     assert_eq!(config.samples, 5);
     assert_eq!(config.capacity, 184);
@@ -62,4 +67,15 @@ fn public_characterization() {
         .validate(),
         Err(WorkloadConfigError::TooLarge { field: "ops", .. })
     ));
+
+    // Invalid config is rejected by the comparison entry itself.
+    let error = host_call_compare_with(WorkloadConfig {
+        ops: 0,
+        ..WorkloadConfig::default()
+    })
+    .expect_err("zero ops must fail before runtime construction");
+    assert!(
+        error.to_string().contains("ops"),
+        "unexpected error: {error:#}"
+    );
 }

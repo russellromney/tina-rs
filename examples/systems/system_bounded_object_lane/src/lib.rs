@@ -695,6 +695,8 @@ fn drive_callers(
             }
         }
     } else {
+        // Stats were not observed. Do not claim agreement — Put terminals are
+        // the only load-bearing fields on this path.
         LaneStats {
             accepted: 0,
             busy: 0,
@@ -703,8 +705,8 @@ fn drive_callers(
             current: 0,
             retired: 0,
             caller_gone: 0,
-            counts_agree: true,
-            settlements_agree: true,
+            counts_agree: false,
+            settlements_agree: false,
         }
     };
 

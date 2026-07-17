@@ -13,13 +13,14 @@ This is not a production benchmark suite. It is alpha evidence:
 - allocation counts for work done inside the load worker op
 - semantic match labeled as `exact` or `partial`
 
-Public workload knobs live in `WorkloadConfig` (defaults: 120 ops, 4 workers,
-5 samples, capacity 184). `WorkloadConfig::validate` rejects zero and oversized
-values and capacity-below-ops before comparison rows allocate. The service
-request/reply chain preserves exact downstream terminals (`DownstreamFull`,
-`DownstreamClosed`, `DownstreamTimeout`, `DownstreamRejected`) instead of
-collapsing them into success. Raw-runtime rows remain intentional comparison
-controls.
+Public workload knobs live in `WorkloadConfig` (defaults: 120 ops, 32 HTTP ops,
+4 workers, 5 samples, capacity 184). Comparison entry points
+(`host_call_compare_with`, `run_all_with`, …) call `WorkloadConfig::validate`
+and then build runtimes, mailboxes, load runners, and sample loops from those
+fields — validation is not advisory. The service request/reply chain preserves
+exact downstream terminals (`DownstreamFull`, `DownstreamClosed`,
+`DownstreamTimeout`, `DownstreamRejected`) instead of collapsing them into
+success. Raw-runtime protocol probes remain intentional comparison controls.
 
 Run:
 
