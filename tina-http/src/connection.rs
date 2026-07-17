@@ -1352,7 +1352,14 @@ impl<S: Shard + 'static, M: Send + 'static> HttpConnection<S, M> {
         self.service_monitor = None;
         self.service_monitor_terminal_seen = true;
         match outcome {
-            HttpPeerMonitorOutcome::Disconnected => stop(),
+            HttpPeerMonitorOutcome::Disconnected => {
+                if self.has_pending_body() {
+                    self.record_body_io_error();
+                    self.begin_close()
+                } else {
+                    stop()
+                }
+            }
             HttpPeerMonitorOutcome::ReadAhead(bytes) => {
                 self.service_read_ahead.extend(bytes);
                 if self.waiting_for_monitor_after_response {
