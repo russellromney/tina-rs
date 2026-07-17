@@ -244,6 +244,8 @@ pub struct SessionStats {
     pub touch_not_found: u64,
     /// Cumulative capacity rejects.
     pub full_rejects: u64,
+    /// Cumulative duplicate-token rejects.
+    pub duplicate_rejects: u64,
     /// Cumulative successful sweep ticks.
     pub sweeps_run: u64,
     /// Cumulative timer dependency failures observed by the sweep.
@@ -263,9 +265,12 @@ pub enum SessionInputError {
     Empty { field: &'static str },
     /// UTF-8 byte length exceeded the public bound.
     TooLong {
+        /// Input field name.
         field: &'static str,
-        actual: usize,
-        max: usize,
+        /// Actual UTF-8 byte length.
+        actual_bytes: usize,
+        /// Maximum accepted UTF-8 byte length.
+        max_bytes: usize,
     },
 }
 
@@ -273,8 +278,15 @@ impl fmt::Display for SessionInputError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty { field } => write!(f, "{field} must not be empty"),
-            Self::TooLong { field, actual, max } => {
-                write!(f, "{field} length {actual} exceeds maximum {max}")
+            Self::TooLong {
+                field,
+                actual_bytes,
+                max_bytes,
+            } => {
+                write!(
+                    f,
+                    "{field} UTF-8 byte length {actual_bytes} exceeds maximum {max_bytes}"
+                )
             }
         }
     }
@@ -284,19 +296,19 @@ impl Error for SessionInputError {}
 
 fn validate_input(
     field: &'static str,
-    value: String,
+    value: &str,
     max: usize,
-) -> Result<String, SessionInputError> {
+) -> Result<(), SessionInputError> {
     if value.is_empty() {
         Err(SessionInputError::Empty { field })
     } else if value.len() > max {
         Err(SessionInputError::TooLong {
             field,
-            actual: value.len(),
-            max,
+            actual_bytes: value.len(),
+            max_bytes: max,
         })
     } else {
-        Ok(value)
+        Ok(())
     }
 }
 
@@ -305,8 +317,22 @@ fn validate_input(
 pub struct UserId(String);
 
 impl UserId {
-    pub fn try_new(value: impl Into<String>) -> Result<Self, SessionInputError> {
-        validate_input("user_id", value.into(), MAX_USER_ID_BYTES).map(Self)
+    /// Validate UTF-8 byte length before allocating owned storage.
+    pub fn try_new(value: impl AsRef<str>) -> Result<Self, SessionInputError> {
+        let value = value.as_ref();
+        validate_input("user_id", value, MAX_USER_ID_BYTES)?;
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Borrow the validated identity as UTF-8.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for UserId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
     }
 }
 
@@ -315,8 +341,22 @@ impl UserId {
 pub struct SessionToken(String);
 
 impl SessionToken {
-    pub fn try_new(value: impl Into<String>) -> Result<Self, SessionInputError> {
-        validate_input("session_token", value.into(), MAX_SESSION_TOKEN_BYTES).map(Self)
+    /// Validate UTF-8 byte length before allocating owned storage.
+    pub fn try_new(value: impl AsRef<str>) -> Result<Self, SessionInputError> {
+        let value = value.as_ref();
+        validate_input("session_token", value, MAX_SESSION_TOKEN_BYTES)?;
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Borrow the validated opaque token as UTF-8.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for SessionToken {
+    fn as_ref(&self) -> &str {
+        self.as_str()
     }
 }
 
@@ -336,7 +376,7 @@ pub enum SessionAuthReply {
     NotFound,
     /// The owning shard bucket was at capacity.
     Full,
-    /// The token already names a live session; no row or counter changed.
+    /// The token already names a live session; no row or admission count changed.
     AlreadyExists,
     /// One shard's operational snapshot.
     Stats(BucketStats),
@@ -359,6 +399,8 @@ pub struct BucketStats {
     pub touch_not_found: u64,
     /// Cumulative capacity rejects.
     pub full_rejects: u64,
+    /// Cumulative duplicate-token rejects.
+    pub duplicate_rejects: u64,
     /// Cumulative successful sweep ticks.
     pub sweeps_run: u64,
     /// Cumulative timer dependency failures.
@@ -484,6 +526,7 @@ impl SessionBucket {
         call: RequestCall<'_, Self>,
     ) -> RequestEffect<Self> {
         if self.rows.contains_key(&token) {
+            self.stats.duplicate_rejects += 1;
             return call.reply(SessionAuthReply::AlreadyExists);
         }
         if self.rows.len() >= self.config.max_sessions_per_shard {
@@ -579,6 +622,7 @@ impl SessionBucket {
         now: Instant,
     ) -> SessionAuthReply {
         if self.rows.contains_key(&token) {
+            self.stats.duplicate_rejects += 1;
             return SessionAuthReply::AlreadyExists;
         }
         if self.rows.len() >= self.config.max_sessions_per_shard {
@@ -652,8 +696,6 @@ struct AuthWorld<'a> {
 /// Workload failure retaining exact host/runtime terminals.
 #[derive(Debug)]
 pub enum WorkloadError {
-    /// A user id or token exceeded its public request bound.
-    InvalidInput(SessionInputError),
     /// Shard placement construction failed.
     Placement(ShardPlacementError),
     /// A per-shard bucket registration/bootstrap failed.
@@ -689,7 +731,6 @@ pub enum WorkloadError {
 impl fmt::Display for WorkloadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidInput(error) => write!(f, "invalid session input: {error}"),
             Self::Placement(error) => write!(f, "placement failed: {error}"),
             Self::Registration { shard, source } => {
                 write!(f, "register bucket on shard {shard} failed: {source}")
@@ -708,7 +749,6 @@ impl fmt::Display for WorkloadError {
 impl Error for WorkloadError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::InvalidInput(error) => Some(error),
             Self::Placement(error) => Some(error),
             Self::Registration { source, .. } => Some(source),
             Self::HostCall { source, .. } => Some(source),
@@ -812,12 +852,11 @@ impl<'a> AuthWorld<'a> {
     }
 
     fn addr_for(&self, token: &SessionToken) -> AuthRequestAddr {
-        let shard = self.placement.owner_for_str(&token.0);
+        let shard = self.placement.owner_for_str(token.as_str());
         self.addrs_by_shard[&shard]
     }
 
-    fn login(&self, user_id: String) -> Result<SessionAuthReply, WorkloadError> {
-        let user_id = UserId::try_new(user_id).map_err(WorkloadError::InvalidInput)?;
+    fn login(&self, user_id: UserId) -> Result<SessionAuthReply, WorkloadError> {
         let token = self.mint_token();
         let addr = self.addr_for(&token);
         expect_reply(
@@ -863,6 +902,7 @@ impl<'a> AuthWorld<'a> {
             touch_ok: 0,
             touch_not_found: 0,
             full_rejects: 0,
+            duplicate_rejects: 0,
             sweeps_run: 0,
             timer_errors: 0,
             per_shard_active: vec![0; self.shard_ids.len()],
@@ -885,6 +925,7 @@ impl<'a> AuthWorld<'a> {
                     combined.touch_ok += s.touch_ok;
                     combined.touch_not_found += s.touch_not_found;
                     combined.full_rejects += s.full_rejects;
+                    combined.duplicate_rejects += s.duplicate_rejects;
                     combined.sweeps_run += s.sweeps_run;
                     combined.timer_errors += s.timer_errors;
                     combined.per_shard_active[idx] = s.active;
@@ -945,7 +986,7 @@ pub fn run(config: RunConfig) -> Result<RunReport, RunError> {
 pub fn run_login_touch_logout(config: RunConfig) -> Result<LoginTouchLogoutReport, RunError> {
     run_local(config, |app, config| {
         let world = AuthWorld::start(app, config)?;
-        let token = match world.login("alice".into())? {
+        let token = match world.login(UserId::try_new("alice").expect("script user is bounded"))? {
             SessionAuthReply::Admitted { token } => token,
             reply => {
                 return Err(WorkloadError::UnexpectedReply {
@@ -972,7 +1013,7 @@ pub fn run_login_touch_logout(config: RunConfig) -> Result<LoginTouchLogoutRepor
 pub fn run_idle_expiry(config: RunConfig) -> Result<IdleExpiryReport, RunError> {
     run_local(config, |app, config| {
         let world = AuthWorld::start(app, config)?;
-        let token = match world.login("bob".into())? {
+        let token = match world.login(UserId::try_new("bob").expect("script user is bounded"))? {
             SessionAuthReply::Admitted { token } => token,
             reply => {
                 return Err(WorkloadError::UnexpectedReply {
@@ -1005,7 +1046,8 @@ pub fn run_overflow(config: RunConfig) -> Result<OverflowReport, RunError> {
         let mut admitted = 0;
         let mut full = 0;
         for i in 0..burst {
-            match world.login(format!("u-{i}"))? {
+            let user_id = UserId::try_new(format!("u-{i}")).expect("script user is bounded");
+            match world.login(user_id)? {
                 SessionAuthReply::Admitted { .. } => admitted += 1,
                 SessionAuthReply::Full => full += 1,
                 reply => {
@@ -1252,18 +1294,42 @@ mod tests {
             UserId::try_new("u".repeat(MAX_USER_ID_BYTES + 1)),
             Err(SessionInputError::TooLong {
                 field: "user_id",
-                actual,
-                max: MAX_USER_ID_BYTES,
-            }) if actual == MAX_USER_ID_BYTES + 1
+                actual_bytes,
+                max_bytes: MAX_USER_ID_BYTES,
+            }) if actual_bytes == MAX_USER_ID_BYTES + 1
         ));
         assert!(SessionToken::try_new("t".repeat(MAX_SESSION_TOKEN_BYTES)).is_ok());
         assert!(matches!(
             SessionToken::try_new("t".repeat(MAX_SESSION_TOKEN_BYTES + 1)),
             Err(SessionInputError::TooLong {
                 field: "session_token",
-                actual,
-                max: MAX_SESSION_TOKEN_BYTES,
-            }) if actual == MAX_SESSION_TOKEN_BYTES + 1
+                actual_bytes,
+                max_bytes: MAX_SESSION_TOKEN_BYTES,
+            }) if actual_bytes == MAX_SESSION_TOKEN_BYTES + 1
+        ));
+
+        let user_boundary = "é".repeat(MAX_USER_ID_BYTES / "é".len());
+        let user = UserId::try_new(&user_boundary).expect("exact UTF-8 byte boundary");
+        assert_eq!(user.as_str(), user_boundary);
+        assert!(matches!(
+            UserId::try_new(format!("{user_boundary}x")),
+            Err(SessionInputError::TooLong {
+                actual_bytes,
+                max_bytes: MAX_USER_ID_BYTES,
+                ..
+            }) if actual_bytes == MAX_USER_ID_BYTES + 1
+        ));
+
+        let token_boundary = "é".repeat(MAX_SESSION_TOKEN_BYTES / "é".len());
+        let token = SessionToken::try_new(&token_boundary).expect("exact UTF-8 byte boundary");
+        assert_eq!(token.as_str(), token_boundary);
+        assert!(matches!(
+            SessionToken::try_new(format!("{token_boundary}x")),
+            Err(SessionInputError::TooLong {
+                actual_bytes,
+                max_bytes: MAX_SESSION_TOKEN_BYTES,
+                ..
+            }) if actual_bytes == MAX_SESSION_TOKEN_BYTES + 1
         ));
     }
 
@@ -1288,9 +1354,18 @@ mod tests {
             ),
             SessionAuthReply::AlreadyExists
         );
+        assert_eq!(
+            bucket.login_at_for_test(
+                UserId::try_new("bob").unwrap(),
+                SessionToken::try_new("new").unwrap(),
+                now + Duration::from_secs(1),
+            ),
+            SessionAuthReply::Full
+        );
         let stats = bucket.stats_for_test();
         assert_eq!(stats.active, 1);
         assert_eq!(stats.admitted, 1);
-        assert_eq!(stats.full_rejects, 0);
+        assert_eq!(stats.full_rejects, 1);
+        assert_eq!(stats.duplicate_rejects, 1);
     }
 }
