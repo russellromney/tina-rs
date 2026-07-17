@@ -1,0 +1,45 @@
+# Landed commits and proof
+
+Append each merged pull request, merge commit, direct proof, adversarial review,
+blast-radius proof, and post-merge workflow result here.
+
+## Frozen start baseline
+
+- UTC: 2026-07-17T03:23:53Z
+- Fetched origin/main SHA: de833e629c4553bb0d31b765c00cc38ce5d04a4e
+- origin/main tip: de833e62 Merge pull request #365 from russellromney/agent/bounded-terminal-examples
+
+### Prior PR state at freeze
+
+| PR | Title | State | Head SHA | Merge commit | Notes |
+| --- | --- | --- | --- | --- | --- |
+| #365 | Canonicalize bounded terminal specimens | MERGED | f3fa75fdeaa793884ba0ed06c31d5879de1b4653 | de833e629c4553bb0d31b765c00cc38ce5d04a4e | Ancestor of origin/main; post-merge workflow green (run 29336927897) |
+| #364 | Add typed service restart continuations | OPEN | e4d38cbeb55d9d8c2a40dbe36263c703c0c438a7 | — | Branch agent/restart-service-event; contains origin/main (behind 0); mergeable; CI green run 29372706170; documented adversarial review in PR body |
+| #366 | Add actor-backed typed gRPC routes | OPEN | 63d34b5b27e0835efb1c29f8c8ecd7edf5e96760 | — | Branch agent/grpc-stream-routing; contains origin/main (behind 0); mergeable; CI green run 29374213031; documented adversarial review in PR body (review commit 63d34b5b) |
+
+### Worktree reconciliation sources (snapshot)
+
+| Path | Branch | HEAD | Status vs remote |
+| --- | --- | --- | --- |
+| tina-rs-restart-service-event | agent/restart-service-event | e4d38cbeb55d9d8c2a40dbe36263c703c0c438a7 | matches origin; clean |
+| tina-rs-grpc-stream-routing | agent/grpc-stream-routing | 63d34b5b27e0835efb1c29f8c8ecd7edf5e96760 | matches origin; clean |
+| tina-rs-bounded-terminals | agent/bounded-terminal-examples | f3fa75fd… | prior #365 source |
+| tina-rs-result-sidecars | agent/remove-result-sidecars | de833e62… | at main |
+
+### Untracked dirty-root lockfiles to preserve (do not copy/delete)
+
+- examples/specimen_two_stage_pipeline/Cargo.lock
+- examples/systems/perf_native/Cargo.lock
+- examples/systems/system_metrics_shipper/Cargo.lock
+
+### Tracking branch
+
+- branch: agent/phase-163-tracking
+- worktree: /Users/russellromney/Documents/Github/tina-rs-phase-163-tracking
+- package commit: phase package only (execute.md, review.md, commits.txt)
+
+### Next eligible work
+
+- I0A: re-run independent adversarial review on #364 head e4d38cbe, then merge
+- I0B: re-run independent adversarial review on #366 head 63d34b5b, then merge
+- After I0A/I0B merge + green main: D1, F1 (after I0A), F2, F3, F4, M2, M3, M5 may proceed per dependency graph
