@@ -17,7 +17,10 @@
 //! - `PendingCancelableCall::cancel(translator)` for cancel-while-running:
 //!   one effect closes the wait AND routes the parked request context into
 //!   the cancel continuation.
-//! - `spawn_observed(ChildDefinition::new(...))` for typed child refs.
+//! - `spawn_observed(ChildDefinition::new(...)).then_service_event(...)` for
+//!   typed child start results (and exact child-start failures).
+//! - Host readiness and quiescence as parked typed requests (`AwaitReady`,
+//!   `AwaitQuiescent`) rather than a readiness mutex or host spin loop.
 //! - Runtime-owned `sleep` as the worker's only async surface.
 //! - The `Worker` isolate uses the `event = .. request = ..` split-service
 //!   macro form: `WorkerEvent::Wake` is fire-and-forget, while
@@ -28,11 +31,11 @@
 //!   isolate with its startup `Bootstrap` event prefilled atomically.
 
 use std::fmt;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::Barrier;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use tina::{ChildDefinition, prelude::*};
+use tina::{ChildDefinition, SpawnObservedError, prelude::*};
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, PendingCancelableCallSet,
     PendingCancelableRemoveError, PendingCancelableTicket, RequestPendingCancelableInsertError,
@@ -225,6 +228,9 @@ pub enum QueueReply {
     Cancelled(JobId),
     NotFound,
     Stats(QueueStats),
+    Ready,
+    Quiescent,
+    StartupFailed(SpawnObservedError),
 }
 
 /// Fire-and-forget facts the queue accepts: bootstrap, spawn/call
@@ -270,12 +276,15 @@ pub enum QueueRequest {
     Submit(Payload),
     Cancel(JobId),
     Stats,
+    /// Parks until every worker slot has a live child, or returns the first
+    /// exact child-start failure seen during bootstrap/replacement.
+    AwaitReady,
+    /// Parks until no job is in flight and no caller is parked.
+    AwaitQuiescent,
 }
 
-/// Split-service envelope for `Queue`. The `event = .. request = ..`
-/// isolate macro form generates the wrong-lane rejection arms, so neither
-/// `handle_event` nor `handle_request` writes one by hand.
-pub type QueueMsg = tina::ServiceMessage<QueueEvent, QueueRequest>;
+/// Private split-service envelope type used only in isolate attributes.
+type QueueMsg = tina::ServiceMessage<QueueEvent, QueueRequest>;
 
 /// Worker's reply to a `Process` call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,8 +413,12 @@ struct Queue {
     worker_busy: Vec<Option<JobId>>,
     next_id: u64,
     stats: QueueStats,
-    spawned_workers: usize,
-    ready_signal: Arc<ReadyGate>,
+    /// Host parked on [`QueueRequest::AwaitReady`].
+    ready_waiter: Option<tina::RequestContext<QueueReply>>,
+    /// Host parked on [`QueueRequest::AwaitQuiescent`].
+    quiescent_waiter: Option<tina::RequestContext<QueueReply>>,
+    /// First exact child-start failure observed during bootstrap/replacement.
+    startup_error: Option<SpawnObservedError>,
 }
 
 #[tina_runtime::isolate(
@@ -457,12 +470,14 @@ impl Queue {
             QueueRequest::Submit(payload) => self.submit(payload, call),
             QueueRequest::Cancel(id) => self.cancel(id, call),
             QueueRequest::Stats => call.reply(QueueReply::Stats(self.snapshot())),
+            QueueRequest::AwaitReady => self.await_ready(call),
+            QueueRequest::AwaitQuiescent => self.await_quiescent(call),
         }
     }
 }
 
 impl Queue {
-    fn new(config: RunConfig, ready: Arc<ReadyGate>) -> Self {
+    fn new(config: RunConfig) -> Self {
         Self {
             config,
             pending: PendingCancelableCallSet::with_capacity(config.workers),
@@ -483,8 +498,9 @@ impl Queue {
                 worker_respawns: 0,
                 cancel_reconciliation_failures: 0,
             },
-            spawned_workers: 0,
-            ready_signal: ready,
+            ready_waiter: None,
+            quiescent_waiter: None,
+            startup_error: None,
         }
     }
 
@@ -512,18 +528,77 @@ impl Queue {
                 self.workers[slot] = Some(tina_runtime::SplitServiceHandle::from_address(
                     child.address,
                 ));
-                self.stats.workers_alive += 1;
-                self.spawned_workers += 1;
-                if self.spawned_workers == self.workers.len() {
-                    self.ready_signal.signal();
-                }
-                noop()
+                self.stats.workers_alive = self.workers.iter().filter(|w| w.is_some()).count();
+                self.settle_ready_waiter()
             }
-            Err(_) => {
+            Err(error) => {
                 self.workers[slot] = None;
-                noop()
+                self.stats.workers_alive = self.workers.iter().filter(|w| w.is_some()).count();
+                self.startup_error = Some(error);
+                self.settle_ready_waiter()
             }
         }
+    }
+
+    fn all_workers_ready(&self) -> bool {
+        self.workers.iter().all(|worker| worker.is_some())
+    }
+
+    fn is_quiescent(&self) -> bool {
+        self.in_flight_count() == 0 && self.pending.is_empty()
+    }
+
+    fn settle_ready_waiter(&mut self) -> Effect<Self> {
+        if let Some(error) = self.startup_error {
+            if let Some(req) = self.ready_waiter.take() {
+                return reply_to::<Self>(req, QueueReply::StartupFailed(error));
+            }
+            return noop();
+        }
+        if self.all_workers_ready() {
+            if let Some(req) = self.ready_waiter.take() {
+                return reply_to::<Self>(req, QueueReply::Ready);
+            }
+        }
+        noop()
+    }
+
+    fn settle_quiescent_waiter(&mut self) -> Effect<Self> {
+        if self.is_quiescent() {
+            if let Some(req) = self.quiescent_waiter.take() {
+                return reply_to::<Self>(req, QueueReply::Quiescent);
+            }
+        }
+        noop()
+    }
+
+    fn await_ready(&mut self, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
+        if let Some(error) = self.startup_error {
+            return call.reply(QueueReply::StartupFailed(error));
+        }
+        if self.all_workers_ready() {
+            return call.reply(QueueReply::Ready);
+        }
+        if self.ready_waiter.is_some() {
+            return call.reply(QueueReply::Busy);
+        }
+        call.capture(|req| {
+            self.ready_waiter = Some(req);
+            noop()
+        })
+    }
+
+    fn await_quiescent(&mut self, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
+        if self.is_quiescent() {
+            return call.reply(QueueReply::Quiescent);
+        }
+        if self.quiescent_waiter.is_some() {
+            return call.reply(QueueReply::Busy);
+        }
+        call.capture(|req| {
+            self.quiescent_waiter = Some(req);
+            noop()
+        })
     }
 
     fn submit(&mut self, payload: Payload, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
@@ -635,17 +710,25 @@ impl Queue {
         match outcome {
             tina::CancelOutcome::Cancelled | tina::CancelOutcome::AlreadyCancelled => {
                 self.stats.jobs_cancelled += 1;
-                reply_to::<Self>(req, QueueReply::Done(JobOutcome::Cancelled { id }))
+                let reply = reply_to::<Self>(req, QueueReply::Done(JobOutcome::Cancelled { id }));
+                match self.settle_quiescent_waiter() {
+                    Effect::Noop => reply,
+                    other => batch(vec![reply, other]),
+                }
             }
             tina::CancelOutcome::AlreadyCompleted => {
                 self.stats.jobs_failed += 1;
-                reply_to::<Self>(
+                let reply = reply_to::<Self>(
                     req,
                     QueueReply::Done(JobOutcome::Failed {
                         id,
                         reason: "cancel raced with an already completed worker call".into(),
                     }),
-                )
+                );
+                match self.settle_quiescent_waiter() {
+                    Effect::Noop => reply,
+                    other => batch(vec![reply, other]),
+                }
             }
             tina::CancelOutcome::NotAdmitted | tina::CancelOutcome::WrongShard => {
                 self.stats.jobs_failed += 1;
@@ -698,8 +781,7 @@ impl Queue {
         match classify_worker_cancel_outcome(id, &outcome) {
             WorkerCancelDisposition::Released => {
                 self.worker_busy[slot] = None;
-                self.stats.in_flight = self.in_flight_count();
-                noop()
+                self.after_slot_or_pending_change()
             }
             WorkerCancelDisposition::Retry if attempt < MAX_WORKER_CANCEL_RETRIES => {
                 let next_attempt = attempt + 1;
@@ -716,12 +798,16 @@ impl Queue {
             WorkerCancelDisposition::Closed => {
                 self.worker_busy[slot] = None;
                 if self.workers[slot].take().is_some() {
-                    self.stats.workers_alive = self.stats.workers_alive.saturating_sub(1);
+                    self.stats.workers_alive = self.workers.iter().filter(|w| w.is_some()).count();
                 }
                 self.stats.in_flight = self.in_flight_count();
                 self.stats.worker_crashes += 1;
                 self.stats.worker_respawns += 1;
-                self.spawn_worker(slot)
+                let spawn = self.spawn_worker(slot);
+                match self.settle_quiescent_waiter() {
+                    Effect::Noop => spawn,
+                    other => batch(vec![other, spawn]),
+                }
             }
             WorkerCancelDisposition::Fatal => self.fail_cancel_reconciliation(),
         }
@@ -830,7 +916,7 @@ impl Queue {
         };
 
         let follow_up = match disposition {
-            WorkerCallDisposition::Released => None,
+            WorkerCallDisposition::Released => Some(self.settle_quiescent_waiter()),
             WorkerCallDisposition::Reconcile => match self.workers[slot] {
                 Some(worker) => Some(self.cancel_worker(slot, id, 0, worker)),
                 None => Some(stop()),
@@ -838,11 +924,15 @@ impl Queue {
             WorkerCallDisposition::Replace => {
                 self.worker_busy[slot] = None;
                 if self.workers[slot].take().is_some() {
-                    self.stats.workers_alive = self.stats.workers_alive.saturating_sub(1);
+                    self.stats.workers_alive = self.workers.iter().filter(|w| w.is_some()).count();
                 }
                 self.stats.in_flight = self.in_flight_count();
                 self.stats.worker_respawns += 1;
-                Some(self.spawn_worker(slot))
+                let spawn = self.spawn_worker(slot);
+                match self.settle_quiescent_waiter() {
+                    Effect::Noop => Some(spawn),
+                    other => Some(batch(vec![other, spawn])),
+                }
             }
             WorkerCallDisposition::Fatal => {
                 self.stats.cancel_reconciliation_failures += 1;
@@ -852,6 +942,7 @@ impl Queue {
 
         let reply = reply_to::<Self>(req, QueueReply::Done(final_outcome));
         match follow_up {
+            Some(Effect::Noop) => reply,
             Some(effect) => batch(vec![reply, effect]),
             None => reply,
         }
@@ -862,6 +953,11 @@ impl Queue {
             self.worker_busy[slot] = None;
             self.stats.in_flight = self.in_flight_count();
         }
+    }
+
+    fn after_slot_or_pending_change(&mut self) -> Effect<Self> {
+        self.stats.in_flight = self.in_flight_count();
+        self.settle_quiescent_waiter()
     }
 
     fn idle_slot(&self) -> Option<usize> {
@@ -1021,7 +1117,7 @@ mod tests {
             job_sleep_ms: 10,
             call_timeout_ms: 100,
         };
-        let mut queue = Queue::new(config, Arc::new(ReadyGate::default()));
+        let mut queue = Queue::new(config);
         queue.worker_busy[0] = Some(id);
         queue.stats.in_flight = 1;
         queue
@@ -1111,22 +1207,6 @@ mod tests {
 }
 
 // ---------- Host-visible entry points ----------
-
-/// Bootstrap signal. Each finished spawn ticks the gate; the host waits on
-/// it before sending traffic.
-#[derive(Debug, Default)]
-pub struct ReadyGate {
-    inner: Mutex<bool>,
-}
-
-impl ReadyGate {
-    pub fn signal(&self) {
-        *self.inner.lock().expect("ready gate") = true;
-    }
-    fn ready(&self) -> bool {
-        *self.inner.lock().expect("ready gate")
-    }
-}
 
 /// Aggregate report for a smoke run.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1298,15 +1378,7 @@ pub fn run_cancel_in_flight(config: RunConfig) -> anyhow::Result<CancelInFlightR
                 Ok((submit_outcome, cancel_reply))
             })?;
 
-            wait_until(
-                Duration::from_secs(2),
-                "worker cancel acknowledgement",
-                || {
-                    stats(app, queue.requests)
-                        .map(|snapshot| snapshot.in_flight == 0)
-                        .unwrap_or(false)
-                },
-            )?;
+            await_quiescent(app, queue.requests, timeout)?;
             let refill_outcome = match app.call_blocking_request(
                 queue.requests,
                 QueueRequest::Submit(Payload::Work(21)),
@@ -1316,7 +1388,7 @@ pub fn run_cancel_in_flight(config: RunConfig) -> anyhow::Result<CancelInFlightR
                 other => anyhow::bail!("unexpected refill outcome: {other:?}"),
             };
 
-            thread::sleep(Duration::from_millis(config.job_sleep_ms + 30));
+            await_quiescent(app, queue.requests, timeout)?;
             Ok(CancelInFlightReport {
                 submit_outcome,
                 cancel_reply,
@@ -1346,11 +1418,11 @@ pub fn run_caller_gone(config: RunConfig) -> anyhow::Result<CallerGoneReport> {
                 anyhow::bail!("caller-gone probe expected Timeout, got {submit_outcome:?}");
             }
 
-            wait_until(Duration::from_secs(2), "caller-gone settlement", || {
-                stats(app, queue.requests)
-                    .map(|snapshot| snapshot.jobs_completed == 1 && snapshot.in_flight == 0)
-                    .unwrap_or(false)
-            })?;
+            await_quiescent(
+                app,
+                queue.requests,
+                Duration::from_millis(config.call_timeout_ms),
+            )?;
             Ok(CallerGoneReport {
                 submit_outcome,
                 stats: stats(app, queue.requests)?,
@@ -1375,11 +1447,7 @@ pub fn run_poison_crash(config: RunConfig) -> anyhow::Result<PoisonCrashReport> 
             other => anyhow::bail!("unexpected poison outcome: {other:?}"),
         };
 
-        wait_until(Duration::from_secs(2), "respawn", || {
-            stats(app, queue.requests)
-                .map(|snapshot| snapshot.workers_alive == config.workers)
-                .unwrap_or(false)
-        })?;
+        await_ready(app, queue.requests, timeout)?;
 
         Ok(PoisonCrashReport {
             failed_outcome,
@@ -1404,11 +1472,7 @@ pub fn run_respawn_then_admit(config: RunConfig) -> anyhow::Result<RespawnThenAd
             other => anyhow::bail!("unexpected poison outcome: {other:?}"),
         };
 
-        wait_until(Duration::from_secs(2), "respawn", || {
-            stats(app, queue.requests)
-                .map(|snapshot| snapshot.workers_alive == config.workers)
-                .unwrap_or(false)
-        })?;
+        await_ready(app, queue.requests, timeout)?;
 
         let follow_up_outcome = match app.call_blocking_request(
             queue.requests,
@@ -1434,8 +1498,6 @@ fn register_queue(
     app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
     config: RunConfig,
 ) -> anyhow::Result<SplitServiceHandle<QueueEvent, QueueRequest, QueueReply>> {
-    let ready = Arc::new(ReadyGate::default());
-
     let service = app
         .register_split_service_with_bootstrap::<
             Queue,
@@ -1443,30 +1505,43 @@ fn register_queue(
             QueueRequest,
             std::convert::Infallible,
         >(
-            Queue::new(config, Arc::clone(&ready)),
+            Queue::new(config),
             config.queue_mailbox,
             QueueEvent::Bootstrap,
         )
         .map_err(|e| anyhow::anyhow!("register queue: {e:?}"))?;
 
-    wait_until(Duration::from_secs(2), "all workers ready", || {
-        ready.ready()
-    })?;
+    await_ready(
+        app,
+        service.requests,
+        Duration::from_millis(config.call_timeout_ms),
+    )?;
     Ok(service)
 }
 
-fn wait_until<F>(timeout: Duration, label: &str, mut predicate: F) -> anyhow::Result<()>
-where
-    F: FnMut() -> bool,
-{
-    let deadline = Instant::now() + timeout;
-    while !predicate() {
-        if Instant::now() > deadline {
-            anyhow::bail!("wait_until({label}) timed out");
+fn await_ready(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    queue: tina::ServiceRequestAddress<QueueEvent, QueueRequest, QueueReply>,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    match app.call_blocking_request(queue, QueueRequest::AwaitReady, timeout)? {
+        CallOutcome::Replied(QueueReply::Ready) => Ok(()),
+        CallOutcome::Replied(QueueReply::StartupFailed(error)) => {
+            anyhow::bail!("queue startup failed: {error:?}")
         }
-        thread::yield_now();
+        other => anyhow::bail!("await ready failed: {other:?}"),
     }
-    Ok(())
+}
+
+fn await_quiescent(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    queue: tina::ServiceRequestAddress<QueueEvent, QueueRequest, QueueReply>,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    match app.call_blocking_request(queue, QueueRequest::AwaitQuiescent, timeout)? {
+        CallOutcome::Replied(QueueReply::Quiescent) => Ok(()),
+        other => anyhow::bail!("await quiescent failed: {other:?}"),
+    }
 }
 
 fn stats(

@@ -60,13 +60,19 @@ Tina uses one isolate per role:
   `broadcast_observed(...)`, classifies each admission outcome
   (`Accepted` / `Full` / `Closed`), retries partial writes, and stops
   with an exact typed protocol, broadcast construction/tracking,
-  read/write, or close terminal.
-- **`Listener`** — `tcp_bind` → `tcp_accept` → `spawn(Connection)`.
+  read/write, or close terminal. Its only outbound is still the
+  broadcast target channel.
+- **`Listener`** — `tcp_bind` → `tcp_accept` →
+  `spawn_observed(Connection).then_result(...).then(...)` → close.
+  The runtime delivers the connection's `stop_with` payload as a
+  parent event; the listener folds it into `ListenerTerminal::ClosedClean
+  { connection }` for the host.
 
 `RunConfig::validate` rejects zero and over-cap burst, target, and mailbox
 values before `LocalSystem` starts. `run_to_shutdown_reported` preserves
-workload and bounded shutdown failures separately, while the listener's typed
-result proves bind/accept/close success.
+workload and bounded shutdown failures separately. The host claims
+`observe_result::<ListenerTerminal>` before start and requires both a clean
+listener close and `ConnectionTerminal::ClosedClean`.
 
 The decimal request is accumulated across TCP reads until the client's
 write-half EOF, under a 32-byte protocol cap, before parsing. TCP packet
@@ -113,12 +119,11 @@ What feels worse:
   be `max_broadcast_targets + slack`. This is documented (see
   `docs/mailbox-capacity.md`) but it's still a number you have to size
   correctly per workload.
-- **Spawned multi-outbound result routing is still missing.** The connection
-  already owns `Outbound<DeliverMsg>` for the broadcast. Reporting its typed
-  terminal directly to the listener needs a second outbound type, but root
-  registration currently only erases spawned children with one
-  `Outbound<T>`. The connection result is typed, but the host cannot yet
-  observe that child result without framework support.
+- **The listener must wait for both facts.** Listener close and connection
+  terminal can arrive in either order. The listener holds state until both
+  are known, then stops with one combined terminal. That is still more
+  bookkeeping than "fire and forget," but it is application state rather
+  than a second outbound or host sidecar.
 
 What this suggests:
 
@@ -129,6 +134,7 @@ What this suggests:
 - `BroadcastTargets` makes the service-owned bound explicit before
   runtime effects exist. That is the important difference from
   `for item in request { spawn/send }`.
-- The remaining setup cost — three isolates plus reply-slot mailbox
-  sizing — is where future ergonomics work for fanout services
-  should focus.
+- Typed child terminal observation lets a multi-outbound child keep its
+  application send channel while the runtime still routes `stop_with`
+  to the parent. That closes the chat's host-observation gap without a
+  generic multi-outbound abstraction.

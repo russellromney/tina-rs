@@ -9,6 +9,12 @@ registers and bootstraps the queue, retains a typed split-service handle, calls
 it through `call_blocking_request`, and uses `run_to_shutdown_reported` so a
 workload error cannot bypass bounded terminal observation.
 
+Readiness is a typed request, not a host mutex or spin loop. After bootstrap the
+host calls `AwaitReady`; the queue parks that caller until every worker slot has
+a live child, or replies `StartupFailed` with the exact `SpawnObservedError`
+from a failed child start. After cancel or in-flight work settles, the host
+calls `AwaitQuiescent` instead of polling stats.
+
 The queue spawns `N` worker isolates as observed children. Submit goes through
 `RequestCall::defer_cancelable(call_cancelable_request(worker, ...))
 .try_admit(&mut self.pending, JobId, ...)`, which returns the child effect only
@@ -78,12 +84,13 @@ What felt rough:
   effects. `LocalSystem::register_split_service_with_bootstrap` makes that
   first-message ordering atomic without exposing the private service envelope
   or lower threaded owner.
-- There is still no in-isolate hook for "my child stopped." The queue
-  detects a dead worker through `CallOutcome::Closed` on the in-flight
-  call. That works for jobs in flight; a worker that dies *between* jobs
-  is silently absent until the next dispatch tries it (and is then
-  replaced reactively). `runtime.observe_child_restarted(parent)` exists,
-  but only outside the isolate.
+- Long-lived workers still surface death primarily through
+  `CallOutcome::Closed` on an in-flight process call. Replacement is a fresh
+  `spawn_observed` into the same slot; the host learns the pool is full again
+  via `AwaitReady`, not by scraping restarts from outside the isolate.
+- A worker that dies *between* jobs is still silent until the next dispatch
+  sees `Closed` and replaces it. That is intentional for this one-shot
+  child shape; supervised restartable workers are a different specimen.
 
 What we sidestepped — the natural-key trap:
 - `PendingCancelableCallSet::try_insert` is single-slot per key and
@@ -103,7 +110,10 @@ Tina capability pulled:
   one-step caller admission with typed `Full` recovery.
 - `PendingCancelableCall::cancel(translator)` for atomic
   cancel-and-answer-original-caller.
-- `spawn_observed(ChildDefinition::new(...))` for typed child refs.
+- `spawn_observed(ChildDefinition::new(...)).then_service_event(...)` for
+  typed child start results and exact child-start failures.
+- Host `AwaitReady` / `AwaitQuiescent` requests for readiness and drain
+  without a readiness mutex or host spin loop.
 - `LocalSystem::register_split_service_with_bootstrap` for atomic startup.
 - `LocalSystem::call_blocking_request` and typed service handles for host work.
 - `LocalSystem::run_to_shutdown_reported` for unconditional clean shutdown.
@@ -114,8 +124,6 @@ Suggested follow-up:
   cancelable child call" if retry-on-crash is supposed to be expressible
   with this helper. Otherwise the docs should explicitly say "for retry
   semantics, do not use `PendingCancelableCallSet`."
-- In-isolate child-stopped / child-restarted events. Same finding as the
-  v1 README and `system_bounded_object_lane`.
 
 Verdict:
 - keep

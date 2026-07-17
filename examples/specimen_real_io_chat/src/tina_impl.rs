@@ -10,7 +10,9 @@ use std::net::{SocketAddr, TcpStream};
 use std::thread;
 use std::time::Duration;
 
-use tina::prelude::*;
+use tina::{
+    ChildDefinition, SpawnObserved, SpawnObservedError, SpawnObservedResult, prelude::*,
+};
 use tina_runtime::{
     BroadcastAssertError, BroadcastRecordError, BroadcastReport, BroadcastTargets,
     BroadcastTargetsError, BroadcastTracker, DefaultThreadedMailboxFactory, ListenerId,
@@ -128,7 +130,7 @@ struct Connection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BurstProtocolError {
+pub enum BurstProtocolError {
     InvalidUtf8,
     Empty,
     InvalidInteger,
@@ -137,8 +139,11 @@ enum BurstProtocolError {
     RequestTooLong,
 }
 
+/// Exact connection stop payload. The listener observes this through
+/// `spawn_observed(...).then_result(...)` and folds it into its own terminal
+/// so the host sees it without a second outbound or lifecycle sidecar.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ConnectionTerminal {
+pub enum ConnectionTerminal {
     ClosedClean,
     Protocol(BurstProtocolError),
     FanoutSetup(BroadcastTargetsError),
@@ -150,7 +155,7 @@ enum ConnectionTerminal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum FanoutProtocolError {
+pub enum FanoutProtocolError {
     MissingTracker,
     Record(BroadcastRecordError<usize>),
     Assert(BroadcastAssertError),
@@ -233,14 +238,17 @@ impl Connection {
 }
 
 // -------------------------------------------------------------------
-// Listener: bind, accept once, spawn the Connection, close listener.
+// Listener: bind, accept once, spawn the Connection with a typed terminal
+// mapper, close the listener, then stop with both facts for the host.
 // -------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum ListenerMsg {
     Start,
     Bound(TcpBindReply),
     Accepted(TcpAcceptReply),
+    ConnectionStarted(SpawnObservedResult<ConnectionMsg>),
+    ConnectionDone(ConnectionTerminal),
     ListenerClosed(TcpListenerCloseReply),
 }
 
@@ -250,11 +258,19 @@ struct Listener {
     connection_capacity: usize,
     max_broadcast_targets: usize,
     listener: Option<ListenerId>,
+    connection_terminal: Option<ConnectionTerminal>,
+    spawn_error: Option<SpawnObservedError>,
+    listener_closed: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ListenerTerminal {
-    ClosedClean,
+/// Listener stop payload. A clean close always carries the connection's typed
+/// terminal so the host does not need a separate child observation path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListenerTerminal {
+    ClosedClean {
+        connection: ConnectionTerminal,
+    },
+    ConnectionSpawnFailed(SpawnObservedError),
     BindFailed(tina_runtime::CallError),
     AcceptFailed(tina_runtime::CallError),
     CloseFailed(tina_runtime::CallError),
@@ -264,6 +280,7 @@ enum ListenerTerminal {
 #[tina_runtime::isolate(
     message = ListenerMsg,
     spawn = ChildDefinition<Connection>,
+    spawn_observed = SpawnObserved<ChildDefinition<Connection>, ListenerMsg, ConnectionMsg>,
 )]
 impl Listener {
     fn handle(
@@ -278,34 +295,65 @@ impl Listener {
                 tcp_accept(listener).then(ListenerMsg::Accepted)
             }
             ListenerMsg::Accepted(Ok((stream, _peer_addr))) => {
-                let Some(listener) = self.listener else {
-                    return stop_with(ListenerTerminal::MissingListener);
-                };
-                batch(vec![
-                    spawn(
-                        ChildDefinition::new(
-                            Connection {
-                                stream,
-                                slow_client: self.slow_client,
-                                max_broadcast_targets: self.max_broadcast_targets,
-                                fanout: FanoutState::default(),
-                                request_bytes: Vec::with_capacity(MAX_BURST_REQUEST_BYTES),
-                                pending_write: Vec::new(),
-                            },
-                            self.connection_capacity,
-                        )
-                        .with_initial_message(ConnectionMsg::Begin),
-                    ),
-                    tcp_close_listener(listener).then(ListenerMsg::ListenerClosed),
-                ])
+                spawn_observed(
+                    ChildDefinition::new(
+                        Connection {
+                            stream,
+                            slow_client: self.slow_client,
+                            max_broadcast_targets: self.max_broadcast_targets,
+                            fanout: FanoutState::default(),
+                            request_bytes: Vec::with_capacity(MAX_BURST_REQUEST_BYTES),
+                            pending_write: Vec::new(),
+                        },
+                        self.connection_capacity,
+                    )
+                    .with_initial_message(ConnectionMsg::Begin),
+                )
+                .then_result(ListenerMsg::ConnectionDone)
+                .then(ListenerMsg::ConnectionStarted)
             }
-            ListenerMsg::ListenerClosed(Ok(())) => stop_with(ListenerTerminal::ClosedClean),
+            ListenerMsg::ConnectionStarted(Ok(_child)) => self.close_listener(),
+            ListenerMsg::ConnectionStarted(Err(error)) => {
+                self.spawn_error = Some(error);
+                self.close_listener()
+            }
+            ListenerMsg::ConnectionDone(terminal) => {
+                self.connection_terminal = Some(terminal);
+                self.try_finish()
+            }
+            ListenerMsg::ListenerClosed(Ok(())) => {
+                self.listener_closed = true;
+                self.try_finish()
+            }
             ListenerMsg::Bound(Err(error)) => stop_with(ListenerTerminal::BindFailed(error)),
             ListenerMsg::Accepted(Err(error)) => stop_with(ListenerTerminal::AcceptFailed(error)),
             ListenerMsg::ListenerClosed(Err(error)) => {
                 stop_with(ListenerTerminal::CloseFailed(error))
             }
         }
+    }
+}
+
+impl Listener {
+    fn close_listener(&mut self) -> Effect<Self> {
+        let Some(listener) = self.listener.take() else {
+            return self.try_finish();
+        };
+        tcp_close_listener(listener).then(ListenerMsg::ListenerClosed)
+    }
+
+    fn try_finish(&mut self) -> Effect<Self> {
+        if !self.listener_closed {
+            return noop();
+        }
+        if let Some(error) = self.spawn_error.take() {
+            return stop_with(ListenerTerminal::ConnectionSpawnFailed(error));
+        }
+        if let Some(connection) = self.connection_terminal.take() {
+            return stop_with(ListenerTerminal::ClosedClean { connection });
+        }
+        // Listener closed first; wait for the connection terminal mapper.
+        noop()
     }
 }
 
@@ -337,6 +385,8 @@ fn run_application(
         .ok_or_else(|| anyhow::anyhow!("connection mailbox capacity overflow"))?;
 
     let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
+    // Listener mailbox: ordinary lifecycle messages plus one reserved slot
+    // for the connection's terminal delivery.
     let listener = app
         .register_root::<_, Infallible>(
             Listener {
@@ -345,8 +395,11 @@ fn run_application(
                 connection_capacity,
                 max_broadcast_targets: config.max_broadcast_targets,
                 listener: None,
+                connection_terminal: None,
+                spawn_error: None,
+                listener_closed: false,
             },
-            8,
+            16,
         )
         .map_err(|e| anyhow::anyhow!("register listener: {e:?}"))?;
 
@@ -367,9 +420,13 @@ fn run_application(
     let listener_terminal = listener_result
         .wait(Duration::from_secs(3))
         .map_err(|error| anyhow::anyhow!("listener terminal: {error:?}"))?;
+    let connection = match listener_terminal {
+        ListenerTerminal::ClosedClean { connection } => connection,
+        other => anyhow::bail!("listener did not close cleanly: {other:?}"),
+    };
     anyhow::ensure!(
-        listener_terminal == ListenerTerminal::ClosedClean,
-        "listener did not close cleanly: {listener_terminal:?}"
+        connection == ConnectionTerminal::ClosedClean,
+        "connection did not close cleanly: {connection:?}"
     );
 
     let (accepted, full, closed) = parse_response(&response)?;
