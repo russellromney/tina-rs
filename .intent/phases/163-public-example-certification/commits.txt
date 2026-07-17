@@ -200,3 +200,15 @@ blast-radius proof, and post-merge workflow result here.
 - M4 network systems (mini_saas, scoped_request_tree, realtime_rooms, websocket_room)
 - M6 residual hosts
 - C1 final certification + FINDINGS.md + guards
+
+### M4 #376 MERGED
+- Head: 378063ffe7e5fc0969ee74c9c1bb89e2c0dee143
+- Merge: see origin/main after #376
+- CI green run 29564839961
+- Owns: mini_saas_api, system_scoped_request_tree, system_realtime_rooms, specimen_websocket_room
+- Quick review: no ThreadedRuntime/build_keepalive/SharedReport left; LocalSystem + typed delivery + install_keepalive_pool/close_and_drain
+- Clippy fixes during CI: field_reassign_with_default (realtime), large_enum_variant Box Http (scoped)
+
+### Next
+- M6 residual hosts
+- C1 final certification + FINDINGS.md + guards
