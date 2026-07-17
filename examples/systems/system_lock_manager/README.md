@@ -24,14 +24,15 @@ Caps in this specimen:
 - `max_keys` — number of active keys with a holder or waiters.
 - `mailbox` — lock manager mailbox capacity.
 
-Zero-valued bounded-shape fields are rejected through the fallible run path
-before the service is registered.
+`RunConfig::validate` rejects zero and oversized waiter, key, mailbox, and
+duration fields before the runtime or `SharedWork` table is constructed.
 
 ## Run
 
 ```bash
 cargo run  --manifest-path examples/systems/system_lock_manager/Cargo.toml
 cargo test --manifest-path examples/systems/system_lock_manager/Cargo.toml
+cargo test --manifest-path examples/systems/system_lock_manager/Cargo.toml --test public_smoke public_smoke -- --exact
 ```
 
 The smoke suite exercises nine behaviours:

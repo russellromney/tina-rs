@@ -2154,6 +2154,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tina-codec"
+version = "0.1.0"
+
+[[package]]
 name = "tina-macros"
 version = "0.1.0"
 dependencies = [
@@ -2171,6 +2175,7 @@ dependencies = [
  "rustls 0.23.40",
  "signal-hook",
  "tina",
+ "tina-codec",
  "tina-macros",
  "tina-supervisor",
 ]

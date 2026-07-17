@@ -1,4 +1,7 @@
-use system_soak_http_db::{RunConfig, run};
+use system_soak_http_db::{
+    MAX_CAPACITY, MAX_DURATION_MS, MAX_REQUESTS_PER_WORKER, MAX_TOTAL_REQUESTS, MAX_WORKERS,
+    RunConfig, RunConfigError, run,
+};
 
 #[test]
 fn soak_emits_grep_friendly_discovery_lines() {
@@ -282,5 +285,138 @@ fn soak_with_no_pressure_passes_assert_no_full() {
         report.copyable_assertion_failures.is_empty(),
         "expected no assertion failures: {:?}",
         report.copyable_assertion_failures
+    );
+}
+
+#[test]
+fn public_config_bounds_reject_before_runtime_startup() {
+    let cases = [
+        (
+            RunConfig {
+                workers: 0,
+                ..RunConfig::default()
+            },
+            RunConfigError::Zero { field: "workers" },
+        ),
+        (
+            RunConfig {
+                requests_per_worker: 0,
+                ..RunConfig::default()
+            },
+            RunConfigError::Zero {
+                field: "requests_per_worker",
+            },
+        ),
+        (
+            RunConfig {
+                http_in_flight_cap: 0,
+                ..RunConfig::default()
+            },
+            RunConfigError::Zero {
+                field: "http_in_flight_cap",
+            },
+        ),
+        (
+            RunConfig {
+                db_in_flight_cap: 0,
+                ..RunConfig::default()
+            },
+            RunConfigError::Zero {
+                field: "db_in_flight_cap",
+            },
+        ),
+        (
+            RunConfig {
+                event_sink_cap: 0,
+                ..RunConfig::default()
+            },
+            RunConfigError::Zero {
+                field: "event_sink_cap",
+            },
+        ),
+        (
+            RunConfig {
+                workers: MAX_WORKERS + 1,
+                ..RunConfig::default()
+            },
+            RunConfigError::TooLarge {
+                field: "workers",
+                value: MAX_WORKERS + 1,
+                max: MAX_WORKERS,
+            },
+        ),
+        (
+            RunConfig {
+                http_in_flight_cap: MAX_CAPACITY + 1,
+                ..RunConfig::default()
+            },
+            RunConfigError::TooLarge {
+                field: "http_in_flight_cap",
+                value: MAX_CAPACITY + 1,
+                max: MAX_CAPACITY,
+            },
+        ),
+        (
+            RunConfig {
+                fake_http_ms: MAX_DURATION_MS + 1,
+                ..RunConfig::default()
+            },
+            RunConfigError::DurationTooLarge {
+                field: "fake_http_ms",
+                value_ms: MAX_DURATION_MS + 1,
+                max_ms: MAX_DURATION_MS,
+            },
+        ),
+        (
+            RunConfig {
+                workers: MAX_WORKERS,
+                requests_per_worker: (MAX_TOTAL_REQUESTS / MAX_WORKERS) + 1,
+                ..RunConfig::default()
+            },
+            RunConfigError::TotalRequestsTooLarge {
+                total: MAX_WORKERS * ((MAX_TOTAL_REQUESTS / MAX_WORKERS) + 1),
+                max: MAX_TOTAL_REQUESTS,
+            },
+        ),
+        (
+            RunConfig {
+                workers: usize::MAX,
+                requests_per_worker: 2,
+                ..RunConfig::default()
+            },
+            RunConfigError::TooLarge {
+                field: "workers",
+                value: usize::MAX,
+                max: MAX_WORKERS,
+            },
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = run(config).expect_err("invalid config must fail before startup");
+        assert_eq!(error.downcast_ref::<RunConfigError>(), Some(&expected));
+    }
+
+    // Checked overflow of workers * requests when both are within individual caps.
+    let overflow = RunConfig {
+        workers: MAX_WORKERS,
+        requests_per_worker: MAX_REQUESTS_PER_WORKER,
+        ..RunConfig::default()
+    };
+    let error = overflow
+        .validate()
+        .expect_err("product of max workers and max requests must overflow or exceed total max");
+    assert!(
+        matches!(
+            error,
+            RunConfigError::TotalRequestOverflow { .. }
+                | RunConfigError::TotalRequestsTooLarge { .. }
+        ),
+        "unexpected overflow error: {error:?}"
+    );
+
+    assert_eq!(
+        RunConfig::default().total_requests().expect("defaults"),
+        8 * 16
     );
 }

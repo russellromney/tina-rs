@@ -24,6 +24,8 @@
 //! capabilities but they do not belong in the first thing a user copies.
 
 use std::convert::Infallible;
+use std::error::Error;
+use std::fmt;
 use std::time::Duration;
 
 #[cfg(test)]
@@ -42,8 +44,19 @@ use tina_runtime::{
     ThreadedRuntimeError, sleep,
 };
 
+/// Upper bound on concurrent callers and in-flight admission weight.
+pub const MAX_CALLERS: usize = 4_096;
+/// Upper bound on gateway mailbox capacity.
+pub const MAX_MAILBOX: usize = 65_536;
+/// Upper bound on the shared in-flight admission budget.
+pub const MAX_CAPACITY: usize = 1_000_000;
+/// Upper bound on concurrently armed runtime timers.
+pub const MAX_TIMER_CAPACITY: usize = 1_000_000;
+/// Upper bound on simulated work and host call timeouts.
+pub const MAX_DURATION_MS: u64 = 60_000;
+
 /// Tunables for one run.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunConfig {
     /// In-flight admission cap (`SharedCapacityScope` weight budget).
     pub capacity: usize,
@@ -70,6 +83,101 @@ impl Default for RunConfig {
             timer_capacity: LocalSystemConfig::default().timer_capacity,
         }
     }
+}
+
+/// Typed rejection of an unsafe public configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunConfigError {
+    Zero {
+        field: &'static str,
+    },
+    TooLarge {
+        field: &'static str,
+        value: usize,
+        max: usize,
+    },
+    DurationTooLarge {
+        field: &'static str,
+        value_ms: u64,
+        max_ms: u64,
+    },
+}
+
+impl fmt::Display for RunConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zero { field } => write!(f, "{field} must be greater than zero"),
+            Self::TooLarge { field, value, max } => {
+                write!(f, "{field} {value} exceeds maximum {max}")
+            }
+            Self::DurationTooLarge {
+                field,
+                value_ms,
+                max_ms,
+            } => write!(f, "{field} {value_ms}ms exceeds maximum {max_ms}ms"),
+        }
+    }
+}
+
+impl Error for RunConfigError {}
+
+impl RunConfig {
+    /// Rejects zero and oversized public counts before runtime, load, or scope
+    /// construction. Zero mailbox and zero timer capacity remain representable
+    /// for intentional pressure proofs and are rejected by the runtime/facade
+    /// rather than this method.
+    pub fn validate(self) -> Result<Self, RunConfigError> {
+        nonzero_bounded("capacity", self.capacity, MAX_CAPACITY)?;
+        if self.mailbox > MAX_MAILBOX {
+            return Err(RunConfigError::TooLarge {
+                field: "mailbox",
+                value: self.mailbox,
+                max: MAX_MAILBOX,
+            });
+        }
+        if self.timer_capacity > MAX_TIMER_CAPACITY {
+            return Err(RunConfigError::TooLarge {
+                field: "timer_capacity",
+                value: self.timer_capacity,
+                max: MAX_TIMER_CAPACITY,
+            });
+        }
+        nonzero_bounded("callers", self.callers, MAX_CALLERS)?;
+        // work_ms may be zero for instant-reply probes.
+        if self.work_ms > MAX_DURATION_MS {
+            return Err(RunConfigError::DurationTooLarge {
+                field: "work_ms",
+                value_ms: self.work_ms,
+                max_ms: MAX_DURATION_MS,
+            });
+        }
+        nonzero_duration("call_timeout_ms", self.call_timeout_ms, MAX_DURATION_MS)?;
+        Ok(self)
+    }
+}
+
+fn nonzero_bounded(field: &'static str, value: usize, max: usize) -> Result<(), RunConfigError> {
+    if value == 0 {
+        return Err(RunConfigError::Zero { field });
+    }
+    if value > max {
+        return Err(RunConfigError::TooLarge { field, value, max });
+    }
+    Ok(())
+}
+
+fn nonzero_duration(field: &'static str, value_ms: u64, max_ms: u64) -> Result<(), RunConfigError> {
+    if value_ms == 0 {
+        return Err(RunConfigError::Zero { field });
+    }
+    if value_ms > max_ms {
+        return Err(RunConfigError::DurationTooLarge {
+            field,
+            value_ms,
+            max_ms,
+        });
+    }
+    Ok(())
 }
 
 /// Aggregate report for one run. Every field here is read back from a
@@ -240,6 +348,7 @@ impl Gateway {
 /// `LocalSystem`, drive real concurrent callers through it, prove
 /// progress and a clean shutdown, then report what actually happened.
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
+    let config = config.validate()?;
     let local_config = LocalSystemConfig {
         timer_capacity: config.timer_capacity,
         ..LocalSystemConfig::default()

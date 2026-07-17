@@ -20,7 +20,7 @@ const MAX_WORK_MS: u64 = 60_000;
 const MAX_CALL_TIMEOUT_MS: u64 = 60_000;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunConfig {
     pub callers: usize,
     pub lane_in_flight: usize,
@@ -67,6 +67,15 @@ impl RunConfig {
             true,
             MAX_CALL_TIMEOUT_MS,
         )?;
+        // Barrier participants = callers + 1 must not overflow.
+        self.callers
+            .checked_add(1)
+            .ok_or(RunConfigError::OutOfRange {
+                field: "callers",
+                value: self.callers,
+                min: 1,
+                max: MAX_CALLERS,
+            })?;
         Ok(self)
     }
 }
@@ -505,7 +514,7 @@ pub fn run_against_s3(
                     timeout: bridge_timeout,
                 },
             )
-            .and_then(|lane| drive_callers(app, lane.requests, config));
+            .and_then(|lane| drive_callers(app, lane.requests, config, true));
             let drain = bridge.closer.close_and_drain(SHUTDOWN_TIMEOUT);
             finish_s3_workload(workload, drain)
         })
@@ -547,7 +556,31 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
                     work: Duration::from_millis(config.work_ms),
                 },
             )?;
-            drive_callers(app, lane.requests, config)
+            drive_callers(app, lane.requests, config, true)
+        })
+        .map_err(anyhow::Error::from)?;
+    report.dropped_permits = tina_runtime::dropped_permit_count().saturating_sub(dropped_before);
+    Ok(report)
+}
+
+/// Drive Puts only and keep exact host terminals without requiring Stats.
+///
+/// Used to prove mailbox `Full` (and other host outcomes) stay distinct from
+/// application `Busy` when the mailbox itself cannot accept work.
+pub fn run_put_terminals(config: RunConfig) -> anyhow::Result<RunReport> {
+    let config = config.validate()?;
+    let dropped_before = tina_runtime::dropped_permit_count();
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    let mut report = app
+        .run_to_shutdown_reported(SHUTDOWN_TIMEOUT, |app| {
+            let lane = register_lane(
+                app,
+                config,
+                WorkBackend::FakeSleep {
+                    work: Duration::from_millis(config.work_ms),
+                },
+            )?;
+            drive_callers(app, lane.requests, config, false)
         })
         .map_err(anyhow::Error::from)?;
     report.dropped_permits = tina_runtime::dropped_permit_count().saturating_sub(dropped_before);
@@ -582,8 +615,13 @@ fn drive_callers(
     app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
     lane: tina::ServiceRequestAddress<LaneEvent, LaneRequest, LaneReply>,
     config: RunConfig,
+    require_stats: bool,
 ) -> anyhow::Result<RunReport> {
-    let barrier = std::sync::Barrier::new(config.callers + 1);
+    let participants = config
+        .callers
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("callers + 1 overflowed"))?;
+    let barrier = std::sync::Barrier::new(participants);
     let call_timeout = Duration::from_millis(config.call_timeout_ms);
     let outcomes = thread::scope(|scope| {
         let mut threads = Vec::with_capacity(config.callers);
@@ -643,16 +681,32 @@ fn drive_callers(
         }
     }
 
-    let stats = match app.call_blocking_request(lane, LaneRequest::Stats, Duration::from_secs(1))? {
-        CallOutcome::Replied(LaneReply::Stats(stats)) => stats,
-        CallOutcome::Replied(other) => {
-            return Err(anyhow::anyhow!(HostFailure::UnexpectedStatsReply(other)));
+    let stats = if require_stats {
+        match app.call_blocking_request(lane, LaneRequest::Stats, Duration::from_secs(1))? {
+            CallOutcome::Replied(LaneReply::Stats(stats)) => stats,
+            CallOutcome::Replied(other) => {
+                return Err(anyhow::anyhow!(HostFailure::UnexpectedStatsReply(other)));
+            }
+            CallOutcome::Full => return Err(anyhow::anyhow!(HostFailure::StatsFull)),
+            CallOutcome::Closed => return Err(anyhow::anyhow!(HostFailure::StatsClosed)),
+            CallOutcome::Timeout => return Err(anyhow::anyhow!(HostFailure::StatsTimeout)),
+            CallOutcome::Rejected(reason) => {
+                return Err(anyhow::anyhow!(HostFailure::StatsRejected(reason)));
+            }
         }
-        CallOutcome::Full => return Err(anyhow::anyhow!(HostFailure::StatsFull)),
-        CallOutcome::Closed => return Err(anyhow::anyhow!(HostFailure::StatsClosed)),
-        CallOutcome::Timeout => return Err(anyhow::anyhow!(HostFailure::StatsTimeout)),
-        CallOutcome::Rejected(reason) => {
-            return Err(anyhow::anyhow!(HostFailure::StatsRejected(reason)));
+    } else {
+        // Stats were not observed. Do not claim agreement — Put terminals are
+        // the only load-bearing fields on this path.
+        LaneStats {
+            accepted: 0,
+            busy: 0,
+            work_completed: 0,
+            completed: 0,
+            current: 0,
+            retired: 0,
+            caller_gone: 0,
+            counts_agree: false,
+            settlements_agree: false,
         }
     };
 

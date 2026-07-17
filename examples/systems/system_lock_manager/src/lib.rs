@@ -28,6 +28,8 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::error::Error;
+use std::fmt;
 use std::sync::{Barrier, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -43,8 +45,17 @@ use tina_runtime::{
 
 type App = LocalSystem<SingleShard, DefaultThreadedMailboxFactory>;
 
+/// Upper bound on parked waiter and keyspace capacities.
+pub const MAX_WAITERS: usize = 65_536;
+/// Upper bound on active keys.
+pub const MAX_KEYS: usize = 65_536;
+/// Upper bound on the lock-manager mailbox.
+pub const MAX_MAILBOX: usize = 65_536;
+/// Upper bound on lease length and host call timeouts.
+pub const MAX_DURATION_MS: u64 = 60_000;
+
 /// Tunables for one specimen run.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunConfig {
     /// Total parked acquire-callers across every key.
     pub waiter_capacity: usize,
@@ -71,6 +82,80 @@ impl Default for RunConfig {
             call_timeout_ms: 5_000,
         }
     }
+}
+
+/// Typed rejection of an unsafe public configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunConfigError {
+    Zero {
+        field: &'static str,
+    },
+    TooLarge {
+        field: &'static str,
+        value: usize,
+        max: usize,
+    },
+    DurationTooLarge {
+        field: &'static str,
+        value_ms: u64,
+        max_ms: u64,
+    },
+}
+
+impl fmt::Display for RunConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zero { field } => write!(f, "{field} must be greater than zero"),
+            Self::TooLarge { field, value, max } => {
+                write!(f, "{field} {value} exceeds maximum {max}")
+            }
+            Self::DurationTooLarge {
+                field,
+                value_ms,
+                max_ms,
+            } => write!(f, "{field} {value_ms}ms exceeds maximum {max_ms}ms"),
+        }
+    }
+}
+
+impl Error for RunConfigError {}
+
+impl RunConfig {
+    /// Rejects zero and oversized public counts before runtime or
+    /// `SharedWork` construction.
+    pub fn validate(self) -> Result<Self, RunConfigError> {
+        nonzero_bounded("waiter_capacity", self.waiter_capacity, MAX_WAITERS)?;
+        nonzero_bounded("max_waiters_per_key", self.max_waiters_per_key, MAX_WAITERS)?;
+        nonzero_bounded("max_keys", self.max_keys, MAX_KEYS)?;
+        nonzero_bounded("mailbox", self.mailbox, MAX_MAILBOX)?;
+        nonzero_duration("lease_ms", self.lease_ms, MAX_DURATION_MS)?;
+        nonzero_duration("call_timeout_ms", self.call_timeout_ms, MAX_DURATION_MS)?;
+        Ok(self)
+    }
+}
+
+fn nonzero_bounded(field: &'static str, value: usize, max: usize) -> Result<(), RunConfigError> {
+    if value == 0 {
+        return Err(RunConfigError::Zero { field });
+    }
+    if value > max {
+        return Err(RunConfigError::TooLarge { field, value, max });
+    }
+    Ok(())
+}
+
+fn nonzero_duration(field: &'static str, value_ms: u64, max_ms: u64) -> Result<(), RunConfigError> {
+    if value_ms == 0 {
+        return Err(RunConfigError::Zero { field });
+    }
+    if value_ms > max_ms {
+        return Err(RunConfigError::DurationTooLarge {
+            field,
+            value_ms,
+            max_ms,
+        });
+    }
+    Ok(())
 }
 
 /// Opaque holder token. Stale tokens are rejected on release/renew.
@@ -1049,24 +1134,7 @@ fn register(
 }
 
 fn validate_config(config: RunConfig) -> anyhow::Result<()> {
-    if config.waiter_capacity == 0 {
-        anyhow::bail!("waiter_capacity must be greater than zero");
-    }
-    if config.max_waiters_per_key == 0 {
-        anyhow::bail!("max_waiters_per_key must be greater than zero");
-    }
-    if config.max_keys == 0 {
-        anyhow::bail!("max_keys must be greater than zero");
-    }
-    if config.mailbox == 0 {
-        anyhow::bail!("mailbox must be greater than zero");
-    }
-    if config.lease_ms == 0 {
-        anyhow::bail!("lease_ms must be greater than zero");
-    }
-    if config.call_timeout_ms == 0 {
-        anyhow::bail!("call_timeout_ms must be greater than zero");
-    }
+    config.validate()?;
     Ok(())
 }
 

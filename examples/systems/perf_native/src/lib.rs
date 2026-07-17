@@ -94,22 +94,176 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 const KEEPALIVE_REQUESTS_PER_CONN: usize = 4;
 const FIXED_BODY_BYTES: usize = 4096;
 
+/// Public upper bounds for configurable workload knobs used by comparison rows.
+pub const MAX_OPS: u64 = 1_000_000;
+pub const MAX_WORKERS: usize = 4_096;
+pub const MAX_SAMPLES: usize = 1_024;
+pub const MAX_CAPACITY: usize = 2_000_000;
+pub const MAX_CALL_TIMEOUT_MS: u64 = 60_000;
+
+/// Public workload knobs for native comparison rows.
+///
+/// Defaults preserve the accepted historical counts. Comparison entry points
+/// call [`WorkloadConfig::validate`] and build runtimes, mailboxes, load
+/// runners, and sample loops from these fields — they do not fall back to
+/// hard-coded private constants after validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkloadConfig {
+    /// Ops for host enqueue / observe / call / chain comparison rows.
+    pub ops: u64,
+    /// Ops for HTTP/1.1 comparison rows (historically smaller than [`Self::ops`]).
+    pub http_ops: u64,
+    pub workers: usize,
+    pub samples: usize,
+    pub capacity: usize,
+    pub call_timeout_ms: u64,
+}
+
+impl Default for WorkloadConfig {
+    fn default() -> Self {
+        Self {
+            ops: OPS,
+            http_ops: HTTP_OPS,
+            workers: WORKERS,
+            samples: SAMPLES,
+            capacity: CAPACITY,
+            call_timeout_ms: CALL_TIMEOUT.as_millis() as u64,
+        }
+    }
+}
+
+impl WorkloadConfig {
+    fn call_timeout(self) -> Duration {
+        Duration::from_millis(self.call_timeout_ms)
+    }
+}
+
+/// Typed rejection of an unsafe public workload configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadConfigError {
+    Zero {
+        field: &'static str,
+    },
+    TooLarge {
+        field: &'static str,
+        value: u128,
+        max: u128,
+    },
+    CapacityTooSmall {
+        capacity: usize,
+        ops: u64,
+    },
+    DerivedOverflow {
+        field: &'static str,
+    },
+}
+
+impl std::fmt::Display for WorkloadConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Zero { field } => write!(f, "{field} must be greater than zero"),
+            Self::TooLarge { field, value, max } => {
+                write!(f, "{field} {value} exceeds maximum {max}")
+            }
+            Self::CapacityTooSmall { capacity, ops } => {
+                write!(f, "capacity {capacity} is below ops {ops}")
+            }
+            Self::DerivedOverflow { field } => write!(f, "{field} overflowed"),
+        }
+    }
+}
+
+impl std::error::Error for WorkloadConfigError {}
+
+impl WorkloadConfig {
+    /// Validates public counts and derived values before allocation.
+    pub fn validate(self) -> Result<Self, WorkloadConfigError> {
+        nonzero_u64("ops", self.ops, MAX_OPS)?;
+        nonzero_u64("http_ops", self.http_ops, MAX_OPS)?;
+        nonzero_usize("workers", self.workers, MAX_WORKERS)?;
+        nonzero_usize("samples", self.samples, MAX_SAMPLES)?;
+        nonzero_usize("capacity", self.capacity, MAX_CAPACITY)?;
+        nonzero_u64("call_timeout_ms", self.call_timeout_ms, MAX_CALL_TIMEOUT_MS)?;
+        let ops_usize = usize::try_from(self.ops).map_err(|_| WorkloadConfigError::DerivedOverflow {
+            field: "ops",
+        })?;
+        if self.capacity < ops_usize {
+            return Err(WorkloadConfigError::CapacityTooSmall {
+                capacity: self.capacity,
+                ops: self.ops,
+            });
+        }
+        self.workers
+            .checked_add(1)
+            .ok_or(WorkloadConfigError::DerivedOverflow {
+                field: "workers_plus_one",
+            })?;
+        Ok(self)
+    }
+}
+
+fn nonzero_usize(
+    field: &'static str,
+    value: usize,
+    max: usize,
+) -> Result<(), WorkloadConfigError> {
+    if value == 0 {
+        return Err(WorkloadConfigError::Zero { field });
+    }
+    if value > max {
+        return Err(WorkloadConfigError::TooLarge {
+            field,
+            value: value as u128,
+            max: max as u128,
+        });
+    }
+    Ok(())
+}
+
+fn nonzero_u64(field: &'static str, value: u64, max: u64) -> Result<(), WorkloadConfigError> {
+    if value == 0 {
+        return Err(WorkloadConfigError::Zero { field });
+    }
+    if value > max {
+        return Err(WorkloadConfigError::TooLarge {
+            field,
+            value: value as u128,
+            max: max as u128,
+        });
+    }
+    Ok(())
+}
+
 pub fn run_all() -> anyhow::Result<Vec<PerfComparisonReport>> {
+    run_all_with(WorkloadConfig::default())
+}
+
+/// Run every comparison row under a validated [`WorkloadConfig`].
+pub fn run_all_with(config: WorkloadConfig) -> anyhow::Result<Vec<PerfComparisonReport>> {
+    let config = config
+        .validate()
+        .map_err(|error| anyhow::anyhow!("workload config: {error}"))?;
     Ok(vec![
-        host_enqueue_compare()?,
-        observed_admission_compare()?,
-        host_call_compare()?,
-        service_call_chain_compare()?,
-        http1_close_compare()?,
-        http1_keepalive_compare()?,
-        http1_fixed_body_compare()?,
-        http1_keepalive_steady_state_small_compare()?,
-        http1_keepalive_steady_state_fixed_compare()?,
+        host_enqueue_compare_with(config)?,
+        observed_admission_compare_with(config)?,
+        host_call_compare_with(config)?,
+        service_call_chain_compare_with(config)?,
+        http1_close_compare_with(config)?,
+        http1_keepalive_compare_with(config)?,
+        http1_fixed_body_compare_with(config)?,
+        http1_keepalive_steady_state_small_compare_with(config)?,
+        http1_keepalive_steady_state_fixed_compare_with(config)?,
     ])
 }
 
 pub fn host_enqueue_compare() -> anyhow::Result<PerfComparisonReport> {
+    host_enqueue_compare_with(WorkloadConfig::default())
+}
+
+/// Host-enqueue comparison under an explicit validated workload.
+pub fn host_enqueue_compare_with(config: WorkloadConfig) -> anyhow::Result<PerfComparisonReport> {
     compare_samples(
+        config,
         "host_enqueue",
         tina_host_enqueue_row,
         tokio_host_enqueue_row,
@@ -119,7 +273,14 @@ pub fn host_enqueue_compare() -> anyhow::Result<PerfComparisonReport> {
 }
 
 pub fn observed_admission_compare() -> anyhow::Result<PerfComparisonReport> {
+    observed_admission_compare_with(WorkloadConfig::default())
+}
+
+pub fn observed_admission_compare_with(
+    config: WorkloadConfig,
+) -> anyhow::Result<PerfComparisonReport> {
     compare_samples(
+        config,
         "observed_admission",
         tina_observed_admission_row,
         tokio_observed_admission_row,
@@ -129,7 +290,13 @@ pub fn observed_admission_compare() -> anyhow::Result<PerfComparisonReport> {
 }
 
 pub fn host_call_compare() -> anyhow::Result<PerfComparisonReport> {
+    host_call_compare_with(WorkloadConfig::default())
+}
+
+/// Host call comparison under an explicit validated workload.
+pub fn host_call_compare_with(config: WorkloadConfig) -> anyhow::Result<PerfComparisonReport> {
     compare_samples(
+        config,
         "host_request_reply",
         tina_host_call_row,
         tokio_host_call_row,
@@ -139,7 +306,14 @@ pub fn host_call_compare() -> anyhow::Result<PerfComparisonReport> {
 }
 
 pub fn service_call_chain_compare() -> anyhow::Result<PerfComparisonReport> {
+    service_call_chain_compare_with(WorkloadConfig::default())
+}
+
+pub fn service_call_chain_compare_with(
+    config: WorkloadConfig,
+) -> anyhow::Result<PerfComparisonReport> {
     compare_samples(
+        config,
         "service_request_reply_chain",
         tina_service_call_chain_row,
         tokio_service_call_chain_row,
@@ -149,7 +323,12 @@ pub fn service_call_chain_compare() -> anyhow::Result<PerfComparisonReport> {
 }
 
 pub fn http1_close_compare() -> anyhow::Result<PerfComparisonReport> {
+    http1_close_compare_with(WorkloadConfig::default())
+}
+
+pub fn http1_close_compare_with(config: WorkloadConfig) -> anyhow::Result<PerfComparisonReport> {
     compare_samples(
+        config,
         "http1_close_request",
         tina_http1_close_row,
         tokio_http1_close_row,
@@ -159,7 +338,14 @@ pub fn http1_close_compare() -> anyhow::Result<PerfComparisonReport> {
 }
 
 pub fn http1_keepalive_compare() -> anyhow::Result<PerfComparisonReport> {
+    http1_keepalive_compare_with(WorkloadConfig::default())
+}
+
+pub fn http1_keepalive_compare_with(
+    config: WorkloadConfig,
+) -> anyhow::Result<PerfComparisonReport> {
     compare_samples(
+        config,
         "http1_keepalive_sequential",
         tina_http1_keepalive_row,
         tokio_http1_keepalive_row,
@@ -169,7 +355,14 @@ pub fn http1_keepalive_compare() -> anyhow::Result<PerfComparisonReport> {
 }
 
 pub fn http1_fixed_body_compare() -> anyhow::Result<PerfComparisonReport> {
+    http1_fixed_body_compare_with(WorkloadConfig::default())
+}
+
+pub fn http1_fixed_body_compare_with(
+    config: WorkloadConfig,
+) -> anyhow::Result<PerfComparisonReport> {
     compare_samples(
+        config,
         "http1_fixed_body_close",
         tina_http1_fixed_body_row,
         tokio_http1_fixed_body_row,
@@ -179,7 +372,14 @@ pub fn http1_fixed_body_compare() -> anyhow::Result<PerfComparisonReport> {
 }
 
 pub fn http1_keepalive_steady_state_small_compare() -> anyhow::Result<PerfComparisonReport> {
+    http1_keepalive_steady_state_small_compare_with(WorkloadConfig::default())
+}
+
+pub fn http1_keepalive_steady_state_small_compare_with(
+    config: WorkloadConfig,
+) -> anyhow::Result<PerfComparisonReport> {
     compare_samples(
+        config,
         "http1_keepalive_steady_state_small",
         tina_http1_keepalive_steady_state_small_row,
         tokio_http1_keepalive_steady_state_small_row,
@@ -189,7 +389,14 @@ pub fn http1_keepalive_steady_state_small_compare() -> anyhow::Result<PerfCompar
 }
 
 pub fn http1_keepalive_steady_state_fixed_compare() -> anyhow::Result<PerfComparisonReport> {
+    http1_keepalive_steady_state_fixed_compare_with(WorkloadConfig::default())
+}
+
+pub fn http1_keepalive_steady_state_fixed_compare_with(
+    config: WorkloadConfig,
+) -> anyhow::Result<PerfComparisonReport> {
     compare_samples(
+        config,
         "http1_keepalive_steady_state_fixed",
         tina_http1_keepalive_steady_state_fixed_row,
         tokio_http1_keepalive_steady_state_fixed_row,
@@ -293,22 +500,26 @@ fn body_pressure_observation(metrics: &BodyMetrics, max_body_bytes: usize) -> Lo
 }
 
 fn compare_samples(
+    config: WorkloadConfig,
     label: &'static str,
-    tina_fn: fn() -> anyhow::Result<PerfReport>,
-    baseline_fn: fn() -> anyhow::Result<PerfReport>,
+    tina_fn: fn(WorkloadConfig) -> anyhow::Result<PerfReport>,
+    baseline_fn: fn(WorkloadConfig) -> anyhow::Result<PerfReport>,
     semantic_match: SemanticMatch,
     mismatch_reason: &'static str,
 ) -> anyhow::Result<PerfComparisonReport> {
+    let config = config
+        .validate()
+        .map_err(|error| anyhow::anyhow!("workload config: {error}"))?;
     // Warmup is deliberately ignored. It lets both sides pay one-time runtime,
     // code path, and allocator setup before the reported samples.
-    let _ = tina_fn()?;
-    let _ = baseline_fn()?;
+    let _ = tina_fn(config)?;
+    let _ = baseline_fn(config)?;
 
-    let mut tina = Vec::with_capacity(SAMPLES);
-    let mut baseline = Vec::with_capacity(SAMPLES);
-    for _ in 0..SAMPLES {
-        tina.push(tina_fn()?);
-        baseline.push(baseline_fn()?);
+    let mut tina = Vec::with_capacity(config.samples);
+    let mut baseline = Vec::with_capacity(config.samples);
+    for _ in 0..config.samples {
+        tina.push(tina_fn(config)?);
+        baseline.push(baseline_fn(config)?);
     }
 
     Ok(PerfComparisonReport::new(
@@ -318,7 +529,7 @@ fn compare_samples(
         semantic_match,
         mismatch_reason,
     )
-    .with_samples(SAMPLES, "median_p50_after_warmup"))
+    .with_samples(config.samples, "median_p50_after_warmup"))
 }
 
 fn median_report(mut reports: Vec<PerfReport>) -> PerfReport {
@@ -397,14 +608,23 @@ enum ChainEvent {
 /// Split-service envelope for [`ChainService`].
 type ChainMsg = tina::ServiceMessage<ChainEvent, ChainRequest>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ChainReply {
     Done,
+    /// Downstream ping mailbox was full; not collapsed into success.
+    DownstreamFull,
+    /// Downstream ping service was closed.
+    DownstreamClosed,
+    /// Downstream ping call timed out.
+    DownstreamTimeout,
+    /// Downstream ping call was rejected with an exact reason.
+    DownstreamRejected(tina::CallRejectedReason),
 }
 
 #[derive(Debug)]
 struct ChainService {
     ping: Address<PingMsg, PingReply>,
+    call_timeout: Duration,
 }
 
 #[tina_runtime::isolate(event = ChainEvent, request = ChainRequest, reply = ChainReply)]
@@ -415,10 +635,9 @@ impl ChainService {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match event {
-            ChainEvent::PingReturned(request, CallOutcome::Replied(PingReply::Pong)) => {
-                reply_to(request, ChainReply::Done)
+            ChainEvent::PingReturned(request, outcome) => {
+                reply_to(request, chain_reply_from_ping(outcome))
             }
-            ChainEvent::PingReturned(request, _) => reply_to(request, ChainReply::Done),
         }
     }
 
@@ -429,9 +648,19 @@ impl ChainService {
     ) -> RequestEffect<Self> {
         match request {
             ChainRequest::Run => call_ctx
-                .defer(call(self.ping, PingMsg::Ping, CALL_TIMEOUT))
+                .defer(call(self.ping, PingMsg::Ping, self.call_timeout))
                 .reply(|req, outcome| ChainMsg::Event(ChainEvent::PingReturned(req, outcome))),
         }
+    }
+}
+
+fn chain_reply_from_ping(outcome: CallOutcome<PingReply>) -> ChainReply {
+    match outcome {
+        CallOutcome::Replied(PingReply::Pong) => ChainReply::Done,
+        CallOutcome::Full => ChainReply::DownstreamFull,
+        CallOutcome::Closed => ChainReply::DownstreamClosed,
+        CallOutcome::Timeout => ChainReply::DownstreamTimeout,
+        CallOutcome::Rejected(reason) => ChainReply::DownstreamRejected(reason),
     }
 }
 
@@ -458,10 +687,11 @@ impl BodyService {
     }
 }
 
-fn tina_host_enqueue_row() -> anyhow::Result<PerfReport> {
-    let runtime = new_runtime()?;
+fn tina_host_enqueue_row(config: WorkloadConfig) -> anyhow::Result<PerfReport> {
+    let runtime = new_runtime_with_capacity(config.capacity)?;
     let count = Arc::new(AtomicU64::new(0));
-    let addr = register_counter(&runtime, &count)?;
+    let addr = register_counter(&runtime, &count, config.capacity)?;
+    let ops = config.ops;
 
     runtime
         .send_and_observe(addr, CounterMsg::Hit)
@@ -471,8 +701,8 @@ fn tina_host_enqueue_row() -> anyhow::Result<PerfReport> {
     let rt = runtime.shared();
     let (mut load, allocations) = run_counted(
         LoadRun {
-            workers: WORKERS,
-            stop: LoadStop::ops(OPS),
+            workers: config.workers,
+            stop: LoadStop::ops(ops),
             label: "tina_host_enqueue",
         },
         move |_| match rt.try_send(addr, CounterMsg::Hit) {
@@ -482,7 +712,7 @@ fn tina_host_enqueue_row() -> anyhow::Result<PerfReport> {
         Some({
             let count = Arc::clone(&count);
             move || {
-                wait_count(&count, OPS + 1);
+                wait_count(&count, ops + 1);
                 LoadObservation::default()
             }
         }),
@@ -496,15 +726,16 @@ fn tina_host_enqueue_row() -> anyhow::Result<PerfReport> {
     ))
 }
 
-fn tokio_host_enqueue_row() -> anyhow::Result<PerfReport> {
-    let (tx, handle, stop_tx, count) = start_tokio_counter();
+fn tokio_host_enqueue_row(config: WorkloadConfig) -> anyhow::Result<PerfReport> {
+    let (tx, handle, stop_tx, count) = start_tokio_counter(config.capacity);
+    let ops = config.ops;
     tx.try_send(()).expect("warm tokio enqueue");
     wait_count(&count, 1);
 
     let (mut load, allocations) = run_counted(
         LoadRun {
-            workers: WORKERS,
-            stop: LoadStop::ops(OPS),
+            workers: config.workers,
+            stop: LoadStop::ops(ops),
             label: "tokio_host_enqueue",
         },
         move |_| match tx.try_send(()) {
@@ -514,7 +745,7 @@ fn tokio_host_enqueue_row() -> anyhow::Result<PerfReport> {
         Some({
             let count = Arc::clone(&count);
             move || {
-                wait_count(&count, OPS + 1);
+                wait_count(&count, ops + 1);
                 LoadObservation::default()
             }
         }),
@@ -529,10 +760,11 @@ fn tokio_host_enqueue_row() -> anyhow::Result<PerfReport> {
     ))
 }
 
-fn tina_observed_admission_row() -> anyhow::Result<PerfReport> {
-    let runtime = new_runtime()?;
+fn tina_observed_admission_row(config: WorkloadConfig) -> anyhow::Result<PerfReport> {
+    let runtime = new_runtime_with_capacity(config.capacity)?;
     let count = Arc::new(AtomicU64::new(0));
-    let addr = register_counter(&runtime, &count)?;
+    let addr = register_counter(&runtime, &count, config.capacity)?;
+    let ops = config.ops;
 
     runtime
         .send_and_observe(addr, CounterMsg::Hit)
@@ -542,8 +774,8 @@ fn tina_observed_admission_row() -> anyhow::Result<PerfReport> {
     let rt = runtime.shared();
     let (mut load, allocations) = run_counted(
         LoadRun {
-            workers: WORKERS,
-            stop: LoadStop::ops(OPS),
+            workers: config.workers,
+            stop: LoadStop::ops(ops),
             label: "tina_observed_admission",
         },
         move |_| match rt.send_and_observe(addr, CounterMsg::Hit) {
@@ -553,11 +785,17 @@ fn tina_observed_admission_row() -> anyhow::Result<PerfReport> {
             ) => OpOutcome::Err { kind: "full" },
             Err(ThreadedSendObservedError::MailboxClosed) => OpOutcome::Err { kind: "closed" },
             Err(ThreadedSendObservedError::WorkerStopped) => OpOutcome::Err { kind: "stopped" },
+            Err(ThreadedSendObservedError::ForeignSystem { .. }) => OpOutcome::Err {
+                kind: "foreign_system",
+            },
+            Err(ThreadedSendObservedError::UnknownShard(_)) => OpOutcome::Err {
+                kind: "unknown_shard",
+            },
         },
         Some({
             let count = Arc::clone(&count);
             move || {
-                wait_count(&count, OPS + 1);
+                wait_count(&count, ops + 1);
                 LoadObservation::default()
             }
         }),
@@ -571,8 +809,8 @@ fn tina_observed_admission_row() -> anyhow::Result<PerfReport> {
     ))
 }
 
-fn tokio_observed_admission_row() -> anyhow::Result<PerfReport> {
-    let (tx, mut rx) = mpsc::channel::<oneshot::Sender<()>>(CAPACITY);
+fn tokio_observed_admission_row(config: WorkloadConfig) -> anyhow::Result<PerfReport> {
+    let (tx, mut rx) = mpsc::channel::<oneshot::Sender<()>>(config.capacity);
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let handle = thread::spawn(move || {
         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
@@ -596,8 +834,8 @@ fn tokio_observed_admission_row() -> anyhow::Result<PerfReport> {
 
     let (mut load, allocations) = run_counted(
         LoadRun {
-            workers: WORKERS,
-            stop: LoadStop::ops(OPS),
+            workers: config.workers,
+            stop: LoadStop::ops(config.ops),
             label: "tokio_observed_admission",
         },
         move |_| {
@@ -629,28 +867,31 @@ fn tokio_observed_admission_row() -> anyhow::Result<PerfReport> {
     ))
 }
 
-fn tina_host_call_row() -> anyhow::Result<PerfReport> {
-    let runtime = new_runtime()?;
+fn tina_host_call_row(config: WorkloadConfig) -> anyhow::Result<PerfReport> {
+    let runtime = new_runtime_with_capacity(config.capacity)?;
+    let call_timeout = config.call_timeout();
     let addr = runtime
-        .register_with_capacity::<_, Infallible>(Ping, CAPACITY)
+        .register_with_capacity::<_, Infallible>(Ping, config.capacity)
         .map_err(|e| anyhow::anyhow!("register tina ping: {e:?}"))?;
     assert_eq!(
-        runtime.call_blocking(addr, PingMsg::Ping, CALL_TIMEOUT)?,
+        runtime.call_blocking(addr, PingMsg::Ping, call_timeout)?,
         CallOutcome::Replied(PingReply::Pong),
     );
 
     let rt = runtime.shared();
     let (mut load, allocations) = run_counted(
         LoadRun {
-            workers: WORKERS,
-            stop: LoadStop::ops(OPS),
+            workers: config.workers,
+            stop: LoadStop::ops(config.ops),
             label: "tina_host_call",
         },
-        move |_| match rt.call_blocking(addr, PingMsg::Ping, CALL_TIMEOUT) {
+        move |_| match rt.call_blocking(addr, PingMsg::Ping, call_timeout) {
             Ok(CallOutcome::Replied(PingReply::Pong)) => OpOutcome::Ok,
             Ok(CallOutcome::Full) => OpOutcome::Err { kind: "full" },
+            Ok(CallOutcome::Closed) => OpOutcome::Err { kind: "closed" },
             Ok(CallOutcome::Timeout) => OpOutcome::Timeout,
-            _ => OpOutcome::Err { kind: "call_error" },
+            Ok(CallOutcome::Rejected(_)) => OpOutcome::Err { kind: "rejected" },
+            Err(_) => OpOutcome::Err { kind: "host_error" },
         },
         None::<fn() -> LoadObservation>,
     );
@@ -663,16 +904,16 @@ fn tina_host_call_row() -> anyhow::Result<PerfReport> {
     ))
 }
 
-fn tokio_host_call_row() -> anyhow::Result<PerfReport> {
-    let (tx, handle, stop_tx) = start_tokio_ping();
+fn tokio_host_call_row(config: WorkloadConfig) -> anyhow::Result<PerfReport> {
+    let (tx, handle, stop_tx) = start_tokio_ping(config.capacity);
     let (warm_tx, warm_rx) = oneshot::channel();
     tx.blocking_send(warm_tx).expect("warm tokio call send");
     warm_rx.blocking_recv().expect("warm tokio call reply");
 
     let (mut load, allocations) = run_counted(
         LoadRun {
-            workers: WORKERS,
-            stop: LoadStop::ops(OPS),
+            workers: config.workers,
+            stop: LoadStop::ops(config.ops),
             label: "tokio_host_call",
         },
         move |_| tokio_call_op(&tx),
@@ -695,37 +936,54 @@ fn tokio_host_call_row() -> anyhow::Result<PerfReport> {
     ))
 }
 
-fn tina_service_call_chain_row() -> anyhow::Result<PerfReport> {
-    let runtime = new_runtime()?;
+fn tina_service_call_chain_row(config: WorkloadConfig) -> anyhow::Result<PerfReport> {
+    let runtime = new_runtime_with_capacity(config.capacity)?;
+    let call_timeout = config.call_timeout();
     let ping = runtime
-        .register_with_capacity::<_, Infallible>(Ping, CAPACITY)
+        .register_with_capacity::<_, Infallible>(Ping, config.capacity)
         .map_err(|e| anyhow::anyhow!("register tina chain ping: {e:?}"))?;
     let chain = runtime
         .register_split_service::<ChainService, ChainEvent, ChainRequest, Infallible>(
-            ChainService { ping },
-            CAPACITY,
+            ChainService {
+                ping,
+                call_timeout,
+            },
+            config.capacity,
         )
         .map_err(|e| anyhow::anyhow!("register tina chain service: {e:?}"))?
         .requests
         .address()
         .address();
     assert_eq!(
-        runtime.call_blocking(chain, ChainMsg::Request(ChainRequest::Run), CALL_TIMEOUT)?,
+        runtime.call_blocking(chain, ChainMsg::Request(ChainRequest::Run), call_timeout)?,
         CallOutcome::Replied(ChainReply::Done),
     );
 
     let rt = runtime.shared();
     let (mut load, allocations) = run_counted(
         LoadRun {
-            workers: WORKERS,
-            stop: LoadStop::ops(OPS),
+            workers: config.workers,
+            stop: LoadStop::ops(config.ops),
             label: "tina_service_call_chain",
         },
-        move |_| match rt.call_blocking(chain, ChainMsg::Request(ChainRequest::Run), CALL_TIMEOUT) {
+        move |_| match rt.call_blocking(chain, ChainMsg::Request(ChainRequest::Run), call_timeout)
+        {
             Ok(CallOutcome::Replied(ChainReply::Done)) => OpOutcome::Ok,
+            Ok(CallOutcome::Replied(ChainReply::DownstreamFull)) => OpOutcome::Err {
+                kind: "downstream_full",
+            },
+            Ok(CallOutcome::Replied(ChainReply::DownstreamClosed)) => OpOutcome::Err {
+                kind: "downstream_closed",
+            },
+            Ok(CallOutcome::Replied(ChainReply::DownstreamTimeout)) => OpOutcome::Timeout,
+            Ok(CallOutcome::Replied(ChainReply::DownstreamRejected(_))) => OpOutcome::Err {
+                kind: "downstream_rejected",
+            },
             Ok(CallOutcome::Full) => OpOutcome::Err { kind: "full" },
+            Ok(CallOutcome::Closed) => OpOutcome::Err { kind: "closed" },
             Ok(CallOutcome::Timeout) => OpOutcome::Timeout,
-            _ => OpOutcome::Err { kind: "call_error" },
+            Ok(CallOutcome::Rejected(_)) => OpOutcome::Err { kind: "rejected" },
+            Err(_) => OpOutcome::Err { kind: "host_error" },
         },
         None::<fn() -> LoadObservation>,
     );
@@ -738,9 +996,9 @@ fn tina_service_call_chain_row() -> anyhow::Result<PerfReport> {
     ))
 }
 
-fn tokio_service_call_chain_row() -> anyhow::Result<PerfReport> {
+fn tokio_service_call_chain_row(config: WorkloadConfig) -> anyhow::Result<PerfReport> {
     let (service_tx, ping_stop, service_stop, ping_handle, service_handle) =
-        start_tokio_chain_service();
+        start_tokio_chain_service(config.capacity);
     let (warm_tx, warm_rx) = oneshot::channel();
     service_tx
         .blocking_send(warm_tx)
@@ -751,8 +1009,8 @@ fn tokio_service_call_chain_row() -> anyhow::Result<PerfReport> {
 
     let (mut load, allocations) = run_counted(
         LoadRun {
-            workers: WORKERS,
-            stop: LoadStop::ops(OPS),
+            workers: config.workers,
+            stop: LoadStop::ops(config.ops),
             label: "tokio_service_call_chain",
         },
         move |_| tokio_call_op(&service_tx),
@@ -781,8 +1039,9 @@ fn tokio_service_call_chain_row() -> anyhow::Result<PerfReport> {
     ))
 }
 
-fn tina_http1_close_row() -> anyhow::Result<PerfReport> {
+fn tina_http1_close_row(config: WorkloadConfig) -> anyhow::Result<PerfReport> {
     tina_http_row(
+        config,
         "tina_http1_close",
         "http1_close",
         small_body(),
@@ -791,14 +1050,19 @@ fn tina_http1_close_row() -> anyhow::Result<PerfReport> {
     )
 }
 
-fn tokio_http1_close_row() -> anyhow::Result<PerfReport> {
-    tokio_http_row("axum_http1_close", "http1_close", small_body(), |addr| {
-        http_get(addr, false, 1, small_body().len())
-    })
+fn tokio_http1_close_row(config: WorkloadConfig) -> anyhow::Result<PerfReport> {
+    tokio_http_row(
+        config,
+        "axum_http1_close",
+        "http1_close",
+        small_body(),
+        |addr| http_get(addr, false, 1, small_body().len()),
+    )
 }
 
-fn tina_http1_keepalive_row() -> anyhow::Result<PerfReport> {
+fn tina_http1_keepalive_row(config: WorkloadConfig) -> anyhow::Result<PerfReport> {
     tina_http_row(
+        config,
         "tina_http1_keepalive",
         "http1_keepalive",
         small_body(),
@@ -807,8 +1071,9 @@ fn tina_http1_keepalive_row() -> anyhow::Result<PerfReport> {
     )
 }
 
-fn tokio_http1_keepalive_row() -> anyhow::Result<PerfReport> {
+fn tokio_http1_keepalive_row(config: WorkloadConfig) -> anyhow::Result<PerfReport> {
     tokio_http_row(
+        config,
         "axum_http1_keepalive",
         "http1_keepalive",
         small_body(),
@@ -816,8 +1081,9 @@ fn tokio_http1_keepalive_row() -> anyhow::Result<PerfReport> {
     )
 }
 
-fn tina_http1_fixed_body_row() -> anyhow::Result<PerfReport> {
+fn tina_http1_fixed_body_row(config: WorkloadConfig) -> anyhow::Result<PerfReport> {
     tina_http_row(
+        config,
         "tina_http1_fixed_body",
         "http1_fixed_body",
         fixed_body(),
@@ -826,8 +1092,9 @@ fn tina_http1_fixed_body_row() -> anyhow::Result<PerfReport> {
     )
 }
 
-fn tokio_http1_fixed_body_row() -> anyhow::Result<PerfReport> {
+fn tokio_http1_fixed_body_row(config: WorkloadConfig) -> anyhow::Result<PerfReport> {
     tokio_http_row(
+        config,
         "axum_http1_fixed_body",
         "http1_fixed_body",
         fixed_body(),
@@ -835,32 +1102,44 @@ fn tokio_http1_fixed_body_row() -> anyhow::Result<PerfReport> {
     )
 }
 
-fn tina_http1_keepalive_steady_state_small_row() -> anyhow::Result<PerfReport> {
+fn tina_http1_keepalive_steady_state_small_row(
+    config: WorkloadConfig,
+) -> anyhow::Result<PerfReport> {
     tina_http_steady_state_row(
+        config,
         "tina_http1_keepalive_steady_state_small",
         "http1_keepalive_steady_state_small",
         small_body(),
     )
 }
 
-fn tokio_http1_keepalive_steady_state_small_row() -> anyhow::Result<PerfReport> {
+fn tokio_http1_keepalive_steady_state_small_row(
+    config: WorkloadConfig,
+) -> anyhow::Result<PerfReport> {
     tokio_http_steady_state_row(
+        config,
         "axum_http1_keepalive_steady_state_small",
         "http1_keepalive_steady_state_small",
         small_body(),
     )
 }
 
-fn tina_http1_keepalive_steady_state_fixed_row() -> anyhow::Result<PerfReport> {
+fn tina_http1_keepalive_steady_state_fixed_row(
+    config: WorkloadConfig,
+) -> anyhow::Result<PerfReport> {
     tina_http_steady_state_row(
+        config,
         "tina_http1_keepalive_steady_state_fixed",
         "http1_keepalive_steady_state_fixed",
         fixed_body(),
     )
 }
 
-fn tokio_http1_keepalive_steady_state_fixed_row() -> anyhow::Result<PerfReport> {
+fn tokio_http1_keepalive_steady_state_fixed_row(
+    config: WorkloadConfig,
+) -> anyhow::Result<PerfReport> {
     tokio_http_steady_state_row(
+        config,
         "axum_http1_keepalive_steady_state_fixed",
         "http1_keepalive_steady_state_fixed",
         fixed_body(),
@@ -868,20 +1147,21 @@ fn tokio_http1_keepalive_steady_state_fixed_row() -> anyhow::Result<PerfReport> 
 }
 
 fn tina_http_row(
+    workload: WorkloadConfig,
     label: &'static str,
     kind: &'static str,
     body: Vec<u8>,
     keepalive: bool,
     request: fn(SocketAddr) -> anyhow::Result<()>,
 ) -> anyhow::Result<PerfReport> {
-    let runtime = new_runtime()?;
+    let runtime = new_runtime_with_capacity(workload.capacity)?;
     let expected_len = body.len();
     let service = runtime
         .register_with_capacity::<_, Infallible>(
             BodyService {
                 body: Arc::new(body),
             },
-            CAPACITY,
+            workload.capacity,
         )
         .map_err(|e| anyhow::anyhow!("register tina http service: {e:?}"))?;
     let mut config = HttpServerConfig::dev();
@@ -906,8 +1186,8 @@ fn tina_http_row(
     let process_before = ProcessSnapshot::now();
     let (mut load, allocations) = run_counted(
         LoadRun {
-            workers: WORKERS,
-            stop: LoadStop::ops(HTTP_OPS),
+            workers: workload.workers,
+            stop: LoadStop::ops(workload.http_ops),
             label,
         },
         move |_| match request(addr) {
@@ -929,18 +1209,19 @@ fn tina_http_row(
 }
 
 fn tina_http_steady_state_row(
+    workload: WorkloadConfig,
     label: &'static str,
     kind: &'static str,
     body: Vec<u8>,
 ) -> anyhow::Result<PerfReport> {
-    let runtime = new_runtime()?;
+    let runtime = new_runtime_with_capacity(workload.capacity)?;
     let expected_len = body.len();
     let service = runtime
         .register_with_capacity::<_, Infallible>(
             BodyService {
                 body: Arc::new(body),
             },
-            CAPACITY,
+            workload.capacity,
         )
         .map_err(|e| anyhow::anyhow!("register tina steady http service: {e:?}"))?;
     let mut config = HttpServerConfig::dev();
@@ -958,12 +1239,13 @@ fn tina_http_steady_state_row(
     let addr = bound
         .wait(Duration::from_secs(2))
         .map_err(|e| anyhow::anyhow!("observe tina steady http bind: {e:?}"))?;
-    let mut report = http_steady_state_load(label, kind, addr, expected_len)?;
+    let mut report = http_steady_state_load(workload, label, kind, addr, expected_len)?;
     shutdown_runtime(runtime, Some(&mut report.load))?;
     Ok(report)
 }
 
 fn tokio_http_row(
+    workload: WorkloadConfig,
     label: &'static str,
     kind: &'static str,
     body: Vec<u8>,
@@ -1002,8 +1284,8 @@ fn tokio_http_row(
     let process_before = ProcessSnapshot::now();
     let (mut load, allocations) = run_counted(
         LoadRun {
-            workers: WORKERS,
-            stop: LoadStop::ops(HTTP_OPS),
+            workers: workload.workers,
+            stop: LoadStop::ops(workload.http_ops),
             label,
         },
         move |_| match request(addr) {
@@ -1036,6 +1318,7 @@ fn tokio_http_row(
 }
 
 fn tokio_http_steady_state_row(
+    workload: WorkloadConfig,
     label: &'static str,
     kind: &'static str,
     body: Vec<u8>,
@@ -1070,7 +1353,7 @@ fn tokio_http_steady_state_row(
         });
     });
     let addr = addr_rx.recv_timeout(Duration::from_secs(2))?;
-    let mut report = http_steady_state_load(label, kind, addr, expected_len)?;
+    let mut report = http_steady_state_load(workload, label, kind, addr, expected_len)?;
     finish_teardown([
         stop_tx
             .send(())
@@ -1089,13 +1372,14 @@ fn tokio_http_steady_state_row(
 fn register_counter(
     runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
     count: &Arc<AtomicU64>,
+    capacity: usize,
 ) -> anyhow::Result<Address<CounterMsg>> {
     runtime
         .register_with_capacity::<_, Infallible>(
             Counter {
                 count: Arc::clone(count),
             },
-            CAPACITY,
+            capacity,
         )
         .map_err(|e| anyhow::anyhow!("register tina counter: {e:?}"))
 }
@@ -1107,8 +1391,8 @@ type TokioCounterHandle = (
     Arc<AtomicU64>,
 );
 
-fn start_tokio_counter() -> TokioCounterHandle {
-    let (tx, mut rx) = mpsc::channel::<()>(CAPACITY);
+fn start_tokio_counter(capacity: usize) -> TokioCounterHandle {
+    let (tx, mut rx) = mpsc::channel::<()>(capacity);
     let count = Arc::new(AtomicU64::new(0));
     let worker_count = Arc::clone(&count);
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
@@ -1153,8 +1437,8 @@ type TokioPingHandle = (
     oneshot::Sender<()>,
 );
 
-fn start_tokio_ping() -> TokioPingHandle {
-    let (tx, mut rx) = mpsc::channel::<oneshot::Sender<()>>(CAPACITY);
+fn start_tokio_ping(capacity: usize) -> TokioPingHandle {
+    let (tx, mut rx) = mpsc::channel::<oneshot::Sender<()>>(capacity);
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let handle = thread::spawn(move || {
         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
@@ -1182,8 +1466,8 @@ type TokioChainHandle = (
     thread::JoinHandle<()>,
 );
 
-fn start_tokio_chain_service() -> TokioChainHandle {
-    let (ping_tx, mut ping_rx) = mpsc::channel::<oneshot::Sender<()>>(CAPACITY);
+fn start_tokio_chain_service(capacity: usize) -> TokioChainHandle {
+    let (ping_tx, mut ping_rx) = mpsc::channel::<oneshot::Sender<()>>(capacity);
     let (ping_stop_tx, ping_stop_rx) = oneshot::channel::<()>();
     let ping_handle = thread::spawn(move || {
         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
@@ -1201,7 +1485,7 @@ fn start_tokio_chain_service() -> TokioChainHandle {
         });
     });
 
-    let (service_tx, mut service_rx) = mpsc::channel::<oneshot::Sender<()>>(CAPACITY);
+    let (service_tx, mut service_rx) = mpsc::channel::<oneshot::Sender<()>>(capacity);
     let (service_stop_tx, service_stop_rx) = oneshot::channel::<()>();
     let service_handle = thread::spawn(move || {
         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
@@ -1426,13 +1710,14 @@ fn http_get(
 }
 
 fn http_steady_state_load(
+    workload: WorkloadConfig,
     label: &'static str,
     kind: &'static str,
     addr: SocketAddr,
     expected_body_len: usize,
 ) -> anyhow::Result<PerfReport> {
-    let mut streams = Vec::with_capacity(WORKERS);
-    for _ in 0..WORKERS {
+    let mut streams = Vec::with_capacity(workload.workers);
+    for _ in 0..workload.workers {
         let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
         stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
@@ -1445,8 +1730,8 @@ fn http_steady_state_load(
         let streams = Arc::clone(&streams);
         run_counted(
             LoadRun {
-                workers: WORKERS,
-                stop: LoadStop::ops(HTTP_OPS),
+                workers: workload.workers,
+                stop: LoadStop::ops(workload.http_ops),
                 label,
             },
             move |worker_id| {
@@ -1600,11 +1885,15 @@ impl PerfRuntime {
 }
 
 fn new_runtime() -> anyhow::Result<PerfRuntime> {
+    new_runtime_with_capacity(CAPACITY)
+}
+
+fn new_runtime_with_capacity(command_capacity: usize) -> anyhow::Result<PerfRuntime> {
     let runtime = Arc::new(ThreadedRuntime::try_with_config(
         SingleShard,
         DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
-            command_capacity: CAPACITY,
+            command_capacity,
             ..ThreadedRuntimeConfig::default()
         },
     )?);
@@ -3325,5 +3614,191 @@ mod tests {
             io_error.kind(),
         );
         let _ = done_tx.send(());
+    }
+
+    #[test]
+    fn application_chain_terminals_remain_exact() {
+        assert_eq!(
+            chain_reply_from_ping(CallOutcome::Replied(PingReply::Pong)),
+            ChainReply::Done
+        );
+        assert_eq!(
+            chain_reply_from_ping(CallOutcome::Full),
+            ChainReply::DownstreamFull
+        );
+        assert_eq!(
+            chain_reply_from_ping(CallOutcome::Closed),
+            ChainReply::DownstreamClosed
+        );
+        assert_eq!(
+            chain_reply_from_ping(CallOutcome::Timeout),
+            ChainReply::DownstreamTimeout
+        );
+        let reason = tina::CallRejectedReason::UnsupportedMessage;
+        assert_eq!(
+            chain_reply_from_ping(CallOutcome::Rejected(reason)),
+            ChainReply::DownstreamRejected(reason)
+        );
+    }
+
+    /// Live chain call: zero-capacity downstream mailbox forces `Full`, and the
+    /// chain must surface `DownstreamFull` rather than collapsing to `Done`.
+    #[test]
+    fn live_chain_preserves_downstream_full() {
+        let runtime = new_runtime_with_capacity(64).expect("runtime");
+        let call_timeout = Duration::from_secs(2);
+        // Capacity 0 rejects every admission into the ping mailbox as Full.
+        let ping = runtime
+            .register_with_capacity::<_, Infallible>(Ping, 0)
+            .expect("register zero-capacity ping");
+        let chain = runtime
+            .register_split_service::<ChainService, ChainEvent, ChainRequest, Infallible>(
+                ChainService {
+                    ping,
+                    call_timeout,
+                },
+                8,
+            )
+            .expect("register chain")
+            .requests
+            .address()
+            .address();
+
+        let outcome = runtime
+            .call_blocking(chain, ChainMsg::Request(ChainRequest::Run), call_timeout)
+            .expect("chain host call");
+        assert_eq!(
+            outcome,
+            CallOutcome::Replied(ChainReply::DownstreamFull),
+            "chain must preserve downstream Full instead of Done"
+        );
+        shutdown_runtime(runtime, None).expect("shutdown");
+    }
+
+    /// Live chain call: a never-replying downstream with a short timeout surfaces
+    /// `DownstreamTimeout` rather than `Done`.
+    #[test]
+    fn live_chain_preserves_downstream_timeout() {
+        let runtime = new_runtime_with_capacity(64).expect("runtime");
+        let call_timeout = Duration::from_millis(30);
+        // Same PingMsg/PingReply shape so ChainService can call it directly.
+        let ping = runtime
+            .register_with_capacity::<_, Infallible>(SlowPing { held: None }, 8)
+            .expect("register slow ping");
+        let chain = runtime
+            .register_split_service::<ChainService, ChainEvent, ChainRequest, Infallible>(
+                ChainService {
+                    ping,
+                    call_timeout,
+                },
+                8,
+            )
+            .expect("register chain")
+            .requests
+            .address()
+            .address();
+
+        let outcome = runtime
+            .call_blocking(
+                chain,
+                ChainMsg::Request(ChainRequest::Run),
+                Duration::from_secs(2),
+            )
+            .expect("chain host call");
+        assert_eq!(
+            outcome,
+            CallOutcome::Replied(ChainReply::DownstreamTimeout),
+            "chain must preserve downstream Timeout instead of Done"
+        );
+        shutdown_runtime(runtime, None).expect("shutdown");
+    }
+
+    #[test]
+    fn public_workload_config_rejects_zero_max_and_overflow() {
+        assert_eq!(
+            WorkloadConfig::default().validate().expect("defaults"),
+            WorkloadConfig::default()
+        );
+        assert_eq!(WorkloadConfig::default().ops, 120);
+        assert_eq!(WorkloadConfig::default().http_ops, 32);
+        assert_eq!(WorkloadConfig::default().workers, 4);
+        assert_eq!(WorkloadConfig::default().samples, 5);
+        assert_eq!(WorkloadConfig::default().capacity, 184);
+
+        assert!(matches!(
+            WorkloadConfig {
+                ops: 0,
+                ..WorkloadConfig::default()
+            }
+            .validate(),
+            Err(WorkloadConfigError::Zero { field: "ops" })
+        ));
+        assert!(matches!(
+            WorkloadConfig {
+                workers: MAX_WORKERS + 1,
+                ..WorkloadConfig::default()
+            }
+            .validate(),
+            Err(WorkloadConfigError::TooLarge {
+                field: "workers",
+                ..
+            })
+        ));
+        assert!(matches!(
+            WorkloadConfig {
+                capacity: 1,
+                ops: 2,
+                ..WorkloadConfig::default()
+            }
+            .validate(),
+            Err(WorkloadConfigError::CapacityTooSmall {
+                capacity: 1,
+                ops: 2
+            })
+        ));
+        assert!(matches!(
+            WorkloadConfig {
+                ops: MAX_OPS + 1,
+                ..WorkloadConfig::default()
+            }
+            .validate(),
+            Err(WorkloadConfigError::TooLarge { field: "ops", .. })
+        ));
+        assert!(matches!(
+            WorkloadConfig {
+                http_ops: 0,
+                ..WorkloadConfig::default()
+            }
+            .validate(),
+            Err(WorkloadConfigError::Zero { field: "http_ops" })
+        ));
+    }
+}
+
+/// Downstream isolate that parks the caller and never replies — live timeout proof.
+#[cfg(test)]
+struct SlowPing {
+    held: Option<RequestContext<PingReply>>,
+}
+
+#[cfg(test)]
+#[tina_runtime::isolate(message = PingMsg, reply = PingReply)]
+impl SlowPing {
+    fn handle(
+        &mut self,
+        _msg: PingMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        noop()
+    }
+
+    fn handle_call(&mut self, msg: PingMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+        match msg {
+            // Park the caller authority forever so the chain sees Timeout.
+            PingMsg::Ping => {
+                self.held = Some(call.into_request_context());
+                noop()
+            }
+        }
     }
 }

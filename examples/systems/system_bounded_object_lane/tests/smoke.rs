@@ -3,7 +3,7 @@ use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
 use system_bounded_object_lane::{
-    RunConfig, S3RunError, S3WorkloadError, WorkFailure, run, run_against_s3,
+    RunConfig, S3RunError, S3WorkloadError, WorkFailure, run, run_against_s3, run_put_terminals,
 };
 use tina_aws_bridge::{InstallError, S3Config, S3ConfigError, S3Credentials};
 use tina_runtime::RunToShutdownError;
@@ -87,6 +87,31 @@ fn report_failure_returns_after_bounded_shutdown() {
         format!("{error:#}").contains("stats call mailbox was full"),
         "unexpected error: {error:#}"
     );
+}
+
+#[test]
+fn host_mailbox_full_is_an_exact_put_terminal() {
+    // With a zero mailbox the Put never enters the isolate. Full must remain
+    // distinct from Busy (admission pressure) and from stats-path failure.
+    let report = run_put_terminals(RunConfig {
+        callers: 4,
+        lane_in_flight: 2,
+        lane_mailbox: 0,
+        work_ms: 1,
+        call_timeout_ms: 200,
+    })
+    .expect("put terminals must remain observable");
+
+    assert_eq!(report.callers, 4);
+    assert_eq!(report.full, 4, "zero mailbox must Full every Put: {report:?}");
+    assert_eq!(report.busy, 0, "mailbox Full must not become Busy: {report:?}");
+    assert_eq!(report.stored, 0, "report={report:?}");
+    assert_eq!(report.closed, 0, "report={report:?}");
+    assert_eq!(report.timeout, 0, "report={report:?}");
+    assert_eq!(report.rejected, 0, "report={report:?}");
+    // Stats were not observed on this path — agreement flags stay false.
+    assert!(!report.stats.counts_agree, "report={report:?}");
+    assert!(!report.stats.settlements_agree, "report={report:?}");
 }
 
 #[test]

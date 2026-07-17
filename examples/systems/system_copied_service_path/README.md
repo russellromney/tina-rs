@@ -52,7 +52,13 @@ HTTP-fronted shape that uses several of them for real.
 ```sh
 cargo run --manifest-path examples/systems/system_copied_service_path/Cargo.toml
 cargo test --manifest-path examples/systems/system_copied_service_path/Cargo.toml
+cargo test --manifest-path examples/systems/system_copied_service_path/Cargo.toml --test public_smoke public_smoke -- --exact
 ```
+
+`RunConfig::validate` rejects zero capacity/callers/timeout and oversized
+counts before the runtime, shared scope, or load runner are constructed.
+Zero mailbox and zero timer capacity remain representable for intentional
+pressure proofs and fail at the facade/runtime with typed outcomes.
 
 ## What proves what
 

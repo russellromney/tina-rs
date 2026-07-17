@@ -1,5 +1,6 @@
 use system_lock_manager::{
-    RunConfig, run_caller_gone_refill, run_expiry_handoff, run_fifo, run_global_overflow,
+    MAX_DURATION_MS, MAX_KEYS, MAX_MAILBOX, MAX_WAITERS, RunConfig, RunConfigError,
+    run_caller_gone_refill, run_expiry_handoff, run_fifo, run_global_overflow,
     run_keyspace_overflow, run_per_key_overflow, run_renewal, run_stale_release,
 };
 
@@ -110,54 +111,105 @@ fn active_keyspace_cap_rejects_only_new_keys() {
 fn invalid_bounded_shape_is_fallible() {
     let invalid = [
         (
-            "waiter_capacity",
             RunConfig {
                 waiter_capacity: 0,
                 ..cfg()
             },
+            RunConfigError::Zero {
+                field: "waiter_capacity",
+            },
         ),
         (
-            "max_waiters_per_key",
             RunConfig {
                 max_waiters_per_key: 0,
                 ..cfg()
             },
+            RunConfigError::Zero {
+                field: "max_waiters_per_key",
+            },
         ),
         (
-            "max_keys",
             RunConfig {
                 max_keys: 0,
                 ..cfg()
             },
+            RunConfigError::Zero {
+                field: "max_keys",
+            },
         ),
         (
-            "mailbox",
             RunConfig {
                 mailbox: 0,
                 ..cfg()
             },
+            RunConfigError::Zero { field: "mailbox" },
         ),
         (
-            "lease_ms",
             RunConfig {
                 lease_ms: 0,
                 ..cfg()
             },
+            RunConfigError::Zero { field: "lease_ms" },
         ),
         (
-            "call_timeout_ms",
             RunConfig {
                 call_timeout_ms: 0,
                 ..cfg()
             },
+            RunConfigError::Zero {
+                field: "call_timeout_ms",
+            },
+        ),
+        (
+            RunConfig {
+                waiter_capacity: MAX_WAITERS + 1,
+                ..cfg()
+            },
+            RunConfigError::TooLarge {
+                field: "waiter_capacity",
+                value: MAX_WAITERS + 1,
+                max: MAX_WAITERS,
+            },
+        ),
+        (
+            RunConfig {
+                max_keys: MAX_KEYS + 1,
+                ..cfg()
+            },
+            RunConfigError::TooLarge {
+                field: "max_keys",
+                value: MAX_KEYS + 1,
+                max: MAX_KEYS,
+            },
+        ),
+        (
+            RunConfig {
+                mailbox: MAX_MAILBOX + 1,
+                ..cfg()
+            },
+            RunConfigError::TooLarge {
+                field: "mailbox",
+                value: MAX_MAILBOX + 1,
+                max: MAX_MAILBOX,
+            },
+        ),
+        (
+            RunConfig {
+                lease_ms: MAX_DURATION_MS + 1,
+                ..cfg()
+            },
+            RunConfigError::DurationTooLarge {
+                field: "lease_ms",
+                value_ms: MAX_DURATION_MS + 1,
+                max_ms: MAX_DURATION_MS,
+            },
         ),
     ];
 
-    for (field, config) in invalid {
+    for (config, expected) in invalid {
         let error = run_fifo(config).expect_err("invalid config must fail before runtime startup");
-        assert!(
-            error.to_string().contains(field),
-            "wrong error for {field}: {error:#}"
-        );
+        assert_eq!(error.downcast_ref::<RunConfigError>(), Some(&expected));
     }
+
+    assert_eq!(cfg().validate().expect("defaults validate"), cfg());
 }

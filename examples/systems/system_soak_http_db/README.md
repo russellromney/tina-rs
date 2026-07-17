@@ -10,10 +10,16 @@ The soak does not open sockets. The point is observability output,
 not the network stack — the same discovery shape is what a real
 HTTP+DB service would print.
 
+`RunConfig::validate` rejects zero workers/requests/scope caps, oversized
+durations, and checked overflow of `workers * requests_per_worker` before the
+runtime, barrier, outcome map, or scopes are constructed. Zero mailbox and
+zero timer capacity remain available for intentional pressure proofs.
+
 ## Run
 
 ```bash
 cargo test --manifest-path examples/systems/system_soak_http_db/Cargo.toml
+cargo test --manifest-path examples/systems/system_soak_http_db/Cargo.toml --test public_smoke public_smoke -- --exact
 ```
 
 ## Output shape
