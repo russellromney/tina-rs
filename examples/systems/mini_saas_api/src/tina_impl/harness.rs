@@ -27,7 +27,7 @@ use crate::budget::BODY_CAP_BYTES;
 use crate::{RunMode, RunReport, UserObservation, get, post, put};
 
 use super::controller::{Controller, ControllerMsg, NotifyEvent, NotifyRequest, NotifySink};
-use super::shutdown::keepalive_close_report;
+use super::shutdown::{keepalive_close_report, settle_after_owner_shutdown};
 use super::{
     REQUEST_TIMEOUT, ScopeSetMetrics, build_startup_summary, listener_config, response_body_text,
     seed_db,
@@ -273,7 +273,7 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
 
     let db_pressure = sqlite.metrics.pressure_report();
     let t_pool = Instant::now();
-    let (outbound_shutdown, outbound_close_report) =
+    let (outbound_shutdown, outbound_close_report, retained_outbound) =
         keepalive_close_report(outbound.close_and_drain(Duration::from_secs(2)), t_pool.elapsed());
     choreo.record_close(&outbound_close_report, "close_outbound_pool");
     let t_notify_listener = Instant::now();
@@ -304,6 +304,8 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     );
     let t_runtime = Instant::now();
     let terminal = runtime.into_threaded_runtime().shutdown_report();
+    let _post_owner_outbound = retained_outbound
+        .map(|authority| settle_after_owner_shutdown(authority, &terminal));
     terminal.ensure_clean()?;
     choreo.record(
         ShutdownStep::StopOwner,
@@ -488,8 +490,14 @@ pub fn prove_drain_cancels_active_scope() -> anyhow::Result<crate::DrainActiveRe
         .try_send(main_listener, HttpListenerMsg::Stop)
         .map_err(|e| anyhow::anyhow!("stop main listener: {e:?}"))?;
     sqlite.closer.close();
-    let _outbound_shutdown = outbound.close_and_drain(Duration::from_secs(2));
-    let runtime_shutdown = runtime.into_threaded_runtime().shutdown_report().ensure_clean();
+    let (_, _, retained_outbound) = keepalive_close_report(
+        outbound.close_and_drain(Duration::from_secs(2)),
+        Duration::from_secs(2),
+    );
+    let terminal = runtime.into_threaded_runtime().shutdown_report();
+    let _post_owner_outbound = retained_outbound
+        .map(|authority| settle_after_owner_shutdown(authority, &terminal));
+    let runtime_shutdown = terminal.ensure_clean();
 
     let slow_aborted = match slow.join() {
         Ok(Ok(parts)) => !(parts.status == 200 && parts.body.contains("notified")),
@@ -988,7 +996,7 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
 
     // Same shutdown sequence as `run`, minus the scripted assertions.
     let db_pressure = sqlite.metrics.pressure_report();
-    let (outbound_shutdown, _) =
+    let (outbound_shutdown, _, retained_outbound) =
         keepalive_close_report(outbound.close_and_drain(Duration::from_secs(2)), Duration::from_secs(2));
     runtime
         .try_send(notify_listener, HttpListenerMsg::Stop)
@@ -998,6 +1006,8 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
         .map_err(|e| anyhow::anyhow!("stop main listener: {e:?}"))?;
     sqlite.closer.close();
     let terminal = runtime.into_threaded_runtime().shutdown_report();
+    let _post_owner_outbound = retained_outbound
+        .map(|authority| settle_after_owner_shutdown(authority, &terminal));
     terminal.ensure_clean()?;
     let pressure = tina_runtime::pressure::PressureSummary::from_events(terminal.trace());
     let shutdown_clean = outbound_shutdown.clean();

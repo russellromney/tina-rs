@@ -2,12 +2,15 @@ use std::time::Duration;
 
 use tina::prelude::Shard;
 use tina_http::{
-    KeepaliveCloseAndDrain, KeepalivePoolDrainOutcome, KeepalivePoolSettledReport,
+    InstalledKeepalivePool, KeepaliveCloseAndDrain, KeepalivePendingCounts,
+    KeepalivePoolDrainOutcome, KeepalivePoolSettledReport,
 };
 use tina_runtime::lifecycle::{
     CloseAdmission, CloseOutcome, ResourceCloseReport, ResourceKind,
 };
-use tina_runtime::MailboxFactory;
+use tina_runtime::{LocalSystemTerminalReport, MailboxFactory};
+
+const POST_OWNER_SETTLE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Summary of an owned keepalive pool `close_and_drain` for terminal lines.
 #[derive(Debug, Clone)]
@@ -47,12 +50,37 @@ impl OutboundDrainSummary {
     }
 }
 
+/// Why an outbound close attempt retained the linear installation authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RetainedKeepaliveReason {
+    TimedOut(KeepalivePendingCounts),
+    OwnerFailed {
+        error: tina_runtime::ThreadedRuntimeError,
+        pending: KeepalivePendingCounts,
+    },
+}
+
+/// Linear authority returned by a keepalive close that did not settle.
+#[must_use = "retained keepalive authority must be retried or settled by owner shutdown"]
+pub(crate) struct RetainedKeepaliveAuthority<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+{
+    pool: InstalledKeepalivePool<S, F>,
+    reason: RetainedKeepaliveReason,
+}
+
 /// Convert an owned [`KeepaliveCloseAndDrain`] into a terminal summary plus a
 /// typed resource-close report for the shutdown choreography.
 pub(crate) fn keepalive_close_report<S, F>(
     outcome: KeepaliveCloseAndDrain<S, F>,
     elapsed: Duration,
-) -> (OutboundDrainSummary, ResourceCloseReport)
+) -> (
+    OutboundDrainSummary,
+    ResourceCloseReport,
+    Option<RetainedKeepaliveAuthority<S, F>>,
+)
 where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
@@ -69,11 +97,10 @@ where
                 failures: 0,
             };
             let close = pool_settled_to_close_report("outbound.pool", &report, elapsed);
-            (summary, close)
+            (summary, close, None)
         }
         KeepaliveCloseAndDrain::TimedOut { pool, pending } => {
             let connections = pool.connections().len();
-            drop(pool);
             let summary = OutboundDrainSummary {
                 drain: KeepalivePoolDrainOutcome::TimedOut {
                     leased: pending.leased,
@@ -99,7 +126,14 @@ where
                     pending.admission_closed,
                 ),
             };
-            (summary, close)
+            (
+                summary,
+                close,
+                Some(RetainedKeepaliveAuthority {
+                    pool,
+                    reason: RetainedKeepaliveReason::TimedOut(pending),
+                }),
+            )
         }
         KeepaliveCloseAndDrain::OwnerFailed {
             pool,
@@ -107,7 +141,6 @@ where
             pending,
         } => {
             let connections = pool.connections().len();
-            drop(pool);
             let summary = OutboundDrainSummary {
                 drain: KeepalivePoolDrainOutcome::NotRequested,
                 requested: connections,
@@ -127,7 +160,14 @@ where
                 elapsed,
                 details: format!("owner_failed={error:?} pending={pending:?}"),
             };
-            (summary, close)
+            (
+                summary,
+                close,
+                Some(RetainedKeepaliveAuthority {
+                    pool,
+                    reason: RetainedKeepaliveReason::OwnerFailed { error, pending },
+                }),
+            )
         }
         KeepaliveCloseAndDrain::Shutdown(settlement) => {
             let summary = OutboundDrainSummary {
@@ -150,7 +190,66 @@ where
                     settlement.drain, settlement.pending
                 ),
             };
-            (summary, close)
+            (summary, close, None)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PostOwnerKeepaliveSettlement {
+    Shutdown {
+        retained_reason: RetainedKeepaliveReason,
+        settlement: tina_http::KeepaliveShutdownSettlement,
+    },
+    Drained {
+        retained_reason: RetainedKeepaliveReason,
+        report: KeepalivePoolSettledReport,
+    },
+    /// The framework still returned retained authority after the owner had
+    /// already terminated. Owner shutdown is the terminal resource proof.
+    OwnerShutdownFallback {
+        retained_reason: RetainedKeepaliveReason,
+        final_reason: RetainedKeepaliveReason,
+    },
+}
+
+pub(crate) fn settle_after_owner_shutdown<S, F>(
+    authority: RetainedKeepaliveAuthority<S, F>,
+    _owner_terminal: &LocalSystemTerminalReport,
+) -> PostOwnerKeepaliveSettlement
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+{
+    let RetainedKeepaliveAuthority { pool, reason } = authority;
+    match pool.close_and_drain(POST_OWNER_SETTLE_TIMEOUT) {
+        KeepaliveCloseAndDrain::Shutdown(settlement) => PostOwnerKeepaliveSettlement::Shutdown {
+            retained_reason: reason,
+            settlement,
+        },
+        KeepaliveCloseAndDrain::Drained(report) => PostOwnerKeepaliveSettlement::Drained {
+            retained_reason: reason,
+            report,
+        },
+        KeepaliveCloseAndDrain::TimedOut { pool, pending } => {
+            // The owner has already terminated, so its shutdown is the final
+            // resource settlement even if this stale host view times out.
+            drop(pool);
+            PostOwnerKeepaliveSettlement::OwnerShutdownFallback {
+                retained_reason: reason,
+                final_reason: RetainedKeepaliveReason::TimedOut(pending),
+            }
+        }
+        KeepaliveCloseAndDrain::OwnerFailed {
+            pool,
+            error,
+            pending,
+        } => {
+            drop(pool);
+            PostOwnerKeepaliveSettlement::OwnerShutdownFallback {
+                retained_reason: reason,
+                final_reason: RetainedKeepaliveReason::OwnerFailed { error, pending },
+            }
         }
     }
 }
@@ -240,10 +339,123 @@ pub(crate) fn pool_shutdown_to_close_report(
 #[cfg(test)]
 mod conversion_tests {
     use super::*;
+    use tina::pool::PoolConfig;
     use tina_http::{
-        KeepaliveConnectionStopFailure, KeepaliveConnectionStopOutcome, KeepalivePoolCloseOutcome,
-        KeepalivePoolShutdownReport,
+        HttpClientConfig, HttpTarget, InstallKeepalivePool, KeepaliveConnectionStopFailure,
+        KeepaliveConnectionStopOutcome, KeepalivePoolCloseOutcome, KeepalivePoolInstallConfig,
+        KeepalivePoolShutdownReport, KeepaliveShutdownSettlement,
     };
+    use tina_runtime::{DefaultThreadedMailboxFactory, LocalSystem, ThreadedRuntimeError};
+
+    fn installed_pool(
+        port: u16,
+    ) -> (
+        LocalSystem<tina::SingleShard, DefaultThreadedMailboxFactory>,
+        InstalledKeepalivePool<tina::SingleShard>,
+    ) {
+        let app = LocalSystem::single_shard(
+            tina::SingleShard,
+            DefaultThreadedMailboxFactory,
+        )
+        .try_build()
+        .expect("system");
+        let pool = app
+            .install_keepalive_pool(KeepalivePoolInstallConfig::new(
+                HttpTarget::http(format!("127.0.0.1:{port}").parse().unwrap()),
+                HttpClientConfig::pressure(),
+                PoolConfig::new(1, 0),
+                8,
+                8,
+            ))
+            .expect("install");
+        (app, pool)
+    }
+
+    fn stopped_owner_settles(
+        app: LocalSystem<tina::SingleShard, DefaultThreadedMailboxFactory>,
+        authority: RetainedKeepaliveAuthority<tina::SingleShard, DefaultThreadedMailboxFactory>,
+    ) -> PostOwnerKeepaliveSettlement {
+        let terminal = app
+            .shutdown_handle()
+            .request_and_wait_report(Duration::from_secs(2))
+            .expect("owner shutdown");
+        let settlement = settle_after_owner_shutdown(authority, &terminal);
+        let _ = app.shutdown().join();
+        settlement
+    }
+
+    #[test]
+    fn close_adapter_exhaustively_retains_and_settles_every_terminal_shape() {
+        let drained = KeepalivePoolSettledReport {
+            pool_close: KeepalivePoolCloseOutcome::Closed,
+            drain: KeepalivePoolDrainOutcome::Drained,
+            requested: 1,
+            stopped: 1,
+            already_closed: 0,
+        };
+        let (_, _, retained) = keepalive_close_report::<
+            tina::SingleShard,
+            DefaultThreadedMailboxFactory,
+        >(KeepaliveCloseAndDrain::Drained(drained), Duration::ZERO);
+        assert!(retained.is_none());
+
+        let shutdown = KeepaliveShutdownSettlement {
+            pool_close: KeepalivePoolCloseOutcome::AlreadyClosed,
+            drain: KeepalivePoolDrainOutcome::PoolAlreadyClosed,
+            pending: KeepalivePendingCounts {
+                leased: None,
+                connections_live: 0,
+                admission_closed: true,
+            },
+        };
+        let (_, _, retained) = keepalive_close_report::<
+            tina::SingleShard,
+            DefaultThreadedMailboxFactory,
+        >(KeepaliveCloseAndDrain::Shutdown(shutdown), Duration::ZERO);
+        assert!(retained.is_none());
+
+        let pending = KeepalivePendingCounts {
+            leased: Some(1),
+            connections_live: 1,
+            admission_closed: true,
+        };
+        let (app, pool) = installed_pool(9);
+        let (_, _, timed_out) = keepalive_close_report(
+            KeepaliveCloseAndDrain::TimedOut { pool, pending },
+            Duration::from_millis(1),
+        );
+        let timed_out = timed_out.expect("timeout retains authority");
+        assert!(matches!(
+            &timed_out.reason,
+            RetainedKeepaliveReason::TimedOut(actual) if *actual == pending
+        ));
+        assert!(matches!(
+            stopped_owner_settles(app, timed_out),
+            PostOwnerKeepaliveSettlement::Shutdown { .. }
+        ));
+
+        let (app, pool) = installed_pool(10);
+        let (_, _, owner_failed) = keepalive_close_report(
+            KeepaliveCloseAndDrain::OwnerFailed {
+                pool,
+                error: ThreadedRuntimeError::CommandFull,
+                pending,
+            },
+            Duration::from_millis(1),
+        );
+        let owner_failed = owner_failed.expect("owner failure retains authority");
+        assert!(matches!(
+            &owner_failed.reason,
+            RetainedKeepaliveReason::OwnerFailed {
+                error: ThreadedRuntimeError::CommandFull,
+                pending: actual,
+            } if *actual == pending
+        ));
+        assert!(matches!(
+            stopped_owner_settles(app, owner_failed),
+            PostOwnerKeepaliveSettlement::Shutdown { .. }
+        ));
+    }
 
     #[test]
     fn pool_shutdown_clean_drain_becomes_clean_close_outcome() {
@@ -337,4 +549,3 @@ mod conversion_tests {
         assert!(matches!(report.outcome, CloseOutcome::AlreadyClosed));
     }
 }
-
