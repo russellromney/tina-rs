@@ -408,9 +408,12 @@ impl HttpResponse {
         Self::with_status(StatusCode::INTERNAL_SERVER_ERROR)
     }
 
-    /// Convenience: `503 Service Unavailable`. Same shape the connection
-    /// isolate emits on a `CallOutcome::Full` when the policy chooses to
-    /// reply rather than close.
+    /// Convenience: `503 Service Unavailable`.
+    ///
+    /// Matches the connection isolate mapping for `Closed` / shutdown /
+    /// foreign-system terminals. Mailbox `Full` is **not** 503 — it is
+    /// `429 Too Many Requests` (see [`crate::response_for_call_outcome`] and
+    /// [`crate::response_for_send_outcome`]).
     pub fn service_unavailable() -> Self {
         Self::with_status(StatusCode::SERVICE_UNAVAILABLE)
     }

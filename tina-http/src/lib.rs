@@ -169,6 +169,7 @@ pub mod chunked_decoder;
 pub mod client;
 pub mod connect;
 pub mod connection;
+pub mod delivery;
 pub mod grpc;
 pub mod grpc_client;
 pub mod http2;
@@ -207,7 +208,8 @@ pub use connect::{
     build_http2_client_pool, build_websocket_client_manager, grpc_health_signal,
     http2_health_signal,
 };
-pub use connection::{HttpConnection, HttpConnectionMsg, response_for_call_outcome};
+pub use connection::{HttpConnection, HttpConnectionMsg};
+pub use delivery::{response_for_call_error, response_for_call_outcome, response_for_send_outcome};
 pub use grpc::{
     GrpcActorRouteFailure, GrpcActorRouteRegistrationError, GrpcBufferedServerStreamingResponse,
     GrpcBufferedStreamLimits, GrpcClientStreamingRequest, GrpcError, GrpcHttp2Request, GrpcLimits,
