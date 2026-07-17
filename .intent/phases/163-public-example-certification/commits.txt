@@ -269,11 +269,11 @@ its post-merge adversarial audit is tracked below. C1 remains incomplete.
 - PR CI (pre-merge): run 29572630925 full matrix SUCCESS (incl. new postgres-example job vs PostgreSQL 16)
 - Post-merge main workflow: https://github.com/russellromney/tina-rs/actions/runs/29573028010 SUCCESS on 127510d3e2e9c8122ecad7d8779fdaa64fd37fc0
 - Owns (all 21 manifest rows complete): specimen_graceful_drain_server, specimen_graceful_pool_shutdown, specimen_http_body_streaming, specimen_idempotent_retry, specimen_mini_keyspace, specimen_mux_client, specimen_native_http, specimen_native_https, specimen_outbound_fetch, specimen_outbound_http, specimen_periodic_batcher, specimen_pool_cancel_reclaim, specimen_postgres_counter, specimen_request_scope_fanout, specimen_retrying_outbound_http, specimen_scatter_gather, specimen_sharded_fanout_read, specimen_sharded_keyspace, specimen_two_stage_pipeline, specimen_webhook_fanout, specimen_webhook_publisher; docs/tcp-loops.md audited (loop-helper guidance only, no stale host vocabulary, no change needed)
-- Raw-runtime allowlist unchanged (cpu_run, mem_run, cross_shard_child_ownership, tracing_demo, owned_state_leak, perf_native raw rows)
+- Raw-runtime allowlist unchanged (cpu_run, mem_run, cross_shard_child_ownership, tracing_demo, owned_state_leak, perf_native raw rows); two residual `host_control()` facade escapes were later found and closed by #389.
 
 ### Direct proof (M6)
 - 13 checkpoint-sweep migrations verified by hand against execute.md §9; 8 remaining rows migrated in this session (mini_keyspace, mux_client, outbound_fetch, outbound_http, postgres_counter, retrying_outbound_http, sharded_fanout_read, sharded_keyspace)
-- every row: LocalSystem/LocalMultiShardSystem + run_to_shutdown_reported; keepalive via install_keepalive_pool + consuming close_and_drain; no raw ThreadedRuntime/MultiShard host remains in any M6 row (reviewer sweep, zero hits)
+- every row: LocalSystem/LocalMultiShardSystem + run_to_shutdown_reported; keepalive via install_keepalive_pool + consuming close_and_drain; no raw ThreadedRuntime/MultiShard host remains in any M6 row. The later #389 review additionally removed two lower-level `host_control()` escapes missed by this sweep.
 - every row gained tests/public_smoke.rs with exact `public_smoke` + `public_characterization` functions pinning report facts through the documented runner; exact commands per row:
   - `cargo test --manifest-path examples/<crate>/Cargo.toml --test public_smoke public_smoke -- --exact`
   - `cargo test --manifest-path examples/<crate>/Cargo.toml --test public_smoke public_characterization -- --exact`
@@ -282,5 +282,27 @@ its post-merge adversarial audit is tracked below. C1 remains incomplete.
 - full local gates green: focused tests + `--all-targets`, clippy `-D warnings`, rustdoc `-D warnings`, per-crate fmt, `git diff --check`
 
 ### Next
-- remediation PR #388 (typed HTTP caller settlement, Codex-owned) must merge green before C1 certification
-- C1 final certification + FINDINGS.md + guards from fresh worktree off 127510d3
+- C1 final certification + FINDINGS.md + guards from current `origin/main`
+- harden or replace the pre-existing shutdown remaining-budget timing test that
+  failed once on post-#389 macOS CI and passed on the failed-job rerun
+
+## M6 post-merge adversarial correction (#389)
+
+- Reviewed head: a7084f817bce88305954fb25e6e59048df562dc7
+- Merge commit: 3de11fc4c55621ef8b5fdf04f9dd431bda6102a7
+- The post-merge review falsified M6's zero-escape claim: PostgreSQL host calls
+  and HTTP iterator-body registration still used `host_control()`.
+- Added capability-typed `LocalSystem`/`LocalMultiShardSystem`
+  `call_blocking_typed` parity and `IterBodySource::register_local`, with exact
+  reply/rejection/authority-drop and Chunk/Chunk/Eof proofs; migrated both
+  examples.
+- Removed Webhook's 20 ms timing workaround, deterministically abort/joined
+  completed-response keepalive tasks, and restored the original webhook-first
+  error precedence. A join-only attempt was falsified by the real two-second
+  keepalive timeout before the final design; smoke passed ten repetitions.
+- PostgreSQL now propagates script-only, cleanup-only, and dual failures. Its
+  public characterization asserts both Tina and Tokio against PostgreSQL 16.
+- PR workflow 29575095572: SUCCESS. Post-merge `main` workflow 29575508172:
+  macOS nextest failed once in the unrelated pre-existing
+  `request_and_wait_passes_only_remaining_budget_to_wait_phase` timing test;
+  failed-job rerun attempt 2 SUCCESS on 3de11fc4c55621ef8b5fdf04f9dd431bda6102a7.
