@@ -188,7 +188,21 @@ where
     pub fn new(shard: S, config: SimulatorConfig) -> Self {
         Self::with_ids(shard, config, IdSource::new())
     }
+}
 
+impl<S> Drop for Simulator<S>
+where
+    S: Shard,
+{
+    fn drop(&mut self) {
+        self.dispose_all_terminal_reservations_on_shutdown();
+    }
+}
+
+impl<S> Simulator<S>
+where
+    S: Shard,
+{
     pub(crate) fn with_ids(shard: S, config: SimulatorConfig, ids: IdSource) -> Self {
         assert!(
             !config
@@ -716,7 +730,9 @@ mod tests {
     }
 
     #[test]
-    fn simulator_observed_restart_full_parent_has_no_hidden_delivery_queue() {
+    fn simulator_observed_restart_full_parent_delivers_via_lifecycle_force_admit() {
+        // Mirror live priority overflow: RestartWithFullMailbox packs capacity 1
+        // with Fill, restart completes, Restarted force-admits (not SendRejected).
         let incarnations = Rc::new(RefCell::new(Vec::new()));
         let mut sim = Simulator::new(NumberedShard(9), SimulatorConfig::default());
         let parent = sim.register_with_mailbox_capacity::<
@@ -751,20 +767,42 @@ mod tests {
             )
             .is_ok()
         );
-        assert_eq!(sim.step(), 1);
-        assert_eq!(sim.step(), 1);
-        assert_eq!(incarnations.borrow().as_slice(), &[initial]);
-        assert!(sim.trace().iter().any(|event| {
-            matches!(
-                event.kind(),
-                RuntimeEventKind::SendRejected {
-                    target_isolate,
-                    reason: tina_runtime::SendRejectedReason::Full,
-                    ..
-                } if target_isolate == parent.isolate()
-            )
-        }));
-        assert_eq!(sim.step(), 0, "no hidden replacement delivery remains");
+        assert_eq!(sim.step(), 1, "restart under packed mailbox");
+        assert!(
+            sim.trace().iter().any(|event| {
+                matches!(event.kind(), RuntimeEventKind::RestartChildCompleted { .. })
+            }),
+            "restart must complete under Full"
+        );
+        if incarnations.borrow().len() < 2 {
+            assert_eq!(sim.step(), 1, "Restarted via lifecycle force-admit");
+        }
+        assert_eq!(incarnations.borrow().len(), 2, "replacement must deliver");
+        assert_ne!(
+            incarnations.borrow()[1].address,
+            initial.address,
+            "replacement is a new incarnation"
+        );
+        assert!(
+            !sim.trace().iter().any(|event| {
+                matches!(
+                    event.kind(),
+                    RuntimeEventKind::SendRejected {
+                        target_isolate,
+                        reason: tina_runtime::SendRejectedReason::Full,
+                        ..
+                    } if target_isolate == parent.isolate()
+                )
+            }),
+            "lifecycle restart continuation must not SendRejected Full"
+        );
+        // Ordinary Fill (and any sibling drain) may remain after force-admit.
+        while sim.step() > 0 {}
+        assert_eq!(
+            incarnations.borrow().len(),
+            2,
+            "no extra restart deliveries"
+        );
     }
 
     #[test]

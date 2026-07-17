@@ -75,6 +75,22 @@ outstanding runtime calls, so it cannot grow without bound.
 means the mailbox is under-sized for the isolate's outstanding work, but no
 continuation was lost.
 
+## Observed-spawn lifecycle continuations
+
+`spawn_observed(...).then(...)` / restart refresh / terminal-admission errors
+are parent lifecycle facts. When the parent's bounded mailbox is full —
+including when a **terminal-delivery reservation** holds the last free slot —
+the runtime parks that one fact in the same **priority overflow** lane and
+drains it on a later step ahead of ordinary ingress. Simulator owners force-
+admit the same fact into the front of the inbox. That keeps initial success,
+admission `ParentMailboxFull` / `ParentMailboxClosed`, and restart refresh
+visible under reservation pressure without a hidden unbounded queue and
+without changing ordinary send semantics for application traffic.
+
+Terminal **result** delivery itself still consumes the reserved slot (or
+disposes with a typed reason). Cross-shard observed delivery does not use
+the overflow lane.
+
 ## Diagnosing under-capacity
 
 When the runtime cannot enqueue a *best-effort* reply because the requester's

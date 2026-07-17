@@ -109,6 +109,10 @@ impl<T> Mailbox<T> for TestMailbox<T> {
     fn close(&self) {
         self.closed.set(true);
     }
+
+    fn is_closed(&self) -> bool {
+        self.closed.get()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -569,7 +573,7 @@ fn spawn_observed_reports_zero_capacity_without_spawning_child() {
 }
 
 #[test]
-fn spawn_observed_parent_delivery_full_is_traced_without_hidden_queue() {
+fn spawn_observed_parent_delivery_full_uses_priority_overflow() {
     let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let child_seen = Rc::new(RefCell::new(Vec::new()));
     let order_log = Rc::new(RefCell::new(Vec::new()));
@@ -583,20 +587,24 @@ fn spawn_observed_parent_delivery_full_is_traced_without_hidden_queue() {
         TestMailbox::new(1),
     );
 
+    // Start batches Fill (fills capacity 1) then spawn_observed. The child-start
+    // continuation parks in the priority overflow lane rather than a hidden
+    // unbounded queue, and is delivered on the next step ahead of ordinary Fill.
     assert!(runtime.try_send(parent, FullParentEvent::Start).is_ok());
     assert_eq!(runtime.step(), 1);
-    assert!(runtime.trace().iter().any(|event| {
-        matches!(
-            event.kind(),
-            RuntimeEventKind::SendRejected {
-                reason: tina_runtime::SendRejectedReason::Full,
-                ..
-            }
-        )
-    }));
+    assert!(!child_started_delivered.get());
+    assert!(
+        runtime
+            .trace()
+            .iter()
+            .any(|event| matches!(event.kind(), RuntimeEventKind::Spawned { .. }))
+    );
 
     assert_eq!(runtime.step(), 1);
-    assert!(!child_started_delivered.get());
+    assert!(
+        child_started_delivered.get(),
+        "overflow delivers the observed-spawn continuation"
+    );
 }
 
 #[test]
@@ -717,7 +725,10 @@ fn service_observed_initial_factory_panic_is_typed_and_runtime_keeps_progressing
 }
 
 #[test]
-fn observed_restart_parent_full_rejects_without_hidden_delivery_queue() {
+fn observed_restart_parent_full_delivers_via_priority_overflow() {
+    // RestartWithFullMailbox packs the only ordinary slot with Fill, then
+    // restarts. The replacement still lands: lifecycle continuations use the
+    // priority overflow lane under Full (not SendRejected, not a hidden queue).
     let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let incarnations = Rc::new(RefCell::new(Vec::new()));
     let restart_message_drops = Rc::new(Cell::new(0));
@@ -755,21 +766,45 @@ fn observed_restart_parent_full_rejects_without_hidden_delivery_queue() {
             )
             .is_ok()
     );
-    assert_eq!(runtime.step(), 1);
-    assert_eq!(runtime.step(), 1);
-    assert_eq!(incarnations.borrow().as_slice(), &[initial]);
-    assert!(runtime.trace().iter().any(|event| {
-        matches!(
-            event.kind(),
-            RuntimeEventKind::SendRejected {
-                target_isolate,
-                reason: tina_runtime::SendRejectedReason::Full,
-                ..
-            } if target_isolate == parent.isolate()
-        )
-    }));
+    assert_eq!(runtime.step(), 1, "restart under packed mailbox");
+    assert!(
+        runtime.trace().iter().any(|event| {
+            matches!(event.kind(), RuntimeEventKind::RestartChildCompleted { .. })
+        }),
+        "restart must complete under Full"
+    );
+    if incarnations.borrow().len() < 2 {
+        assert_eq!(runtime.step(), 1, "Restarted via priority overflow");
+    }
+    assert_eq!(incarnations.borrow().len(), 2, "replacement must deliver");
+    assert_ne!(
+        incarnations.borrow()[1].address,
+        initial.address,
+        "replacement is a new incarnation"
+    );
+    assert!(
+        !runtime.trace().iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::SendRejected {
+                    target_isolate,
+                    reason: tina_runtime::SendRejectedReason::Full,
+                    ..
+                } if target_isolate == parent.isolate()
+            )
+        }),
+        "lifecycle restart continuation must not SendRejected Full"
+    );
+    // DropProbe is released when the parent handles Restarted (one drop), not
+    // because the message was rejected before delivery.
     assert_eq!(restart_message_drops.get(), 1);
-    assert_eq!(runtime.step(), 0, "no hidden replacement delivery remains");
+    // Ordinary Fill (and any sibling drain) may remain after the overflow fact.
+    while runtime.step() > 0 {}
+    assert_eq!(
+        incarnations.borrow().len(),
+        2,
+        "no extra restart deliveries"
+    );
 }
 
 #[test]
