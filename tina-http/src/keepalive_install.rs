@@ -46,12 +46,15 @@ use crate::target::HttpTarget;
 use crate::types::HttpClientConfig;
 
 #[cfg(test)]
-static INSTALL_RESOURCE_BOUNDARY_ENTRIES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+std::thread_local! {
+    static INSTALL_RESOURCE_BOUNDARY_ENTRIES: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
 
 fn record_install_resource_boundary() {
     #[cfg(test)]
-    INSTALL_RESOURCE_BOUNDARY_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    INSTALL_RESOURCE_BOUNDARY_ENTRIES.with(|entries| entries.set(entries.get() + 1));
 }
 
 /// Largest keepalive connection pool accepted by the installation facade.
@@ -1527,7 +1530,7 @@ mod tests {
 
     #[test]
     fn invalid_max_plus_one_never_crosses_resource_boundary() {
-        INSTALL_RESOURCE_BOUNDARY_ENTRIES.store(0, std::sync::atomic::Ordering::SeqCst);
+        INSTALL_RESOURCE_BOUNDARY_ENTRIES.with(|entries| entries.set(0));
         let system =
             LocalSystem::single_shard(SingleShard, tina_runtime::DefaultThreadedMailboxFactory)
                 .try_build()
@@ -1545,10 +1548,7 @@ mod tests {
                 KeepalivePoolConfigError::TooLarge { .. }
             ))
         ));
-        assert_eq!(
-            INSTALL_RESOURCE_BOUNDARY_ENTRIES.load(std::sync::atomic::Ordering::SeqCst),
-            0
-        );
+        INSTALL_RESOURCE_BOUNDARY_ENTRIES.with(|entries| assert_eq!(entries.get(), 0));
         let _ = system.shutdown().join();
     }
 
