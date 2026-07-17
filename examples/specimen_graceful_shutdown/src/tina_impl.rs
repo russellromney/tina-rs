@@ -1,14 +1,15 @@
 //! Tina: three isolates — `Producer` ticks out items, `Consumer`
 //! drains them, `SignalWatcher` runs `signal_wait("sigint",
 //! timeout)` and on receipt sends `Stop` to the producer. The
-//! producer respects `Stop` (no new items); the consumer keeps
-//! draining until everything in flight is processed.
+//! producer respects `Stop` (no new items) and tells the consumer
+//! the final produced count; the consumer keeps draining until every
+//! in-flight item is processed, then `stop_with(Report)`. The host
+//! claims that report with `observe_result` before start.
 
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
@@ -17,26 +18,21 @@ use tina_runtime::{
 
 use crate::{ITEM_INTERVAL_MS, Report, SIGNAL_AFTER_MS, TOTAL_PLANNED_ITEMS};
 
-/// Side channel for the host to read final counts. Same shape as
-/// the other examples' app-data slots.
-#[derive(Default)]
-struct Telemetry {
-    produced: AtomicU32,
-    processed: AtomicU32,
-    signal_received: AtomicBool,
-    producer_stopped: AtomicBool,
-}
-
 // ---------- Consumer ----------
 
 #[derive(Debug, Clone, Copy)]
 enum ConsumerMsg {
     Item(#[allow(dead_code)] u32),
     Done(SleepReply),
+    /// Producer finished: either signal-stop or natural end. Carries the
+    /// final produced count so the consumer can drain exactly that far.
+    ProducerDone { produced: u32, signal_received: bool },
 }
 
 struct Consumer {
-    telemetry: Arc<Telemetry>,
+    processed: u32,
+    expected: Option<u32>,
+    signal_received: bool,
 }
 
 #[tina_runtime::isolate(message = ConsumerMsg)]
@@ -49,10 +45,46 @@ impl Consumer {
         match msg {
             ConsumerMsg::Item(_) => sleep(Duration::from_millis(1)).then(ConsumerMsg::Done),
             ConsumerMsg::Done(Ok(())) => {
-                self.telemetry.processed.fetch_add(1, Ordering::Relaxed);
-                noop()
+                self.processed += 1;
+                self.maybe_finish()
             }
-            ConsumerMsg::Done(Err(_)) => noop(),
+            ConsumerMsg::Done(Err(_)) => {
+                // Work timer cancelled (shutdown). Report what we have rather
+                // than pretend a clean drain.
+                stop_with(Report {
+                    items_produced: self.expected.unwrap_or(self.processed),
+                    items_processed: self.processed,
+                    signal_received: self.signal_received,
+                    items_remaining_in_queue_at_exit: self
+                        .expected
+                        .map(|e| e.saturating_sub(self.processed))
+                        .unwrap_or(0),
+                    exit_clean: false,
+                })
+            }
+            ConsumerMsg::ProducerDone {
+                produced,
+                signal_received,
+            } => {
+                self.expected = Some(produced);
+                self.signal_received = signal_received;
+                self.maybe_finish()
+            }
+        }
+    }
+}
+
+impl Consumer {
+    fn maybe_finish(&self) -> Effect<Self> {
+        match self.expected {
+            Some(produced) if self.processed >= produced => stop_with(Report {
+                items_produced: produced,
+                items_processed: self.processed,
+                signal_received: self.signal_received,
+                items_remaining_in_queue_at_exit: 0,
+                exit_clean: true,
+            }),
+            _ => noop(),
         }
     }
 }
@@ -68,9 +100,10 @@ enum ProducerMsg {
 
 struct Producer {
     consumer: Address<ConsumerMsg>,
-    telemetry: Arc<Telemetry>,
     target: u32,
+    produced: u32,
     stopped: bool,
+    signal_stop: bool,
 }
 
 #[tina_runtime::isolate(
@@ -95,21 +128,40 @@ impl Producer {
                 if self.stopped || n >= self.target {
                     return noop();
                 }
-                self.telemetry.produced.fetch_add(1, Ordering::Relaxed);
+                self.produced += 1;
                 let next = n + 1;
-                batch(vec![
-                    send(self.consumer, ConsumerMsg::Item(n)),
-                    sleep(Duration::from_millis(ITEM_INTERVAL_MS))
-                        .then(move |result| ProducerMsg::TimerFired(next, result)),
-                ])
+                if next >= self.target {
+                    // Natural end after the final item: hand the count to the
+                    // consumer so it can drain without a signal.
+                    batch(vec![
+                        send(self.consumer, ConsumerMsg::Item(n)),
+                        send(
+                            self.consumer,
+                            ConsumerMsg::ProducerDone {
+                                produced: self.produced,
+                                signal_received: self.signal_stop,
+                            },
+                        ),
+                    ])
+                } else {
+                    batch(vec![
+                        send(self.consumer, ConsumerMsg::Item(n)),
+                        sleep(Duration::from_millis(ITEM_INTERVAL_MS))
+                            .then(move |result| ProducerMsg::TimerFired(next, result)),
+                    ])
+                }
             }
             ProducerMsg::TimerFired(_, Err(_)) => noop(),
             ProducerMsg::Stop => {
                 self.stopped = true;
-                self.telemetry
-                    .producer_stopped
-                    .store(true, Ordering::Release);
-                noop()
+                self.signal_stop = true;
+                send(
+                    self.consumer,
+                    ConsumerMsg::ProducerDone {
+                        produced: self.produced,
+                        signal_received: true,
+                    },
+                )
             }
         }
     }
@@ -125,7 +177,6 @@ enum SignalMsg {
 
 struct SignalWatcher {
     producer: Address<ProducerMsg>,
-    telemetry: Arc<Telemetry>,
 }
 
 #[tina_runtime::isolate(
@@ -142,12 +193,7 @@ impl SignalWatcher {
             SignalMsg::Begin => {
                 signal_wait("sigint", Duration::from_secs(10)).then(SignalMsg::Received)
             }
-            SignalMsg::Received(Ok(_)) => {
-                self.telemetry
-                    .signal_received
-                    .store(true, Ordering::Release);
-                send(self.producer, ProducerMsg::Stop)
-            }
+            SignalMsg::Received(Ok(_)) => send(self.producer, ProducerMsg::Stop),
             SignalMsg::Received(Err(_)) => stop(),
         }
     }
@@ -156,38 +202,43 @@ impl SignalWatcher {
 // ---------- Run ----------
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
-    let telemetry = Arc::new(Telemetry::default());
+    let runtime = Arc::new(ThreadedRuntime::try_new(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+    )?);
+    let shutdown = runtime.shutdown_handle();
 
     let consumer = runtime
         .register_with_capacity::<_, Infallible>(
             Consumer {
-                telemetry: Arc::clone(&telemetry),
+                processed: 0,
+                expected: None,
+                signal_received: false,
             },
             (TOTAL_PLANNED_ITEMS as usize) + 4,
         )
         .map_err(|e| anyhow::anyhow!("register consumer: {e:?}"))?;
 
+    // Claim the terminal drain report before any message can stop the consumer.
+    let waiter = runtime
+        .observe_result::<Report, _, _>(consumer)
+        .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
+
     let producer = runtime
         .register_with_capacity::<_, _>(
             Producer {
                 consumer,
-                telemetry: Arc::clone(&telemetry),
                 target: TOTAL_PLANNED_ITEMS,
+                produced: 0,
                 stopped: false,
+                signal_stop: false,
             },
             16,
         )
         .map_err(|e| anyhow::anyhow!("register producer: {e:?}"))?;
 
     let watcher = runtime
-        .register_with_capacity::<_, _>(
-            SignalWatcher {
-                producer,
-                telemetry: Arc::clone(&telemetry),
-            },
-            8,
-        )
+        .register_with_capacity::<_, _>(SignalWatcher { producer }, 8)
         .map_err(|e| anyhow::anyhow!("register watcher: {e:?}"))?;
 
     runtime
@@ -203,37 +254,13 @@ pub fn run() -> anyhow::Result<Report> {
         signal_hook::low_level::raise(signal_hook::consts::SIGINT).expect("raise SIGINT");
     });
 
-    // Wait for: signal observed AND producer stopped AND consumer
-    // has caught up. App-data side channel — same pattern as
-    // `specimen_persistent_counter::Observation`.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let stopped = telemetry.producer_stopped.load(Ordering::Acquire);
-        let produced = telemetry.produced.load(Ordering::Acquire);
-        let processed = telemetry.processed.load(Ordering::Acquire);
-        let signal = telemetry.signal_received.load(Ordering::Acquire);
-        if stopped && signal && processed >= produced && produced > 0 {
-            // One last yield in case a `Done` is in flight.
-            thread::sleep(Duration::from_millis(5));
-            if telemetry.processed.load(Ordering::Acquire) == produced {
-                break;
-            }
-        }
-        if Instant::now() > deadline {
-            anyhow::bail!(
-                "graceful drain timed out: signal={signal} stopped={stopped} produced={produced} processed={processed}",
-            );
-        }
-        thread::yield_now();
-    }
+    let report = waiter
+        .wait(Duration::from_secs(5))
+        .map_err(|e| anyhow::anyhow!("consumer did not finish drain: {e:?}"))?;
 
-    runtime.shutdown_report().ensure_clean()?;
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
 
-    Ok(Report {
-        items_produced: telemetry.produced.load(Ordering::Relaxed),
-        items_processed: telemetry.processed.load(Ordering::Relaxed),
-        signal_received: telemetry.signal_received.load(Ordering::Acquire),
-        items_remaining_in_queue_at_exit: 0,
-        exit_clean: true,
-    })
+    Ok(report)
 }
