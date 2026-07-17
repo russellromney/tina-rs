@@ -278,6 +278,40 @@ pub fn emit_event(event: &RuntimeEvent) {
             child_isolate = child_isolate.get(),
             child_generation = child_generation.get(),
         ),
+        RuntimeEventKind::ChildTerminalDelivered {
+            child_ordinal,
+            child_isolate,
+            child_generation,
+        } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::DEBUG,
+            kind = "child_terminal_delivered",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            child_ordinal = child_ordinal as u64,
+            child_isolate = child_isolate.get(),
+            child_generation = child_generation.get(),
+        ),
+        RuntimeEventKind::ChildTerminalDisposed {
+            child_ordinal,
+            child_isolate,
+            child_generation,
+            reason,
+        } => event!(
+            target: RUNTIME_TRACE_TARGET,
+            Level::DEBUG,
+            kind = "child_terminal_disposed",
+            event_id,
+            cause_id = ?cause_id,
+            shard,
+            isolate,
+            child_ordinal = child_ordinal as u64,
+            child_isolate = child_isolate.get(),
+            child_generation = child_generation.get(),
+            reason = child_terminal_disposed_reason_name(reason),
+        ),
         RuntimeEventKind::ChildStarted {
             child_shard,
             child_isolate,
@@ -838,6 +872,25 @@ pub fn restart_skipped_reason_name(reason: RestartSkippedReason) -> &'static str
         RestartSkippedReason::NotRestartable => "NotRestartable",
         RestartSkippedReason::FactoryPanicked => "FactoryPanicked",
         RestartSkippedReason::RemoteNotRestartable => "RemoteNotRestartable",
+        RestartSkippedReason::ParentMailboxFull => "ParentMailboxFull",
+        RestartSkippedReason::ParentMailboxClosed => "ParentMailboxClosed",
+    }
+}
+
+/// Stable string name for a [`tina_runtime::ChildTerminalDisposedReason`].
+pub fn child_terminal_disposed_reason_name(
+    reason: tina_runtime::ChildTerminalDisposedReason,
+) -> &'static str {
+    use tina_runtime::ChildTerminalDisposedReason as R;
+    match reason {
+        R::StoppedWithoutResult => "StoppedWithoutResult",
+        R::TypeMismatch => "TypeMismatch",
+        R::StaleGeneration => "StaleGeneration",
+        R::Duplicate => "Duplicate",
+        R::ParentMailboxFull => "ParentMailboxFull",
+        R::ParentMailboxClosed => "ParentMailboxClosed",
+        R::ParentStopped => "ParentStopped",
+        R::Shutdown => "Shutdown",
     }
 }
 

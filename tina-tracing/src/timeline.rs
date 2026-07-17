@@ -432,6 +432,8 @@ fn push_runtime_events(timeline: &TraceTimeline, out: &mut Vec<EmittedEvent>, or
             | RuntimeEventKind::RestartChildSkipped { .. }
             | RuntimeEventKind::RestartChildCompleted { .. }
             | RuntimeEventKind::ChildStopped { .. }
+            | RuntimeEventKind::ChildTerminalDelivered { .. }
+            | RuntimeEventKind::ChildTerminalDisposed { .. }
             | RuntimeEventKind::RemoteChildStopRequested { .. }
             | RuntimeEventKind::RemoteChildStopped { .. }
             | RuntimeEventKind::RemoteChildControlRejected { .. }
@@ -928,10 +930,29 @@ fn insert_kind_args(args: &mut Map<String, Value>, kind: RuntimeEventKind) {
             child_ordinal,
             child_isolate,
             child_generation,
+        }
+        | RuntimeEventKind::ChildTerminalDelivered {
+            child_ordinal,
+            child_isolate,
+            child_generation,
         } => {
             args.insert("child_ordinal".into(), json!(child_ordinal));
             args.insert("child_isolate".into(), json!(child_isolate.get()));
             args.insert("child_generation".into(), json!(child_generation.get()));
+        }
+        RuntimeEventKind::ChildTerminalDisposed {
+            child_ordinal,
+            child_isolate,
+            child_generation,
+            reason,
+        } => {
+            args.insert("child_ordinal".into(), json!(child_ordinal));
+            args.insert("child_isolate".into(), json!(child_isolate.get()));
+            args.insert("child_generation".into(), json!(child_generation.get()));
+            args.insert(
+                "reason".into(),
+                json!(crate::events::child_terminal_disposed_reason_name(reason)),
+            );
         }
         RuntimeEventKind::RemoteChildStopRequested {
             child_shard,
@@ -1081,6 +1102,8 @@ fn event_name(kind: RuntimeEventKind) -> &'static str {
         RuntimeEventKind::RestartChildSkipped { .. } => "restart_child_skipped",
         RuntimeEventKind::RestartChildCompleted { .. } => "restart_child_completed",
         RuntimeEventKind::ChildStopped { .. } => "child_stopped",
+        RuntimeEventKind::ChildTerminalDelivered { .. } => "child_terminal_delivered",
+        RuntimeEventKind::ChildTerminalDisposed { .. } => "child_terminal_disposed",
         RuntimeEventKind::RemoteChildStopRequested { .. } => "remote_child_stop_requested",
         RuntimeEventKind::RemoteChildStopped { .. } => "remote_child_stopped",
         RuntimeEventKind::RemoteChildControlRejected { .. } => "remote_child_control_rejected",
@@ -1140,6 +1163,8 @@ fn event_category(kind: RuntimeEventKind) -> &'static str {
         | RuntimeEventKind::RestartChildSkipped { .. }
         | RuntimeEventKind::RestartChildCompleted { .. }
         | RuntimeEventKind::ChildStopped { .. }
+        | RuntimeEventKind::ChildTerminalDelivered { .. }
+        | RuntimeEventKind::ChildTerminalDisposed { .. }
         | RuntimeEventKind::RemoteChildStopRequested { .. }
         | RuntimeEventKind::RemoteChildStopped { .. }
         | RuntimeEventKind::RemoteChildControlRejected { .. }

@@ -227,6 +227,13 @@ impl SupervisorReport {
                             skipped_not_restartable += 1;
                             child.skipped_not_restartable += 1;
                         }
+                        RestartSkippedReason::ParentMailboxFull
+                        | RestartSkippedReason::ParentMailboxClosed => {
+                            // Admission rejection for terminal reservation is a
+                            // restart skip with no replacement child.
+                            skipped_not_restartable += 1;
+                            child.skipped_not_restartable += 1;
+                        }
                     }
                 }
                 RuntimeEventKind::ChildStopped {

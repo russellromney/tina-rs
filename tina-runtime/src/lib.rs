@@ -352,9 +352,9 @@ pub use tcp_loops::{LoopStep, ReadExactStep, TcpReadExact, TcpReadToEof, TcpWrit
 pub use tina_macros::runtime_isolate as isolate;
 pub use trace::{
     CallCompletionRejectedReason, CallKind, CallReplyRejectedReason, CauseId,
-    DeferredReplyRejectedReason, DeferredSlotId, EffectKind, EventId, RestartSkippedReason,
-    RuntimeEvent, RuntimeEventKind, RuntimeTraceExt, SendRejectedReason, SupervisionRejectedReason,
-    TerminalCompletionAction, stable_trace_hash,
+    ChildTerminalDisposedReason, DeferredReplyRejectedReason, DeferredSlotId, EffectKind, EventId,
+    RestartSkippedReason, RuntimeEvent, RuntimeEventKind, RuntimeTraceExt, SendRejectedReason,
+    SupervisionRejectedReason, TerminalCompletionAction, stable_trace_hash,
 };
 pub use unix_framed::{FramedWriteError, UnixFramedWriter};
 pub use unix_loops::{UnixReadToEof, UnixWriteAll};

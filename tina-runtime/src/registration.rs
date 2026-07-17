@@ -87,10 +87,7 @@ where
         let address = self.register_entry::<I, Outbound>(
             isolate,
             None,
-            Box::new(MailboxAdapter::<M, I::Message> {
-                mailbox,
-                marker: PhantomData,
-            }),
+            Box::new(MailboxAdapter::<M, I::Message>::new(mailbox)),
         );
 
         Address::new_with_generation_in(
@@ -122,9 +119,9 @@ where
         let address = self.register_entry::<I, Outbound>(
             isolate,
             None,
-            Box::new(AnyMailboxAdapter {
-                mailbox: self.create_mailbox::<Box<dyn Any>>(mailbox_capacity),
-            }),
+            Box::new(AnyMailboxAdapter::new(
+                self.create_mailbox::<Box<dyn Any>>(mailbox_capacity),
+            )),
         );
 
         Address::new_with_generation_in(
@@ -415,7 +412,7 @@ where
         let address = self.register_entry_with_id::<I, Outbound>(
             isolate,
             None,
-            Box::new(AnyMailboxAdapter { mailbox }),
+            Box::new(AnyMailboxAdapter::with_occupied(mailbox, 1)),
             isolate_id,
         );
         let entry_index = self
@@ -497,7 +494,7 @@ where
             parent: None,
             stopped: Cell::new(false),
             stopped_event: Cell::new(None),
-            mailbox: Box::new(AnyMailboxAdapter { mailbox }),
+            mailbox: Box::new(AnyMailboxAdapter::new(mailbox)),
             call_contexts: RefCell::new(VecDeque::new()),
             continuation_overflow: RefCell::new(VecDeque::new()),
             handler: RefCell::new(Box::new(HandlerAdapter::<I, Outbound> {
@@ -842,9 +839,9 @@ where
         let child = self.register_entry::<I, Outbound>(
             isolate,
             local_parent,
-            Box::new(AnyMailboxAdapter {
-                mailbox: self.create_mailbox::<Box<dyn Any>>(mailbox_capacity),
-            }),
+            Box::new(AnyMailboxAdapter::new(
+                self.create_mailbox::<Box<dyn Any>>(mailbox_capacity),
+            )),
         );
         let child_isolate = child.isolate;
         // A same-shard owner records a ChildRecord and attributes the `Spawned`
@@ -859,6 +856,9 @@ where
                     mailbox_capacity,
                     restart_recipe,
                     restart_continuation: None,
+                    terminal_continuation: None,
+                    terminal_slot_reserved: false,
+                    terminal_settled_generation: None,
                     remote_request_id: None,
                     remote_owner: None,
                     remote_restartable: false,
@@ -874,6 +874,9 @@ where
                     mailbox_capacity,
                     restart_recipe,
                     restart_continuation: None,
+                    terminal_continuation: None,
+                    terminal_slot_reserved: false,
+                    terminal_settled_generation: None,
                     remote_request_id,
                     remote_owner,
                     remote_restartable: false,
@@ -912,9 +915,9 @@ where
         let address = self.register_sendable_entry::<I, Outbound>(
             isolate,
             None,
-            Box::new(AnyMailboxAdapter {
-                mailbox: self.create_mailbox::<Box<dyn Any>>(mailbox_capacity),
-            }),
+            Box::new(AnyMailboxAdapter::new(
+                self.create_mailbox::<Box<dyn Any>>(mailbox_capacity),
+            )),
         );
 
         Address::new_with_generation_in(
@@ -961,7 +964,7 @@ where
             parent: None,
             stopped: Cell::new(false),
             stopped_event: Cell::new(None),
-            mailbox: Box::new(AnyMailboxAdapter { mailbox }),
+            mailbox: Box::new(AnyMailboxAdapter::new(mailbox)),
             call_contexts: RefCell::new(VecDeque::new()),
             continuation_overflow: RefCell::new(VecDeque::new()),
             handler: RefCell::new(Box::new(SendableHandlerAdapter::<I, Outbound> {
@@ -1010,7 +1013,7 @@ where
         let address = self.register_sendable_entry_with_id::<I, Outbound>(
             isolate,
             None,
-            Box::new(AnyMailboxAdapter { mailbox }),
+            Box::new(AnyMailboxAdapter::with_occupied(mailbox, 1)),
             isolate_id,
         );
         let entry_index = self
@@ -1123,9 +1126,9 @@ where
         let child = self.register_entry::<I, Outbound>(
             isolate,
             Some(parent),
-            Box::new(AnyMailboxAdapter {
-                mailbox: self.create_mailbox::<Box<dyn Any>>(mailbox_capacity),
-            }),
+            Box::new(AnyMailboxAdapter::new(
+                self.create_mailbox::<Box<dyn Any>>(mailbox_capacity),
+            )),
         );
 
         SpawnOutcome {
@@ -1133,6 +1136,8 @@ where
             mailbox_capacity,
             restart_recipe: None,
             restart_continuation: None,
+            terminal_continuation: None,
+            terminal_slot_reserved: false,
             bootstrap_message: bootstrap_message.map(|message| Box::new(message) as Box<dyn Any>),
         }
     }
@@ -1151,6 +1156,9 @@ where
             mailbox_capacity: outcome.mailbox_capacity,
             restart_recipe: outcome.restart_recipe,
             restart_continuation: outcome.restart_continuation,
+            terminal_continuation: outcome.terminal_continuation,
+            terminal_slot_reserved: outcome.terminal_slot_reserved,
+            terminal_settled_generation: None,
             remote_request_id: None,
             remote_owner: None,
             remote_restartable: false,
@@ -1180,6 +1188,9 @@ where
             mailbox_capacity,
             restart_recipe: None,
             restart_continuation: None,
+            terminal_continuation: None,
+            terminal_slot_reserved: false,
+            terminal_settled_generation: None,
             remote_request_id: None,
             remote_owner: None,
             remote_restartable,

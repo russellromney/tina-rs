@@ -434,6 +434,37 @@ pub enum RestartSkippedReason {
     /// The child lives on another shard and was not spawned with a sendable
     /// cross-shard restart recipe.
     RemoteNotRestartable,
+
+    /// The parent's mailbox could not reserve a slot for the replacement
+    /// generation's terminal-result delivery.
+    ParentMailboxFull,
+
+    /// The parent's mailbox is closed, so a terminal-delivery reservation for
+    /// the replacement generation cannot be taken.
+    ParentMailboxClosed,
+}
+
+/// Why a reserved child terminal result was disposed instead of delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ChildTerminalDisposedReason {
+    /// The child stopped without a `stop_with` payload.
+    StoppedWithoutResult,
+    /// The `stop_with` payload type did not match the parent's terminal mapper.
+    TypeMismatch,
+    /// A terminal observation for an older generation arrived after replacement.
+    StaleGeneration,
+    /// A second terminal settlement was attempted for the same generation.
+    Duplicate,
+    /// The parent mailbox was full at delivery time (should not happen when a
+    /// reservation was held through delivery).
+    ParentMailboxFull,
+    /// The parent mailbox closed before the reserved result could be delivered.
+    ParentMailboxClosed,
+    /// The parent stopped (or disappeared) while holding the reservation.
+    ParentStopped,
+    /// Runtime or system shutdown cancelled the reservation.
+    Shutdown,
 }
 
 /// Why a supervised restart response did not run.
@@ -666,6 +697,28 @@ pub enum RuntimeEventKind {
 
         /// The generation of the child incarnation that was stopped.
         child_generation: AddressGeneration,
+    },
+
+    /// A child's typed terminal result was delivered to the observing parent.
+    ChildTerminalDelivered {
+        /// Stable per-parent child ordinal.
+        child_ordinal: usize,
+        /// The child incarnation that produced the result.
+        child_isolate: IsolateId,
+        /// The generation of the child incarnation that produced the result.
+        child_generation: AddressGeneration,
+    },
+
+    /// A reserved child terminal result was disposed without parent delivery.
+    ChildTerminalDisposed {
+        /// Stable per-parent child ordinal.
+        child_ordinal: usize,
+        /// The child incarnation whose result was disposed.
+        child_isolate: IsolateId,
+        /// The generation of the child incarnation whose result was disposed.
+        child_generation: AddressGeneration,
+        /// Why the result was not delivered.
+        reason: ChildTerminalDisposedReason,
     },
 
     /// The runner applied the stopped state after observing [`tina::Effect::Stop`].
@@ -1593,6 +1646,21 @@ fn restart_skipped_tag(reason: RestartSkippedReason) -> u8 {
         RestartSkippedReason::NotRestartable => 1,
         RestartSkippedReason::FactoryPanicked => 2,
         RestartSkippedReason::RemoteNotRestartable => 3,
+        RestartSkippedReason::ParentMailboxFull => 4,
+        RestartSkippedReason::ParentMailboxClosed => 5,
+    }
+}
+
+fn child_terminal_disposed_tag(reason: ChildTerminalDisposedReason) -> u8 {
+    match reason {
+        ChildTerminalDisposedReason::StoppedWithoutResult => 1,
+        ChildTerminalDisposedReason::TypeMismatch => 2,
+        ChildTerminalDisposedReason::StaleGeneration => 3,
+        ChildTerminalDisposedReason::Duplicate => 4,
+        ChildTerminalDisposedReason::ParentMailboxFull => 5,
+        ChildTerminalDisposedReason::ParentMailboxClosed => 6,
+        ChildTerminalDisposedReason::ParentStopped => 7,
+        ChildTerminalDisposedReason::Shutdown => 8,
     }
 }
 
@@ -1958,6 +2026,28 @@ fn write_kind_stable(kind: RuntimeEventKind, hasher: &mut StableHasher) {
         RuntimeEventKind::DriverCompletionQuarantined { call_id } => {
             hasher.write_u8(46);
             hasher.write_u64(call_id.get());
+        }
+        RuntimeEventKind::ChildTerminalDelivered {
+            child_ordinal,
+            child_isolate,
+            child_generation,
+        } => {
+            hasher.write_u8(47);
+            hasher.write_u64(child_ordinal as u64);
+            hasher.write_u64(child_isolate.get());
+            hasher.write_u64(child_generation.get());
+        }
+        RuntimeEventKind::ChildTerminalDisposed {
+            child_ordinal,
+            child_isolate,
+            child_generation,
+            reason,
+        } => {
+            hasher.write_u8(48);
+            hasher.write_u64(child_ordinal as u64);
+            hasher.write_u64(child_isolate.get());
+            hasher.write_u64(child_generation.get());
+            hasher.write_u8(child_terminal_disposed_tag(reason));
         }
     }
 }
