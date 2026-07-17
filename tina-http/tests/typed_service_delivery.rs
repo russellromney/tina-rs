@@ -16,6 +16,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::Duration;
 
 use tina::prelude::*;
@@ -446,7 +447,10 @@ impl From<HttpRequest> for TimeoutHttp {
     }
 }
 
-struct TimeoutSplit;
+struct TimeoutSplit {
+    admitted: Option<SyncSender<()>>,
+    late_context_open: SyncSender<bool>,
+}
 
 #[tina_runtime::isolate(
     event = TimeoutEvent,
@@ -461,7 +465,12 @@ impl TimeoutSplit {
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
         match event {
-            TimeoutEvent::Late(req) => reply_to(req, HttpResponse::text("late")),
+            TimeoutEvent::Late(req) => {
+                self.late_context_open
+                    .send(req.is_open())
+                    .expect("late-context observer remains open");
+                reply_to(req, HttpResponse::text("late"))
+            }
         }
     }
 
@@ -470,23 +479,31 @@ impl TimeoutSplit {
         _request: TimeoutHttp,
         call: tina::RequestCall<'_, Self>,
     ) -> tina::RequestEffect<Self> {
-        // Sleep longer than service_call_timeout so the connection sees Timeout.
-        call.defer(tina_runtime::sleep(Duration::from_secs(2)))
-            .reply(|req, _| tina::ServiceMessage::Event(TimeoutEvent::Late(req)))
+        if let Some(admitted) = self.admitted.take() {
+            admitted.send(()).expect("admission observer remains open");
+        }
+        // Sleep longer than service_call_timeout so the connection closes its
+        // caller authority before the continuation reaches the service again.
+        call.defer(tina_runtime::sleep(Duration::from_millis(100)))
+            .reply_service_event(|req, _| TimeoutEvent::Late(req))
     }
 }
 
 #[test]
 fn request_timeout_returns_504() {
     let runtime = make_runtime();
+    let (late_tx, late_rx) = sync_channel(1);
     let handle = runtime
         .register_split_service::<TimeoutSplit, TimeoutEvent, TimeoutHttp, Infallible>(
-            TimeoutSplit,
+            TimeoutSplit {
+                admitted: None,
+                late_context_open: late_tx,
+            },
             8,
         )
         .expect("register timeout service");
     let mut cfg = config();
-    cfg.service_call_timeout = Duration::from_millis(50);
+    cfg.service_call_timeout = Duration::from_millis(10);
     let listener = HttpListener::<TestShard, _>::for_split_service(
         "127.0.0.1:0".parse().unwrap(),
         handle,
@@ -498,6 +515,55 @@ fn request_timeout_returns_504() {
     assert!(
         status_line(&response).starts_with("HTTP/1.1 504"),
         "slow service must answer 504, got {response}"
+    );
+    assert!(
+        !late_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("late continuation settles"),
+        "service timeout must close the captured caller context"
+    );
+
+    let _ = runtime.try_send(listener_addr, HttpListenerMsg::Stop);
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn peer_disconnect_does_not_strand_pending_service_caller() {
+    let runtime = make_runtime();
+    let (admitted_tx, admitted_rx) = sync_channel(1);
+    let (late_tx, late_rx) = sync_channel(1);
+    let handle = runtime
+        .register_split_service::<TimeoutSplit, TimeoutEvent, TimeoutHttp, Infallible>(
+            TimeoutSplit {
+                admitted: Some(admitted_tx),
+                late_context_open: late_tx,
+            },
+            8,
+        )
+        .expect("register timeout service");
+    let mut cfg = config();
+    cfg.service_call_timeout = Duration::from_millis(10);
+    let listener = HttpListener::<TestShard, _>::for_split_service(
+        "127.0.0.1:0".parse().unwrap(),
+        handle,
+        cfg,
+    );
+    let (addr, listener_addr) = start_listener(&runtime, listener, 8);
+
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+    stream
+        .write_all(b"GET /abandon HTTP/1.1\r\nHost: x\r\n\r\n")
+        .expect("write request");
+    admitted_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("service admitted request");
+    drop(stream);
+
+    assert!(
+        !late_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("late continuation settles"),
+        "a disconnected client must not leave service caller authority open"
     );
 
     let _ = runtime.try_send(listener_addr, HttpListenerMsg::Stop);
