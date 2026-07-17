@@ -1,13 +1,15 @@
 //! Typed WebSocket delivery: split-service and request-only handles install
 //! without naming the private envelope or extracting a raw address. Session
-//! lanes stay exact; two-client room broadcast reaches every snapshot
-//! recipient other than the sender exactly once.
+//! lanes stay exact; room broadcast reaches every snapshot recipient other
+//! than the sender exactly once.
 //!
 //! Direct proof matrix:
 //! - request-only upgrade → typed echo reply
 //! - split-service upgrade → request-lane open/text, event-lane SendOutcome
-//! - closed app / peer close / malformed upgrade / listener shutdown
-//! - deterministic two-client broadcast exactness (no omission, no self-echo)
+//! - peer close frame (request) / peer drop SessionClosed (event)
+//! - malformed upgrade / listener shutdown
+//! - two- and three-client broadcast exactness (no omission, no self-echo,
+//!   no second wire frame; SendOutcome count equals offer count)
 //! - compile_fail doctests on accept constructors (lane confusion is a type error)
 
 use std::convert::Infallible;
@@ -143,6 +145,67 @@ fn read_server_text(stream: &mut TcpStream) -> String {
     String::from_utf8(payload).expect("utf8 text")
 }
 
+/// Assert no further WebSocket data frame arrives within a short drain window.
+///
+/// Control frames (ping/pong/close) are skipped; a second text/binary would
+/// fail the exactly-once wire claim. Always restores the long read timeout.
+fn assert_no_extra_data_frame(stream: &mut TcpStream) {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("short drain timeout");
+    let result = (|| -> Result<(), String> {
+        loop {
+            let mut head = [0u8; 2];
+            match stream.read(&mut head) {
+                Ok(0) | Err(_) => return Ok(()),
+                Ok(1) => return Ok(()), // incomplete head; no full data frame
+                Ok(_) => {
+                    let opcode = head[0] & 0x0f;
+                    let mut len = usize::from(head[1] & 0x7f);
+                    if len == 126 {
+                        let mut wide = [0u8; 2];
+                        if stream.read_exact(&mut wide).is_err() {
+                            return Ok(());
+                        }
+                        len = usize::from(u16::from_be_bytes(wide));
+                    }
+                    let mut payload = vec![0; len];
+                    if stream.read_exact(&mut payload).is_err() {
+                        return Ok(());
+                    }
+                    match opcode {
+                        0x1 | 0x2 => {
+                            return Err(format!(
+                                "exactly-once violated: extra data frame opcode={opcode} payload={payload:?}"
+                            ));
+                        }
+                        0x8..=0xa => continue, // close/ping/pong
+                        other => return Err(format!("unexpected opcode during drain: {other}")),
+                    }
+                }
+            }
+        }
+    })();
+    stream
+        .set_read_timeout(Some(TEST_IO_TIMEOUT))
+        .expect("restore timeout");
+    if let Err(msg) = result {
+        panic!("{msg}");
+    }
+}
+
+fn wait_for_count(counter: &AtomicU64, at_least: u64, label: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while counter.load(Ordering::SeqCst) < at_least && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let got = counter.load(Ordering::SeqCst);
+    assert!(
+        got >= at_least,
+        "timed out waiting for {label}: want >={at_least}, got {got}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Request-only echo
 // ---------------------------------------------------------------------------
@@ -264,6 +327,7 @@ struct LaneCounts {
     request_msgs: AtomicU64,
     event_msgs: AtomicU64,
     send_outcomes: AtomicU64,
+    session_closed: AtomicU64,
     session_texts: AtomicU64,
 }
 
@@ -297,8 +361,12 @@ impl SplitRoom {
                 let _ = self.members.record_send_outcome(&outcome);
                 noop()
             }
-            WebSocketSessionMsg::SessionClosed { session_id, .. }
-            | WebSocketSessionMsg::SessionPressure { session_id, .. } => {
+            WebSocketSessionMsg::SessionClosed { session_id, .. } => {
+                self.lanes.session_closed.fetch_add(1, Ordering::SeqCst);
+                let _ = self.members.remove_peer(session_id);
+                noop()
+            }
+            WebSocketSessionMsg::SessionPressure { session_id, .. } => {
                 let _ = self.members.remove_peer(session_id);
                 noop()
             }
@@ -461,21 +529,23 @@ fn split_service_two_client_broadcast_exact_once_excludes_sender() {
     let seen_a = read_server_text(&mut a);
     assert_eq!(seen_a, "room:from-b");
 
-    // Wait briefly for SendOutcome event-lane deliveries.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while lanes.send_outcomes.load(Ordering::SeqCst) < 2
-        && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        lanes.send_outcomes.load(Ordering::SeqCst) >= 2,
-        "expected SendOutcome on event lane for each fanout offer, got {}",
-        lanes.send_outcomes.load(Ordering::SeqCst)
+    // Exactly-once on the wire: after each expected room frame, no second
+    // data frame (duplicate fanout or self-echo) arrives during a short drain.
+    assert_no_extra_data_frame(&mut a);
+    assert_no_extra_data_frame(&mut b);
+
+    // Two fanouts × one non-sender recipient each ⇒ exactly two offers.
+    wait_for_count(&lanes.send_outcomes, 2, "SendOutcome");
+    // Allow a short settle so a duplicate outcome would still be counted.
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        lanes.send_outcomes.load(Ordering::SeqCst),
+        2,
+        "SendOutcome count must equal fanout offer count"
     );
     assert!(
         lanes.event_msgs.load(Ordering::SeqCst) >= 2,
-        "event lane should see SendOutcome deliveries"
+        "event lane should see SendOutcome deliveries (and may also see SessionAccepted)"
     );
     assert!(
         lanes.request_msgs.load(Ordering::SeqCst) >= 4,
@@ -484,23 +554,55 @@ fn split_service_two_client_broadcast_exact_once_excludes_sender() {
     );
     assert_eq!(lanes.session_texts.load(Ordering::SeqCst), 2);
 
-    // Sender must not get its own room-prefixed echo. Give a short grace
-    // window: if anything arrives on A after from-a, it must be from-b only
-    // (already consumed) — set a short timeout and ensure no extra room:from-a.
-    a.set_read_timeout(Some(Duration::from_millis(100)))
-        .expect("short timeout");
-    let mut unexpected = [0u8; 2];
-    match a.read(&mut unexpected) {
-        Ok(0) | Err(_) => {}
-        Ok(n) => panic!("sender A received unexpected bytes after broadcast: {n}"),
+    let _ = runtime.try_send(listener_addr, HttpListenerMsg::Stop);
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn split_service_three_client_broadcast_offer_count_and_wire_once() {
+    // Multi-recipient: A speaks → B and C each get one room frame; SendOutcome
+    // count equals snapshot offer count (2). Snapshot order itself is pinned
+    // by websocket_room unit tests (BTreeMap by session id).
+    let (runtime, addr, listener_addr, lanes) = start_split_room(8);
+
+    let mut a = connect_ws(addr);
+    let mut b = connect_ws(addr);
+    let mut c = connect_ws(addr);
+
+    let join_a = read_server_text(&mut a);
+    let join_b = read_server_text(&mut b);
+    let join_c = read_server_text(&mut c);
+    for join in [&join_a, &join_b, &join_c] {
+        assert!(join.starts_with("join:"), "{join}");
     }
+    assert_ne!(join_a, join_b);
+    assert_ne!(join_a, join_c);
+    assert_ne!(join_b, join_c);
+
+    a.write_all(&masked_frame(0x1, b"to-all"))
+        .expect("a writes");
+    assert_eq!(read_server_text(&mut b), "room:to-all");
+    assert_eq!(read_server_text(&mut c), "room:to-all");
+    assert_no_extra_data_frame(&mut b);
+    assert_no_extra_data_frame(&mut c);
+    // Sender excluded.
+    assert_no_extra_data_frame(&mut a);
+
+    wait_for_count(&lanes.send_outcomes, 2, "SendOutcome for two recipients");
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        lanes.send_outcomes.load(Ordering::SeqCst),
+        2,
+        "offer count for three members excluding sender is 2"
+    );
+    assert_eq!(lanes.session_texts.load(Ordering::SeqCst), 1);
 
     let _ = runtime.try_send(listener_addr, HttpListenerMsg::Stop);
     let _ = runtime.shutdown();
 }
 
 #[test]
-fn split_service_peer_close_frame_uses_request_lane_then_event_closed() {
+fn split_service_peer_close_frame_uses_request_lane() {
     let (runtime, addr, listener_addr, lanes) = start_split_room(4);
     let mut stream = connect_ws(addr);
     let _join = read_server_text(&mut stream);
@@ -515,26 +617,48 @@ fn split_service_peer_close_frame_uses_request_lane_then_event_closed() {
         }))
         .expect("write close");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while lanes.request_msgs.load(Ordering::SeqCst) <= requests_after_join
-        && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_count(
+        &lanes.request_msgs,
+        requests_after_join + 1,
+        "SessionClose on request lane",
+    );
     assert!(
         lanes.request_msgs.load(Ordering::SeqCst) > requests_after_join,
         "SessionClose must enter the request lane"
     );
+    // Clean close handshake does not deliver app SessionClosed (that path is
+    // peer-drop / empty-read). Event lane must not be required here.
+    assert_eq!(
+        lanes.session_closed.load(Ordering::SeqCst),
+        0,
+        "clean close frame is SessionClose on request, not SessionClosed on event"
+    );
 
-    // Abrupt peer drop surfaces SessionClosed on the event lane.
+    let _ = runtime.try_send(listener_addr, HttpListenerMsg::Stop);
+    let _ = runtime.shutdown();
+}
+
+#[test]
+fn split_service_peer_drop_delivers_session_closed_on_event_lane() {
+    let (runtime, addr, listener_addr, lanes) = start_split_room(4);
+    let mut stream = connect_ws(addr);
+    // Join ack proves SessionOpen on the request lane before we tear the peer.
+    let join = read_server_text(&mut stream);
+    assert!(join.starts_with("join:"), "{join}");
+    // Abrupt TCP drop (no close frame) → SessionClosed on the event lane.
     drop(stream);
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while lanes.event_msgs.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    // Event lane may already have SendOutcomes from other paths; zero is only
-    // a failure if the connection is still live without any notification.
-    // After drop, shutdown is still clean:
+
+    wait_for_count(&lanes.session_closed, 1, "SessionClosed on event lane");
+    assert_eq!(
+        lanes.session_closed.load(Ordering::SeqCst),
+        1,
+        "one peer drop must deliver one SessionClosed to the event handler"
+    );
+    assert!(
+        lanes.event_msgs.load(Ordering::SeqCst) >= 1,
+        "SessionClosed must be counted as an event-lane delivery"
+    );
+
     let _ = runtime.try_send(listener_addr, HttpListenerMsg::Stop);
     let _ = runtime.shutdown();
 }
@@ -574,49 +698,6 @@ fn listener_shutdown_during_session_is_clean() {
         .expect("timeout");
     let mut buf = [0u8; 64];
     let _ = stream.read(&mut buf);
-}
-
-#[test]
-fn closed_app_after_stop_does_not_hang_new_upgrade() {
-    // Register a room, stop it, then attempt an upgrade that still names the
-    // stopped handle. Connection should close rather than hang.
-    let runtime = make_runtime();
-    let lanes = Arc::new(LaneCounts::default());
-    let room = runtime
-        .register_split_service::<SplitRoom, WebSocketSessionMsg, WebSocketSessionMsg, tina_http::HttpConnectionMsg>(
-            SplitRoom {
-                members: WebSocketMemberTable::new(2),
-                lanes,
-            },
-            4,
-        )
-        .expect("register room");
-    // Stop the room isolate by shutting the whole runtime after one successful
-    // bind path is proven separately; here we just prove accept_split_service
-    // compiles and a live session works, then shutdown is clean.
-    let gateway = runtime
-        .register_with_capacity::<SplitGateway, Infallible>(
-            SplitGateway {
-                room,
-                limits: WebSocketLimits::default(),
-            },
-            8,
-        )
-        .expect("gateway");
-    let listener = HttpListener::<TestShard>::new(
-        "127.0.0.1:0".parse().unwrap(),
-        gateway,
-        HttpLimits::default(),
-        Duration::from_secs(2),
-        16,
-    );
-    let (addr, listener_addr) = start_listener(&runtime, listener);
-    let mut stream = connect_ws(addr);
-    let join = read_server_text(&mut stream);
-    assert!(join.starts_with("join:"), "{join}");
-
-    let _ = runtime.try_send(listener_addr, HttpListenerMsg::Stop);
-    let _ = runtime.shutdown();
 }
 
 

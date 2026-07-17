@@ -10,11 +10,13 @@ This file records completed work.
   `accept_split_service`, `accept_split_service_subprotocol`, and
   `accept_request_service`. The private `ServiceMessage` envelope stays inside
   `tina-http`; install sites do not extract a raw app address.
-- Connection delivery classifies session messages by lane. Reply-needed work
-  (`SessionOpen`, `SessionText`, …) uses `call` into the request capability.
-  Notifications (`SendOutcome`, `SessionClosed`, …) use observed send into the
-  event capability. Write/send-admission completions never enter the
-  application's request lane.
+- Connection delivery classifies session messages by lane for Call and Split
+  installs. Reply-needed work (`SessionOpen`, `SessionText`, …) uses `call`
+  into the request capability. Notifications (`SendOutcome`, `SessionClosed`,
+  …) use observed send into the event capability, so write/send-admission
+  completions do not enter the request lane on those installs. RequestOnly
+  intentionally routes every session message (including notifications) as a
+  request-lane `call` because that handle has no event capability.
 - `WebSocketMemberTable` snapshots recipients, excludes the sender, and offers
   each remaining member exactly once in snapshot order. Fanout bounds no longer
   force the room's message type to be `WebSocketSessionMsg`.

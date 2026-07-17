@@ -387,8 +387,9 @@ impl WebSocketUpgradeRequest {
     ///
     /// Prefer [`Self::accept_split_service`] or
     /// [`Self::accept_request_service`] for capability-typed install sites.
-    /// Event-lane notifications still use observed send on this path so
-    /// write completions never enter the application's request lane.
+    /// On this raw Call path, event-lane notifications use observed send so
+    /// write completions do not enter the application's request lane (unlike
+    /// RequestOnly, which has no event capability).
     pub fn accept(
         self,
         app: Address<WebSocketSessionMsg, WebSocketSessionOutcome>,

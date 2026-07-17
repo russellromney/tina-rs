@@ -10,14 +10,18 @@
 //!
 //! # Lane contract
 //!
-//! | Message class | Delivery | Authority |
-//! |---------------|----------|-----------|
+//! | Message class | Delivery (Call / Split) | Authority |
+//! |---------------|-------------------------|-----------|
 //! | Reply-needed session work (`SessionOpen`, `SessionText`, …) | `call` into request capability | request/reply |
 //! | Notifications (`SendOutcome`, `SessionClosed`, …) | observed `send` into event capability | event |
 //!
-//! Connection write / send-admission completions never enter the application's
-//! request lane. A closed or full app mailbox yields the same exact terminal
-//! pressure the call path already used (`AppMailboxFull` / begin close).
+//! On Call and Split installs, connection write / send-admission completions
+//! do not enter the application's request lane. RequestOnly has no event
+//! capability, so every session message (including notifications) is a
+//! request-lane `call` by design — use Split for room fanout that needs
+//! [`WebSocketSessionMsg::SendOutcome`] on an event lane. A closed or full app
+//! mailbox yields the same exact terminal pressure the call path already used
+//! (`AppMailboxFull` / begin close).
 
 use std::convert::Infallible;
 
