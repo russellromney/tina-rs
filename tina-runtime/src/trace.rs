@@ -442,6 +442,10 @@ pub enum RestartSkippedReason {
     /// The parent's mailbox is closed, so a terminal-delivery reservation for
     /// the replacement generation cannot be taken.
     ParentMailboxClosed,
+
+    /// The parent's custom mailbox cannot physically reserve capacity for a
+    /// replacement generation's terminal result.
+    ParentMailboxReservationsUnsupported,
 }
 
 /// Why a reserved child terminal result was disposed instead of delivered.
@@ -452,6 +456,8 @@ pub enum ChildTerminalDisposedReason {
     StoppedWithoutResult,
     /// The `stop_with` payload type did not match the parent's terminal mapper.
     TypeMismatch,
+    /// The parent's terminal mapper panicked while translating the payload.
+    MapperPanicked,
     /// A terminal observation for an older generation arrived after replacement.
     StaleGeneration,
     /// A second terminal settlement was attempted for the same generation.
@@ -1648,6 +1654,7 @@ fn restart_skipped_tag(reason: RestartSkippedReason) -> u8 {
         RestartSkippedReason::RemoteNotRestartable => 3,
         RestartSkippedReason::ParentMailboxFull => 4,
         RestartSkippedReason::ParentMailboxClosed => 5,
+        RestartSkippedReason::ParentMailboxReservationsUnsupported => 6,
     }
 }
 
@@ -1661,6 +1668,7 @@ fn child_terminal_disposed_tag(reason: ChildTerminalDisposedReason) -> u8 {
         ChildTerminalDisposedReason::ParentMailboxClosed => 6,
         ChildTerminalDisposedReason::ParentStopped => 7,
         ChildTerminalDisposedReason::Shutdown => 8,
+        ChildTerminalDisposedReason::MapperPanicked => 9,
     }
 }
 

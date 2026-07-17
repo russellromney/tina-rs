@@ -36,6 +36,13 @@ This file records completed work.
 
 ### Typed child terminal observation
 
+- Mailbox reservations are now enforced by the physical mailbox rather than
+  adapter-local occupancy estimates. Direct sends through a cloned custom
+  mailbox cannot consume terminal-result capacity. Custom mailboxes that do
+  not implement the optional reservation capability reject observed-child
+  admission with `ParentMailboxReservationsUnsupported` before child creation.
+- A faulty custom reservation implementation can produce a typed
+  `ParentMailboxFull` disposal at delivery, but can no longer panic the runtime.
 - `spawn_observed(...).then_result(...)` / `.then_service_result(...)` map a
   child's `stop_with` payload into a parent event after the existing initial
   (and optional replacement) continuations.

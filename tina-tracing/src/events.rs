@@ -874,6 +874,9 @@ pub fn restart_skipped_reason_name(reason: RestartSkippedReason) -> &'static str
         RestartSkippedReason::RemoteNotRestartable => "RemoteNotRestartable",
         RestartSkippedReason::ParentMailboxFull => "ParentMailboxFull",
         RestartSkippedReason::ParentMailboxClosed => "ParentMailboxClosed",
+        RestartSkippedReason::ParentMailboxReservationsUnsupported => {
+            "ParentMailboxReservationsUnsupported"
+        }
     }
 }
 

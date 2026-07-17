@@ -17,7 +17,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tina::{
     Address, AddressGeneration, CallContext, Context, DeferredReply, Effect, Isolate, IsolateId,
-    Mailbox, Outbound, ShardId, SystemIncarnation, TrySendError, batch, noop, send, spawn, stop,
+    Mailbox, MailboxReservationError, Outbound, ShardId, SystemIncarnation, TrySendError, batch,
+    noop, send, spawn, stop,
 };
 use tina_supervisor::SupervisorConfig;
 
@@ -551,6 +552,7 @@ impl Shard for NumberedShard {
 struct TestMailbox<T> {
     capacity: usize,
     queue: Rc<RefCell<VecDeque<T>>>,
+    reserved: Rc<Cell<usize>>,
     closed: Rc<Cell<bool>>,
 }
 
@@ -559,6 +561,7 @@ impl<T> TestMailbox<T> {
         Self {
             capacity,
             queue: Rc::new(RefCell::new(VecDeque::new())),
+            reserved: Rc::new(Cell::new(0)),
             closed: Rc::new(Cell::new(false)),
         }
     }
@@ -575,7 +578,7 @@ impl<T> Mailbox<T> for TestMailbox<T> {
         }
 
         let mut queue = self.queue.borrow_mut();
-        if queue.len() >= self.capacity {
+        if queue.len().saturating_add(self.reserved.get()) >= self.capacity {
             return Err(TrySendError::Full(message));
         }
 
@@ -593,6 +596,47 @@ impl<T> Mailbox<T> for TestMailbox<T> {
 
     fn close(&self) {
         self.closed.set(true);
+    }
+
+    fn try_reserve(&self) -> Result<(), MailboxReservationError> {
+        if self.closed.get() {
+            return Err(MailboxReservationError::Closed);
+        }
+        if self
+            .queue
+            .borrow()
+            .len()
+            .saturating_add(self.reserved.get())
+            >= self.capacity
+        {
+            return Err(MailboxReservationError::Full);
+        }
+        self.reserved.set(self.reserved.get() + 1);
+        Ok(())
+    }
+
+    fn release_reserved(&self) -> bool {
+        let reserved = self.reserved.get();
+        if reserved == 0 {
+            return false;
+        }
+        self.reserved.set(reserved - 1);
+        true
+    }
+
+    fn try_send_reserved(&self, message: T) -> Result<(), TrySendError<T>> {
+        if !self.release_reserved() {
+            return Err(TrySendError::Full(message));
+        }
+        if self.closed.get() {
+            return Err(TrySendError::Closed(message));
+        }
+        let mut queue = self.queue.borrow_mut();
+        if queue.len() >= self.capacity {
+            return Err(TrySendError::Full(message));
+        }
+        queue.push_back(message);
+        Ok(())
     }
 }
 
@@ -4546,6 +4590,20 @@ fn default_mailbox_factory_returns_full_with_message() {
 }
 
 #[test]
+fn default_mailbox_factory_physically_holds_reserved_capacity() {
+    let factory = DefaultMailboxFactory;
+    let mailbox: Box<dyn Mailbox<&'static str>> = factory.create(1);
+
+    assert_eq!(mailbox.try_reserve(), Ok(()));
+    assert_eq!(
+        mailbox.try_send("ordinary"),
+        Err(TrySendError::Full("ordinary"))
+    );
+    assert_eq!(mailbox.try_send_reserved("terminal"), Ok(()));
+    assert_eq!(mailbox.recv(), Some("terminal"));
+}
+
+#[test]
 fn default_mailbox_factory_returns_closed_with_message() {
     let factory = DefaultMailboxFactory;
     let mailbox: Box<dyn Mailbox<&'static str>> = factory.create(2);
@@ -4589,6 +4647,60 @@ fn default_threaded_mailbox_factory_is_fifo_within_capacity() {
     assert_eq!(mailbox.recv(), Some(7));
     assert_eq!(mailbox.recv(), Some(8));
     assert_eq!(mailbox.recv(), None);
+}
+
+#[test]
+fn default_threaded_mailbox_factory_physically_holds_reserved_capacity() {
+    let factory = DefaultThreadedMailboxFactory;
+    let mailbox: Box<dyn Mailbox<&'static str>> = factory.create(1);
+
+    assert_eq!(mailbox.try_reserve(), Ok(()));
+    assert_eq!(
+        mailbox.try_send("ordinary"),
+        Err(TrySendError::Full("ordinary"))
+    );
+    mailbox.close();
+    assert_eq!(
+        mailbox.try_send_reserved("terminal"),
+        Err(TrySendError::Closed("terminal"))
+    );
+    assert!(!mailbox.release_reserved());
+}
+
+fn assert_default_mailbox_reservation_parity(mailbox: Box<dyn Mailbox<&'static str>>) {
+    assert_eq!(mailbox.try_reserve(), Ok(()));
+    assert_eq!(mailbox.try_reserve(), Ok(()));
+    assert_eq!(mailbox.try_send("ordinary-1"), Ok(()));
+    assert_eq!(mailbox.try_send("full"), Err(TrySendError::Full("full")));
+    assert_eq!(mailbox.recv(), Some("ordinary-1"));
+    assert_eq!(mailbox.try_send("ordinary-2"), Ok(()));
+    assert_eq!(
+        mailbox.try_send("still-full"),
+        Err(TrySendError::Full("still-full"))
+    );
+    assert_eq!(mailbox.try_send_reserved("terminal-1"), Ok(()));
+    assert_eq!(
+        mailbox.try_send("reserved-full"),
+        Err(TrySendError::Full("reserved-full"))
+    );
+    assert_eq!(mailbox.try_send_reserved("terminal-2"), Ok(()));
+    assert!(!mailbox.release_reserved());
+    assert_eq!(mailbox.recv(), Some("ordinary-2"));
+    assert_eq!(mailbox.recv(), Some("terminal-1"));
+    assert_eq!(mailbox.recv(), Some("terminal-2"));
+    assert_eq!(mailbox.recv(), None);
+    mailbox.close();
+    assert_eq!(mailbox.try_reserve(), Err(MailboxReservationError::Closed));
+    assert_eq!(
+        mailbox.try_send("closed"),
+        Err(TrySendError::Closed("closed"))
+    );
+}
+
+#[test]
+fn default_mailboxes_have_identical_reservation_semantics() {
+    assert_default_mailbox_reservation_parity(DefaultMailboxFactory.create(3));
+    assert_default_mailbox_reservation_parity(DefaultThreadedMailboxFactory.create(3));
 }
 
 #[test]

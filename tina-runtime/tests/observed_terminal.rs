@@ -7,9 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tina::{
-    ChildDefinition, ChildRef, Context, Effect, Isolate, Mailbox, Outbound, ServiceMessage, Shard,
-    ShardId, SpawnObservedError, TrySendError, noop, restart_children, send, spawn_observed, stop,
-    stop_with,
+    ChildDefinition, ChildRef, Context, Effect, Isolate, Mailbox, MailboxReservationError,
+    Outbound, ServiceMessage, Shard, ShardId, SpawnObservedError, TrySendError, noop,
+    restart_children, send, spawn_observed, stop, stop_with,
 };
 use tina_runtime::{
     ChildTerminalDisposedReason, MailboxFactory, RestartSkippedReason, Runtime, RuntimeEventKind,
@@ -47,6 +47,7 @@ impl Shard for TestShard {
 struct TestMailbox<T> {
     capacity: usize,
     queue: Rc<RefCell<std::collections::VecDeque<T>>>,
+    reserved: Rc<Cell<usize>>,
     closed: Rc<Cell<bool>>,
 }
 
@@ -55,6 +56,7 @@ impl<T> Clone for TestMailbox<T> {
         Self {
             capacity: self.capacity,
             queue: Rc::clone(&self.queue),
+            reserved: Rc::clone(&self.reserved),
             closed: Rc::clone(&self.closed),
         }
     }
@@ -65,8 +67,13 @@ impl<T> TestMailbox<T> {
         Self {
             capacity,
             queue: Rc::new(RefCell::new(std::collections::VecDeque::new())),
+            reserved: Rc::new(Cell::new(0)),
             closed: Rc::new(Cell::new(false)),
         }
+    }
+
+    fn reserved(&self) -> usize {
+        self.reserved.get()
     }
 }
 
@@ -79,7 +86,7 @@ impl<T> Mailbox<T> for TestMailbox<T> {
             return Err(TrySendError::Closed(message));
         }
         let mut q = self.queue.borrow_mut();
-        if q.len() >= self.capacity {
+        if q.len().saturating_add(self.reserved.get()) >= self.capacity {
             return Err(TrySendError::Full(message));
         }
         q.push_back(message);
@@ -96,6 +103,105 @@ impl<T> Mailbox<T> for TestMailbox<T> {
     }
     fn is_closed(&self) -> bool {
         self.closed.get()
+    }
+    fn try_reserve(&self) -> Result<(), MailboxReservationError> {
+        if self.closed.get() {
+            return Err(MailboxReservationError::Closed);
+        }
+        if self
+            .queue
+            .borrow()
+            .len()
+            .saturating_add(self.reserved.get())
+            >= self.capacity
+        {
+            return Err(MailboxReservationError::Full);
+        }
+        self.reserved.set(self.reserved.get() + 1);
+        Ok(())
+    }
+    fn release_reserved(&self) -> bool {
+        let reserved = self.reserved.get();
+        if reserved == 0 {
+            return false;
+        }
+        self.reserved.set(reserved - 1);
+        true
+    }
+    fn try_send_reserved(&self, message: T) -> Result<(), TrySendError<T>> {
+        if !self.release_reserved() {
+            return Err(TrySendError::Full(message));
+        }
+        if self.closed.get() {
+            return Err(TrySendError::Closed(message));
+        }
+        let mut queue = self.queue.borrow_mut();
+        if queue.len() >= self.capacity {
+            return Err(TrySendError::Full(message));
+        }
+        queue.push_back(message);
+        Ok(())
+    }
+}
+
+struct UnsupportedMailbox<T>(TestMailbox<T>);
+
+impl<T> Mailbox<T> for UnsupportedMailbox<T> {
+    fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
+    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
+        self.0.try_send(message)
+    }
+
+    fn recv(&self) -> Option<T> {
+        self.0.recv()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn close(&self) {
+        self.0.close();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.0.is_closed()
+    }
+}
+
+struct FaultyReservedSendMailbox<T>(TestMailbox<T>);
+
+impl<T> Mailbox<T> for FaultyReservedSendMailbox<T> {
+    fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+    fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
+        self.0.try_send(message)
+    }
+    fn recv(&self) -> Option<T> {
+        self.0.recv()
+    }
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    fn close(&self) {
+        self.0.close();
+    }
+    fn is_closed(&self) -> bool {
+        self.0.is_closed()
+    }
+    fn try_reserve(&self) -> Result<(), MailboxReservationError> {
+        self.0.try_reserve()
+    }
+    fn release_reserved(&self) -> bool {
+        self.0.release_reserved()
+    }
+    fn try_send_reserved(&self, message: T) -> Result<(), TrySendError<T>> {
+        let _ = self.0.release_reserved();
+        Err(TrySendError::Full(message))
     }
 }
 
@@ -146,6 +252,7 @@ impl Isolate for Child {
 #[derive(Debug)]
 enum ParentEvent {
     Start,
+    StartWithPanickingMapper,
     StartWhenFull,
     Fill,
     ChildStarted(Result<ChildRef<ChildEvent>, SpawnObservedError>),
@@ -182,6 +289,14 @@ impl Isolate for Parent {
                     .then_result(ParentEvent::ChildDone)
                     .then(ParentEvent::ChildStarted)
             }
+            ParentEvent::StartWithPanickingMapper => {
+                let drops = Arc::clone(&self.probe_drops);
+                spawn_observed(ChildDefinition::new(Child { probe_drops: drops }, 4))
+                    .then_result(|_: ChildTerminal| -> ParentEvent {
+                        panic!("terminal mapper panic")
+                    })
+                    .then(ParentEvent::ChildStarted)
+            }
             ParentEvent::StartWhenFull => batch([send(ctx.me(), ParentEvent::Fill), {
                 let drops = Arc::clone(&self.probe_drops);
                 spawn_observed(ChildDefinition::new(Child { probe_drops: drops }, 4))
@@ -208,10 +323,12 @@ impl Isolate for Parent {
 use tina::batch;
 
 #[test]
-fn delivers_typed_terminal_once() {
+fn cloned_mailbox_cannot_consume_reserved_terminal_slot() {
     let mut rt = Runtime::new(TestShard, TestMailboxFactory);
     let child = Rc::new(RefCell::new(None));
     let terminals = Rc::new(RefCell::new(Vec::new()));
+    let mailbox = TestMailbox::new(1);
+    let direct = mailbox.clone();
     let parent = rt.register(
         Parent {
             child: Rc::clone(&child),
@@ -219,14 +336,150 @@ fn delivers_typed_terminal_once() {
             terminals: Rc::clone(&terminals),
             probe_drops: Arc::new(AtomicUsize::new(0)),
         },
-        TestMailbox::new(8),
+        mailbox,
+    );
+
+    assert!(rt.try_send(parent, ParentEvent::Start).is_ok());
+    assert_eq!(rt.step(), 1);
+    assert_eq!(rt.step(), 1);
+    assert!(matches!(
+        direct.try_send(ParentEvent::Fill),
+        Err(TrySendError::Full(ParentEvent::Fill))
+    ));
+
+    let child = child.borrow().expect("child");
+    assert!(rt.try_send(child.address, ChildEvent::Report(41)).is_ok());
+    assert_eq!(rt.step(), 1);
+    assert_eq!(rt.step(), 1);
+    assert_eq!(terminals.borrow().as_slice(), &[ChildTerminal(41)]);
+}
+
+#[test]
+fn mixed_ingress_shares_physical_capacity_with_terminal_reservation() {
+    let mut rt = Runtime::new(TestShard, TestMailboxFactory);
+    let child = Rc::new(RefCell::new(None));
+    let terminals = Rc::new(RefCell::new(Vec::new()));
+    let mailbox = TestMailbox::new(2);
+    let direct = mailbox.clone();
+    let parent = rt.register(
+        Parent {
+            child: Rc::clone(&child),
+            errors: Rc::new(RefCell::new(Vec::new())),
+            terminals: Rc::clone(&terminals),
+            probe_drops: Arc::new(AtomicUsize::new(0)),
+        },
+        mailbox,
+    );
+
+    assert!(rt.try_send(parent, ParentEvent::Start).is_ok());
+    assert_eq!(rt.step(), 1);
+    assert_eq!(rt.step(), 1);
+    assert!(direct.try_send(ParentEvent::Fill).is_ok());
+    assert!(matches!(
+        rt.try_send(parent, ParentEvent::Fill),
+        Err(tina_runtime::IngressSendError::Full(ParentEvent::Fill))
+    ));
+    assert_eq!(rt.step(), 1);
+    assert!(rt.try_send(parent, ParentEvent::Fill).is_ok());
+
+    let child = child.borrow().expect("child");
+    assert!(rt.try_send(child.address, ChildEvent::Report(42)).is_ok());
+    assert_eq!(rt.step(), 2);
+    assert_eq!(rt.step(), 1);
+    assert_eq!(terminals.borrow().as_slice(), &[ChildTerminal(42)]);
+}
+
+#[test]
+fn unsupported_custom_mailbox_rejects_before_child_admission() {
+    let mut rt = Runtime::new(TestShard, TestMailboxFactory);
+    let child = Rc::new(RefCell::new(None));
+    let errors = Rc::new(RefCell::new(Vec::new()));
+    let parent = rt.register(
+        Parent {
+            child: Rc::clone(&child),
+            errors: Rc::clone(&errors),
+            terminals: Rc::new(RefCell::new(Vec::new())),
+            probe_drops: Arc::new(AtomicUsize::new(0)),
+        },
+        UnsupportedMailbox(TestMailbox::new(1)),
+    );
+
+    assert!(rt.try_send(parent, ParentEvent::Start).is_ok());
+    assert_eq!(rt.step(), 1);
+    assert_eq!(rt.step(), 1);
+    assert_eq!(
+        errors.borrow().as_slice(),
+        &[SpawnObservedError::ParentMailboxReservationsUnsupported]
+    );
+    assert!(child.borrow().is_none());
+    assert!(
+        !rt.trace()
+            .iter()
+            .any(|event| matches!(event.kind(), RuntimeEventKind::Spawned { .. }))
+    );
+}
+
+#[test]
+fn faulty_custom_reserved_send_is_disposed_without_panicking() {
+    let mut rt = Runtime::new(TestShard, TestMailboxFactory);
+    let child = Rc::new(RefCell::new(None));
+    let terminals = Rc::new(RefCell::new(Vec::new()));
+    let mailbox = TestMailbox::new(1);
+    let direct = mailbox.clone();
+    let parent = rt.register(
+        Parent {
+            child: Rc::clone(&child),
+            errors: Rc::new(RefCell::new(Vec::new())),
+            terminals: Rc::clone(&terminals),
+            probe_drops: Arc::new(AtomicUsize::new(0)),
+        },
+        FaultyReservedSendMailbox(mailbox),
+    );
+
+    assert!(rt.try_send(parent, ParentEvent::Start).is_ok());
+    assert_eq!(rt.step(), 1);
+    assert_eq!(direct.reserved(), 1);
+    assert_eq!(rt.step(), 1);
+    let child = child.borrow().expect("child");
+    assert!(rt.try_send(child.address, ChildEvent::Report(43)).is_ok());
+    assert_eq!(rt.step(), 1);
+    assert_eq!(direct.reserved(), 0);
+    assert!(terminals.borrow().is_empty());
+    assert!(rt.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::ChildTerminalDisposed {
+                reason: ChildTerminalDisposedReason::ParentMailboxFull,
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn delivers_typed_terminal_once() {
+    let mut rt = Runtime::new(TestShard, TestMailboxFactory);
+    let child = Rc::new(RefCell::new(None));
+    let terminals = Rc::new(RefCell::new(Vec::new()));
+    let mailbox = TestMailbox::new(8);
+    let direct = mailbox.clone();
+    let parent = rt.register(
+        Parent {
+            child: Rc::clone(&child),
+            errors: Rc::new(RefCell::new(Vec::new())),
+            terminals: Rc::clone(&terminals),
+            probe_drops: Arc::new(AtomicUsize::new(0)),
+        },
+        mailbox,
     );
     assert!(rt.try_send(parent, ParentEvent::Start).is_ok());
     assert_eq!(rt.step(), 1);
+    assert_eq!(direct.reserved(), 1);
     assert_eq!(rt.step(), 1);
     let c = child.borrow().expect("child");
     assert!(rt.try_send(c.address, ChildEvent::Report(9)).is_ok());
     assert_eq!(rt.step(), 1);
+    assert_eq!(direct.reserved(), 0);
     assert_eq!(rt.step(), 1);
     assert_eq!(terminals.borrow().as_slice(), &[ChildTerminal(9)]);
     assert!(
@@ -237,9 +490,11 @@ fn delivers_typed_terminal_once() {
 }
 
 #[test]
-fn plain_stop_disposes_without_result() {
+fn panicking_terminal_mapper_releases_reservation_and_runtime_progresses() {
     let mut rt = Runtime::new(TestShard, TestMailboxFactory);
     let child = Rc::new(RefCell::new(None));
+    let mailbox = TestMailbox::new(2);
+    let direct = mailbox.clone();
     let parent = rt.register(
         Parent {
             child: Rc::clone(&child),
@@ -247,14 +502,57 @@ fn plain_stop_disposes_without_result() {
             terminals: Rc::new(RefCell::new(Vec::new())),
             probe_drops: Arc::new(AtomicUsize::new(0)),
         },
-        TestMailbox::new(8),
+        mailbox,
+    );
+
+    assert!(
+        rt.try_send(parent, ParentEvent::StartWithPanickingMapper)
+            .is_ok()
+    );
+    assert_eq!(rt.step(), 1);
+    assert_eq!(rt.step(), 1);
+    assert_eq!(direct.reserved(), 1);
+
+    let child = child.borrow().expect("child");
+    assert!(rt.try_send(child.address, ChildEvent::Report(44)).is_ok());
+    assert_eq!(rt.step(), 1);
+    assert_eq!(direct.reserved(), 0);
+    assert!(rt.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::ChildTerminalDisposed {
+                reason: ChildTerminalDisposedReason::MapperPanicked,
+                ..
+            }
+        )
+    }));
+    assert!(direct.try_send(ParentEvent::Fill).is_ok());
+    assert_eq!(rt.step(), 1);
+}
+
+#[test]
+fn plain_stop_disposes_without_result() {
+    let mut rt = Runtime::new(TestShard, TestMailboxFactory);
+    let child = Rc::new(RefCell::new(None));
+    let mailbox = TestMailbox::new(8);
+    let direct = mailbox.clone();
+    let parent = rt.register(
+        Parent {
+            child: Rc::clone(&child),
+            errors: Rc::new(RefCell::new(Vec::new())),
+            terminals: Rc::new(RefCell::new(Vec::new())),
+            probe_drops: Arc::new(AtomicUsize::new(0)),
+        },
+        mailbox,
     );
     assert!(rt.try_send(parent, ParentEvent::Start).is_ok());
     assert_eq!(rt.step(), 1);
+    assert_eq!(direct.reserved(), 1);
     assert_eq!(rt.step(), 1);
     let c = child.borrow().expect("child");
     assert!(rt.try_send(c.address, ChildEvent::StopPlain).is_ok());
     assert_eq!(rt.step(), 1);
+    assert_eq!(direct.reserved(), 0);
     assert!(rt.trace().iter().any(|e| {
         matches!(
             e.kind(),
@@ -271,6 +569,8 @@ fn type_mismatch_disposes_and_drops_payload() {
     let mut rt = Runtime::new(TestShard, TestMailboxFactory);
     let child = Rc::new(RefCell::new(None));
     let probe_drops = Arc::new(AtomicUsize::new(0));
+    let mailbox = TestMailbox::new(8);
+    let direct = mailbox.clone();
     let parent = rt.register(
         Parent {
             child: Rc::clone(&child),
@@ -278,15 +578,17 @@ fn type_mismatch_disposes_and_drops_payload() {
             terminals: Rc::new(RefCell::new(Vec::new())),
             probe_drops: Arc::clone(&probe_drops),
         },
-        TestMailbox::new(8),
+        mailbox,
     );
     assert!(rt.try_send(parent, ParentEvent::Start).is_ok());
     assert_eq!(rt.step(), 1);
+    assert_eq!(direct.reserved(), 1);
     assert_eq!(rt.step(), 1);
     let c = child.borrow().expect("child");
     // Parent mapper expects ChildTerminal; child sends SendDropProbe.
     assert!(rt.try_send(c.address, ChildEvent::ReportProbe(7)).is_ok());
     assert_eq!(rt.step(), 1);
+    assert_eq!(direct.reserved(), 0);
     assert_eq!(probe_drops.load(Ordering::SeqCst), 1);
     assert!(rt.trace().iter().any(|e| {
         matches!(
@@ -407,9 +709,12 @@ fn parent_stop_disposes_reservation() {
         }
     }
     let mut rt = Runtime::new(TestShard, TestMailboxFactory);
-    let parent = rt.register(P, TestMailbox::new(8));
+    let mailbox = TestMailbox::new(8);
+    let direct = mailbox.clone();
+    let parent = rt.register(P, mailbox);
     assert!(rt.try_send(parent, Ev::Go).is_ok());
     assert_eq!(rt.step(), 1);
+    assert_eq!(direct.reserved(), 0);
     assert!(rt.trace().iter().any(|e| {
         matches!(
             e.kind(),
@@ -425,6 +730,8 @@ fn parent_stop_disposes_reservation() {
 fn shutdown_dispose_emits_shutdown_reason() {
     let mut rt = Runtime::new(TestShard, TestMailboxFactory);
     let child = Rc::new(RefCell::new(None));
+    let mailbox = TestMailbox::new(8);
+    let direct = mailbox.clone();
     let parent = rt.register(
         Parent {
             child: Rc::clone(&child),
@@ -432,13 +739,14 @@ fn shutdown_dispose_emits_shutdown_reason() {
             terminals: Rc::new(RefCell::new(Vec::new())),
             probe_drops: Arc::new(AtomicUsize::new(0)),
         },
-        TestMailbox::new(8),
+        mailbox,
     );
     assert!(rt.try_send(parent, ParentEvent::Start).is_ok());
     assert_eq!(rt.step(), 1);
     assert_eq!(rt.step(), 1);
     assert!(child.borrow().is_some());
     rt.settle_terminal_reservations_on_shutdown();
+    assert_eq!(direct.reserved(), 0);
     assert!(rt.trace().iter().any(|e| {
         matches!(
             e.kind(),

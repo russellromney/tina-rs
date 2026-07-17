@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use tina::{Mailbox, TrySendError};
+use tina::{Mailbox, MailboxReservationError, TrySendError};
 
 /// Runtime-owned mailbox factory for registered and spawned isolate mailboxes.
 ///
@@ -44,6 +44,7 @@ impl MailboxFactory for DefaultMailboxFactory {
 pub(crate) struct DefaultMailbox<T> {
     capacity: usize,
     queue: Rc<RefCell<VecDeque<T>>>,
+    reserved: Rc<Cell<usize>>,
     closed: Rc<Cell<bool>>,
 }
 
@@ -52,6 +53,7 @@ impl<T> DefaultMailbox<T> {
         Self {
             capacity,
             queue: Rc::new(RefCell::new(VecDeque::with_capacity(capacity))),
+            reserved: Rc::new(Cell::new(0)),
             closed: Rc::new(Cell::new(false)),
         }
     }
@@ -67,7 +69,7 @@ impl<T> Mailbox<T> for DefaultMailbox<T> {
             return Err(TrySendError::Closed(message));
         }
         let mut queue = self.queue.borrow_mut();
-        if queue.len() >= self.capacity {
+        if queue.len().saturating_add(self.reserved.get()) >= self.capacity {
             return Err(TrySendError::Full(message));
         }
         queue.push_back(message);
@@ -88,6 +90,47 @@ impl<T> Mailbox<T> for DefaultMailbox<T> {
 
     fn is_closed(&self) -> bool {
         self.closed.get()
+    }
+
+    fn try_reserve(&self) -> Result<(), MailboxReservationError> {
+        if self.closed.get() {
+            return Err(MailboxReservationError::Closed);
+        }
+        if self
+            .queue
+            .borrow()
+            .len()
+            .saturating_add(self.reserved.get())
+            >= self.capacity
+        {
+            return Err(MailboxReservationError::Full);
+        }
+        self.reserved.set(self.reserved.get() + 1);
+        Ok(())
+    }
+
+    fn release_reserved(&self) -> bool {
+        let reserved = self.reserved.get();
+        if reserved == 0 {
+            return false;
+        }
+        self.reserved.set(reserved - 1);
+        true
+    }
+
+    fn try_send_reserved(&self, message: T) -> Result<(), TrySendError<T>> {
+        if !self.release_reserved() {
+            return Err(TrySendError::Full(message));
+        }
+        if self.closed.get() {
+            return Err(TrySendError::Closed(message));
+        }
+        let mut queue = self.queue.borrow_mut();
+        if queue.len() >= self.capacity {
+            return Err(TrySendError::Full(message));
+        }
+        queue.push_back(message);
+        Ok(())
     }
 }
 
@@ -119,6 +162,7 @@ pub(crate) struct DefaultThreadedMailbox<T> {
 
 pub(crate) struct DefaultThreadedMailboxState<T> {
     queue: VecDeque<T>,
+    reserved: usize,
     closed: bool,
 }
 
@@ -128,6 +172,7 @@ impl<T> DefaultThreadedMailbox<T> {
             capacity,
             state: Arc::new(std::sync::Mutex::new(DefaultThreadedMailboxState {
                 queue: VecDeque::with_capacity(capacity),
+                reserved: 0,
                 closed: false,
             })),
         }
@@ -147,7 +192,7 @@ impl<T> Mailbox<T> for DefaultThreadedMailbox<T> {
         if state.closed {
             return Err(TrySendError::Closed(message));
         }
-        if state.queue.len() >= self.capacity {
+        if state.queue.len().saturating_add(state.reserved) >= self.capacity {
             return Err(TrySendError::Full(message));
         }
         state.queue.push_back(message);
@@ -183,5 +228,51 @@ impl<T> Mailbox<T> for DefaultThreadedMailbox<T> {
             .lock()
             .expect("DefaultThreadedMailbox mutex poisoned")
             .closed
+    }
+
+    fn try_reserve(&self) -> Result<(), MailboxReservationError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("DefaultThreadedMailbox mutex poisoned");
+        if state.closed {
+            return Err(MailboxReservationError::Closed);
+        }
+        if state.queue.len().saturating_add(state.reserved) >= self.capacity {
+            return Err(MailboxReservationError::Full);
+        }
+        state.reserved += 1;
+        Ok(())
+    }
+
+    fn release_reserved(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .expect("DefaultThreadedMailbox mutex poisoned");
+        if state.reserved == 0 {
+            return false;
+        }
+        state.reserved -= 1;
+        true
+    }
+
+    fn try_send_reserved(&self, message: T) -> Result<(), TrySendError<T>> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("DefaultThreadedMailbox mutex poisoned");
+        if state.reserved == 0 {
+            return Err(TrySendError::Full(message));
+        }
+        state.reserved -= 1;
+        if state.closed {
+            return Err(TrySendError::Closed(message));
+        }
+        if state.queue.len() >= self.capacity {
+            return Err(TrySendError::Full(message));
+        }
+        state.queue.push_back(message);
+        Ok(())
     }
 }

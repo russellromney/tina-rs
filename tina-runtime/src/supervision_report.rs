@@ -85,6 +85,9 @@ pub struct ChildSupervision {
     /// Restart attempts skipped because the parent mailbox was closed for
     /// terminal-delivery reservation.
     pub skipped_parent_mailbox_closed: u64,
+    /// Restart attempts skipped because the parent's custom mailbox cannot
+    /// physically reserve terminal-delivery capacity.
+    pub skipped_parent_mailbox_reservations_unsupported: u64,
     /// The owner stopped this child via supervised shutdown
     /// ([`tina::Effect::StopChildren`]).
     pub stopped_by_owner: bool,
@@ -102,6 +105,7 @@ impl ChildSupervision {
             skipped_factory_panicked: 0,
             skipped_parent_mailbox_full: 0,
             skipped_parent_mailbox_closed: 0,
+            skipped_parent_mailbox_reservations_unsupported: 0,
             stopped_by_owner: false,
         }
     }
@@ -133,6 +137,8 @@ pub struct SupervisorReport {
     pub skipped_parent_mailbox_full: u64,
     /// Restart attempts skipped: parent mailbox Closed for terminal reservation.
     pub skipped_parent_mailbox_closed: u64,
+    /// Restart attempts skipped: parent mailbox reservations unsupported.
+    pub skipped_parent_mailbox_reservations_unsupported: u64,
     /// Failures rejected because the restart budget was exhausted.
     pub rejected_budget_exceeded: u64,
     /// Failures rejected because the supervisor parent had stopped.
@@ -163,6 +169,7 @@ impl SupervisorReport {
         let mut skipped_factory_panicked = 0u64;
         let mut skipped_parent_mailbox_full = 0u64;
         let mut skipped_parent_mailbox_closed = 0u64;
+        let mut skipped_parent_mailbox_reservations_unsupported = 0u64;
         let mut rejected_budget_exceeded = 0u64;
         let mut rejected_supervisor_stopped = 0u64;
         let mut children_stopped = 0u64;
@@ -249,6 +256,10 @@ impl SupervisorReport {
                             skipped_parent_mailbox_closed += 1;
                             child.skipped_parent_mailbox_closed += 1;
                         }
+                        RestartSkippedReason::ParentMailboxReservationsUnsupported => {
+                            skipped_parent_mailbox_reservations_unsupported += 1;
+                            child.skipped_parent_mailbox_reservations_unsupported += 1;
+                        }
                     }
                 }
                 RuntimeEventKind::ChildStopped {
@@ -278,6 +289,7 @@ impl SupervisorReport {
             skipped_factory_panicked,
             skipped_parent_mailbox_full,
             skipped_parent_mailbox_closed,
+            skipped_parent_mailbox_reservations_unsupported,
             rejected_budget_exceeded,
             rejected_supervisor_stopped,
             children_stopped,
@@ -296,6 +308,7 @@ impl SupervisorReport {
             || self.skipped_factory_panicked > 0
             || self.skipped_parent_mailbox_full > 0
             || self.skipped_parent_mailbox_closed > 0
+            || self.skipped_parent_mailbox_reservations_unsupported > 0
             || self.rejected_budget_exceeded > 0
             || self.rejected_supervisor_stopped > 0
             || self.children_stopped > 0
@@ -312,7 +325,7 @@ impl fmt::Display for SupervisorReport {
         write!(
             formatter,
             "supervisor parent={} spawned={} restarts[triggered={} attempted={} completed={}] \
-             skipped[not_restartable={} factory_panicked={} parent_mailbox_full={} parent_mailbox_closed={}] \
+             skipped[not_restartable={} factory_panicked={} parent_mailbox_full={} parent_mailbox_closed={} parent_mailbox_reservations_unsupported={}] \
              rejected[budget={} supervisor_stopped={}] stopped_by_owner={} halt={}",
             self.parent.get(),
             self.children_spawned,
@@ -323,6 +336,7 @@ impl fmt::Display for SupervisorReport {
             self.skipped_factory_panicked,
             self.skipped_parent_mailbox_full,
             self.skipped_parent_mailbox_closed,
+            self.skipped_parent_mailbox_reservations_unsupported,
             self.rejected_budget_exceeded,
             self.rejected_supervisor_stopped,
             self.children_stopped,
@@ -531,7 +545,7 @@ mod tests {
         assert_eq!(
             report.to_string(),
             "supervisor parent=7 spawned=0 restarts[triggered=0 attempted=0 completed=0] \
-             skipped[not_restartable=0 factory_panicked=0 parent_mailbox_full=0 parent_mailbox_closed=0] \
+             skipped[not_restartable=0 factory_panicked=0 parent_mailbox_full=0 parent_mailbox_closed=0 parent_mailbox_reservations_unsupported=0] \
              rejected[budget=1 supervisor_stopped=0] stopped_by_owner=0 halt=budget_exhausted(4/3)"
         );
     }

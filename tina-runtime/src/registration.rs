@@ -412,7 +412,7 @@ where
         let address = self.register_entry_with_id::<I, Outbound>(
             isolate,
             None,
-            Box::new(AnyMailboxAdapter::with_occupied(mailbox, 1)),
+            Box::new(AnyMailboxAdapter::new(mailbox)),
             isolate_id,
         );
         let entry_index = self
@@ -1040,7 +1040,7 @@ where
         let address = self.register_sendable_entry_with_id::<I, Outbound>(
             isolate,
             None,
-            Box::new(AnyMailboxAdapter::with_occupied(mailbox, 1)),
+            Box::new(AnyMailboxAdapter::new(mailbox)),
             isolate_id,
         );
         let entry_index = self

@@ -91,6 +91,16 @@ Terminal **result** delivery itself still consumes the reserved slot (or
 disposes with a typed reason). Cross-shard observed delivery does not use
 the overflow lane.
 
+The blessed runtime mailbox factories implement physical reservations in the
+same shared queue state used by ordinary sends. A custom [`Mailbox`] remains
+source-compatible, but terminal-result observation requires it to implement
+`try_reserve`, `release_reserved`, and `try_send_reserved`. Every clone and
+ingress path must consult the same reservation count. If that capability is
+absent, initial observed-child admission returns
+`ParentMailboxReservationsUnsupported` without constructing a child. This is
+an explicit capability boundary: the runtime does not infer occupancy from the
+sends it happened to mediate.
+
 ## Diagnosing under-capacity
 
 When the runtime cannot enqueue a *best-effort* reply because the requester's
@@ -151,3 +161,4 @@ incoming traffic. That is the price of a single trace truth.
 [`DefaultThreadedMailboxFactory`]: https://docs.rs/tina-runtime
 [`tina_runtime::observe_isolate_complete`]: https://docs.rs/tina-runtime
 [`tina_runtime::send_and_observe`]: https://docs.rs/tina-runtime
+[`Mailbox`]: https://docs.rs/tina/latest/tina/trait.Mailbox.html
