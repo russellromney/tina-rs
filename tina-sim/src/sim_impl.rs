@@ -1070,23 +1070,17 @@ where
                             target_generation: self.entries[index].generation,
                         },
                     );
-                    let delivery = if admitted {
-                        self.dispatch_local_send(ErasedSend {
-                            target_system: self.system_incarnation,
-                            target_shard: self.shard.id(),
-                            target_isolate: isolate_id,
-                            target_generation: self.entries[index].generation,
-                            message,
-                        })
-                    } else {
-                        self.entries[index]
-                            .inbox
-                            .push_admission_error(message, self.step_ordinal)
-                            .map_err(|err| match err {
-                                TrySendError::Full(_) => SendRejectedReason::Full,
-                                TrySendError::Closed(_) => SendRejectedReason::Closed,
-                            })
-                    };
+                    // Success and admission-failure paths both force-admit the
+                    // lifecycle continuation under reservation pressure, matching
+                    // the live runtime's priority overflow lane.
+                    let _ = admitted;
+                    let delivery = self.entries[index]
+                        .inbox
+                        .push_lifecycle_continuation(message, self.step_ordinal)
+                        .map_err(|err| match err {
+                            TrySendError::Full(_) => SendRejectedReason::Full,
+                            TrySendError::Closed(_) => SendRejectedReason::Closed,
+                        });
                     match delivery {
                         Ok(()) => {
                             self.push_event(
@@ -1812,10 +1806,11 @@ where
         }
     }
 
-    /// Delivers an observed-spawn continuation to its owner through the traced
-    /// local-send path, so a full/closed/stale owner mailbox records
-    /// SendRejected truth rather than dropping the continuation silently.
-    /// Simulator mirror of the live runtime's `deliver_observed_continuation`.
+    /// Delivers an observed-spawn or restart continuation to its owner.
+    ///
+    /// Same-shard owners force-admit the lifecycle message under reservation
+    /// pressure (matching the live runtime's priority overflow). Cross-shard
+    /// delivery stays on the ordinary send path.
     pub(crate) fn deliver_observed_continuation(
         &mut self,
         owner: RegisteredAddress,
@@ -1831,13 +1826,31 @@ where
                 target_generation: owner.generation,
             },
         );
-        match self.dispatch_local_send(ErasedSend {
-            target_system: owner.system,
-            target_shard: owner.shard,
-            target_isolate: owner.isolate,
-            target_generation: owner.generation,
-            message,
-        }) {
+        let delivery =
+            if owner.system == self.system_incarnation && owner.shard == self.shard.id() {
+                match self.entries.iter().position(|entry| {
+                    entry.id == owner.isolate && entry.generation == owner.generation
+                }) {
+                    Some(entry_index) if !self.entries[entry_index].stopped.get() => self.entries
+                        [entry_index]
+                        .inbox
+                        .push_lifecycle_continuation(message, self.step_ordinal)
+                        .map_err(|err| match err {
+                            TrySendError::Full(_) => SendRejectedReason::Full,
+                            TrySendError::Closed(_) => SendRejectedReason::Closed,
+                        }),
+                    _ => Err(SendRejectedReason::Closed),
+                }
+            } else {
+                self.dispatch_local_send(ErasedSend {
+                    target_system: owner.system,
+                    target_shard: owner.shard,
+                    target_isolate: owner.isolate,
+                    target_generation: owner.generation,
+                    message,
+                })
+            };
+        match delivery {
             Ok(()) => {
                 self.push_event(
                     owner.isolate,

@@ -2961,11 +2961,13 @@ where
         }))
     }
 
-    /// Delivers an observed-spawn continuation message to its owner (on this
-    /// shard) through the traced local-send path, so a full or closed owner
-    /// mailbox produces the usual `SendDispatchAttempted` / `SendAccepted` /
-    /// `SendRejected` truth instead of a silent drop — matching ordinary
-    /// `spawn_observed`.
+    /// Delivers an observed-spawn or restart continuation to its owner.
+    ///
+    /// Same-shard owners use the priority overflow lane when the ordinary
+    /// mailbox is full (including when terminal-reservation pressure holds the
+    /// last slot). That is not a hidden admission queue: capacity is still
+    /// bounded, and the fact is drained on a later step ahead of ordinary
+    /// ingress. Cross-shard delivery stays on the ordinary send path.
     pub(crate) fn deliver_observed_continuation(
         &mut self,
         owner: RegisteredAddress,
@@ -2981,14 +2983,28 @@ where
                 target_generation: owner.generation,
             },
         );
-        let send = ErasedSend {
-            target_system: owner.system,
-            target_shard: owner.shard,
-            target_isolate: owner.isolate,
-            target_generation: owner.generation,
-            message,
+        let delivery = if owner.system == self.system_incarnation && owner.shard == self.shard.id()
+        {
+            match self.entry_index(owner) {
+                Some(entry_index) => {
+                    match self.enqueue_call_continuation(entry_index, message.into_any(), None) {
+                        Ok(_) => Ok(()),
+                        Err(TrySendError::Full(_)) => Err(SendRejectedReason::Full),
+                        Err(TrySendError::Closed(_)) => Err(SendRejectedReason::Closed),
+                    }
+                }
+                None => Err(SendRejectedReason::Closed),
+            }
+        } else {
+            self.dispatch_local_send(ErasedSend {
+                target_system: owner.system,
+                target_shard: owner.shard,
+                target_isolate: owner.isolate,
+                target_generation: owner.generation,
+                message,
+            })
         };
-        match self.dispatch_local_send(send) {
+        match delivery {
             Ok(()) => {
                 self.push_event(
                     owner.isolate,

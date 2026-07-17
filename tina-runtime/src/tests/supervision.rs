@@ -897,3 +897,143 @@ fn child_terminal_duplicate_settlement_is_rejected_once() {
         )
     }));
 }
+
+#[test]
+fn child_terminal_previous_incarnation_settle_is_stale_generation() {
+    use tina::{
+        ChildRef, RestartableChildDefinition, SpawnObservedError, restart_children, spawn_observed,
+        stop_with,
+    };
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Term(u32);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[allow(dead_code)]
+    enum CMsg {
+        Done(u32),
+    }
+
+    struct C;
+    impl Isolate for C {
+        type Message = CMsg;
+        type Reply = ();
+        type Send = Outbound<NeverOutbound>;
+        type Spawn = std::convert::Infallible;
+        type SpawnObserved = std::convert::Infallible;
+        type Io = std::convert::Infallible;
+        type Fact = ::std::convert::Infallible;
+        type Shard = TestShard;
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                CMsg::Done(v) => stop_with(Term(v)),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    enum PMsg {
+        Start,
+        Restart,
+        Started(Result<ChildRef<CMsg>, SpawnObservedError>),
+        Restarted(ChildRef<CMsg>),
+        ChildDone(Term),
+    }
+
+    struct P {
+        child: Rc<RefCell<Option<ChildRef<CMsg>>>>,
+        done: Rc<Cell<u32>>,
+    }
+
+    impl Isolate for P {
+        type Message = PMsg;
+        type Reply = ();
+        type Send = Outbound<NeverOutbound>;
+        type Spawn = RestartableChildDefinition<C>;
+        type SpawnObserved = tina::SpawnObserved<RestartableChildDefinition<C>, PMsg, CMsg>;
+        type Io = std::convert::Infallible;
+        type Fact = ::std::convert::Infallible;
+        type Shard = TestShard;
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                PMsg::Start => spawn_observed(RestartableChildDefinition::new(|| C, 4))
+                    .then_result(PMsg::ChildDone)
+                    .then_with_restarts(PMsg::Started, PMsg::Restarted),
+                PMsg::Restart => restart_children(),
+                PMsg::Started(Ok(c)) | PMsg::Restarted(c) => {
+                    *self.child.borrow_mut() = Some(c);
+                    Effect::Noop
+                }
+                PMsg::Started(Err(_)) => Effect::Noop,
+                PMsg::ChildDone(Term(v)) => {
+                    self.done.set(self.done.get().saturating_add(v));
+                    Effect::Noop
+                }
+            }
+        }
+    }
+
+    let done = Rc::new(Cell::new(0));
+    let child_slot = Rc::new(RefCell::new(None));
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let parent = runtime.register(
+        P {
+            child: Rc::clone(&child_slot),
+            done: Rc::clone(&done),
+        },
+        TestMailbox::new(8),
+    );
+    assert!(runtime.try_send(parent, PMsg::Start).is_ok());
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 1);
+    let old = (*child_slot.borrow()).expect("child");
+    let old_addr = crate::RegisteredAddress {
+        system: runtime.system_incarnation(),
+        shard: parent.shard(),
+        isolate: old.address.isolate(),
+        generation: old.generation,
+    };
+
+    // Restart sets previous_child to the old incarnation.
+    assert!(runtime.try_send(parent, PMsg::Restart).is_ok());
+    assert_eq!(runtime.step(), 1);
+    let _ = runtime.step();
+    assert!(
+        runtime
+            .trace()
+            .iter()
+            .any(|e| { matches!(e.kind(), RuntimeEventKind::RestartChildCompleted { .. }) }),
+        "restart must complete so previous_child is retained"
+    );
+
+    // Explicit settle of the old address after restart must be StaleGeneration
+    // and must not deliver into the parent terminal mapper.
+    let leftover = runtime.settle_child_terminal_observation(
+        old_addr,
+        Some(tina::StopResult::new(Term(77))),
+        CauseId::new(EventId::new(1)),
+    );
+    assert!(leftover.is_none(), "stale generation consumes the payload");
+    assert_eq!(
+        done.get(),
+        0,
+        "no parent terminal delivery for stale generation"
+    );
+    assert!(runtime.trace().iter().any(|e| {
+        matches!(
+            e.kind(),
+            RuntimeEventKind::ChildTerminalDisposed {
+                reason: crate::ChildTerminalDisposedReason::StaleGeneration,
+                ..
+            }
+        )
+    }));
+}

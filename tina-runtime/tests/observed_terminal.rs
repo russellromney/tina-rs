@@ -657,3 +657,145 @@ fn settle_then_restart_no_second_parent_delivery_for_old() {
     let _ = rt.try_send(first.address, ChildEvent::Report(2));
     assert_eq!(terminals.borrow().len(), 1);
 }
+
+#[test]
+fn child_started_delivers_under_capacity_one_with_terminal_reservation() {
+    // capacity 1 + terminal reservation holds the only ordinary slot; ChildStarted
+    // must still land via priority overflow (sim force-admit parity).
+    let mut rt = Runtime::new(TestShard, TestMailboxFactory);
+    let child = Rc::new(RefCell::new(None));
+    let parent = rt.register(
+        Parent {
+            child: Rc::clone(&child),
+            errors: Rc::new(RefCell::new(Vec::new())),
+            terminals: Rc::new(RefCell::new(Vec::new())),
+            probe_drops: Arc::new(AtomicUsize::new(0)),
+        },
+        TestMailbox::new(1),
+    );
+    assert!(rt.try_send(parent, ParentEvent::Start).is_ok());
+    assert_eq!(rt.step(), 1, "spawn effect");
+    assert_eq!(rt.step(), 1, "ChildStarted via overflow");
+    assert!(
+        child.borrow().is_some(),
+        "ChildStarted must deliver under capacity-1 + terminal reservation"
+    );
+    assert!(
+        rt.trace()
+            .iter()
+            .any(|e| matches!(e.kind(), RuntimeEventKind::Spawned { .. }))
+    );
+}
+
+#[test]
+fn restart_continuation_delivers_under_mailbox_full() {
+    // Without terminal reservation: RestartWhenFull packs the only slot with
+    // Fill, then restart succeeds and Restarted must still land via overflow
+    // (same path as initial ChildStarted under Full).
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    enum Ev {
+        Start,
+        RestartWhenFull,
+        Fill,
+        Started(Result<ChildRef<ChildEvent>, SpawnObservedError>),
+        Restarted(ChildRef<ChildEvent>),
+    }
+    struct P {
+        incarnations: Rc<RefCell<Vec<ChildRef<ChildEvent>>>>,
+        factory: Rc<Cell<usize>>,
+        probe_drops: Arc<AtomicUsize>,
+    }
+    impl Isolate for P {
+        tina::isolate_types! {
+            message: ServiceMessage<Ev, Infallible>,
+            reply: (),
+            send: Outbound<ServiceMessage<Ev, Infallible>>,
+            spawn: tina::RestartableChildDefinition<Child>,
+            spawn_observed: tina::SpawnObserved<tina::RestartableChildDefinition<Child>, ServiceMessage<Ev, Infallible>, ChildEvent>,
+            io: Infallible,
+            shard: TestShard,
+        }
+        fn handle(
+            &mut self,
+            message: Self::Message,
+            ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            let msg = match message {
+                ServiceMessage::Event(e) => e,
+                ServiceMessage::Request(r) => match r {},
+            };
+            match msg {
+                Ev::Start => {
+                    let factory = Rc::clone(&self.factory);
+                    let drops = Arc::clone(&self.probe_drops);
+                    spawn_observed(tina::RestartableChildDefinition::new(
+                        move || {
+                            factory.set(factory.get() + 1);
+                            Child {
+                                probe_drops: Arc::clone(&drops),
+                            }
+                        },
+                        4,
+                    ))
+                    .then_service_event_with_restarts(Ev::Started, Ev::Restarted)
+                }
+                Ev::RestartWhenFull => batch([
+                    send(ctx.me(), ServiceMessage::Event(Ev::Fill)),
+                    restart_children(),
+                ]),
+                Ev::Fill => noop(),
+                Ev::Started(Ok(c)) => {
+                    self.incarnations.borrow_mut().push(c);
+                    noop()
+                }
+                Ev::Started(Err(_)) => noop(),
+                Ev::Restarted(c) => {
+                    self.incarnations.borrow_mut().push(c);
+                    noop()
+                }
+            }
+        }
+    }
+
+    let mut rt = Runtime::new(TestShard, TestMailboxFactory);
+    let incarnations = Rc::new(RefCell::new(Vec::new()));
+    let parent = rt.register(
+        P {
+            incarnations: Rc::clone(&incarnations),
+            factory: Rc::new(Cell::new(0)),
+            probe_drops: Arc::new(AtomicUsize::new(0)),
+        },
+        TestMailbox::new(1),
+    );
+    assert!(
+        rt.try_send(parent, ServiceMessage::Event(Ev::Start))
+            .is_ok()
+    );
+    assert_eq!(rt.step(), 1);
+    assert_eq!(rt.step(), 1);
+    assert_eq!(incarnations.borrow().len(), 1);
+
+    assert!(
+        rt.try_send(parent, ServiceMessage::Event(Ev::RestartWhenFull))
+            .is_ok()
+    );
+    assert_eq!(rt.step(), 1, "restart under packed mailbox");
+    assert!(
+        rt.trace()
+            .iter()
+            .any(|e| { matches!(e.kind(), RuntimeEventKind::RestartChildCompleted { .. }) }),
+        "restart must complete (no terminal reservation to block)"
+    );
+    assert_eq!(
+        incarnations.borrow().len(),
+        1,
+        "Restarted still in overflow after restart step"
+    );
+    assert_eq!(rt.step(), 1, "Restarted via priority overflow");
+    assert_eq!(
+        incarnations.borrow().len(),
+        2,
+        "restart continuation must deliver under Full"
+    );
+}

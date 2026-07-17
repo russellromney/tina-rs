@@ -576,11 +576,11 @@ impl LocalInbox {
         Ok(())
     }
 
-    /// Admits one typed admission-failure continuation even when capacity is
-    /// exhausted by reserved terminal slots or ordinary messages. Bounded to
-    /// the failed spawn itself (one message), matching the live runtime's
-    /// priority overflow for the same path.
-    pub(crate) fn push_admission_error(
+    /// Admits one lifecycle continuation (initial spawn result, admission
+    /// failure, or restart refresh) even when capacity is exhausted by reserved
+    /// terminal slots or ordinary messages. Bounded to the lifecycle fact
+    /// itself (one message), matching the live runtime's priority overflow.
+    pub(crate) fn push_lifecycle_continuation(
         &self,
         message: Box<dyn Any>,
         visible_at_step: u64,

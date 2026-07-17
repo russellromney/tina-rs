@@ -39,11 +39,19 @@ the typed `Address<ChildMsg, ChildReply>` plus its generation. A restart creates
 a fresh child incarnation; the old address/ref is stale and sends through it
 close or reject like any stale address.
 
-`SpawnObservedError` is for spawn construction rejection, such as a zero
-mailbox capacity. If the parent mailbox itself is full or closed when the
-continuation should be delivered, Tina records the normal send rejection in
-the trace. It does not add a hidden queue or bypass the parent's mailbox to
-force the continuation through.
+`SpawnObservedError` is for spawn construction rejection (zero mailbox
+capacity, factory panic, destination unavailable) and for terminal-observation
+admission failure (`ParentMailboxFull` / `ParentMailboxClosed`) when a spawn
+with `.then_result` / `.then_service_result` cannot reserve a parent mailbox
+slot for the eventual child terminal.
+
+Lifecycle continuations (initial result, restart refresh, and those admission
+errors) are ordinary parent messages. When the parent's bounded mailbox is full
+— including when a terminal-delivery reservation holds the last free slot —
+Tina parks that one lifecycle fact in a **priority overflow lane** and drains
+it on a later step ahead of ordinary ingress. That is not a hidden admission
+queue and not a retry loop: capacity stays bounded, and a closed parent still
+rejects. Cross-shard observed delivery does not use the overflow lane.
 
 ## Restartable Child
 
@@ -96,13 +104,31 @@ child is published and `ChildStarted` receives
 `Err(SpawnObservedError::FactoryPanicked)`. The runtime and simulator remain
 available for later work.
 
-Both continuations use the parent's ordinary bounded mailbox. Full or stopped
-delivery is traced as the corresponding send rejection, with no hidden retry
-or lifecycle queue.
+Both continuations use the parent's ordinary bounded mailbox, with the same
+priority overflow rule as initial observed spawn when full under reservation
+pressure (see above). A closed or stopped parent still rejects.
 
 If a replacement factory panics, Tina records `FactoryPanicked` and does not
 invoke the restart continuation. A later restart attempt may use the retained
 recipe again.
+
+When the spawn also observes the child's terminal result:
+
+```rust
+spawn_observed(RestartableChildDefinition::new(|| Worker::default(), 32))
+    .then_service_result(ParentEvent::ChildStopped)
+    .then_service_event_with_restarts(
+        ParentEvent::ChildStarted,
+        ParentEvent::ChildRestarted,
+    )
+```
+
+Admission reserves one parent mailbox slot for that generation's terminal
+delivery. If reservation is `Full` or `Closed`, spawn or restart is not
+admitted and the parent gets that typed outcome (via the lifecycle delivery
+path above). On `stop_with`, the runtime maps the payload once into the parent
+event; plain stop, type mismatch, stale generation, duplicate settlement,
+parent stop, and shutdown dispose the result with a typed trace reason.
 
 The effect has the same semantics in the live runtime and simulator.
 

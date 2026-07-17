@@ -328,6 +328,38 @@ fn sim_parent_stop_disposes_reservation() {
 }
 
 #[test]
+fn sim_child_started_delivers_under_capacity_one_with_terminal_reservation() {
+    // capacity 1 + terminal reservation holds the only ordinary slot; ChildStarted
+    // must still land via lifecycle force-admit (live overflow parity).
+    let mut sim = Simulator::new(SingleShard, SimulatorConfig::default());
+    let child = Rc::new(RefCell::new(None));
+    let parent = sim.register_with_mailbox_capacity(
+        Parent {
+            child: Rc::clone(&child),
+            errors: Rc::new(RefCell::new(Vec::new())),
+            terminals: Rc::new(RefCell::new(Vec::new())),
+            probe_drops: Arc::new(AtomicUsize::new(0)),
+        },
+        1,
+    );
+    assert!(
+        sim.try_send(parent, ServiceMessage::Event(ParentEvent::Start))
+            .is_ok()
+    );
+    assert_eq!(sim.step(), 1, "spawn effect");
+    assert_eq!(sim.step(), 1, "ChildStarted via lifecycle force-admit");
+    assert!(
+        child.borrow().is_some(),
+        "ChildStarted must deliver under capacity-1 + terminal reservation"
+    );
+    assert!(
+        sim.trace()
+            .iter()
+            .any(|e| { matches!(e.kind(), RuntimeEventKind::Spawned { .. }) })
+    );
+}
+
+#[test]
 fn sim_restart_full_skips_with_parent_mailbox_full() {
     #[derive(Debug)]
     #[allow(dead_code)]
@@ -417,37 +449,153 @@ fn sim_restart_full_skips_with_parent_mailbox_full() {
             .is_ok()
     );
     assert_eq!(sim.step(), 1);
-    // ChildStarted may use force-push on sim only for admission errors; success
-    // may Full. Drain until incarnation appears or give up after a few steps.
-    for _ in 0..4 {
-        if !incarnations.borrow().is_empty() {
-            break;
-        }
-        let _ = sim.step();
-    }
-    // If ChildStarted never landed under capacity 1+reservation, still prove
-    // restart Full by settling reservation via child stop when we have a ref,
-    // else skip structural setup with capacity 2 for start then shrink path.
-    if incarnations.borrow().is_empty() {
-        // Fallback: capacity was too tight for start success; restart Full is
-        // covered by live tests. Still assert no panic on a plain restart try.
-        return;
-    }
+    assert_eq!(sim.step(), 1, "ChildStarted must land under capacity 1");
+    assert_eq!(
+        incarnations.borrow().len(),
+        1,
+        "must have a child before restart Full"
+    );
     let first = incarnations.borrow()[0];
+
+    // Free reservation so RestartWhenFull can enter the mailbox.
     assert!(sim.try_send(first.address, ChildEvent::StopPlain).is_ok());
     assert_eq!(sim.step(), 1);
+
     assert!(
         sim.try_send(parent, ServiceMessage::Event(REv::RestartWhenFull))
             .is_ok()
     );
     assert_eq!(sim.step(), 1);
-    assert!(sim.trace().iter().any(|e| {
-        matches!(
-            e.kind(),
-            RuntimeEventKind::RestartChildSkipped {
-                reason: RestartSkippedReason::ParentMailboxFull,
-                ..
+    assert!(
+        sim.trace().iter().any(|e| {
+            matches!(
+                e.kind(),
+                RuntimeEventKind::RestartChildSkipped {
+                    reason: RestartSkippedReason::ParentMailboxFull,
+                    ..
+                }
+            )
+        }),
+        "restart must skip with ParentMailboxFull when Fill packs capacity"
+    );
+    assert_eq!(
+        incarnations.borrow().len(),
+        1,
+        "no replacement incarnation when restart reservation Full"
+    );
+}
+
+#[test]
+fn sim_restart_continuation_delivers_under_mailbox_full() {
+    // Mirror of live: no terminal reservation; Fill packs capacity 1; restart
+    // succeeds; Restarted force-admits via lifecycle continuation.
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    enum Ev {
+        Start,
+        RestartWhenFull,
+        Fill,
+        Started(Result<ChildRef<ChildEvent>, SpawnObservedError>),
+        Restarted(ChildRef<ChildEvent>),
+    }
+    struct P {
+        incarnations: Rc<RefCell<Vec<ChildRef<ChildEvent>>>>,
+        factory: Rc<Cell<usize>>,
+        probe_drops: Arc<AtomicUsize>,
+    }
+    impl Isolate for P {
+        type Message = ServiceMessage<Ev, Infallible>;
+        type Reply = ();
+        type Send = Outbound<ServiceMessage<Ev, Infallible>>;
+        type Spawn = tina::RestartableChildDefinition<Child>;
+        type SpawnObserved = tina::SpawnObserved<
+            tina::RestartableChildDefinition<Child>,
+            ServiceMessage<Ev, Infallible>,
+            ChildEvent,
+        >;
+        type Io = RuntimeCall<ServiceMessage<Ev, Infallible>>;
+        type Fact = Infallible;
+        type Shard = SingleShard;
+
+        fn handle(
+            &mut self,
+            message: Self::Message,
+            ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            let event = match message {
+                ServiceMessage::Event(e) => e,
+                ServiceMessage::Request(n) => match n {},
+            };
+            match event {
+                Ev::Start => {
+                    let factory = Rc::clone(&self.factory);
+                    let drops = Arc::clone(&self.probe_drops);
+                    spawn_observed(tina::RestartableChildDefinition::new(
+                        move || {
+                            factory.set(factory.get() + 1);
+                            Child {
+                                probe_drops: Arc::clone(&drops),
+                            }
+                        },
+                        4,
+                    ))
+                    .then_service_event_with_restarts(Ev::Started, Ev::Restarted)
+                }
+                Ev::RestartWhenFull => batch([
+                    send(ctx.me(), ServiceMessage::Event(Ev::Fill)),
+                    restart_children(),
+                ]),
+                Ev::Fill => noop(),
+                Ev::Started(Ok(c)) => {
+                    self.incarnations.borrow_mut().push(c);
+                    noop()
+                }
+                Ev::Started(Err(_)) => noop(),
+                Ev::Restarted(c) => {
+                    self.incarnations.borrow_mut().push(c);
+                    noop()
+                }
             }
-        )
-    }));
+        }
+    }
+
+    let mut sim = Simulator::new(SingleShard, SimulatorConfig::default());
+    let incarnations = Rc::new(RefCell::new(Vec::new()));
+    let parent = sim.register_with_mailbox_capacity(
+        P {
+            incarnations: Rc::clone(&incarnations),
+            factory: Rc::new(Cell::new(0)),
+            probe_drops: Arc::new(AtomicUsize::new(0)),
+        },
+        1,
+    );
+    assert!(
+        sim.try_send(parent, ServiceMessage::Event(Ev::Start))
+            .is_ok()
+    );
+    assert_eq!(sim.step(), 1);
+    assert_eq!(sim.step(), 1);
+    assert_eq!(incarnations.borrow().len(), 1);
+
+    assert!(
+        sim.try_send(parent, ServiceMessage::Event(Ev::RestartWhenFull))
+            .is_ok()
+    );
+    assert_eq!(sim.step(), 1, "restart under packed mailbox");
+    assert!(
+        sim.trace()
+            .iter()
+            .any(|e| { matches!(e.kind(), RuntimeEventKind::RestartChildCompleted { .. }) }),
+        "restart must complete"
+    );
+    // Force-admit may drain Restarted in the same step as restart effects, or
+    // the next — either way the replacement incarnation must land.
+    if incarnations.borrow().len() < 2 {
+        assert_eq!(sim.step(), 1, "Restarted via lifecycle force-admit");
+    }
+    assert_eq!(
+        incarnations.borrow().len(),
+        2,
+        "restart continuation must deliver under Full"
+    );
 }
