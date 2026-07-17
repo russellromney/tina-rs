@@ -149,15 +149,17 @@ Closed by the lifecycle/health/topology pass (lifecycle, health, topology):
   `Lifecycle::{Ready,Draining,Stopped}` so a non-HTTP service reports
   state in the same words as `mini_saas_api`.
 
-Closed by the host-control ergonomics pass (host-control ergonomics):
-- `Arc::try_unwrap(runtime)` is gone from this specimen. The host now
-  takes a cloneable `ThreadedShutdownHandle` from
-  `runtime.shutdown_handle()`, calls `request_shutdown()` (nonblocking,
-  idempotent, fails fast with `ShutdownRequestError::CommandFull`
-  rather than hanging), and waits on the cached terminal report via
-  `wait_report(timeout)`. The handle controls **runtime** shutdown;
-  the shipper's own `Stop`/`DrainState` protocol still owns
-  service-level drain.
+Host result paths:
+- Burst outcomes return from join handles — no shared outcomes mutex.
+- After a burst, the host waits with typed
+  `ShipperRequest::AwaitRouted { target }` rather than sleep-polling
+  stats. Metrics still come from `Stats` replies and the terminal
+  `Stopped` report.
+- `Arc::try_unwrap(runtime)` is gone. The host takes a cloneable
+  `ThreadedShutdownHandle` from `runtime.shutdown_handle()`, calls
+  `request_shutdown()`, and waits via `wait_report(timeout)`. The
+  handle controls **runtime** shutdown; the shipper's own
+  `Stop`/`DrainState` protocol still owns service-level drain.
 
 Related shapes:
 - `ergonomics_playground::debounced_batch` parks each submitter in
