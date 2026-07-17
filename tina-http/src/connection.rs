@@ -1061,6 +1061,7 @@ impl<S: Shard + 'static, M: Send + 'static> HttpConnection<S, M> {
         match self.delivery {
             ServiceDelivery::Call { address, .. } => {
                 if !self.service_peer_monitor_enabled
+                    || self.will_close
                     || request_streams_body
                     || !self.service_read_ahead.is_empty()
                     || matches!(self.transport, HttpTransport::Tls(_))

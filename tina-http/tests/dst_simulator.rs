@@ -425,14 +425,13 @@ fn saved_seed_interleaving_fingerprint_is_stable() {
     const SAVED_SEED: u64 = 0xBEEF_C0DE;
     /// Pinned trace fingerprint for `SAVED_SEED` + the config below.
     /// Bump only after reviewing why the trace shape changed.
-    /// Last update: each fully buffered plain-TCP service call now spawns one
-    /// observed peer monitor. The two peers add their bounded child lifecycle,
-    /// terminal reservation, one-byte read, settlement, and disposal facts
-    /// (81 -> 121). The monitor terminates once, and the same-seed rerun below
-    /// still proves byte-identical replay.
-    const EXPECTED_HASH: u64 = 10_434_183_390_251_076_748;
+    /// Last update: terminal requests bypass peer monitoring because their
+    /// response write owns transport close. Both saved-seed peers use
+    /// `Connection: close`, restoring the pre-monitor 81-event trace. The
+    /// keepalive monitor lifecycle is covered separately by typed delivery.
+    const EXPECTED_HASH: u64 = 3_203_362_481_028_129_978;
     /// Pinned trace event count for `SAVED_SEED` + the config below.
-    const EXPECTED_LEN: usize = 121;
+    const EXPECTED_LEN: usize = 81;
 
     let bind: SocketAddr = "127.0.0.1:9007".parse().unwrap();
     let peer_a: SocketAddr = "10.0.0.1:55008".parse().unwrap();

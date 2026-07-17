@@ -599,6 +599,7 @@ fn peer_disconnect_closes_pending_service_caller() {
         .expect("register timeout service");
     let mut cfg = config();
     cfg.service_call_timeout = Duration::from_secs(5);
+    cfg.limits.keepalive_idle_timeout = Some(Duration::from_secs(2));
     let listener = HttpListener::<TestShard, _>::for_split_service(
         "127.0.0.1:0".parse().unwrap(),
         handle,
@@ -643,6 +644,62 @@ fn peer_disconnect_closes_pending_service_caller() {
         );
         std::thread::sleep(Duration::from_millis(1));
     }
+
+    runtime
+        .try_send(listener_addr, HttpListenerMsg::Stop)
+        .expect("stop listener");
+    runtime.shutdown().expect("clean runtime shutdown");
+}
+
+#[test]
+fn connection_close_request_does_not_arm_peer_monitor() {
+    let runtime = make_runtime();
+    let (late_tx, late_rx) = sync_channel(1);
+    let handle = runtime
+        .register_split_service::<TimeoutSplit, TimeoutEvent, TimeoutHttp, Infallible>(
+            TimeoutSplit {
+                admitted: None,
+                late_context: late_tx,
+            },
+            8,
+        )
+        .expect("register delayed service");
+    let mut cfg = config();
+    cfg.service_call_timeout = Duration::from_secs(5);
+    cfg.limits.keepalive_idle_timeout = Some(Duration::from_secs(2));
+    let listener = HttpListener::<TestShard, _>::for_split_service(
+        "127.0.0.1:0".parse().unwrap(),
+        handle,
+        cfg,
+    );
+    let (addr, listener_addr) = start_listener(&runtime, listener, 8);
+    let spawned_before = runtime
+        .trace()
+        .events()
+        .iter()
+        .filter(|event| matches!(event.kind(), RuntimeEventKind::Spawned { .. }))
+        .count();
+
+    let response = scripted(
+        addr,
+        b"GET /close HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        status_line(&response).starts_with("HTTP/1.1 200"),
+        "{response}"
+    );
+    assert!(late_rx.recv_timeout(Duration::from_secs(2)).unwrap().1);
+    let spawned_after = runtime
+        .trace()
+        .events()
+        .iter()
+        .filter(|event| matches!(event.kind(), RuntimeEventKind::Spawned { .. }))
+        .count();
+    assert_eq!(
+        spawned_after - spawned_before,
+        1,
+        "a terminal request spawns its connection child but no peer monitor"
+    );
 
     runtime
         .try_send(listener_addr, HttpListenerMsg::Stop)

@@ -667,11 +667,12 @@ pub struct HttpServerConfig {
     pub service_call_timeout: std::time::Duration,
     /// Mailbox size for each [`crate::HttpConnection`] child. A capacity of at
     /// least three enables buffered-request peer disconnect monitoring for
-    /// plain TCP: two ordinary completion slots plus one reserved monitor
-    /// terminal slot. Capacities one and two remain supported, but cannot
-    /// observe peer EOF while a service call is pending. TLS connections and
-    /// streaming request bodies retain their existing timeout or pull-driven
-    /// disconnect behavior because those transport reads are serialized.
+    /// keepalive plain TCP: two ordinary completion slots plus one reserved
+    /// monitor terminal slot. Capacities one and two remain supported, but
+    /// cannot observe peer EOF while a service call is pending. Terminal
+    /// requests do not arm a future-request read while their response closes
+    /// the transport. TLS connections and streaming request bodies retain
+    /// their existing serialized or pull-driven disconnect behavior.
     pub connection_mailbox_capacity: usize,
     /// Mailbox size for the listener isolate itself.
     pub listener_mailbox_capacity: usize,

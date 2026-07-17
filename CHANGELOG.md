@@ -6,10 +6,11 @@ This file records completed work.
 
 ### HTTP service-call peer disconnects
 
-- Fully buffered plain-TCP HTTP/1 service calls now observe peer EOF
+- Fully buffered keepalive plain-TCP HTTP/1 service calls now observe peer EOF
   concurrently, so a disconnected client stops the connection owner and
   closes downstream caller authority without waiting for the service-call
-  timeout.
+  timeout. Terminal requests do not arm a competing read while their response
+  write closes the transport.
 - The bounded monitor preserves a one-byte early keepalive read for the next
   request. TLS and streaming bodies retain their serialized or pull-driven
   behavior, and connection mailbox capacities below three retain the previous
