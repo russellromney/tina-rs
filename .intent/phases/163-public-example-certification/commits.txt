@@ -153,3 +153,34 @@ blast-radius proof, and post-merge workflow result here.
 - M5 session auth independent
 - M6 residual hosts after migrations
 - C1 final certification
+
+## Checkpoint 2
+
+### D1 #367 MERGED
+- Merge: 83700b3f
+- Post-merge CI green (29556351654)
+
+### M2 #370 MERGED
+- Merge: 30500ff9
+- Post-merge CI green (29556054740)
+
+### M3 #369 MERGED
+- Merge: bf2e915a
+
+### M5 #372 MERGED
+- Reviewed APPROVE
+- Merge: c18ec119
+- Owns: system_session_auth
+
+### F1 #368
+- Head a3caecec after host-result fix + rebase on M5 main
+- Replacement CI pending then merge
+- Unblocks M1
+
+### Open in flight
+- F2 #371 keepalive install (fixing drain pending counts)
+- F3 HTTP delivery (in progress)
+- M1 child lifecycle (waiting F1 merge)
+
+### Still todo
+- F4 WebSocket, M4 network systems, M6 residual, C1 certification
