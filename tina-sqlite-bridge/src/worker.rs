@@ -51,6 +51,7 @@ fn admission_reason_name(err: &SqliteError) -> &'static str {
         SqliteError::Closed => "Closed",
         SqliteError::InvalidRequest(_) => "InvalidRequest",
         SqliteError::Internal(_) => "Internal",
+        SqliteError::Protocol(_) => "Protocol",
         // Worker-class errors never fire from admission. Fall through
         // to a stable string so a future variant doesn't silently log
         // an empty reason.
@@ -101,6 +102,7 @@ fn emit_replied(result: &SqliteResult, request_kind: &'static str) {
             let reason = worker_reason_name(err);
             let level = match err {
                 SqliteError::Internal(_) => Level::ERROR,
+                SqliteError::Protocol(_) => Level::ERROR,
                 _ => Level::WARN,
             };
             // tracing::event! bakes the level into static callsite

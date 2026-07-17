@@ -11,11 +11,12 @@ final_value=50 updates_ok=50 queries_ok=1 rows_changed=50 exit_clean=true
 The Tina side drives a real
 [`tina-sqlite-bridge`](../../tina-sqlite-bridge) worker from a root
 isolate. That isolate privately accumulates query/update metrics and
-publishes them once through `stop_with`. The host claims
+publishes success or a typed terminal failure once through `stop_with`. The host claims
 `observe_result` before start. The shard thread is never blocked while
 SQLite runs; admission, in-flight, and timeouts are named caps with
 typed failure modes. Point-in-time inspection uses the bridge's
 existing typed query request — there is no result mutex or poll loop.
+A failed counter never fabricates an `exit_clean=false` report.
 
 ## Run
 
@@ -31,6 +32,8 @@ cargo test --manifest-path examples/specimen_sqlite_counter/Cargo.toml \
   --test public_smoke public_smoke -- --exact
 cargo test --manifest-path examples/specimen_sqlite_counter/Cargo.toml \
   --test public_smoke public_characterization -- --exact
+cargo test --manifest-path examples/specimen_sqlite_counter/Cargo.toml \
+  --test public_correction
 ```
 
 ```
@@ -105,12 +108,12 @@ execute_call(self.db, "UPDATE counter SET value = value + 1 WHERE id = 0", vec![
 // On the final SELECT:
 //   self.report.queries_ok += 1;
 //   self.report.final_value = value;
-//   stop_with(self.report)
+//   stop_with(Ok::<Report, CounterFailure>(self.report))
 
 // Host:
-let waiter = app.observe_result::<Report, _, _>(counter_addr)?;
+let waiter = app.observe_result::<Result<Report, CounterFailure>, _, _>(counter_addr)?;
 app.try_send(counter_addr, CounterMsg::Begin)?;
-let report = waiter.wait(Duration::from_secs(10))?;
+let report = waiter.wait(Duration::from_secs(10))??;
 ```
 
 Point-in-time inspection of the live database uses the existing typed
@@ -136,6 +139,9 @@ row buffer cap    -> SqliteError::ResponseTooLarge
 SQLITE_BUSY/LOCK  -> SqliteError::Busy
 constraint viol.  -> SqliteError::Constraint(detail)
 worker closed     -> SqliteError::Closed
+helper shape bug  -> SqliteError::Protocol(exact shape)
+runtime rejection -> BridgeDeliveryFailure::Rejected(exact reason)
+counter mismatch  -> CounterFailure::Protocol(exact mismatch)
 ```
 
 ## Serial one-connection mode vs named pool mode

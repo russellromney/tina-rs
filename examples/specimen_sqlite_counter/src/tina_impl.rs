@@ -15,13 +15,19 @@ use std::time::Duration;
 
 use rusqlite::{Connection, params};
 use tina::prelude::*;
-use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, LocalSystem};
+use tina_runtime::{
+    CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, ResultWaitError, RunToShutdownError,
+    StartupError, ThreadedRuntimeError, ThreadedTrySendError,
+};
 use tina_sqlite_bridge::{
-    SqliteAddress, SqliteConfig, SqliteExecutedOutcome, SqliteRowsOutcome, SqliteWorker,
-    execute_call, query_call,
+    InstallError, SqliteAddress, SqliteConfig, SqliteError, SqliteExecutedOutcome,
+    SqliteRowsOutcome, SqliteValue, SqliteWorker, execute_call, query_call,
 };
 
-use crate::{INCREMENTS, Report};
+use crate::{
+    BridgeDeliveryFailure, CounterFailure, CounterProtocolFailure, INCREMENTS, Report,
+    SqliteValueKind,
+};
 
 const SQL_TIMEOUT: Duration = Duration::from_secs(5);
 const UPDATE_SQL: &str = "UPDATE counter SET value = value + 1 WHERE id = 0";
@@ -37,8 +43,12 @@ enum CounterMsg {
 struct Counter {
     db: SqliteAddress,
     remaining_updates: u32,
+    update_sql: &'static str,
+    query_sql: &'static str,
     report: Report,
 }
+
+type CounterTerminal = Result<Report, CounterFailure>;
 
 #[tina_runtime::isolate(message = CounterMsg)]
 impl Counter {
@@ -58,10 +68,10 @@ impl Counter {
 impl Counter {
     fn next_update(&mut self) -> Effect<Self> {
         if self.remaining_updates == 0 {
-            return query_call(self.db, QUERY_SQL, vec![], 1, SQL_TIMEOUT)
+            return query_call(self.db, self.query_sql, vec![], 1, SQL_TIMEOUT)
                 .then(CounterMsg::QueryDone);
         }
-        execute_call(self.db, UPDATE_SQL, vec![], SQL_TIMEOUT).then(CounterMsg::UpdateDone)
+        execute_call(self.db, self.update_sql, vec![], SQL_TIMEOUT).then(CounterMsg::UpdateDone)
     }
 
     fn on_update(&mut self, outcome: SqliteExecutedOutcome) -> Effect<Self> {
@@ -72,48 +82,230 @@ impl Counter {
                 self.remaining_updates = self.remaining_updates.saturating_sub(1);
                 self.next_update()
             }
-            other => self.fail(format!("unexpected update outcome {other:?}")),
+            CallOutcome::Replied(Ok(rows_changed)) => self.fail(CounterFailure::Protocol(
+                CounterProtocolFailure::UnexpectedRowsChanged {
+                    expected: 1,
+                    actual: rows_changed,
+                },
+            )),
+            other => self.fail(call_failure(other)),
         }
     }
 
     fn on_query(&mut self, outcome: SqliteRowsOutcome) -> Effect<Self> {
         match outcome {
-            CallOutcome::Replied(Ok(rows)) => {
-                let value = rows
-                    .row(0)
-                    .and_then(|row| row.col(0))
-                    .and_then(|cell| cell.as_i64())
-                    .and_then(|v| u64::try_from(v).ok());
-                match value {
-                    Some(final_value) => {
-                        self.report.queries_ok += 1;
-                        self.report.final_value = final_value;
-                        self.report.exit_clean = true;
-                        stop_with(self.report)
-                    }
-                    None => self.fail("final query did not return one unsigned integer".into()),
+            CallOutcome::Replied(Ok(rows)) => match decode_final_value(&rows) {
+                Ok(final_value) => {
+                    self.report.queries_ok += 1;
+                    self.report.final_value = final_value;
+                    self.report.exit_clean = true;
+                    stop_with(Ok::<_, CounterFailure>(self.report))
                 }
-            }
-            other => self.fail(format!("unexpected finalize outcome {other:?}")),
+                Err(error) => self.fail(CounterFailure::Protocol(error)),
+            },
+            other => self.fail(call_failure(other)),
         }
     }
 
-    fn fail(&mut self, message: String) -> Effect<Self> {
-        eprintln!("specimen_sqlite_counter (tina): {message}");
-        self.report.exit_clean = false;
-        stop_with(self.report)
+    fn fail(&mut self, error: CounterFailure) -> Effect<Self> {
+        stop_with(Err::<Report, _>(error))
     }
 }
 
-pub fn run() -> anyhow::Result<Report> {
-    let dir = tempfile::tempdir()?;
-    let path: PathBuf = dir.path().join("counter-tina.sqlite");
-    seed_database(&path)?;
+/// Exact Tina runner failure. Workload and shutdown failures remain distinct
+/// through [`RunToShutdownError`].
+#[derive(Debug)]
+pub enum TinaRunError {
+    TempDir(std::io::Error),
+    Seed(rusqlite::Error),
+    Startup(StartupError),
+    Run(Box<RunToShutdownError<TinaWorkloadError>>),
+}
 
-    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
-    let report = app.run_to_shutdown_reported(Duration::from_secs(10), |app| {
-        run_application(app, &path)
-    })?;
+/// Exact failure while the local system is live.
+#[derive(Debug)]
+pub enum TinaWorkloadError {
+    Install(InstallError),
+    Register(ThreadedRuntimeError),
+    Observer(ResultWaitError),
+    Start(ThreadedTrySendError),
+    Counter(CounterFailure),
+    SettlementTimeout(tina_sqlite_bridge::SqliteMetrics),
+}
+
+impl std::fmt::Display for TinaRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TempDir(error) => write!(f, "temporary database directory: {error}"),
+            Self::Seed(error) => write!(f, "seed database: {error}"),
+            Self::Startup(error) => write!(f, "start local system: {error}"),
+            Self::Run(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for TinaRunError {}
+
+impl std::fmt::Display for TinaWorkloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Install(error) => write!(f, "install sqlite bridge: {error}"),
+            Self::Register(error) => write!(f, "register counter: {error}"),
+            Self::Observer(error) => write!(f, "observe counter result: {error:?}"),
+            Self::Start(error) => write!(f, "start counter: {error}"),
+            Self::Counter(error) => error.fmt(f),
+            Self::SettlementTimeout(metrics) => {
+                write!(
+                    f,
+                    "sqlite worker did not settle before deadline: {metrics:?}"
+                )
+            }
+        }
+    }
+}
+
+/// Adversarial input used by [`run_correction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorrectionScenario {
+    /// SQLite rejects malformed SQL.
+    MalformedSql,
+    /// The bridge has been closed before the counter sends its request.
+    ClosedBridge,
+    /// The bridge deadline expires while SQLite continues synchronously.
+    WorkerTimeout,
+    /// A successful query returns a value with the wrong SQLite type.
+    ProtocolValueType,
+    /// The host claims the terminal result with the wrong Rust type.
+    ObserverTypeMismatch,
+}
+
+/// Exact terminal observed by [`run_correction`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CorrectionOutcome {
+    /// The counter completed successfully.
+    Completed(Report),
+    /// The counter stopped with its typed terminal failure.
+    Counter(CounterFailure),
+    /// Result observation itself failed.
+    Observer(ResultWaitError),
+}
+
+/// Correction evidence captured only after the worker has settled and the bridge is closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrectionReport {
+    pub outcome: CorrectionOutcome,
+    pub metrics: tina_sqlite_bridge::SqliteMetrics,
+    pub bridge_closed: bool,
+}
+
+/// Run one deterministic non-happy scenario through the production counter and bridge.
+pub fn run_correction(scenario: CorrectionScenario) -> Result<CorrectionReport, TinaRunError> {
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+        .try_build()
+        .map_err(TinaRunError::Startup)?;
+    app.run_to_shutdown(Duration::from_secs(10), |app| {
+        run_correction_application(app, scenario)
+    })
+    .map_err(|error| TinaRunError::Run(Box::new(error)))
+}
+
+fn run_correction_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    scenario: CorrectionScenario,
+) -> Result<CorrectionReport, TinaWorkloadError> {
+    const HEAVY_QUERY: &str = "WITH RECURSIVE seq(x) AS (\
+        SELECT 1 UNION ALL SELECT x + 1 FROM seq WHERE x < 1000000\
+    ) SELECT sum(x) FROM seq";
+
+    let timeout = if scenario == CorrectionScenario::WorkerTimeout {
+        Duration::from_millis(1)
+    } else {
+        Duration::from_secs(5)
+    };
+    let cfg = SqliteConfig::memory()
+        .with_default_timeout(timeout)
+        .with_poll_interval(Duration::from_millis(1));
+    let bridge =
+        SqliteWorker::<SingleShard>::install_local(app, cfg).map_err(TinaWorkloadError::Install)?;
+
+    let query_sql = match scenario {
+        CorrectionScenario::MalformedSql => "SELEC broken",
+        CorrectionScenario::WorkerTimeout => HEAVY_QUERY,
+        CorrectionScenario::ProtocolValueType => "SELECT 'not-an-integer'",
+        CorrectionScenario::ClosedBridge | CorrectionScenario::ObserverTypeMismatch => "SELECT 0",
+    };
+    let counter = Counter {
+        db: bridge.address,
+        remaining_updates: 0,
+        update_sql: UPDATE_SQL,
+        query_sql,
+        report: Report::default(),
+    };
+    let counter_addr = app
+        .register_root::<_, Infallible>(counter, 8)
+        .map_err(TinaWorkloadError::Register)?;
+
+    if scenario == CorrectionScenario::ClosedBridge {
+        bridge.closer.close();
+    }
+
+    let outcome = if scenario == CorrectionScenario::ObserverTypeMismatch {
+        let waiter = app
+            .observe_result::<String, _, _>(counter_addr)
+            .map_err(TinaWorkloadError::Observer)?;
+        app.try_send(counter_addr, CounterMsg::Begin)
+            .map_err(TinaWorkloadError::Start)?;
+        match waiter.wait(Duration::from_secs(5)) {
+            Ok(_) => unreachable!("counter terminal cannot be a String"),
+            Err(error) => CorrectionOutcome::Observer(error),
+        }
+    } else {
+        let waiter = app
+            .observe_result::<CounterTerminal, _, _>(counter_addr)
+            .map_err(TinaWorkloadError::Observer)?;
+        app.try_send(counter_addr, CounterMsg::Begin)
+            .map_err(TinaWorkloadError::Start)?;
+        match waiter
+            .wait(Duration::from_secs(5))
+            .map_err(TinaWorkloadError::Observer)?
+        {
+            Ok(report) => CorrectionOutcome::Completed(report),
+            Err(error) => CorrectionOutcome::Counter(error),
+        }
+    };
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let metrics = bridge.metrics.snapshot();
+        if metrics.current_in_flight == 0 {
+            bridge.closer.close();
+            return Ok(CorrectionReport {
+                outcome,
+                metrics,
+                bridge_closed: bridge.closer.is_closed(),
+            });
+        }
+        if std::time::Instant::now() >= deadline {
+            bridge.closer.close();
+            return Err(TinaWorkloadError::SettlementTimeout(metrics));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+impl std::error::Error for TinaWorkloadError {}
+
+pub fn run() -> Result<Report, TinaRunError> {
+    let dir = tempfile::tempdir().map_err(TinaRunError::TempDir)?;
+    let path: PathBuf = dir.path().join("counter-tina.sqlite");
+    seed_database(&path).map_err(TinaRunError::Seed)?;
+
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+        .try_build()
+        .map_err(TinaRunError::Startup)?;
+    let report = app
+        .run_to_shutdown(Duration::from_secs(10), |app| run_application(app, &path))
+        .map_err(|error| TinaRunError::Run(Box::new(error)))?;
     drop(dir);
     Ok(report)
 }
@@ -121,34 +313,36 @@ pub fn run() -> anyhow::Result<Report> {
 fn run_application(
     app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
     path: &std::path::Path,
-) -> anyhow::Result<Report> {
+) -> Result<Report, TinaWorkloadError> {
     let cfg = SqliteConfig::path(path)
         .with_default_timeout(Duration::from_secs(5))
         .with_busy_timeout(Duration::from_secs(2))
         .with_pragma("journal_mode = WAL")
         .with_poll_interval(Duration::from_millis(1));
-    let bridge = SqliteWorker::<SingleShard>::install_local(app, cfg)
-        .map_err(|e| anyhow::anyhow!("install sqlite bridge: {e}"))?;
+    let bridge =
+        SqliteWorker::<SingleShard>::install_local(app, cfg).map_err(TinaWorkloadError::Install)?;
 
     let counter = Counter {
         db: bridge.address,
         remaining_updates: INCREMENTS,
+        update_sql: UPDATE_SQL,
+        query_sql: QUERY_SQL,
         report: Report::default(),
     };
     let counter_addr = app
         .register_root::<_, Infallible>(counter, 8)
-        .map_err(|e| anyhow::anyhow!("register counter: {e:?}"))?;
+        .map_err(TinaWorkloadError::Register)?;
 
     let waiter = app
-        .observe_result::<Report, _, _>(counter_addr)
-        .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
+        .observe_result::<CounterTerminal, _, _>(counter_addr)
+        .map_err(TinaWorkloadError::Observer)?;
 
     app.try_send(counter_addr, CounterMsg::Begin)
-        .map_err(|e| anyhow::anyhow!("kick counter: {e:?}"))?;
+        .map_err(TinaWorkloadError::Start)?;
 
-    let report = waiter
+    let terminal = waiter
         .wait(Duration::from_secs(10))
-        .map_err(|e| anyhow::anyhow!("counter did not finish: {e:?}"))?;
+        .map_err(TinaWorkloadError::Observer)?;
 
     bridge.closer.close();
 
@@ -167,7 +361,7 @@ fn run_application(
         snap.in_flight_high_water,
     );
 
-    Ok(report)
+    terminal.map_err(TinaWorkloadError::Counter)
 }
 
 /// Point-in-time inspection helper: read the current counter value
@@ -176,7 +370,7 @@ fn run_application(
 pub fn query_counter_value(
     app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
     db: SqliteAddress,
-) -> anyhow::Result<u64> {
+) -> Result<u64, QueryCounterError> {
     use tina_sqlite_bridge::{SqliteMsg, SqliteRequest, SqliteResponse};
 
     let outcome = app
@@ -185,19 +379,89 @@ pub fn query_counter_value(
             SqliteMsg::Request(SqliteRequest::query_rows(QUERY_SQL, 1)),
             SQL_TIMEOUT,
         )
-        .map_err(|e| anyhow::anyhow!("point-in-time query: {e:?}"))?;
+        .map_err(QueryCounterError::Host)?;
     match outcome {
-        CallOutcome::Replied(Ok(SqliteResponse::Rows { rows, .. })) => rows
-            .first()
-            .and_then(|row| row.first())
-            .and_then(|cell| cell.as_i64())
-            .and_then(|v| u64::try_from(v).ok())
-            .ok_or_else(|| anyhow::anyhow!("point-in-time query returned no integer")),
-        other => anyhow::bail!("unexpected point-in-time outcome {other:?}"),
+        CallOutcome::Replied(Ok(SqliteResponse::Rows { columns, rows })) => {
+            let rows = tina_sqlite_bridge::SqliteRows { columns, rows };
+            decode_final_value(&rows).map_err(QueryCounterError::Protocol)
+        }
+        CallOutcome::Replied(Ok(SqliteResponse::Executed { .. })) => {
+            Err(QueryCounterError::Sqlite(SqliteError::Protocol(
+                tina_sqlite_bridge::SqliteProtocolError::QueryReturnedExecuted,
+            )))
+        }
+        CallOutcome::Replied(Err(error)) => Err(QueryCounterError::Sqlite(error)),
+        CallOutcome::Full => Err(QueryCounterError::Delivery(BridgeDeliveryFailure::Full)),
+        CallOutcome::Closed => Err(QueryCounterError::Delivery(BridgeDeliveryFailure::Closed)),
+        CallOutcome::Timeout => Err(QueryCounterError::Delivery(BridgeDeliveryFailure::Timeout)),
+        CallOutcome::Rejected(reason) => Err(QueryCounterError::Delivery(
+            BridgeDeliveryFailure::Rejected(reason),
+        )),
     }
 }
 
-fn seed_database(path: &std::path::Path) -> anyhow::Result<()> {
+/// Exact point-in-time query failure.
+#[derive(Debug)]
+pub enum QueryCounterError {
+    Host(ThreadedRuntimeError),
+    Sqlite(SqliteError),
+    Delivery(BridgeDeliveryFailure),
+    Protocol(CounterProtocolFailure),
+}
+
+impl std::fmt::Display for QueryCounterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for QueryCounterError {}
+
+fn call_failure<T>(outcome: CallOutcome<Result<T, SqliteError>>) -> CounterFailure {
+    match outcome {
+        CallOutcome::Replied(Err(error)) => CounterFailure::Sqlite(error),
+        CallOutcome::Full => CounterFailure::Delivery(BridgeDeliveryFailure::Full),
+        CallOutcome::Closed => CounterFailure::Delivery(BridgeDeliveryFailure::Closed),
+        CallOutcome::Timeout => CounterFailure::Delivery(BridgeDeliveryFailure::Timeout),
+        CallOutcome::Rejected(reason) => {
+            CounterFailure::Delivery(BridgeDeliveryFailure::Rejected(reason))
+        }
+        CallOutcome::Replied(Ok(_)) => unreachable!("successful outcomes are handled by caller"),
+    }
+}
+
+fn decode_final_value(
+    rows: &tina_sqlite_bridge::SqliteRows,
+) -> Result<u64, CounterProtocolFailure> {
+    if rows.len() != 1 {
+        return Err(CounterProtocolFailure::UnexpectedRowCount { actual: rows.len() });
+    }
+    let row = rows.row(0).expect("row count checked");
+    if row.len() != 1 {
+        return Err(CounterProtocolFailure::UnexpectedColumnCount { actual: row.len() });
+    }
+    match row.col(0).expect("column count checked") {
+        SqliteValue::Integer(value) if *value >= 0 => Ok(*value as u64),
+        SqliteValue::Integer(value) => {
+            Err(CounterProtocolFailure::NegativeFinalValue { actual: *value })
+        }
+        other => Err(CounterProtocolFailure::UnexpectedValueKind {
+            actual: sqlite_value_kind(other),
+        }),
+    }
+}
+
+fn sqlite_value_kind(value: &SqliteValue) -> SqliteValueKind {
+    match value {
+        SqliteValue::Null => SqliteValueKind::Null,
+        SqliteValue::Integer(_) => SqliteValueKind::Integer,
+        SqliteValue::Real(_) => SqliteValueKind::Real,
+        SqliteValue::Text(_) => SqliteValueKind::Text,
+        SqliteValue::Blob(_) => SqliteValueKind::Blob,
+    }
+}
+
+fn seed_database(path: &std::path::Path) -> rusqlite::Result<()> {
     let conn = Connection::open(path)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS counter (id INTEGER PRIMARY KEY, value INTEGER NOT NULL);",

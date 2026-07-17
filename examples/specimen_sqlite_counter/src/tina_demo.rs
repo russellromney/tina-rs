@@ -402,4 +402,3 @@ pub fn demo_point_in_time_query() -> anyhow::Result<()> {
         Ok(())
     })
 }
-

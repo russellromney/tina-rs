@@ -343,6 +343,9 @@ pub enum SqliteError {
     Io(String),
     /// Catch-all SQLite error with message preserved.
     Sqlite(String),
+    /// A typed helper received the opposite response shape from the worker.
+    /// This indicates a bridge protocol bug, not a SQLite/database failure.
+    Protocol(SqliteProtocolError),
     /// Bridge invariant failed (e.g. worker thread died mid-request).
     /// Never used to hide a SQLite error.
     Internal(String),
@@ -362,10 +365,31 @@ impl std::fmt::Display for SqliteError {
             Self::Constraint(msg) => write!(f, "sqlite worker: constraint violation: {msg}"),
             Self::Io(msg) => write!(f, "sqlite worker: io error: {msg}"),
             Self::Sqlite(msg) => write!(f, "sqlite worker: sqlite error: {msg}"),
+            Self::Protocol(error) => write!(f, "sqlite worker: protocol error: {error}"),
             Self::Internal(msg) => write!(f, "sqlite worker: internal: {msg}"),
         }
     }
 }
+
+/// Exact response-shape violation detected by a typed SQLite helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqliteProtocolError {
+    /// `execute_call` received a row response.
+    ExecuteReturnedRows,
+    /// `query_call` received an execute response.
+    QueryReturnedExecuted,
+}
+
+impl std::fmt::Display for SqliteProtocolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExecuteReturnedRows => f.write_str("execute call returned rows"),
+            Self::QueryReturnedExecuted => f.write_str("query call returned executed"),
+        }
+    }
+}
+
+impl std::error::Error for SqliteProtocolError {}
 
 impl std::error::Error for SqliteError {}
 

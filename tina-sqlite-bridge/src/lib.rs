@@ -164,7 +164,7 @@ pub use tina_runtime::bridge::{
     BridgeFatal, BridgeOutcomeClass, BridgePressure, BridgeRetryable, BridgeUnavailable,
 };
 pub use types::{
-    InstallError, SqliteConfig, SqliteConfigError, SqliteError, SqlitePath, SqliteRequest,
-    SqliteResponse, SqliteValue, U64TooLarge,
+    InstallError, SqliteConfig, SqliteConfigError, SqliteError, SqlitePath, SqliteProtocolError,
+    SqliteRequest, SqliteResponse, SqliteValue, U64TooLarge,
 };
 pub use worker::{InstalledSqliteBridge, SqliteCloser, SqliteMsg, SqliteWorker};

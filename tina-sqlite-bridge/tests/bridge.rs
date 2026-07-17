@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig,
+    CallOutcome, DefaultThreadedMailboxFactory, DeferredReplyRejectedReason, RuntimeCall,
+    RuntimeEventKind, ThreadedRuntime, ThreadedRuntimeConfig,
 };
 use tina_sqlite_bridge::{
     InstalledSqliteBridge, SqliteAddress, SqliteCallOutcome, SqliteConfig, SqliteConfigError,
@@ -79,6 +80,51 @@ struct CallerIsolate {
     worker: SqliteAddress,
     timeout: Duration,
     sink: Arc<Sink>,
+}
+
+#[derive(Debug)]
+enum GoneCallerMsg {
+    Run,
+    Stop,
+    Done(SqliteCallOutcome),
+}
+
+struct GoneCaller {
+    worker: SqliteAddress,
+}
+
+impl Isolate for GoneCaller {
+    tina::isolate_types! {
+        message: GoneCallerMsg,
+        reply: (),
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        io: RuntimeCall<GoneCallerMsg>,
+        shard: SingleShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: GoneCallerMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            GoneCallerMsg::Run => send_request(
+                self.worker,
+                SqliteRequest::QueryRows {
+                    sql: HEAVY_QUERY.into(),
+                    params: vec![],
+                    max_rows: 1,
+                },
+                Duration::from_secs(15),
+            )
+            .then(GoneCallerMsg::Done),
+            GoneCallerMsg::Stop => stop(),
+            GoneCallerMsg::Done(outcome) => {
+                panic!("a stopped caller cannot receive completion: {outcome:?}")
+            }
+        }
+    }
 }
 
 impl Isolate for CallerIsolate {
@@ -793,6 +839,61 @@ fn bridge_attempt_timeout_surfaces_and_late_result_is_recorded() {
     assert_eq!(snap.worker_executed, 0);
     assert_eq!(snap.timeouts, 1);
 
+    shutdown_runtime(runtime);
+}
+
+#[test]
+fn caller_gone_is_traced_exactly_and_worker_resources_settle() {
+    let runtime = make_runtime();
+    let bridge = install_bridge(
+        &runtime,
+        test_config().with_default_timeout(Duration::from_secs(10)),
+    );
+    let caller = runtime
+        .register_with_capacity::<_, Infallible>(
+            GoneCaller {
+                worker: bridge.address,
+            },
+            8,
+        )
+        .expect("register caller");
+    runtime
+        .try_send(caller, GoneCallerMsg::Run)
+        .expect("start and stop caller");
+
+    wait_admitted(&bridge, 1, Duration::from_secs(5));
+    runtime
+        .try_send(caller, GoneCallerMsg::Stop)
+        .expect("stop caller with request in flight");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while bridge.metrics.snapshot().current_in_flight != 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let metrics = bridge.metrics.snapshot();
+    assert_eq!(metrics.admitted, 1, "{metrics:?}");
+    assert_eq!(metrics.worker_rows, 1, "{metrics:?}");
+    assert_eq!(metrics.current_in_flight, 0, "{metrics:?}");
+    assert_eq!(metrics.late_results, 0, "{metrics:?}");
+
+    let trace = runtime.trace();
+    let owner_stopped_rejections = trace
+        .events()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::DeferredReplyRejected {
+                    reason: DeferredReplyRejectedReason::OwnerStopped,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(owner_stopped_rejections, 1, "{trace:?}");
+
+    bridge.closer.close();
+    assert!(bridge.closer.is_closed());
     shutdown_runtime(runtime);
 }
 

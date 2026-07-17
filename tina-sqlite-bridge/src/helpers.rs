@@ -40,9 +40,9 @@ use tina::Isolate;
 use tina_runtime::bridge::{BridgeFatal, BridgeOutcomeClass, BridgeRetryable, BridgeUnavailable};
 use tina_runtime::{CallOutcome, IsolateCall, RuntimeCall, call_typed};
 
-use crate::SqliteError;
 use crate::types::{SqliteRequest, SqliteResponse, SqliteValue};
 use crate::worker::SqliteMsg;
+use crate::{SqliteError, SqliteProtocolError};
 
 /// Worker reply type. Same as the inner `Result` carried inside a
 /// [`CallOutcome`].
@@ -305,10 +305,10 @@ fn project_executed(outcome: SqliteCallOutcome) -> SqliteExecutedOutcome {
         // Unreachable in practice: `execute_call` only ever sends
         // `SqliteRequest::Execute`, and the worker's `run_request`
         // matches request shape to response shape. Surface
-        // `Internal` rather than panic if a future code change
-        // breaks that invariant.
+        // a typed protocol failure rather than panic if a future code
+        // change breaks that invariant.
         CallOutcome::Replied(Ok(SqliteResponse::Rows { .. })) => CallOutcome::Replied(Err(
-            SqliteError::Internal("execute_call: worker returned Rows response".into()),
+            SqliteError::Protocol(SqliteProtocolError::ExecuteReturnedRows),
         )),
         CallOutcome::Replied(Err(e)) => CallOutcome::Replied(Err(e)),
         CallOutcome::Full => CallOutcome::Full,
@@ -325,7 +325,7 @@ fn project_rows(outcome: SqliteCallOutcome) -> SqliteRowsOutcome {
         }
         // See `project_executed` for the same invariant note.
         CallOutcome::Replied(Ok(SqliteResponse::Executed { .. })) => CallOutcome::Replied(Err(
-            SqliteError::Internal("query_call: worker returned Executed response".into()),
+            SqliteError::Protocol(SqliteProtocolError::QueryReturnedExecuted),
         )),
         CallOutcome::Replied(Err(e)) => CallOutcome::Replied(Err(e)),
         CallOutcome::Full => CallOutcome::Full,
@@ -402,6 +402,10 @@ pub enum SqliteFatalReason {
     Sqlite(String),
     /// Bridge invariant failed.
     Internal(String),
+    /// Typed helper response-shape invariant failed.
+    Protocol(SqliteProtocolError),
+    /// Runtime rejected the bridge call before an application reply.
+    Rejected(tina::CallRejectedReason),
     /// Bridge ingress mailbox full (runtime layer).
     BridgeFull,
     /// Bridge target closed or stale (runtime layer).
@@ -496,6 +500,9 @@ pub fn sqlite_bridge_class<T>(outcome: &CallOutcome<Result<T, SqliteError>>) -> 
         CallOutcome::Replied(Err(SqliteError::Internal(_))) => {
             BridgeOutcomeClass::Fatal(BridgeFatal::Internal)
         }
+        CallOutcome::Replied(Err(SqliteError::Protocol(_))) => {
+            BridgeOutcomeClass::Fatal(BridgeFatal::Internal)
+        }
         CallOutcome::Timeout => BridgeOutcomeClass::Retryable(BridgeRetryable::CallerTimeout),
         CallOutcome::Full => BridgeOutcomeClass::Retryable(BridgeRetryable::BridgeFull),
         CallOutcome::Closed => BridgeOutcomeClass::Unavailable(BridgeUnavailable::BridgeClosed),
@@ -539,11 +546,58 @@ fn classify_inner<R, T>(
         CallOutcome::Replied(Err(SqliteError::Internal(msg))) => {
             SqliteOutcomeClass::Fatal(SqliteFatalReason::Internal(msg))
         }
+        CallOutcome::Replied(Err(SqliteError::Protocol(error))) => {
+            SqliteOutcomeClass::Fatal(SqliteFatalReason::Protocol(error))
+        }
         CallOutcome::Timeout => SqliteOutcomeClass::Transient(SqliteTransientReason::BridgeTimeout),
         CallOutcome::Full => SqliteOutcomeClass::Fatal(SqliteFatalReason::BridgeFull),
         CallOutcome::Closed => SqliteOutcomeClass::Fatal(SqliteFatalReason::BridgeClosed),
-        CallOutcome::Rejected(reason) => SqliteOutcomeClass::Fatal(SqliteFatalReason::Internal(
-            format!("bridge call rejected: {reason:?}"),
-        )),
+        CallOutcome::Rejected(reason) => {
+            SqliteOutcomeClass::Fatal(SqliteFatalReason::Rejected(reason))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execute_projection_preserves_the_exact_response_shape_violation() {
+        let outcome = project_executed(CallOutcome::Replied(Ok(SqliteResponse::Rows {
+            columns: vec!["value".into()],
+            rows: vec![vec![SqliteValue::Integer(1)]],
+        })));
+        assert_eq!(
+            outcome,
+            CallOutcome::Replied(Err(SqliteError::Protocol(
+                SqliteProtocolError::ExecuteReturnedRows
+            )))
+        );
+    }
+
+    #[test]
+    fn query_projection_preserves_the_exact_response_shape_violation() {
+        let outcome = project_rows(CallOutcome::Replied(Ok(SqliteResponse::Executed {
+            rows_changed: 1,
+        })));
+        assert_eq!(
+            outcome,
+            CallOutcome::Replied(Err(SqliteError::Protocol(
+                SqliteProtocolError::QueryReturnedExecuted
+            )))
+        );
+    }
+
+    #[test]
+    fn classifier_preserves_the_runtime_rejection_reason() {
+        let outcome: SqliteExecutedOutcome =
+            CallOutcome::Rejected(tina::CallRejectedReason::ReplyAbandoned);
+        assert!(matches!(
+            outcome.classify(),
+            SqliteOutcomeClass::Fatal(SqliteFatalReason::Rejected(
+                tina::CallRejectedReason::ReplyAbandoned
+            ))
+        ));
     }
 }
