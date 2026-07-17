@@ -227,7 +227,8 @@ pub struct KeepaliveInstallRollbackReport {
     pub connections_registered: usize,
     /// Connection isolates that replied `Stopped` during rollback.
     pub connections_stopped: usize,
-    /// Connection isolates that were already closed when rollback asked them to stop.
+    /// Connection isolates already terminal when rollback asked them to stop,
+    /// or proven terminal by owner shutdown during recovery.
     pub connections_already_closed: usize,
     /// Per-slot stop failures that are not clean stops or already-closed.
     pub connection_stop_failures: Vec<KeepaliveConnectionStopFailure>,
@@ -272,6 +273,9 @@ where
 {
     /// Every registered connection is now terminal and the origin claim was released.
     Recovered(KeepaliveInstallRollbackReport),
+    /// Owner shutdown made every registered connection terminal and released
+    /// the origin claim without claiming an explicit stop reply.
+    Shutdown(KeepaliveInstallRollbackReport),
     /// Cleanup remains incomplete; authority and the origin claim are retained.
     Retained {
         /// Authority for another bounded retry.
@@ -288,8 +292,20 @@ where
 {
     /// Retry cleanup within one total timeout.
     pub fn retry(mut self, timeout: Duration) -> KeepaliveRollbackResult<S, F> {
+        if host_state(&self.host) == LiveShardState::Stopped {
+            self.settle_owner_shutdown();
+            let report = self.report(Vec::new());
+            self.claim.release();
+            return KeepaliveRollbackResult::Shutdown(report);
+        }
         let deadline = deadline_after(timeout);
         let report = self.attempt(deadline);
+        if host_state(&self.host) == LiveShardState::Stopped {
+            self.settle_owner_shutdown();
+            let report = self.report(Vec::new());
+            self.claim.release();
+            return KeepaliveRollbackResult::Shutdown(report);
+        }
         if self.live_count() == 0 {
             self.claim.release();
             KeepaliveRollbackResult::Recovered(report)
@@ -306,6 +322,14 @@ where
             .iter()
             .filter(|outcome| outcome.is_none())
             .count()
+    }
+
+    fn settle_owner_shutdown(&mut self) {
+        for outcome in &mut self.settled {
+            if outcome.is_none() {
+                *outcome = Some(KeepaliveConnectionStopOutcome::AlreadyClosed);
+            }
+        }
     }
 
     fn attempt(&mut self, deadline: Instant) -> KeepaliveInstallRollbackReport {
@@ -359,6 +383,18 @@ where
                 .count(),
             connection_stop_failures,
             pool_registered: false,
+        }
+    }
+}
+
+impl<S, F> Drop for KeepaliveInstallRecovery<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+{
+    fn drop(&mut self) {
+        if host_state(&self.host) == LiveShardState::Stopped {
+            self.claim.release();
         }
     }
 }
@@ -549,8 +585,10 @@ where
 ///
 /// Drive the pool with [`Self::pool`] / [`Self::connections`]. Settle with the
 /// consuming [`Self::close_and_drain`]. Dropping an unsettled handle does not
-/// free its origin claim: later installs remain in typed conflict until owner
-/// shutdown, rather than creating a second pool beside orphaned resources.
+/// free its origin claim while the owner is live: later installs in that system
+/// incarnation remain in typed conflict rather than creating a second pool
+/// beside orphaned resources. A handle dropped after owner shutdown releases
+/// its now-terminal tombstone.
 #[must_use = "installed keepalive resources must be closed and drained"]
 pub struct InstalledKeepalivePool<S, F = tina_runtime::DefaultThreadedMailboxFactory>
 where
@@ -800,6 +838,18 @@ where
                 .filter(|value| value.is_none())
                 .count(),
             admission_closed: self.admission_closed,
+        }
+    }
+}
+
+impl<S, F> Drop for InstalledKeepalivePool<S, F>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+{
+    fn drop(&mut self) {
+        if host_state(&self.host) == LiveShardState::Stopped {
+            self.claim.release();
         }
     }
 }
@@ -1110,7 +1160,7 @@ where
     let mut last_leased: Option<usize> = None;
 
     loop {
-        let Some(remaining) = remaining(deadline) else {
+        let Some(call_budget) = remaining(deadline) else {
             return Ok(drain_timeout_outcome(last_leased));
         };
 
@@ -1118,7 +1168,7 @@ where
             host,
             handles.pool,
             WorkerPoolMsg::PressureReport,
-            remaining,
+            call_budget,
         ) {
             Ok(outcome) => outcome,
             Err(ThreadedRuntimeError::HostWaitTimeout) => {
@@ -1150,6 +1200,9 @@ where
             }
         }
 
+        let Some(remaining) = remaining(deadline) else {
+            return Ok(drain_timeout_outcome(last_leased));
+        };
         let nap = remaining.min(Duration::from_millis(10));
         if !nap.is_zero() {
             thread::sleep(nap);
@@ -1166,9 +1219,7 @@ where
     S: Shard + Send + 'static,
     F: MailboxFactory + Send + 'static,
 {
-    if error == ThreadedRuntimeError::WorkerStopped
-        && host_state(&pool.host) == LiveShardState::Stopped
-    {
+    if host_state(&pool.host) == LiveShardState::Stopped {
         // A stopped worker is a shutdown settlement only when live
         // topology proves graceful owner shutdown.
         let settlement = KeepaliveShutdownSettlement {
@@ -1420,6 +1471,59 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_public_config_ceilings_validate_without_conversion_loss() {
+        let config = KeepalivePoolInstallConfig::new(
+            HttpTarget::http("127.0.0.1:9".parse().unwrap()),
+            HttpClientConfig::pressure(),
+            PoolConfig::new(MAX_KEEPALIVE_POOL_CAPACITY, MAX_KEEPALIVE_POOL_WAITERS),
+            MAX_KEEPALIVE_MAILBOX_CAPACITY,
+            MAX_KEEPALIVE_MAILBOX_CAPACITY,
+        );
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
+    fn dropped_handle_releases_its_tombstone_after_owner_shutdown() {
+        let system =
+            LocalSystem::single_shard(SingleShard, tina_runtime::DefaultThreadedMailboxFactory)
+                .try_build()
+                .expect("system");
+        let target = HttpTarget::http("127.0.0.1:9".parse().unwrap());
+        let key = ClaimKey {
+            system: system.system_incarnation().get(),
+            origin: OriginKey::from_target(&target),
+        };
+        let pool = system
+            .install_keepalive_pool(KeepalivePoolInstallConfig::new(
+                target,
+                HttpClientConfig::pressure(),
+                PoolConfig::new(1, 0),
+                8,
+                8,
+            ))
+            .expect("install");
+        assert!(
+            installed_origins()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains(&key)
+        );
+
+        system
+            .shutdown_handle()
+            .request_and_wait_report(Duration::from_secs(2))
+            .expect("owner shutdown");
+        drop(pool);
+        assert!(
+            !installed_origins()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains(&key)
+        );
+        let _ = system.shutdown().join();
+    }
 
     #[test]
     fn invalid_max_plus_one_never_crosses_resource_boundary() {

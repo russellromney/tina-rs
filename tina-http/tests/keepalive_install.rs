@@ -511,6 +511,38 @@ fn incomplete_rollback_retains_cleanup_and_conflict_authority() {
     let _ = app.shutdown().join();
 }
 
+#[test]
+fn incomplete_rollback_owner_shutdown_is_typed_and_terminal() {
+    let app = system();
+    let target = HttpTarget::http("127.0.0.1:9".parse().unwrap());
+    let error =
+        install_keepalive_pool_fail_after_with_rollback_failure(&app, config(target, 2), 2, 1)
+            .expect_err("pool registration failure");
+    let recovery = match error {
+        KeepalivePoolInstallError::Register {
+            recovery: Some(recovery),
+            ..
+        } => recovery,
+        other => panic!("expected retained recovery, got {other:?}"),
+    };
+
+    app.shutdown_handle()
+        .request_and_wait_report(Duration::from_secs(2))
+        .expect("owner shutdown");
+    match recovery.retry(Duration::from_secs(2)) {
+        KeepaliveRollbackResult::Shutdown(report) => {
+            assert_eq!(report.connections_registered, 2);
+            assert_eq!(
+                report.connections_stopped + report.connections_already_closed,
+                2
+            );
+            assert!(report.connection_stop_failures.is_empty());
+        }
+        other => panic!("expected typed rollback shutdown, got {other:?}"),
+    }
+    let _ = app.shutdown().join();
+}
+
 // =====================================================================
 // Close / drain proofs
 // =====================================================================
@@ -535,6 +567,29 @@ fn close_and_drain_success_settles_every_connection() {
 
     let _ = app.shutdown().join();
     server.stop();
+}
+
+#[test]
+fn zero_total_deadline_returns_authority_without_starting_close() {
+    let app = system();
+    let pool = app
+        .install_keepalive_pool(config(HttpTarget::http("127.0.0.1:9".parse().unwrap()), 2))
+        .expect("install");
+
+    let retained = match pool.close_and_drain(Duration::ZERO) {
+        KeepaliveCloseAndDrain::TimedOut { pool, pending } => {
+            assert_eq!(pending.leased, None);
+            assert_eq!(pending.connections_live, 2);
+            assert!(!pending.admission_closed);
+            pool
+        }
+        other => panic!("zero total deadline must retain authority, got {other:?}"),
+    };
+    assert!(matches!(
+        retained.close_and_drain(Duration::from_secs(2)),
+        KeepaliveCloseAndDrain::Drained(_)
+    ));
+    let _ = app.shutdown().join();
 }
 
 #[test]
