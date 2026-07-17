@@ -20,15 +20,19 @@ pub fn run() -> anyhow::Result<Report> {
     rt.block_on(async {
         let conn = Arc::new(Mutex::new(open_and_init(&path).await?));
 
+        let mut updates_ok = 0u64;
+        let mut rows_changed = 0u64;
         for _ in 0..INCREMENTS {
             let conn = Arc::clone(&conn);
-            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let changed = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
                 let conn = conn.lock().expect("conn mutex");
-                conn.execute("UPDATE counter SET value = value + 1 WHERE id = 0", [])?;
-                Ok(())
+                let n = conn.execute("UPDATE counter SET value = value + 1 WHERE id = 0", [])?;
+                Ok(n as u64)
             })
             .await
             .map_err(|e| anyhow::anyhow!("blocking task: {e}"))??;
+            updates_ok += 1;
+            rows_changed += changed;
         }
 
         let conn = Arc::clone(&conn);
@@ -43,6 +47,9 @@ pub fn run() -> anyhow::Result<Report> {
 
         Ok(Report {
             final_value,
+            updates_ok,
+            queries_ok: 1,
+            rows_changed,
             exit_clean: true,
         })
     })

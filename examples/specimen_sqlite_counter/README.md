@@ -2,13 +2,20 @@
 
 Tokio-vs-Tina counter persisted in SQLite. Each side initialises a
 fresh `tempfile`-managed database, increments a single-row counter
-50 times, reads it back, and ends with `final_value = 50`.
+50 times, reads it back, and ends with matching reports:
 
-The Tina side now drives a real
-[`tina-sqlite-bridge`](../../tina-sqlite-bridge) worker instead of
-running rusqlite inline in a handler. The shard thread is no longer
-blocked while SQLite runs; admission, in-flight, and timeouts are
-named caps with typed failure modes.
+```
+final_value=50 updates_ok=50 queries_ok=1 rows_changed=50 exit_clean=true
+```
+
+The Tina side drives a real
+[`tina-sqlite-bridge`](../../tina-sqlite-bridge) worker from a root
+isolate. That isolate privately accumulates query/update metrics and
+publishes them once through `stop_with`. The host claims
+`observe_result` before start. The shard thread is never blocked while
+SQLite runs; admission, in-flight, and timeouts are named caps with
+typed failure modes. Point-in-time inspection uses the bridge's
+existing typed query request — there is no result mutex or poll loop.
 
 ## Run
 
@@ -17,12 +24,22 @@ cargo run --manifest-path examples/specimen_sqlite_counter/Cargo.toml -- both
 cargo test --manifest-path examples/specimen_sqlite_counter/Cargo.toml
 ```
 
-```
-side=tokio final_value=50 exit_clean=true
-side=tina  final_value=50 exit_clean=true
+Public certification targets:
+
+```sh
+cargo test --manifest-path examples/specimen_sqlite_counter/Cargo.toml \
+  --test public_smoke public_smoke -- --exact
+cargo test --manifest-path examples/specimen_sqlite_counter/Cargo.toml \
+  --test public_smoke public_characterization -- --exact
 ```
 
-The Tina side also prints a one-line bridge metrics summary:
+```
+comparison=specimen_sqlite_counter side=tokio final_value=50 updates_ok=50 queries_ok=1 rows_changed=50 exit_clean=true
+comparison=specimen_sqlite_counter side=tina  final_value=50 updates_ok=50 queries_ok=1 rows_changed=50 exit_clean=true
+```
+
+The Tina side also prints a one-line bridge metrics summary (bridge
+pressure, not the application report):
 
 ```
 specimen_sqlite_counter (tina) bridge metrics: \
@@ -31,8 +48,9 @@ specimen_sqlite_counter (tina) bridge metrics: \
 
 ### Failure-shape demos
 
-`demo` runs four short scripts that surface each typed error a user
-will hit at the call site:
+`demo` runs short scripts that surface each typed error a user will
+hit at the call site. Each demo isolate ends with `stop_with`; the host
+reads the outcome through `observe_result`:
 
 ```sh
 cargo run --manifest-path examples/specimen_sqlite_counter/Cargo.toml -- demo
@@ -42,6 +60,8 @@ cargo run --manifest-path examples/specimen_sqlite_counter/Cargo.toml -- demo
 #                      late_results bumps (SqliteError::Timeout)
 #   demo-closed      — bridge closed before send (SqliteError::Closed)
 #   demo-invalid     — over-cap params (SqliteError::InvalidRequest)
+#   demo-retry       — classify() transient-vs-fatal loop
+#   demo-point-in-time — host typed query request reads current value
 ```
 
 ## Read
@@ -71,38 +91,36 @@ sync calls. Pressure (how many blocking tasks are queued, how long
 each one waits) lives entirely inside Tokio's blocking pool defaults
 and is not nameable from the call site.
 
-## Tina shape: `tina-sqlite-bridge` install + host `call_blocking`
+## Tina shape: root isolate + bridge + terminal report
 
 ```rust
-use tina_runtime::CallOutcome;
-use tina_sqlite_bridge::{SqliteConfig, SqliteMsg, SqliteRequest, SqliteResponse, SqliteWorker};
+use tina::prelude::*;
+use tina_runtime::{CallOutcome, LocalSystem};
+use tina_sqlite_bridge::{SqliteConfig, SqliteWorker, execute_call, query_call};
 
-let cfg = SqliteConfig::path(&path)
-    .with_default_timeout(Duration::from_secs(5))
-    .with_busy_timeout(Duration::from_secs(2))
-    .with_pragma("journal_mode = WAL")
-    .with_poll_interval(Duration::from_millis(1));
-let bridge = SqliteWorker::<SingleShard>::install(&runtime, cfg)?;
+// Inside the counter isolate:
+execute_call(self.db, "UPDATE counter SET value = value + 1 WHERE id = 0", vec![], timeout)
+    .then(CounterMsg::UpdateDone);
 
-// From the host thread. Service isolates should still use
-// execute_call(...).then(...) when they want a continuation message.
-let outcome = runtime.call_blocking_typed(
-    bridge.address,
-    SqliteMsg::Request(SqliteRequest::execute(
-        "UPDATE counter SET value = value + 1 WHERE id = 0",
-    )),
-    Duration::from_secs(5),
-)?;
-assert!(matches!(
-    outcome,
-    CallOutcome::Replied(Ok(SqliteResponse::Executed { rows_changed: 1 }))
-));
+// On the final SELECT:
+//   self.report.queries_ok += 1;
+//   self.report.final_value = value;
+//   stop_with(self.report)
+
+// Host:
+let waiter = app.observe_result::<Report, _, _>(counter_addr)?;
+app.try_send(counter_addr, CounterMsg::Begin)?;
+let report = waiter.wait(Duration::from_secs(10))?;
 ```
 
+Point-in-time inspection of the live database uses the existing typed
+query request (host `call_blocking` of `SqliteRequest::query_rows`, or
+`query_call` from another isolate). Application metrics for the full
+script arrive only through the terminal report.
+
 The service-isolate helpers `execute_call(...)` and `query_call(...)`
-are still the copied path when you are already inside `handle()` and
-want to continue through `.then(...)`. The host-side specimen uses
-`call_blocking` because it is a script, not a long-lived app isolate.
+are the copied path when you are already inside `handle()` and want to
+continue through `.then(...)`.
 
 Under the hood the bridge owns one std-thread blocking worker that
 holds the `rusqlite::Connection`. The Tina shard thread submits
@@ -119,28 +137,6 @@ SQLITE_BUSY/LOCK  -> SqliteError::Busy
 constraint viol.  -> SqliteError::Constraint(detail)
 worker closed     -> SqliteError::Closed
 ```
-
-## Why inline `rusqlite` in `handle()` was only a specimen, not production
-
-The earlier version of this specimen ran `self.conn.execute(...)`
-directly inside the handler. That works for a 50-row counter, but
-hides three problems:
-
-1. **The shard thread blocks while SQLite runs.** Every other
-   isolate on the shard is paused for the duration of the query.
-   Microsecond `UPDATE` calls hide it; a 50ms `Postgres` query
-   against a remote server would not.
-2. **No named caps.** There is no `mailbox_capacity`, no
-   `max_in_flight`, no `default_timeout`. Pressure is invisible. A
-   slow query becomes a slow shard becomes a slow service.
-3. **Errors collapse to `expect(...)`.** A real bridge surfaces a
-   typed `SqliteError::*`. The inline version had no place to put
-   a reply translator because handlers return `Effect<Self>`, not
-   `Result<Effect<Self>, _>`.
-
-The bridge fixes all three. The shard thread does no SQLite work;
-each cap is named in `SqliteConfig`; every failure has a typed
-variant.
 
 ## Serial one-connection mode vs named pool mode
 
