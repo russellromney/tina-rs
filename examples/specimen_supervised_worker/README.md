@@ -66,9 +66,10 @@ A worker, a parent, and a supervisor config:
 - **`runtime.try_supervise(parent, SupervisorConfig::new(OneForOne,
   RestartBudget::new(N)))`** — the budget is typed and finite. If
   the worker exceeds N restarts, the supervisor stops trying.
-- **`spawn_observed(...).then_with_restarts(...)`** — the initial spawn result
-  and every successful replacement arrive as ordinary bounded parent
-  messages. No shared address slot or manual reconstruction.
+- **`spawn_observed(...).then_service_event_with_restarts(...)`** — the initial
+  spawn result and every successful replacement arrive as ordinary bounded
+  parent events. No shared address slot, manual reconstruction, or service
+  envelope construction.
 - **`runtime.observe_child_restarted(parent).wait(timeout)`** — the
   host's ground-truth synchronization signal per `Poison` job. It counts
   restarts but no longer acts as address authority.
@@ -120,8 +121,8 @@ What this suggests:
 - The supervisor + restart budget is the right shape. The Tokio
   hand-rolled loop is exactly the kind of thing that quietly
   diverges across codebases; Tina names it once.
-- `then_with_restarts` keeps typed address ownership in the parent without
-  creating a second observation registry or asking the host to assert the
-  child's message type.
+- `then_service_event_with_restarts` keeps typed address ownership in the
+  parent without creating a second observation registry, exposing the split
+  service envelope, or asking the host to assert the child's message type.
 - Join/stop-child convenience remains separate lifecycle work; this specimen
   no longer needs an address-side-channel workaround.

@@ -1371,6 +1371,21 @@ simulator preserve system/shard/generation provenance, stale-address truth,
 and bounded parent delivery. A full parent mailbox records the normal
 `SendRejected::Full` and does not retain a hidden retry queue.
 
+**Closed (2026-07 split-service restart continuation):**
+`then_service_event_with_restarts(initial, restarted)` preserves that same
+initial-result, replacement-ref, stale-address, and bounded-delivery contract
+for split services while keeping the framework-owned `ServiceMessage::Event`
+envelope out of application code. `specimen_supervised_worker` is the motivating
+migration and no longer constructs a service envelope in either lifecycle
+continuation.
+
+The adversarial pass also closed an initial/replacement asymmetry: a panic in a
+restartable child's first isolate or bootstrap factory now produces the typed
+initial `SpawnObservedError::FactoryPanicked`, publishes no child, and leaves
+the live runtime or simulator able to continue. Replacement factory panics
+remain `RestartSkippedReason::FactoryPanicked` lifecycle facts and do not invoke
+the replacement continuation.
+
 `specimen_supervised_worker` now stores the current child ref only in its
 parent. Startup carries a typed host request through the initial continuation;
 subsequent work routes through the parent as a typed worker request. Work is

@@ -338,8 +338,8 @@ mod tests {
     use std::convert::Infallible;
     use std::rc::Rc;
     use tina::{
-        ChildDefinition, ChildRef, Outbound, SpawnObservedError, batch, noop, send, spawn,
-        spawn_observed, stop,
+        ChildDefinition, ChildRef, Outbound, ServiceEventAddress, ServiceMessage,
+        SpawnObservedError, batch, noop, send, spawn, spawn_observed, stop,
     };
 
     #[test]
@@ -608,20 +608,23 @@ mod tests {
         let mut sim = Simulator::new(NumberedShard(9), SimulatorConfig::default());
         let parent = sim.register_with_mailbox_capacity::<
             SimRestartObservedParent,
-            SimRestartObservedParentMsg,
-            SimRestartObservedParentMsg,
+            ServiceMessage<SimRestartObservedParentMsg, Infallible>,
+            ServiceMessage<SimRestartObservedParentMsg, Infallible>,
         >(
             SimRestartObservedParent {
                 seen: Rc::clone(&seen),
                 incarnations: Rc::clone(&incarnations),
                 factory_calls: Rc::new(Cell::new(0)),
                 panic_on_factory_call: None,
+                initial_errors: Rc::new(RefCell::new(Vec::new())),
+                initial_authority_drops: Rc::new(Cell::new(0)),
             },
             4,
         );
+        let parent_events = ServiceEventAddress::from_send_address(parent.send_only());
 
         assert!(
-            sim.try_send(parent, SimRestartObservedParentMsg::Start)
+            sim.try_send_event(parent_events, SimRestartObservedParentMsg::Start)
                 .is_ok()
         );
         assert_eq!(sim.step(), 1);
@@ -630,7 +633,7 @@ mod tests {
 
         for expected_len in 2..=4 {
             assert!(
-                sim.try_send(parent, SimRestartObservedParentMsg::Restart)
+                sim.try_send_event(parent_events, SimRestartObservedParentMsg::Restart)
                     .is_ok()
             );
             assert_eq!(sim.step(), 1);
@@ -658,25 +661,83 @@ mod tests {
     }
 
     #[test]
+    fn simulator_service_initial_factory_panic_is_typed_and_progress_continues() {
+        let incarnations = Rc::new(RefCell::new(Vec::new()));
+        let factory_calls = Rc::new(Cell::new(0));
+        let initial_errors = Rc::new(RefCell::new(Vec::new()));
+        let initial_authority_drops = Rc::new(Cell::new(0));
+        let mut sim = Simulator::new(NumberedShard(9), SimulatorConfig::default());
+        let parent = sim.register_with_mailbox_capacity::<
+            SimRestartObservedParent,
+            ServiceMessage<SimRestartObservedParentMsg, Infallible>,
+            ServiceMessage<SimRestartObservedParentMsg, Infallible>,
+        >(
+            SimRestartObservedParent {
+                seen: Rc::new(RefCell::new(Vec::new())),
+                incarnations: Rc::clone(&incarnations),
+                factory_calls: Rc::clone(&factory_calls),
+                panic_on_factory_call: Some(1),
+                initial_errors: Rc::clone(&initial_errors),
+                initial_authority_drops: Rc::clone(&initial_authority_drops),
+            },
+            4,
+        );
+        let parent_events = ServiceEventAddress::from_send_address(parent.send_only());
+
+        assert!(
+            sim.try_send_event(parent_events, SimRestartObservedParentMsg::Start)
+                .is_ok()
+        );
+        assert_eq!(sim.step(), 1, "factory panic is contained in the effect");
+        assert_eq!(sim.step(), 1, "typed error callback is delivered once");
+        assert_eq!(factory_calls.get(), 1);
+        assert_eq!(
+            initial_errors.borrow().as_slice(),
+            &[SpawnObservedError::FactoryPanicked]
+        );
+        assert_eq!(initial_authority_drops.get(), 1);
+        assert!(incarnations.borrow().is_empty());
+        assert!(
+            !sim.trace()
+                .iter()
+                .any(|event| matches!(event.kind(), RuntimeEventKind::Spawned { .. }))
+        );
+
+        assert!(
+            sim.try_send_event(parent_events, SimRestartObservedParentMsg::Start)
+                .is_ok()
+        );
+        assert_eq!(sim.step(), 1);
+        assert_eq!(sim.step(), 1);
+        assert_eq!(factory_calls.get(), 2);
+        assert_eq!(initial_errors.borrow().len(), 1);
+        assert_eq!(initial_authority_drops.get(), 2);
+        assert_eq!(incarnations.borrow().len(), 1);
+    }
+
+    #[test]
     fn simulator_observed_restart_full_parent_has_no_hidden_delivery_queue() {
         let incarnations = Rc::new(RefCell::new(Vec::new()));
         let mut sim = Simulator::new(NumberedShard(9), SimulatorConfig::default());
         let parent = sim.register_with_mailbox_capacity::<
             SimRestartObservedParent,
-            SimRestartObservedParentMsg,
-            SimRestartObservedParentMsg,
+            ServiceMessage<SimRestartObservedParentMsg, Infallible>,
+            ServiceMessage<SimRestartObservedParentMsg, Infallible>,
         >(
             SimRestartObservedParent {
                 seen: Rc::new(RefCell::new(Vec::new())),
                 incarnations: Rc::clone(&incarnations),
                 factory_calls: Rc::new(Cell::new(0)),
                 panic_on_factory_call: None,
+                initial_errors: Rc::new(RefCell::new(Vec::new())),
+                initial_authority_drops: Rc::new(Cell::new(0)),
             },
             1,
         );
+        let parent_events = ServiceEventAddress::from_send_address(parent.send_only());
 
         assert!(
-            sim.try_send(parent, SimRestartObservedParentMsg::Start)
+            sim.try_send_event(parent_events, SimRestartObservedParentMsg::Start)
                 .is_ok()
         );
         assert_eq!(sim.step(), 1);
@@ -684,8 +745,11 @@ mod tests {
         let initial = incarnations.borrow()[0];
 
         assert!(
-            sim.try_send(parent, SimRestartObservedParentMsg::RestartWithFullMailbox,)
-                .is_ok()
+            sim.try_send_event(
+                parent_events,
+                SimRestartObservedParentMsg::RestartWithFullMailbox,
+            )
+            .is_ok()
         );
         assert_eq!(sim.step(), 1);
         assert_eq!(sim.step(), 1);
@@ -710,20 +774,23 @@ mod tests {
         let mut sim = Simulator::new(NumberedShard(9), SimulatorConfig::default());
         let parent = sim.register_with_mailbox_capacity::<
             SimRestartObservedParent,
-            SimRestartObservedParentMsg,
-            SimRestartObservedParentMsg,
+            ServiceMessage<SimRestartObservedParentMsg, Infallible>,
+            ServiceMessage<SimRestartObservedParentMsg, Infallible>,
         >(
             SimRestartObservedParent {
                 seen: Rc::new(RefCell::new(Vec::new())),
                 incarnations: Rc::clone(&incarnations),
                 factory_calls: Rc::clone(&factory_calls),
                 panic_on_factory_call: Some(2),
+                initial_errors: Rc::new(RefCell::new(Vec::new())),
+                initial_authority_drops: Rc::new(Cell::new(0)),
             },
             4,
         );
+        let parent_events = ServiceEventAddress::from_send_address(parent.send_only());
 
         assert!(
-            sim.try_send(parent, SimRestartObservedParentMsg::Start)
+            sim.try_send_event(parent_events, SimRestartObservedParentMsg::Start)
                 .is_ok()
         );
         assert_eq!(sim.step(), 1);
@@ -731,7 +798,7 @@ mod tests {
         let initial = incarnations.borrow()[0];
 
         assert!(
-            sim.try_send(parent, SimRestartObservedParentMsg::Restart)
+            sim.try_send_event(parent_events, SimRestartObservedParentMsg::Restart)
                 .is_ok()
         );
         assert_eq!(sim.step(), 1);
@@ -749,7 +816,7 @@ mod tests {
         assert_eq!(sim.step(), 0, "failed restart must not queue a callback");
 
         assert!(
-            sim.try_send(parent, SimRestartObservedParentMsg::Restart)
+            sim.try_send_event(parent_events, SimRestartObservedParentMsg::Restart)
                 .is_ok()
         );
         assert_eq!(sim.step(), 1);
@@ -978,12 +1045,22 @@ mod tests {
         incarnations: Rc<RefCell<Vec<ChildRef<SimObservedChildMsg>>>>,
         factory_calls: Rc<Cell<usize>>,
         panic_on_factory_call: Option<usize>,
+        initial_errors: Rc<RefCell<Vec<SpawnObservedError>>>,
+        initial_authority_drops: Rc<Cell<usize>>,
+    }
+
+    struct SimDropProbe(Rc<Cell<usize>>);
+
+    impl Drop for SimDropProbe {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
     }
 
     impl Isolate for SimRestartObservedParent {
-        type Message = SimRestartObservedParentMsg;
+        type Message = ServiceMessage<SimRestartObservedParentMsg, Infallible>;
         type Reply = ();
-        type Send = Outbound<SimRestartObservedParentMsg>;
+        type Send = Outbound<Self::Message>;
         type Spawn = tina::RestartableChildDefinition<SimObservedChild>;
         type SpawnObserved =
             tina::SpawnObserved<Self::Spawn, Self::Message, SimObservedChildMsg, ()>;
@@ -993,14 +1070,19 @@ mod tests {
 
         fn handle(
             &mut self,
-            msg: Self::Message,
+            message: Self::Message,
             ctx: &mut Context<'_, Self::Shard, Self::Reply>,
         ) -> Effect<Self> {
+            let msg = match message {
+                ServiceMessage::Event(msg) => msg,
+                ServiceMessage::Request(request) => match request {},
+            };
             match msg {
                 SimRestartObservedParentMsg::Start => {
                     let seen = Rc::clone(&self.seen);
                     let factory_calls = Rc::clone(&self.factory_calls);
                     let panic_on_factory_call = self.panic_on_factory_call;
+                    let initial_authority_drops = Rc::clone(&self.initial_authority_drops);
                     spawn_observed(tina::RestartableChildDefinition::new(
                         move || {
                             let call = factory_calls.get() + 1;
@@ -1012,9 +1094,9 @@ mod tests {
                         },
                         4,
                     ))
-                    .then_with_restarts(
+                    .then_service_event_with_restarts(
                         {
-                            let initial_authority = Box::new(());
+                            let initial_authority = SimDropProbe(initial_authority_drops);
                             move |result| {
                                 drop(initial_authority);
                                 SimRestartObservedParentMsg::ChildStarted(result)
@@ -1025,7 +1107,10 @@ mod tests {
                 }
                 SimRestartObservedParentMsg::Restart => tina::restart_children(),
                 SimRestartObservedParentMsg::RestartWithFullMailbox => batch([
-                    send(ctx.me(), SimRestartObservedParentMsg::Fill),
+                    send(
+                        ctx.me(),
+                        ServiceMessage::Event(SimRestartObservedParentMsg::Fill),
+                    ),
                     tina::restart_children(),
                 ]),
                 SimRestartObservedParentMsg::Fill => noop(),
@@ -1034,7 +1119,10 @@ mod tests {
                     self.incarnations.borrow_mut().push(child);
                     noop()
                 }
-                SimRestartObservedParentMsg::ChildStarted(Err(_)) => stop(),
+                SimRestartObservedParentMsg::ChildStarted(Err(error)) => {
+                    self.initial_errors.borrow_mut().push(error);
+                    noop()
+                }
             }
         }
     }

@@ -91,6 +91,11 @@ fresh `ChildRef<WorkerMsg>` after each successful replacement. Store that ref
 in the parent and route work through the parent; do not reconstruct an address
 from untyped isolate/generation fields. The old ref remains honestly stale.
 
+If the restartable child's initial isolate or bootstrap factory panics, no
+child is published and `ChildStarted` receives
+`Err(SpawnObservedError::FactoryPanicked)`. The runtime and simulator remain
+available for later work.
+
 Both continuations use the parent's ordinary bounded mailbox. Full or stopped
 delivery is traced as the corresponding send rejection, with no hidden retry
 or lifecycle queue.
@@ -100,6 +105,21 @@ invoke the restart continuation. A later restart attempt may use the retained
 recipe again.
 
 The effect has the same semantics in the live runtime and simulator.
+
+For a split event/request service, keep the routing envelope out of the
+application and map both lifecycle points directly into events:
+
+```rust
+spawn_observed(RestartableChildDefinition::new(|| Worker::default(), 32))
+    .then_service_event_with_restarts(
+        ParentEvent::ChildStarted,
+        ParentEvent::ChildRestarted,
+    )
+```
+
+The result and bounded-delivery semantics are identical to
+`then_with_restarts`; only the framework-owned `ServiceMessage::Event` wrapping
+is hidden.
 
 ## Budget
 

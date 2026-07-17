@@ -5,8 +5,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 
 use tina::{
-    Address, ChildDefinition, Isolate, IsolateId, Mailbox, Outbound, Shard, ShardId, TrySendError,
-    prelude::*,
+    Address, ChildDefinition, Isolate, IsolateId, Mailbox, Outbound, ServiceMessage, Shard,
+    ShardId, TrySendError, prelude::*,
 };
 use tina_runtime::{
     CauseId, EffectKind, EventId, MailboxFactory, Runtime, RuntimeEvent, RuntimeEventKind,
@@ -174,7 +174,16 @@ enum RestartObservedParentEvent {
     RestartWithFullMailbox,
     Fill,
     ChildStarted(Result<ChildRef<ChildEvent>, SpawnObservedError>),
-    ChildRestarted(ChildRef<ChildEvent>),
+    ChildRestarted(ChildRef<ChildEvent>, DropProbe),
+}
+
+#[derive(Debug)]
+struct DropProbe(Rc<Cell<usize>>);
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+    }
 }
 
 struct RestartObservedParent {
@@ -183,30 +192,39 @@ struct RestartObservedParent {
     incarnations: Rc<RefCell<Vec<ChildRef<ChildEvent>>>>,
     factory_calls: Rc<Cell<usize>>,
     panic_on_factory_call: Option<usize>,
+    initial_errors: Rc<RefCell<Vec<SpawnObservedError>>>,
+    initial_authority_drops: Rc<Cell<usize>>,
+    restart_message_drops: Rc<Cell<usize>>,
 }
 
 impl Isolate for RestartObservedParent {
     tina::isolate_types! {
-        message: RestartObservedParentEvent,
+        message: ServiceMessage<RestartObservedParentEvent, Infallible>,
         reply: (),
-        send: Outbound<RestartObservedParentEvent>,
+        send: Outbound<ServiceMessage<RestartObservedParentEvent, Infallible>>,
         spawn: tina::RestartableChildDefinition<Child>,
-        spawn_observed: tina::SpawnObserved<tina::RestartableChildDefinition<Child>, RestartObservedParentEvent, ChildEvent>,
+        spawn_observed: tina::SpawnObserved<tina::RestartableChildDefinition<Child>, ServiceMessage<RestartObservedParentEvent, Infallible>, ChildEvent>,
         io: Infallible,
         shard: TestShard,
     }
 
     fn handle(
         &mut self,
-        msg: Self::Message,
+        message: Self::Message,
         ctx: &mut Context<'_, Self::Shard, Self::Reply>,
     ) -> Effect<Self> {
+        let msg = match message {
+            ServiceMessage::Event(event) => event,
+            ServiceMessage::Request(request) => match request {},
+        };
         match msg {
             RestartObservedParentEvent::Start => {
                 let child_seen = Rc::clone(&self.child_seen);
                 let order_log = Rc::clone(&self.order_log);
                 let factory_calls = Rc::clone(&self.factory_calls);
                 let panic_on_factory_call = self.panic_on_factory_call;
+                let initial_authority_drops = Rc::clone(&self.initial_authority_drops);
+                let restart_message_drops = Rc::clone(&self.restart_message_drops);
                 spawn_observed(tina::RestartableChildDefinition::new(
                     move || {
                         let call = factory_calls.get() + 1;
@@ -219,29 +237,44 @@ impl Isolate for RestartObservedParent {
                     },
                     4,
                 ))
-                .then_with_restarts(
+                .then_service_event_with_restarts(
                     {
-                        let initial_authority = Box::new(());
+                        let initial_authority = DropProbe(initial_authority_drops);
                         move |result| {
                             drop(initial_authority);
                             RestartObservedParentEvent::ChildStarted(result)
                         }
                     },
-                    RestartObservedParentEvent::ChildRestarted,
+                    move |child| {
+                        RestartObservedParentEvent::ChildRestarted(
+                            child,
+                            DropProbe(Rc::clone(&restart_message_drops)),
+                        )
+                    },
                 )
             }
             RestartObservedParentEvent::Restart => restart_children(),
             RestartObservedParentEvent::RestartWithFullMailbox => batch([
-                send(ctx.me(), RestartObservedParentEvent::Fill),
+                send(
+                    ctx.me(),
+                    ServiceMessage::Event(RestartObservedParentEvent::Fill),
+                ),
                 restart_children(),
             ]),
             RestartObservedParentEvent::Fill => noop(),
-            RestartObservedParentEvent::ChildStarted(Ok(child))
-            | RestartObservedParentEvent::ChildRestarted(child) => {
+            RestartObservedParentEvent::ChildStarted(Ok(child)) => {
                 self.incarnations.borrow_mut().push(child);
                 noop()
             }
-            RestartObservedParentEvent::ChildStarted(Err(_)) => stop(),
+            RestartObservedParentEvent::ChildRestarted(child, message_authority) => {
+                self.incarnations.borrow_mut().push(child);
+                drop(message_authority);
+                noop()
+            }
+            RestartObservedParentEvent::ChildStarted(Err(error)) => {
+                self.initial_errors.borrow_mut().push(error);
+                noop()
+            }
         }
     }
 }
@@ -571,6 +604,7 @@ fn observed_restart_delivers_each_typed_replacement_and_stales_old_address() {
     let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let child_seen = Rc::new(RefCell::new(Vec::new()));
     let incarnations = Rc::new(RefCell::new(Vec::new()));
+    let restart_message_drops = Rc::new(Cell::new(0));
     let parent = runtime.register(
         RestartObservedParent {
             child_seen: Rc::clone(&child_seen),
@@ -578,13 +612,19 @@ fn observed_restart_delivers_each_typed_replacement_and_stales_old_address() {
             incarnations: Rc::clone(&incarnations),
             factory_calls: Rc::new(Cell::new(0)),
             panic_on_factory_call: None,
+            initial_errors: Rc::new(RefCell::new(Vec::new())),
+            initial_authority_drops: Rc::new(Cell::new(0)),
+            restart_message_drops: Rc::clone(&restart_message_drops),
         },
         TestMailbox::new(4),
     );
 
     assert!(
         runtime
-            .try_send(parent, RestartObservedParentEvent::Start)
+            .try_send(
+                parent,
+                ServiceMessage::Event(RestartObservedParentEvent::Start),
+            )
             .is_ok()
     );
     assert_eq!(runtime.step(), 1);
@@ -595,7 +635,10 @@ fn observed_restart_delivers_each_typed_replacement_and_stales_old_address() {
     for expected_len in 2..=4 {
         assert!(
             runtime
-                .try_send(parent, RestartObservedParentEvent::Restart)
+                .try_send(
+                    parent,
+                    ServiceMessage::Event(RestartObservedParentEvent::Restart),
+                )
                 .is_ok()
         );
         assert_eq!(runtime.step(), 1);
@@ -618,12 +661,66 @@ fn observed_restart_delivers_each_typed_replacement_and_stales_old_address() {
     );
     assert_eq!(runtime.step(), 1);
     assert_eq!(&*child_seen.borrow(), &[9]);
+    assert_eq!(restart_message_drops.get(), 3);
+}
+
+#[test]
+fn service_observed_initial_factory_panic_is_typed_and_runtime_keeps_progressing() {
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let incarnations = Rc::new(RefCell::new(Vec::new()));
+    let factory_calls = Rc::new(Cell::new(0));
+    let initial_errors = Rc::new(RefCell::new(Vec::new()));
+    let initial_authority_drops = Rc::new(Cell::new(0));
+    let parent = runtime.register(
+        RestartObservedParent {
+            child_seen: Rc::new(RefCell::new(Vec::new())),
+            order_log: Rc::new(RefCell::new(Vec::new())),
+            incarnations: Rc::clone(&incarnations),
+            factory_calls: Rc::clone(&factory_calls),
+            panic_on_factory_call: Some(1),
+            initial_errors: Rc::clone(&initial_errors),
+            initial_authority_drops: Rc::clone(&initial_authority_drops),
+            restart_message_drops: Rc::new(Cell::new(0)),
+        },
+        TestMailbox::new(4),
+    );
+
+    let start = || ServiceMessage::Event(RestartObservedParentEvent::Start);
+    assert!(runtime.try_send(parent, start()).is_ok());
+    assert_eq!(
+        runtime.step(),
+        1,
+        "factory panic is contained in the effect"
+    );
+    assert_eq!(runtime.step(), 1, "typed error callback is delivered once");
+    assert_eq!(factory_calls.get(), 1);
+    assert_eq!(
+        initial_errors.borrow().as_slice(),
+        &[SpawnObservedError::FactoryPanicked]
+    );
+    assert_eq!(initial_authority_drops.get(), 1);
+    assert!(incarnations.borrow().is_empty());
+    assert!(
+        !runtime
+            .trace()
+            .iter()
+            .any(|event| matches!(event.kind(), RuntimeEventKind::Spawned { .. }))
+    );
+
+    assert!(runtime.try_send(parent, start()).is_ok());
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(factory_calls.get(), 2);
+    assert_eq!(initial_errors.borrow().len(), 1);
+    assert_eq!(initial_authority_drops.get(), 2);
+    assert_eq!(incarnations.borrow().len(), 1);
 }
 
 #[test]
 fn observed_restart_parent_full_rejects_without_hidden_delivery_queue() {
     let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let incarnations = Rc::new(RefCell::new(Vec::new()));
+    let restart_message_drops = Rc::new(Cell::new(0));
     let parent = runtime.register(
         RestartObservedParent {
             child_seen: Rc::new(RefCell::new(Vec::new())),
@@ -631,13 +728,19 @@ fn observed_restart_parent_full_rejects_without_hidden_delivery_queue() {
             incarnations: Rc::clone(&incarnations),
             factory_calls: Rc::new(Cell::new(0)),
             panic_on_factory_call: None,
+            initial_errors: Rc::new(RefCell::new(Vec::new())),
+            initial_authority_drops: Rc::new(Cell::new(0)),
+            restart_message_drops: Rc::clone(&restart_message_drops),
         },
         TestMailbox::new(1),
     );
 
     assert!(
         runtime
-            .try_send(parent, RestartObservedParentEvent::Start)
+            .try_send(
+                parent,
+                ServiceMessage::Event(RestartObservedParentEvent::Start),
+            )
             .is_ok()
     );
     assert_eq!(runtime.step(), 1);
@@ -646,7 +749,10 @@ fn observed_restart_parent_full_rejects_without_hidden_delivery_queue() {
 
     assert!(
         runtime
-            .try_send(parent, RestartObservedParentEvent::RestartWithFullMailbox)
+            .try_send(
+                parent,
+                ServiceMessage::Event(RestartObservedParentEvent::RestartWithFullMailbox),
+            )
             .is_ok()
     );
     assert_eq!(runtime.step(), 1);
@@ -662,6 +768,7 @@ fn observed_restart_parent_full_rejects_without_hidden_delivery_queue() {
             } if target_isolate == parent.isolate()
         )
     }));
+    assert_eq!(restart_message_drops.get(), 1);
     assert_eq!(runtime.step(), 0, "no hidden replacement delivery remains");
 }
 
@@ -669,6 +776,7 @@ fn observed_restart_parent_full_rejects_without_hidden_delivery_queue() {
 fn observed_restart_parent_closed_rejects_without_hidden_delivery_queue() {
     let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let incarnations = Rc::new(RefCell::new(Vec::new()));
+    let restart_message_drops = Rc::new(Cell::new(0));
     let parent_mailbox = TestMailbox::new(4);
     let parent = runtime.register(
         RestartObservedParent {
@@ -677,13 +785,19 @@ fn observed_restart_parent_closed_rejects_without_hidden_delivery_queue() {
             incarnations: Rc::clone(&incarnations),
             factory_calls: Rc::new(Cell::new(0)),
             panic_on_factory_call: None,
+            initial_errors: Rc::new(RefCell::new(Vec::new())),
+            initial_authority_drops: Rc::new(Cell::new(0)),
+            restart_message_drops: Rc::clone(&restart_message_drops),
         },
         parent_mailbox.clone(),
     );
 
     assert!(
         runtime
-            .try_send(parent, RestartObservedParentEvent::Start)
+            .try_send(
+                parent,
+                ServiceMessage::Event(RestartObservedParentEvent::Start),
+            )
             .is_ok()
     );
     assert_eq!(runtime.step(), 1);
@@ -692,7 +806,10 @@ fn observed_restart_parent_closed_rejects_without_hidden_delivery_queue() {
 
     assert!(
         runtime
-            .try_send(parent, RestartObservedParentEvent::Restart)
+            .try_send(
+                parent,
+                ServiceMessage::Event(RestartObservedParentEvent::Restart),
+            )
             .is_ok()
     );
     parent_mailbox.close();
@@ -708,6 +825,7 @@ fn observed_restart_parent_closed_rejects_without_hidden_delivery_queue() {
             } if target_isolate == parent.isolate()
         )
     }));
+    assert_eq!(restart_message_drops.get(), 1);
     assert_eq!(runtime.step(), 0, "no hidden replacement delivery remains");
 }
 
@@ -716,6 +834,7 @@ fn observed_restart_factory_panic_skips_callback_and_later_retry_succeeds() {
     let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
     let incarnations = Rc::new(RefCell::new(Vec::new()));
     let factory_calls = Rc::new(Cell::new(0));
+    let restart_message_drops = Rc::new(Cell::new(0));
     let parent = runtime.register(
         RestartObservedParent {
             child_seen: Rc::new(RefCell::new(Vec::new())),
@@ -723,13 +842,19 @@ fn observed_restart_factory_panic_skips_callback_and_later_retry_succeeds() {
             incarnations: Rc::clone(&incarnations),
             factory_calls: Rc::clone(&factory_calls),
             panic_on_factory_call: Some(2),
+            initial_errors: Rc::new(RefCell::new(Vec::new())),
+            initial_authority_drops: Rc::new(Cell::new(0)),
+            restart_message_drops: Rc::clone(&restart_message_drops),
         },
         TestMailbox::new(4),
     );
 
     assert!(
         runtime
-            .try_send(parent, RestartObservedParentEvent::Start)
+            .try_send(
+                parent,
+                ServiceMessage::Event(RestartObservedParentEvent::Start),
+            )
             .is_ok()
     );
     assert_eq!(runtime.step(), 1);
@@ -738,11 +863,15 @@ fn observed_restart_factory_panic_skips_callback_and_later_retry_succeeds() {
 
     assert!(
         runtime
-            .try_send(parent, RestartObservedParentEvent::Restart)
+            .try_send(
+                parent,
+                ServiceMessage::Event(RestartObservedParentEvent::Restart),
+            )
             .is_ok()
     );
     assert_eq!(runtime.step(), 1);
     assert_eq!(factory_calls.get(), 2);
+    assert_eq!(restart_message_drops.get(), 0);
     assert_eq!(incarnations.borrow().as_slice(), &[initial]);
     assert!(runtime.trace().iter().any(|event| {
         matches!(
@@ -761,13 +890,17 @@ fn observed_restart_factory_panic_skips_callback_and_later_retry_succeeds() {
 
     assert!(
         runtime
-            .try_send(parent, RestartObservedParentEvent::Restart)
+            .try_send(
+                parent,
+                ServiceMessage::Event(RestartObservedParentEvent::Restart),
+            )
             .is_ok()
     );
     assert_eq!(runtime.step(), 1);
     assert_eq!(runtime.step(), 1);
     assert_eq!(factory_calls.get(), 3);
     assert_eq!(incarnations.borrow().len(), 2);
+    assert_eq!(restart_message_drops.get(), 1);
     assert_ne!(incarnations.borrow()[1].address, initial.address);
 }
 

@@ -4422,7 +4422,23 @@ where
         if self.mailbox_capacity == 0 {
             return Err(SpawnObservedError::ZeroMailboxCapacity);
         }
-        Ok(self.spawn(runtime, parent))
+        let adapter = Rc::new(*self);
+        let isolate = catch_unwind(AssertUnwindSafe(|| (adapter.factory)()))
+            .map_err(|_| SpawnObservedError::FactoryPanicked)?;
+        let bootstrap_message = adapter
+            .bootstrap_factory
+            .as_ref()
+            .map(|factory| catch_unwind(AssertUnwindSafe(factory)))
+            .transpose()
+            .map_err(|_| SpawnObservedError::FactoryPanicked)?;
+        let mut outcome = runtime.spawn_isolate::<I, Outbound>(
+            parent,
+            isolate,
+            adapter.mailbox_capacity,
+            bootstrap_message,
+        );
+        outcome.restart_recipe = Some(adapter);
+        Ok(outcome)
     }
 }
 
@@ -4513,8 +4529,14 @@ where
             return Err(SpawnObservedError::ZeroMailboxCapacity);
         }
         let adapter = Rc::new(*self);
-        let isolate = (adapter.factory)();
-        let bootstrap = adapter.bootstrap_factory.as_ref().map(|f| f());
+        let isolate = catch_unwind(AssertUnwindSafe(|| (adapter.factory)()))
+            .map_err(|_| SpawnObservedError::FactoryPanicked)?;
+        let bootstrap = adapter
+            .bootstrap_factory
+            .as_ref()
+            .map(|factory| catch_unwind(AssertUnwindSafe(factory.as_ref())))
+            .transpose()
+            .map_err(|_| SpawnObservedError::FactoryPanicked)?;
         Ok(runtime.register_remote_child::<I, Outbound>(
             isolate,
             adapter.mailbox_capacity,

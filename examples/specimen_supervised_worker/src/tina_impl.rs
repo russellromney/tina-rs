@@ -1,7 +1,8 @@
 //! Tina: a supervised worker. The parent owns the current typed child
-//! reference. `spawn_observed(...).then_with_restarts(...)` delivers both the
-//! initial child and every successful replacement as ordinary bounded parent
-//! messages, so neither the host nor application code reconstructs addresses.
+//! reference. `spawn_observed(...).then_service_event_with_restarts(...)`
+//! delivers both the initial child and every successful replacement as
+//! ordinary bounded parent events, so neither the host nor application code
+//! reconstructs addresses or service envelopes.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -49,12 +50,12 @@ impl Worker {
 
 #[derive(Debug)]
 enum ParentEvent {
-    WorkerStarted {
+    Started {
         result: SpawnObservedResult<ServiceMessage<Infallible, WorkerRequest>, WorkerReply>,
         request: RequestContext<ParentReply>,
     },
-    WorkerRestarted(ChildRef<ServiceMessage<Infallible, WorkerRequest>, WorkerReply>),
-    WorkerDone(RequestContext<ParentReply>, CallOutcome<WorkerReply>),
+    Restarted(ChildRef<ServiceMessage<Infallible, WorkerRequest>, WorkerReply>),
+    WorkDone(RequestContext<ParentReply>, CallOutcome<WorkerReply>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -102,7 +103,7 @@ impl Parent {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match event {
-            ParentEvent::WorkerStarted {
+            ParentEvent::Started {
                 result: Ok(worker),
                 request,
             } => {
@@ -110,18 +111,18 @@ impl Parent {
                 self.worker = Some(worker);
                 reply_to(request, ParentReply::Started)
             }
-            ParentEvent::WorkerStarted {
+            ParentEvent::Started {
                 result: Err(error),
                 request,
             } => {
                 self.starting = false;
                 reply_to(request, ParentReply::SpawnRejected(error))
             }
-            ParentEvent::WorkerRestarted(worker) => {
+            ParentEvent::Restarted(worker) => {
                 self.worker = Some(worker);
                 noop()
             }
-            ParentEvent::WorkerDone(request, outcome) => {
+            ParentEvent::WorkDone(request, outcome) => {
                 reply_to(request, parent_reply_from_worker(outcome))
             }
         }
@@ -140,14 +141,9 @@ impl Parent {
                 let capacity = self.worker_capacity;
                 call.capture(|request| {
                     spawn_observed(RestartableChildDefinition::new(move || Worker, capacity))
-                        .then_with_restarts(
-                            move |result| {
-                                ServiceMessage::Event(ParentEvent::WorkerStarted {
-                                    result,
-                                    request,
-                                })
-                            },
-                            |worker| ServiceMessage::Event(ParentEvent::WorkerRestarted(worker)),
+                        .then_service_event_with_restarts(
+                            move |result| ParentEvent::Started { result, request },
+                            ParentEvent::Restarted,
                         )
                 })
             }
@@ -159,7 +155,7 @@ impl Parent {
                         WorkerRequest::Process(job),
                         CALL_TIMEOUT,
                     ))
-                    .reply_service_event(ParentEvent::WorkerDone)
+                    .reply_service_event(ParentEvent::WorkDone)
                 }
                 None => call.reply(ParentReply::NotStarted),
             },
