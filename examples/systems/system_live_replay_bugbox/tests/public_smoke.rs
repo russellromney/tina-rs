@@ -11,6 +11,7 @@ fn assert_bugbox(report: system_live_replay_bugbox::BugboxReport) {
         report.live_trace_shape.trace_hash, 0,
         "live trace hash must be non-zero: {report:#?}",
     );
+    assert_eq!(report.capture.expected, report.live_trace_shape);
 
     let original = &report.capture.history;
     let non_poison = original
@@ -61,6 +62,7 @@ fn assert_bugbox(report: system_live_replay_bugbox::BugboxReport) {
         report.shrunk.capture().live_facts == report.capture.live_facts,
         "live-derived shrink must preserve proving facts",
     );
+    assert_eq!(report.capture_replay.live_facts, report.capture.live_facts);
     assert!(!report.live_pressure.non_zero());
     assert!(!report.capture_summary.replay_blocked);
     assert!(report.unsupported_mismatch_seen);

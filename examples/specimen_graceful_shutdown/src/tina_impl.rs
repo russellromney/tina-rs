@@ -82,16 +82,21 @@ impl Consumer {
 
 impl Consumer {
     fn maybe_finish(&self) -> Effect<Self> {
-        match self.expected {
-            Some(produced) if self.processed >= produced => stop_with(Report {
-                items_produced: produced,
-                items_processed: self.processed,
-                signal_received: self.signal_received,
-                items_remaining_in_queue_at_exit: 0,
-                exit_clean: self.exit_clean,
-            }),
-            _ => noop(),
+        match self.finished_report() {
+            Some(report) => stop_with(report),
+            None => noop(),
         }
+    }
+
+    fn finished_report(&self) -> Option<Report> {
+        let produced = self.expected?;
+        (self.processed >= produced).then_some(Report {
+            items_produced: produced,
+            items_processed: self.processed,
+            signal_received: self.signal_received,
+            items_remaining_in_queue_at_exit: 0,
+            exit_clean: self.exit_clean,
+        })
     }
 }
 
@@ -159,7 +164,10 @@ impl Producer {
                     ])
                 }
             }
-            ProducerMsg::TimerFired(_, Err(_)) => noop(),
+            ProducerMsg::TimerFired(_, Err(_)) => {
+                self.stopped = true;
+                send(self.consumer, dependency_failure(self.produced))
+            }
             ProducerMsg::Stop => {
                 self.stopped = true;
                 self.signal_stop = true;
@@ -174,16 +182,17 @@ impl Producer {
             }
             ProducerMsg::SignalFailed => {
                 self.stopped = true;
-                send(
-                    self.consumer,
-                    ConsumerMsg::ProducerDone {
-                        produced: self.produced,
-                        signal_received: false,
-                        exit_clean: false,
-                    },
-                )
+                send(self.consumer, dependency_failure(self.produced))
             }
         }
+    }
+}
+
+fn dependency_failure(produced: u32) -> ConsumerMsg {
+    ConsumerMsg::ProducerDone {
+        produced,
+        signal_received: false,
+        exit_clean: false,
     }
 }
 
@@ -298,5 +307,32 @@ mod tests {
             signal_completion(Ok("sigint".to_owned())),
             ProducerMsg::Stop
         ));
+
+        assert!(matches!(
+            dependency_failure(3),
+            ConsumerMsg::ProducerDone {
+                produced: 3,
+                signal_received: false,
+                exit_clean: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn dependency_failure_still_drains_before_reporting_unclean() {
+        let mut consumer = Consumer {
+            processed: 2,
+            expected: Some(3),
+            signal_received: false,
+            exit_clean: false,
+        };
+        assert!(consumer.finished_report().is_none());
+        consumer.processed = 3;
+        let report = consumer.finished_report().expect("all admitted work drained");
+        assert_eq!(report.items_produced, 3);
+        assert_eq!(report.items_processed, 3);
+        assert_eq!(report.items_remaining_in_queue_at_exit, 0);
+        assert!(!report.signal_received);
+        assert!(!report.exit_clean, "dependency failure must never look clean");
     }
 }

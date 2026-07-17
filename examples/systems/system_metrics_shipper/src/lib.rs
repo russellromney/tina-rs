@@ -22,8 +22,10 @@ use tina_runtime::lifecycle::{
     ServiceTopology, ShutdownChoreography, ShutdownStep, StepOutcome, TopologyComponent,
 };
 use tina_runtime::{
-    AdmitDecision, CallOutcome, DefaultThreadedMailboxFactory, DrainStage, DrainState,
-    LocalPermitGate, LocalPermitName, LocalSystem, Permit, call_request, sleep,
+    AdmitDecision, CallOutcome, ConcurrencyParkError, ConcurrencyParkTicket,
+    ConcurrencyPendingReplies, ConcurrencyReplyError, DefaultThreadedMailboxFactory, DrainStage,
+    DrainState, LocalPermitGate, LocalPermitName, LocalSystem, Permit, call_request,
+    request_effect_after_concurrency_park, sleep,
 };
 
 /// One submitted metric event. Payload is opaque; the specimen only cares
@@ -143,6 +145,9 @@ pub struct ShipperStats {
     pub ticks_fired_useful: u64,
     pub ticks_fired_stale: u64,
     pub ticks_fired_idle: u64,
+    pub await_waiters_high_water: usize,
+    pub await_caller_gone: u64,
+    pub await_full_rejects: u64,
 }
 
 /// Snapshot of every sink-side cap and pressure counter.
@@ -195,6 +200,8 @@ pub enum ShipperReply {
     Stats(ShipperStats),
     /// [`ShipperRequest::AwaitRouted`] resolved; `routed` is delivered + lost.
     Routed { routed: u64 },
+    AwaitBusy,
+    RouteWaitStopped { routed: u64 },
     Stopped {
         flushed_on_drain: usize,
         drained_batches: usize,
@@ -246,7 +253,8 @@ struct Shipper {
     drain: DrainState,
     pending_stop: Option<RequestContext<ShipperReply>>,
     /// Host wait for "burst has reached the sink (or been lost)".
-    pending_await: Option<(u64, RequestContext<ShipperReply>)>,
+    pending_await: ConcurrencyPendingReplies<u64, ShipperReply>,
+    pending_await_ticket: Option<(u64, ConcurrencyParkTicket<u64>)>,
     /// Events successfully delivered to the sink (Ack path).
     events_delivered: u64,
     drained_events: usize,
@@ -280,7 +288,10 @@ impl Shipper {
     ) -> RequestEffect<Self> {
         match request {
             ShipperRequest::Submit { event } => self.on_submit(event, call),
-            ShipperRequest::Stats => call.reply(ShipperReply::Stats(self.snapshot())),
+            ShipperRequest::Stats => {
+                self.sweep_await();
+                call.reply(ShipperReply::Stats(self.snapshot()))
+            }
             ShipperRequest::AwaitRouted { target } => self.on_await_routed(target, call),
             ShipperRequest::Stop => self.on_stop(call),
         }
@@ -301,7 +312,8 @@ impl Shipper {
                 .catch_up(RecurringCatchUp::Skip),
             drain: DrainState::new(),
             pending_stop: None,
-            pending_await: None,
+            pending_await: ConcurrencyPendingReplies::with_capacity("shipper.await_routed", 1),
+            pending_await_ticket: None,
             events_delivered: 0,
             drained_events: 0,
             drained_batches: 0,
@@ -313,7 +325,8 @@ impl Shipper {
     }
 
     fn routed_total(&self) -> u64 {
-        self.events_delivered + self.stats.events_lost_on_flush
+        self.events_delivered
+            .saturating_add(self.stats.events_lost_on_flush)
     }
 
     fn on_await_routed(
@@ -321,36 +334,76 @@ impl Shipper {
         target: u64,
         call: RequestCall<'_, Self>,
     ) -> RequestEffect<Self> {
+        self.sweep_await();
         if self.routed_total() >= target {
             return call.reply(ShipperReply::Routed {
                 routed: self.routed_total(),
             });
         }
-        if self.pending_await.is_some() {
-            // Specimen hosts issue one await at a time; a second waiter is a
-            // real policy reject rather than a silent overwrite.
-            return call.reject(tina::CallRejectedReason::UnsupportedMessage);
-        }
-        call.capture(|req| {
-            self.pending_await = Some((target, req));
-            noop()
-        })
+        let (ticket, permit) = match self.pending_await.park_request(target, call) {
+            Ok(parked) => parked,
+            Err(ConcurrencyParkError::Admission { call, .. })
+            | Err(ConcurrencyParkError::DuplicateKey { call, .. })
+            | Err(ConcurrencyParkError::PendingFull { call, .. }) => {
+                return call.reply(ShipperReply::AwaitBusy);
+            }
+        };
+        self.pending_await_ticket = Some((target, ticket));
+        request_effect_after_concurrency_park(permit, noop())
     }
 
     fn maybe_complete_await(&mut self) -> Effect<Self> {
-        let Some((target, req)) = self.pending_await.take() else {
+        self.sweep_await();
+        let Some((target, _)) = self.pending_await_ticket.as_ref() else {
             return noop();
         };
-        if self.routed_total() >= target {
-            return reply_to(
-                req,
-                ShipperReply::Routed {
-                    routed: self.routed_total(),
-                },
-            );
+        if self.routed_total() < *target {
+            return noop();
         }
-        self.pending_await = Some((target, req));
-        noop()
+        let (_, ticket) = self
+            .pending_await_ticket
+            .take()
+            .expect("checked pending await ticket");
+        self.reply_await_ticket(
+            ticket,
+            ShipperReply::Routed {
+                routed: self.routed_total(),
+            },
+        )
+    }
+
+    fn settle_await_on_stop(&mut self) -> Effect<Self> {
+        self.sweep_await();
+        let Some((_, ticket)) = self.pending_await_ticket.take() else {
+            return noop();
+        };
+        self.reply_await_ticket(
+            ticket,
+            ShipperReply::RouteWaitStopped {
+                routed: self.routed_total(),
+            },
+        )
+    }
+
+    fn reply_await_ticket(
+        &mut self,
+        ticket: ConcurrencyParkTicket<u64>,
+        reply: ShipperReply,
+    ) -> Effect<Self> {
+        match self.pending_await.reply_ticket(ticket, reply) {
+            Ok(effect) => effect,
+            Err(ConcurrencyReplyError::CallerGone { .. }) => noop(),
+            Err(ConcurrencyReplyError::Missing { .. })
+            | Err(ConcurrencyReplyError::StaleTicket { .. }) => {
+                panic!("shipper await ticket must remain owned until settlement")
+            }
+        }
+    }
+
+    fn sweep_await(&mut self) {
+        if self.pending_await.sweep() > 0 {
+            self.pending_await_ticket = None;
+        }
     }
 
     fn on_submit(&mut self, event: Event, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
@@ -404,10 +457,14 @@ impl Shipper {
 
         if self.buffer.is_empty() && self.flush_gate.is_idle() {
             self.drain.finish();
-            return call.reply(ShipperReply::Stopped {
-                flushed_on_drain: self.drained_events,
-                drained_batches: self.drained_batches,
-            });
+            let await_effect = self.settle_await_on_stop();
+            return call.reply_and(
+                ShipperReply::Stopped {
+                    flushed_on_drain: self.drained_events,
+                    drained_batches: self.drained_batches,
+                },
+                vec![await_effect],
+            );
         }
         call.capture(|req| {
             self.pending_stop = Some(req);
@@ -448,7 +505,7 @@ impl Shipper {
         let succeeded = matches!(outcome, CallOutcome::Replied(SinkReply::Ack));
         if succeeded {
             self.drain.record_complete();
-            self.events_delivered += count as u64;
+            self.events_delivered = self.events_delivered.saturating_add(count as u64);
             match kind {
                 FlushKind::Size => self.stats.batches_flushed_by_size += 1,
                 FlushKind::Time => self.stats.batches_flushed_by_time += 1,
@@ -461,7 +518,10 @@ impl Shipper {
         } else {
             self.drain.record_cancelled_or_retired();
             self.stats.flush_failures += 1;
-            self.stats.events_lost_on_flush += count as u64;
+            self.stats.events_lost_on_flush = self
+                .stats
+                .events_lost_on_flush
+                .saturating_add(count as u64);
         }
 
         let drain_done =
@@ -474,7 +534,7 @@ impl Shipper {
                     drained_batches: self.drained_batches,
                 };
                 // Also release any host await so it does not hang across stop.
-                let await_effect = self.maybe_complete_await();
+                let await_effect = self.settle_await_on_stop();
                 return batch(vec![reply_to(req, reply), await_effect]);
             }
             return self.maybe_complete_await();
@@ -545,7 +605,12 @@ impl Shipper {
     }
 
     fn snapshot(&self) -> ShipperStats {
-        self.stats
+        let mut stats = self.stats;
+        let await_report = self.pending_await.report();
+        stats.await_waiters_high_water = await_report.parked_high_water;
+        stats.await_caller_gone = await_report.caller_gone_count;
+        stats.await_full_rejects = await_report.admission.full_count;
+        stats
     }
 }
 
@@ -642,7 +707,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         // Force buffer overflow: parallel callers + slow sink + small
         // buffer. Each in-flight flush blocks for sink_flush_delay_ms so
         // the buffer fills and the next Submit gets a typed Dropped.
-        events: config.events * 4,
+        events: config.events.saturating_mul(4),
         callers: 8,
         buffer_capacity: (config.buffer_capacity / 2).max(2),
         batch_size: (config.batch_size / 2).max(1),
@@ -719,7 +784,10 @@ pub fn run_overload(config: &RunConfig) -> anyhow::Result<OverloadReport> {
     world.wait_for_flushed_events(accepted, Duration::from_secs(3))?;
     let stats = world.shipper_stats()?;
     let sink = world.sink_stats()?;
-    let _ = world.stop_and_shutdown()?;
+    anyhow::ensure!(
+        world.stop_and_shutdown()?,
+        "overload run service or owner shutdown not clean"
+    );
     Ok(OverloadReport {
         submitted: outcomes.len(),
         accepted,
@@ -1073,21 +1141,21 @@ impl World {
                 let end = ((caller + 1) * per_caller).min(events);
                 threads.push(scope.spawn(
                     move || -> anyhow::Result<Vec<CallOutcome<ShipperReply>>> {
-                    gate.wait();
-                    let mut local = Vec::with_capacity(end.saturating_sub(start));
-                    for i in start..end {
-                        let event = Event {
-                            key: format!("k{i}"),
-                            value: i as i64,
-                        };
-                        let outcome = self.app.call_blocking_request(
-                            shipper,
-                            ShipperRequest::Submit { event },
-                            timeout,
-                        )?;
-                        local.push(outcome);
-                    }
-                    Ok(local)
+                        gate.wait();
+                        let mut local = Vec::with_capacity(end.saturating_sub(start));
+                        for i in start..end {
+                            let event = Event {
+                                key: format!("k{i}"),
+                                value: i as i64,
+                            };
+                            let outcome = self.app.call_blocking_request(
+                                shipper,
+                                ShipperRequest::Submit { event },
+                                timeout,
+                            )?;
+                            local.push(outcome);
+                        }
+                        Ok(local)
                     },
                 ));
             }
@@ -1154,8 +1222,8 @@ impl World {
             self.stop_timeout,
         )?;
         let clean = matches!(outcome, CallOutcome::Replied(ShipperReply::Stopped { .. }));
-        self.shutdown()?;
-        Ok(clean)
+        let owner_clean = self.shutdown()?;
+        Ok(clean && owner_clean)
     }
 
     /// Service-level drain (the shipper's own `Stop`/`DrainState`
@@ -1165,5 +1233,100 @@ impl World {
     fn shutdown(self) -> anyhow::Result<bool> {
         let report = self.app.shutdown().join_report();
         Ok(report.error().is_none())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wait_until_await_is_parked(world: &World) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let stats = world.shipper_stats().expect("await pressure");
+            if stats.await_waiters_high_water == 1 && stats.await_caller_gone == 0 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "await caller was not parked before the deadline: {stats:?}"
+            );
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn await_routed_is_bounded_and_reclaims_a_gone_caller() {
+        let config = RunConfig {
+            events: 1,
+            callers: 1,
+            batch_window_ms: 100,
+            ..RunConfig::default()
+        };
+        let world = World::start(&config).expect("world");
+        let first = thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                world.app.call_blocking_request(
+                    world.shipper,
+                    ShipperRequest::AwaitRouted { target: 1 },
+                    Duration::from_millis(250),
+                )
+            });
+            wait_until_await_is_parked(&world);
+            let second = world
+                .app
+                .call_blocking_request(
+                    world.shipper,
+                    ShipperRequest::AwaitRouted { target: 2 },
+                    Duration::from_millis(50),
+                )
+                .expect("second call");
+            assert!(matches!(
+                second,
+                CallOutcome::Replied(ShipperReply::AwaitBusy)
+            ));
+            waiting.join().expect("wait thread").expect("first call")
+        });
+        assert!(matches!(first, CallOutcome::Timeout));
+
+        let stats = world.shipper_stats().expect("stats sweep");
+        assert_eq!(stats.await_waiters_high_water, 1);
+        assert_eq!(stats.await_full_rejects, 1);
+        assert_eq!(stats.await_caller_gone, 1);
+        assert!(world.stop_and_shutdown().expect("shutdown"));
+    }
+
+    #[test]
+    fn stop_explicitly_settles_an_unreachable_route_waiter() {
+        let config = RunConfig::default();
+        let world = World::start(&config).expect("world");
+        thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                world.app.call_blocking_request(
+                    world.shipper,
+                    ShipperRequest::AwaitRouted { target: 1 },
+                    Duration::from_secs(1),
+                )
+            });
+            wait_until_await_is_parked(&world);
+            let stopped = world
+                .app
+                .call_blocking_request(
+                    world.shipper,
+                    ShipperRequest::Stop,
+                    Duration::from_secs(1),
+                )
+                .expect("stop call");
+            assert!(matches!(
+                stopped,
+                CallOutcome::Replied(ShipperReply::Stopped { .. })
+            ));
+            let waiter = waiting.join().expect("wait thread").expect("wait call");
+            assert!(matches!(
+                waiter,
+                CallOutcome::Replied(ShipperReply::RouteWaitStopped { routed: 0 })
+            ));
+        });
+        assert!(world.shutdown().expect("shutdown"));
     }
 }
