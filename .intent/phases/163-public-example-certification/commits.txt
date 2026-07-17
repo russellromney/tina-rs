@@ -230,6 +230,7 @@ head and its fully green replacement workflow.
 | #383 | Pre-allocation bounded session identities and duplicate accounting | 0b341c159150897523afb6c19a4e98c19cb9de50 | 77be6c1f1215904ff40bb294d22509ef0c0795b5 | 29569751683 SUCCESS |
 | #384 | LocalSystem hosts, transactional persistence, graceful dependency failure, replay parity, and bounded metrics waiters | 7e72bfc5050f3c3693ab01f91de97048c70146ea | da0c9050f79e1ca752e1f93393b89d5eed6f2625 | 29570501459 SUCCESS |
 | #385 | Mini-SaaS retained keepalive authority and post-owner typed settlement | d1a3dac9debd693bfaf37f0070c5dea4ade362fa | 0f28b65c5b48c8236687fbb72526999a4a5845c5 | 29570879101 SUCCESS |
+| #386 | Exact SQLite bridge failures, envelope-free host calls, and retryable close settlement | a32cc9748cd713d86a45b2b4d4ac96a957edcd35 | 325157cbbe72c420ec09fe2373d2eeb093de2af3 | 29571201133 SUCCESS |
 
 Remaining remediation at this checkpoint: bounded session identities, SQLite
 failure fidelity, mini-SaaS retained keepalive authority, residual LocalSystem
