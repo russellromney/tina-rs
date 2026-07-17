@@ -93,3 +93,22 @@ blast-radius proof, and post-merge workflow result here.
 ### Next eligible (I0A+I0B complete once post-merge green)
 - D1, F1, F2, F3, F4, M2, M3, M5 concurrent
 - M1 waits F1; M4 waits F2+F3+F4; M6 waits migrations; C1 waits all
+
+## In flight (not yet merged)
+
+### D1 — PR #367
+- Branch: agent/phase-163-d1-bounds-outcomes
+- Head: 5487f282a711d747daadefc705d32ba4a1e74f6a
+- URL: https://github.com/russellromney/tina-rs/pull/367
+- Worktree: tina-rs-phase-163-d1
+- Adversarial review: in progress
+- CI: run 29554224207 in progress
+
+### F1 — PR #368
+- Branch: agent/phase-163-f1-terminal-observation
+- Head: ddb620419117316a6446e235b4e900afca63515a
+- URL: https://github.com/russellromney/tina-rs/pull/368
+- Worktree: tina-rs-phase-163-f1
+- Adversarial review: in progress
+- CI: run 29554363635 in progress
+- Note: macro ServiceMessage synthesis deferred; same-shard terminal observation only
