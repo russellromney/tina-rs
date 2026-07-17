@@ -79,7 +79,8 @@ blast-radius proof, and post-merge workflow result here.
 - Replacement PR CI: https://github.com/russellromney/tina-rs/actions/runs/29552844232 SUCCESS
 - Merge commit: 69ff461ae09b7a9b902e1b768026e109fa3a7e87
 - Merged at: 2026-07-17T03:43:19Z
-- Post-merge main workflow: https://github.com/russellromney/tina-rs/actions/runs/29553076469 (awaiting)
+- Post-merge main workflow: https://github.com/russellromney/tina-rs/actions/runs/29553076469 SUCCESS
+- I0A+I0B baseline complete; origin/main=69ff461ae09b7a9b902e1b768026e109fa3a7e87
 - origin/main after merge: 69ff461ae09b7a9b902e1b768026e109fa3a7e87
 
 ### Direct proof (I0B)
