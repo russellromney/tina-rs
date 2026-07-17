@@ -231,10 +231,26 @@ head and its fully green replacement workflow.
 | #384 | LocalSystem hosts, transactional persistence, graceful dependency failure, replay parity, and bounded metrics waiters | 7e72bfc5050f3c3693ab01f91de97048c70146ea | da0c9050f79e1ca752e1f93393b89d5eed6f2625 | 29570501459 SUCCESS |
 | #385 | Mini-SaaS retained keepalive authority and post-owner typed settlement | d1a3dac9debd693bfaf37f0070c5dea4ade362fa | 0f28b65c5b48c8236687fbb72526999a4a5845c5 | 29570879101 SUCCESS |
 | #386 | Exact SQLite bridge failures, envelope-free host calls, and retryable close settlement | a32cc9748cd713d86a45b2b4d4ac96a957edcd35 | 325157cbbe72c420ec09fe2373d2eeb093de2af3 | 29571201133 SUCCESS |
+| #388 | Typed HTTP caller settlement on buffered keepalive peer disconnect | 0ae02ac8beaa98b34147ff60654f4dc38e16c145 | ae39332318e0b7621d5cea755bb0efde8c3ef712 | 29573383824 SUCCESS |
 
-Remaining remediation at this checkpoint: bounded session identities, SQLite
-failure fidelity, mini-SaaS retained keepalive authority, residual LocalSystem
-hosts, and typed HTTP caller-settlement proof. M6 and C1 remain incomplete.
+The #364-#376 remediation train is complete. M6 merged separately as #387;
+its post-merge adversarial audit is tracked below. C1 remains incomplete.
+
+### HTTP settlement correction (#388)
+
+- The original #373 proof was falsified: its short service timeout, not peer
+  EOF, closed the typed caller.
+- Fully buffered plain-TCP keepalive calls now use one bounded observed child
+  with reserved terminal delivery; peer EOF closes the caller exactly once.
+- Capacity-1/2, TLS, and streaming-request paths retain their documented
+  fallback behavior; early HTTP and WebSocket bytes are preserved.
+- Disconnect cancels an issued response source and settles body metrics.
+- A first CI run exposed terminal-request monitor contention on Linux. The
+  monitor is now keepalive-only, with a trace proof that `Connection: close`
+  creates no monitor child and five repeated mini-SaaS soak runs showing no
+  unexpected 4xx responses.
+- PR workflow 29573383824: SUCCESS. Post-merge `main` workflow 29573802769:
+  SUCCESS on ae39332318e0b7621d5cea755bb0efde8c3ef712.
 
 ## M6 #387 MERGED — residual host migrations complete
 
