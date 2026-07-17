@@ -39,11 +39,21 @@ cargo run --manifest-path examples/specimen_grpc_counter/Cargo.toml
 cargo test --manifest-path examples/specimen_grpc_counter/Cargo.toml
 ```
 
-The service uses hand-written `prost::Message` types and `GrpcRouter` routes:
-`unary("/specimen.Counter/Increment", ...)`,
-`server_streaming("/specimen.Counter/Watch", ...)`,
+The service uses hand-written `prost::Message` types and typed `GrpcRouter`
+routes. Stateful unary and bidirectional methods point directly at split-service
+request addresses:
+
+```rust,ignore
+let router = GrpcRouter::<S>::new(limits)
+    .with_actor_route_capacity(16)?
+    .try_unary_actor("/specimen.Counter/Increment", counter.requests, timeout)?
+    .try_streaming_actor("/specimen.Counter/Chat", streams.requests, timeout)?;
+```
+
+The complete route set uses `try_unary_actor` for `Increment` and `Forbidden`,
+`server_streaming_buffered("/specimen.Counter/Watch", ...)`,
 `client_streaming("/specimen.Counter/Sum", ...)`, and
-`streaming("/specimen.Counter/Chat", ...)`. The wire path is:
+`try_streaming_actor` for `Chat`. The wire path is:
 
 ```text
 TCP -> Tina HTTP/2 h2c -> gRPC frame -> prost payload -> service handler
@@ -52,11 +62,17 @@ TCP -> Tina HTTP/2 h2c -> gRPC frame -> prost payload -> service handler
 This is intentionally not tonic feature parity. It ships server-side h2c
 unary, server-streaming, client-streaming, and bidirectional streaming, typed
 status trailers, per-message caps, explicit service-call timeouts, and no
-compression. The bidirectional route uses `GrpcStreamingCall`,
-`GrpcRequestStream`, and `GrpcStreamingResponse` so service code does not
-hand-parse gRPC frame bytes. The example keeps per-call response-source
-ownership explicit with a named bounded source pool, so overload is a visible
-`ResourceExhausted` status instead of a hidden queue. The tonic h2c proof is:
+compression. The bidirectional route atomically moves `GrpcStreamingCall` and
+its `GrpcRequestStream` into a streaming-factory service. That service observes
+one child spawn and returns the child's typed response-source address. There is
+no mutex stream slot, router-state mutex, or preallocated response pool.
+
+Actor-route admission is bounded once for the router. Over-capacity calls become
+`ResourceExhausted`; target `Closed`, route deadline, and runtime rejection map
+to distinct `Unavailable`, `DeadlineExceeded`, and `FailedPrecondition`
+statuses. If the HTTP caller disappears before a stream source returns, the
+router cancels that source so the child releases its owned request stream. The
+tonic h2c proof is:
 
 ```sh
 cargo test --manifest-path examples/specimen_grpc_counter/Cargo.toml specimen_grpc_counter_tonic_h2c_interop -- --nocapture
