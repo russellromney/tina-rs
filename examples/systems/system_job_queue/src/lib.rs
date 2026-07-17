@@ -549,6 +549,7 @@ impl Queue {
     }
 
     fn settle_ready_waiter(&mut self) -> Effect<Self> {
+        self.discard_closed_ready_waiter();
         if let Some(error) = self.startup_error {
             if let Some(req) = self.ready_waiter.take() {
                 return reply_to::<Self>(req, QueueReply::StartupFailed(error));
@@ -564,6 +565,7 @@ impl Queue {
     }
 
     fn settle_quiescent_waiter(&mut self) -> Effect<Self> {
+        self.discard_closed_quiescent_waiter();
         if self.is_quiescent() {
             if let Some(req) = self.quiescent_waiter.take() {
                 return reply_to::<Self>(req, QueueReply::Quiescent);
@@ -573,6 +575,7 @@ impl Queue {
     }
 
     fn await_ready(&mut self, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
+        self.discard_closed_ready_waiter();
         if let Some(error) = self.startup_error {
             return call.reply(QueueReply::StartupFailed(error));
         }
@@ -589,6 +592,7 @@ impl Queue {
     }
 
     fn await_quiescent(&mut self, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
+        self.discard_closed_quiescent_waiter();
         if self.is_quiescent() {
             return call.reply(QueueReply::Quiescent);
         }
@@ -599,6 +603,20 @@ impl Queue {
             self.quiescent_waiter = Some(req);
             noop()
         })
+    }
+
+    fn discard_closed_ready_waiter(&mut self) {
+        Self::discard_closed_waiter(&mut self.ready_waiter);
+    }
+
+    fn discard_closed_quiescent_waiter(&mut self) {
+        Self::discard_closed_waiter(&mut self.quiescent_waiter);
+    }
+
+    fn discard_closed_waiter(waiter: &mut Option<tina::RequestContext<QueueReply>>) {
+        if waiter.as_ref().is_some_and(|waiter| !waiter.is_open()) {
+            *waiter = None;
+        }
     }
 
     fn submit(&mut self, payload: Payload, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
@@ -1035,6 +1053,61 @@ fn classify_worker_cancel_outcome(
 mod tests {
     use super::*;
 
+    fn request_context(open: bool, slot_id: u64) -> tina::RequestContext<QueueReply> {
+        use std::any::TypeId;
+        use std::sync::Arc;
+
+        let shared = Arc::new(tina::DeferredSlotShared::new(
+            slot_id,
+            TypeId::of::<QueueReply>(),
+        ));
+        if !open {
+            shared.set_state(tina::DeferredSlotState::Closed);
+        }
+        let deferred = tina::runtime_internal::deferred_from_handle(
+            tina::runtime_internal::handle_from_shared(shared),
+        );
+        tina::runtime_internal::request_context_from_deferred(deferred)
+    }
+
+    #[test]
+    fn ready_and_quiescent_waiter_slots_reclaim_only_closed_callers() {
+        let mut queue = cancel_queue(JobId(1));
+        queue.ready_waiter = Some(request_context(false, 1));
+        queue.quiescent_waiter = Some(request_context(false, 2));
+        queue.discard_closed_ready_waiter();
+        queue.discard_closed_quiescent_waiter();
+        assert!(queue.ready_waiter.is_none());
+        assert!(queue.quiescent_waiter.is_none());
+
+        queue.ready_waiter = Some(request_context(true, 3));
+        queue.quiescent_waiter = Some(request_context(true, 4));
+        queue.discard_closed_ready_waiter();
+        queue.discard_closed_quiescent_waiter();
+        assert!(queue.ready_waiter.as_ref().is_some_and(|waiter| waiter.is_open()));
+        assert!(
+            queue
+                .quiescent_waiter
+                .as_ref()
+                .is_some_and(|waiter| waiter.is_open())
+        );
+    }
+
+    #[test]
+    fn terminal_settlement_never_replies_through_abandoned_waiter_slots() {
+        let mut queue = cancel_queue(JobId(1));
+        queue.ready_waiter = Some(request_context(false, 1));
+        queue.startup_error = Some(SpawnObservedError::ParentMailboxClosed);
+        assert!(matches!(queue.settle_ready_waiter(), Effect::Noop));
+        assert!(queue.ready_waiter.is_none());
+
+        queue.quiescent_waiter = Some(request_context(false, 2));
+        queue.worker_busy[0] = None;
+        queue.stats.in_flight = 0;
+        assert!(matches!(queue.settle_quiescent_waiter(), Effect::Noop));
+        assert!(queue.quiescent_waiter.is_none());
+    }
+
     #[test]
     fn worker_cancel_classification_is_exhaustive_and_id_sensitive() {
         let id = JobId(7);
@@ -1245,6 +1318,13 @@ pub struct CallerGoneReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaiterReplacementReport {
+    pub abandoned_waiter: CallOutcome<QueueReply>,
+    pub replacement_waiter: CallOutcome<QueueReply>,
+    pub submit_outcome: JobOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoisonCrashReport {
     pub failed_outcome: JobOutcome,
     pub stats: QueueStats,
@@ -1429,6 +1509,71 @@ pub fn run_caller_gone(config: RunConfig) -> anyhow::Result<CallerGoneReport> {
             })
         },
     )
+    .map_err(anyhow::Error::from)
+}
+
+/// Proves that a timed-out parked waiter releases its admission slot.
+pub fn run_quiescent_waiter_replacement(
+    config: RunConfig,
+) -> anyhow::Result<WaiterReplacementReport> {
+    let mut config = config.validate()?;
+    config.job_sleep_ms = config.job_sleep_ms.max(150);
+    config.call_timeout_ms = config
+        .call_timeout_ms
+        .max(config.job_sleep_ms.saturating_add(1_000));
+    let config = config.validate()?;
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    app.run_to_shutdown_reported(SHUTDOWN_TIMEOUT, |app| {
+        let queue = register_queue(app, config)?;
+        thread::scope(|scope| -> anyhow::Result<WaiterReplacementReport> {
+            let submit = scope.spawn(|| {
+                app.call_blocking_request(
+                    queue.requests,
+                    QueueRequest::Submit(Payload::Work(21)),
+                    Duration::from_millis(config.call_timeout_ms),
+                )
+            });
+
+            let observation_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if stats(app, queue.requests)?.in_flight == 1 {
+                    break;
+                }
+                if std::time::Instant::now() >= observation_deadline {
+                    anyhow::bail!("submitted job was not admitted before proof deadline");
+                }
+                thread::yield_now();
+            }
+
+            let abandoned_waiter = app.call_blocking_request(
+                queue.requests,
+                QueueRequest::AwaitQuiescent,
+                Duration::from_millis(1),
+            )?;
+            if !matches!(abandoned_waiter, CallOutcome::Timeout) {
+                anyhow::bail!("first waiter must time out, got {abandoned_waiter:?}");
+            }
+
+            let replacement_waiter = app.call_blocking_request(
+                queue.requests,
+                QueueRequest::AwaitQuiescent,
+                Duration::from_millis(config.call_timeout_ms),
+            )?;
+            let submit_outcome = match submit
+                .join()
+                .map_err(|_| anyhow::anyhow!("submit thread panicked"))??
+            {
+                CallOutcome::Replied(QueueReply::Done(outcome)) => outcome,
+                other => anyhow::bail!("unexpected submit outcome: {other:?}"),
+            };
+
+            Ok(WaiterReplacementReport {
+                abandoned_waiter,
+                replacement_waiter,
+                submit_outcome,
+            })
+        })
+    })
     .map_err(anyhow::Error::from)
 }
 
