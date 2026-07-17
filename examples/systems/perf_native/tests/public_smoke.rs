@@ -78,4 +78,25 @@ fn public_characterization() {
         error.to_string().contains("ops"),
         "unexpected error: {error:#}"
     );
+
+    // Non-default knobs must round-trip into the report. Hardcoding private
+    // OPS/SAMPLES constants inside the row would still pass a default-only smoke.
+    let custom = WorkloadConfig {
+        ops: 8,
+        http_ops: 4,
+        workers: 1,
+        samples: 1,
+        capacity: 16,
+        call_timeout_ms: 2_000,
+    }
+    .validate()
+    .expect("small accepted workload");
+    let report = host_call_compare_with(custom).expect("custom host call comparison");
+    assert_eq!(report.tina.load.ops_attempted, 8, "ops must come from config");
+    assert_eq!(
+        report.baseline.load.ops_attempted, 8,
+        "baseline must share config ops"
+    );
+    assert_eq!(report.samples, 1, "samples must come from config");
+    assert!(report.tina.load.ops_ok > 0, "custom row must do useful work");
 }
