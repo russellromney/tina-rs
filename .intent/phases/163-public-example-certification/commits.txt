@@ -67,3 +67,28 @@ blast-radius proof, and post-merge workflow result here.
 - F1 terminal observation (framework-only) unblocked
 - I0B still open; needs rebase onto 96383353 then merge
 - D1, F2, F3, F4, M2, M3, M5 remain eligible after I0B or independently as graph allows
+
+## I0B — PR #366 merged
+
+- Work code: I0B actor-backed gRPC
+- Pre-rebase reviewed head: 63d34b5b27e0835efb1c29f8c8ecd7edf5e96760
+- Independent adversarial review: APPROVE (no FIX REQUIRED)
+  - Reviewer session: 019f6e1b-1dec-76d0-b198-7e865c38f124
+- Rebase onto main 96383353 (after I0A): clean, no conflicts
+- Rebased head: 5f8a69158d7c8c88feda2d1c9e645cf4ca79c8c7
+- Replacement PR CI: https://github.com/russellromney/tina-rs/actions/runs/29552844232 SUCCESS
+- Merge commit: 69ff461ae09b7a9b902e1b768026e109fa3a7e87
+- Merged at: 2026-07-17T03:43:19Z
+- Post-merge main workflow: https://github.com/russellromney/tina-rs/actions/runs/29553076469 (awaiting)
+- origin/main after merge: 69ff461ae09b7a9b902e1b768026e109fa3a7e87
+
+### Direct proof (I0B)
+- bounded actor unary/streaming routes with with_actor_route_capacity
+- Full/Closed/Timeout/Rejected distinct wire statuses
+- specimen_grpc_counter off mutex/pool sidecars
+- unforgeable GrpcActorRouteCompletion
+- content-type/grpc-encoding before stream authority transfer
+
+### Next eligible (I0A+I0B complete once post-merge green)
+- D1, F1, F2, F3, F4, M2, M3, M5 concurrent
+- M1 waits F1; M4 waits F2+F3+F4; M6 waits migrations; C1 waits all
