@@ -18,7 +18,7 @@ use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use prost::Message;
 use tina::prelude::*;
 use tina::reply_to;
-use tina_runtime::{CallOutcome, call, call_cancelable_request, cancel_call};
+use tina_runtime::{CallOutcome, call, call_cancelable_request, cancel_call, sleep};
 
 use crate::{
     Http2ConnectionReply, Http2RequestParts, Http2RequestStream, Http2ServiceMessage, HttpRequest,
@@ -37,6 +37,7 @@ const FLAG_END_HEADERS: u8 = 0x4;
 const CLIENT_DATA_FRAME_PAYLOAD: usize = 16 * 1024;
 const CLIENT_MAX_INBOUND_FRAME_PAYLOAD: usize = 64 * 1024;
 const REQUEST_BODY_PULL_TIMEOUT: Duration = Duration::from_secs(10);
+const ACTOR_ROUTE_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Configurable limits for the native gRPC first form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,7 +306,7 @@ where
     R: Send + 'static,
 {
     fn cancel(self: Box<Self>) -> Effect<GrpcRouter<S>> {
-        cancel_call(self.handle).then(|_outcome| GrpcRouterMsg::ActorRouteMaintenance)
+        cancel_call(self.handle).then(|_outcome| GrpcRouterMsg::ActorRouteCancellationSettled)
     }
 }
 
@@ -1486,6 +1487,7 @@ pub struct GrpcRouter<S: Shard> {
     streaming_raw: BTreeMap<String, Box<dyn ErasedStreamingRaw>>,
     pending: BTreeMap<u64, PendingGrpcRequest>,
     actor_pending: BTreeMap<u64, PendingActorRoute<S>>,
+    actor_maintenance_armed: bool,
     next_pending_id: u64,
     _shard: PhantomData<S>,
 }
@@ -1501,7 +1503,9 @@ pub enum GrpcRouterMsg {
     #[doc(hidden)]
     ActorRouteReturned(GrpcActorRouteCompletion),
     #[doc(hidden)]
-    ActorRouteMaintenance,
+    ActorRouteMaintenance(Result<(), tina_runtime::CallError>),
+    #[doc(hidden)]
+    ActorRouteCancellationSettled,
 }
 
 /// Why an actor-backed gRPC route could not produce its typed reply.
@@ -1660,6 +1664,7 @@ impl<S: Shard + 'static> GrpcRouter<S> {
             streaming_raw: BTreeMap::new(),
             pending: BTreeMap::new(),
             actor_pending: BTreeMap::new(),
+            actor_maintenance_armed: false,
             next_pending_id: 1,
             _shard: PhantomData,
         }
@@ -2049,6 +2054,31 @@ impl<S: Shard + 'static> GrpcRouter<S> {
         batch(effects)
     }
 
+    fn arm_actor_route_maintenance(&mut self) -> Effect<Self> {
+        if self.actor_pending.is_empty() || self.actor_maintenance_armed {
+            return noop();
+        }
+        self.actor_maintenance_armed = true;
+        sleep(ACTOR_ROUTE_MAINTENANCE_INTERVAL).then(GrpcRouterMsg::ActorRouteMaintenance)
+    }
+
+    fn maintain_actor_routes(
+        &mut self,
+        timer: Result<(), tina_runtime::CallError>,
+    ) -> Effect<Self> {
+        self.actor_maintenance_armed = false;
+        let cleanup = self.cancel_abandoned_actor_routes();
+        // A rejected timer must not immediately resubmit itself: persistent
+        // TimerFull would otherwise turn one parked route into a hot loop.
+        // Ordinary router traffic retries arming after capacity returns.
+        let next = if timer.is_ok() {
+            self.arm_actor_route_maintenance()
+        } else {
+            noop()
+        };
+        batch([cleanup, next])
+    }
+
     fn actor_route_inflight(&self) -> usize {
         self.actor_pending.len()
             + self
@@ -2428,6 +2458,9 @@ impl<S: Shard + 'static> Isolate for GrpcRouter<S> {
         msg: GrpcRouterMsg,
         _ctx: &mut Context<'_, S, Self::Reply>,
     ) -> Effect<Self> {
+        if let GrpcRouterMsg::ActorRouteMaintenance(timer) = msg {
+            return self.maintain_actor_routes(timer);
+        }
         let cleanup = self.cancel_abandoned_actor_routes();
         let current = match msg {
             GrpcRouterMsg::Request(request) => reply(self.response_for(request)),
@@ -2438,9 +2471,11 @@ impl<S: Shard + 'static> Isolate for GrpcRouter<S> {
             GrpcRouterMsg::ActorRouteReturned(completion) => {
                 self.complete_actor_route(completion.id, completion.result)
             }
-            GrpcRouterMsg::ActorRouteMaintenance => noop(),
+            GrpcRouterMsg::ActorRouteCancellationSettled => noop(),
+            GrpcRouterMsg::ActorRouteMaintenance(_) => unreachable!(),
         };
-        batch([cleanup, current])
+        let maintenance = self.arm_actor_route_maintenance();
+        batch([cleanup, current, maintenance])
     }
 
     fn handle_call(
@@ -2456,11 +2491,13 @@ impl<S: Shard + 'static> Isolate for GrpcRouter<S> {
             }
             GrpcRouterMsg::RequestBodyChunk { .. }
             | GrpcRouterMsg::ActorRouteReturned(_)
-            | GrpcRouterMsg::ActorRouteMaintenance => {
+            | GrpcRouterMsg::ActorRouteMaintenance(_)
+            | GrpcRouterMsg::ActorRouteCancellationSettled => {
                 call.reject(tina::CallRejectedReason::UnsupportedMessage)
             }
         };
-        batch([cleanup, current])
+        let maintenance = self.arm_actor_route_maintenance();
+        batch([cleanup, current, maintenance])
     }
 }
 
@@ -3513,6 +3550,80 @@ mod tests {
         let effect = router.cancel_abandoned_actor_routes();
         assert!(router.actor_pending.is_empty());
         assert!(matches!(effect, Effect::Batch(effects) if effects.len() == 1));
+    }
+
+    #[test]
+    fn maintenance_wakeup_reclaims_lone_caller_without_router_traffic() {
+        let mut router = GrpcRouter::<SingleShard>::new(GrpcLimits::default())
+            .with_actor_route_capacity(1)
+            .unwrap();
+        router.actor_pending.insert(
+            9,
+            PendingActorRoute {
+                call: closed_request_context(9),
+                cancel: Box::new(ActorCancel {
+                    handle: pending_handle::<()>(),
+                }),
+            },
+        );
+        router.actor_maintenance_armed = true;
+
+        let effect = router.maintain_actor_routes(Ok(()));
+
+        assert!(router.actor_pending.is_empty());
+        assert!(!router.actor_maintenance_armed);
+        assert!(matches!(effect, Effect::Batch(effects) if !effects.is_empty()));
+    }
+
+    #[test]
+    fn maintenance_has_at_most_one_wakeup_while_routes_remain_open() {
+        let mut router = GrpcRouter::<SingleShard>::new(GrpcLimits::default())
+            .with_actor_route_capacity(1)
+            .unwrap();
+        router.actor_pending.insert(
+            9,
+            PendingActorRoute {
+                call: open_request_context(9),
+                cancel: Box::new(ActorCancel {
+                    handle: pending_handle::<()>(),
+                }),
+            },
+        );
+
+        let first = router.arm_actor_route_maintenance();
+        let duplicate = router.arm_actor_route_maintenance();
+        assert!(router.actor_maintenance_armed);
+        assert!(!matches!(first, Effect::Noop));
+        assert!(matches!(duplicate, Effect::Noop));
+
+        let _ = router.maintain_actor_routes(Ok(()));
+        assert!(router.actor_maintenance_armed);
+        assert_eq!(router.actor_pending.len(), 1);
+    }
+
+    #[test]
+    fn rejected_maintenance_timer_does_not_hot_loop() {
+        let mut router = GrpcRouter::<SingleShard>::new(GrpcLimits::default())
+            .with_actor_route_capacity(1)
+            .unwrap();
+        router.actor_pending.insert(
+            9,
+            PendingActorRoute {
+                call: open_request_context(9),
+                cancel: Box::new(ActorCancel {
+                    handle: pending_handle::<()>(),
+                }),
+            },
+        );
+        router.actor_maintenance_armed = true;
+
+        let effect = router.maintain_actor_routes(Err(tina_runtime::CallError::TimerFull));
+
+        assert!(!router.actor_maintenance_armed);
+        assert_eq!(router.actor_pending.len(), 1);
+        assert!(
+            matches!(effect, Effect::Batch(effects) if effects.iter().all(|effect| !matches!(effect, Effect::Io(_))))
+        );
     }
 
     #[test]
