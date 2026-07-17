@@ -25,6 +25,12 @@ The browser smoke requests `tina.room.v1`; the gateway selects that
 subprotocol when offered and omits it otherwise. Unsupported extension offers
 such as `permessage-deflate` remain ignored rather than negotiated.
 
+Public runner:
+
+```sh
+cargo test --manifest-path examples/specimen_websocket_room/Cargo.toml --test public_smoke public_smoke -- --exact
+```
+
 Run the Rust e2e checks with:
 
 ```sh

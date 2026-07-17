@@ -20,7 +20,7 @@ use tina_runtime::{
 };
 use tina_sqlite_bridge::{InstalledSqliteBridge, SqliteConfig, SqliteWorker};
 
-use super::controller::{Controller, ControllerMsg, NotifyMsg, NotifySink};
+use super::controller::{Controller, ControllerMsg, NotifyEvent, NotifyRequest, NotifySink};
 use super::harness::wait_for_capacity;
 use super::shutdown::pool_shutdown_to_close_report;
 use super::{
@@ -193,12 +193,12 @@ impl ServiceInstance {
         .map_err(|e| anyhow::anyhow!("install sqlite bridge: {e}"))?;
 
         let notify_service = runtime
-            .register_with_capacity::<_, Infallible>(NotifySink::default(), caps.notify_mailbox)
+            .register_split_service::<NotifySink, NotifyEvent, NotifyRequest, Infallible>(NotifySink::default(), caps.notify_mailbox)
             .map_err(|e| anyhow::anyhow!("register notify sink: {e:?}"))?;
         let notify_listener_config = listener_config(caps.notify_body);
         let notify_listener = runtime
             .register_with_capacity::<_, Infallible>(
-                HttpListener::<SingleShard, NotifyMsg>::with_config(
+                HttpListener::<SingleShard, _>::for_split_service(
                     "127.0.0.1:0".parse()?,
                     notify_service,
                     notify_listener_config,

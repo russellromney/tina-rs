@@ -36,36 +36,42 @@ pub(crate) struct NotifySink {
     accepted: u64,
 }
 
-pub(crate) enum NotifyMsg {
-    Request(HttpRequest),
-    Delayed(RequestContext<HttpResponse>),
+pub(crate) enum NotifyRequest {
+    Http(HttpRequest),
 }
 
-impl From<HttpRequest> for NotifyMsg {
+impl From<HttpRequest> for NotifyRequest {
     fn from(request: HttpRequest) -> Self {
-        Self::Request(request)
+        Self::Http(request)
     }
 }
 
-#[tina_runtime::isolate(message = NotifyMsg, reply = HttpResponse)]
+pub(crate) enum NotifyEvent {
+    Delayed(RequestContext<HttpResponse>),
+}
+
+#[tina_runtime::isolate(event = NotifyEvent, request = NotifyRequest, reply = HttpResponse)]
 impl NotifySink {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: NotifyMsg,
+        msg: NotifyEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match msg {
-            NotifyMsg::Request(_) => noop(),
-            NotifyMsg::Delayed(req) => {
+            NotifyEvent::Delayed(req) => {
                 self.accepted += 1;
                 reply_to(req, text(StatusCode::OK, "accepted\n"))
             }
         }
     }
 
-    fn handle_call(&mut self, msg: NotifyMsg, call: CallContext<'_, Self>) -> Effect<Self> {
+    fn handle_request(
+        &mut self,
+        msg: NotifyRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
         match msg {
-            NotifyMsg::Request(request) => {
+            NotifyRequest::Http(request) => {
                 if request.method != http::Method::POST || request.path != "/notify" {
                     return call.reply(text(StatusCode::NOT_FOUND, "missing\n"));
                 }
@@ -85,12 +91,11 @@ impl NotifySink {
                 if body_text(&request).contains("slow") {
                     return call
                         .defer(sleep(Duration::from_millis(250)))
-                        .reply(|req, _| NotifyMsg::Delayed(req));
+                        .reply_service_event(|req, _| NotifyEvent::Delayed(req));
                 }
                 self.accepted += 1;
                 call.reply(text(StatusCode::OK, "accepted\n"))
             }
-            NotifyMsg::Delayed(_) => call.reject(tina::CallRejectedReason::UnsupportedMessage),
         }
     }
 }

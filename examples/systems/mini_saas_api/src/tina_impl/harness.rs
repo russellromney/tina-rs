@@ -26,7 +26,7 @@ use tina_sqlite_bridge::{SqliteConfig, SqlitePressureReport, SqliteWorker};
 use crate::budget::BODY_CAP_BYTES;
 use crate::{RunMode, RunReport, UserObservation, get, post, put};
 
-use super::controller::{Controller, ControllerMsg, NotifyMsg, NotifySink};
+use super::controller::{Controller, ControllerMsg, NotifyEvent, NotifyRequest, NotifySink};
 use super::shutdown::pool_shutdown_to_close_report;
 use super::{
     REQUEST_TIMEOUT, ScopeSetMetrics, build_startup_summary, listener_config, response_body_text,
@@ -67,12 +67,12 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     .map_err(|e| anyhow::anyhow!("install sqlite bridge: {e}"))?;
 
     let notify_service = runtime
-        .register_with_capacity::<_, Infallible>(NotifySink::default(), caps.notify_mailbox)
+        .register_split_service::<NotifySink, NotifyEvent, NotifyRequest, Infallible>(NotifySink::default(), caps.notify_mailbox)
         .map_err(|e| anyhow::anyhow!("register notify sink: {e:?}"))?;
     let notify_listener_config = listener_config(caps.notify_body);
     let notify_listener = runtime
         .register_with_capacity::<_, Infallible>(
-            HttpListener::<SingleShard, NotifyMsg>::with_config(
+            HttpListener::<SingleShard, _>::for_split_service(
                 "127.0.0.1:0".parse()?,
                 notify_service,
                 notify_listener_config,
@@ -406,12 +406,12 @@ pub fn prove_drain_cancels_active_scope() -> anyhow::Result<crate::DrainActiveRe
     .map_err(|e| anyhow::anyhow!("install sqlite bridge: {e}"))?;
 
     let notify_service = runtime
-        .register_with_capacity::<_, Infallible>(NotifySink::default(), caps.notify_mailbox)
+        .register_split_service::<NotifySink, NotifyEvent, NotifyRequest, Infallible>(NotifySink::default(), caps.notify_mailbox)
         .map_err(|e| anyhow::anyhow!("register notify sink: {e:?}"))?;
     let notify_listener_config = listener_config(caps.notify_body);
     let notify_listener = runtime
         .register_with_capacity::<_, Infallible>(
-            HttpListener::<SingleShard, NotifyMsg>::with_config(
+            HttpListener::<SingleShard, _>::for_split_service(
                 "127.0.0.1:0".parse()?,
                 notify_service,
                 notify_listener_config,
@@ -847,12 +847,12 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
     .map_err(|e| anyhow::anyhow!("install sqlite bridge: {e}"))?;
 
     let notify_service = runtime
-        .register_with_capacity::<_, Infallible>(NotifySink::default(), caps.notify_mailbox)
+        .register_split_service::<NotifySink, NotifyEvent, NotifyRequest, Infallible>(NotifySink::default(), caps.notify_mailbox)
         .map_err(|e| anyhow::anyhow!("register notify sink: {e:?}"))?;
     let notify_listener_config = listener_config(caps.notify_body);
     let notify_listener = runtime
         .register_with_capacity::<_, Infallible>(
-            HttpListener::<SingleShard, NotifyMsg>::with_config(
+            HttpListener::<SingleShard, _>::for_split_service(
                 "127.0.0.1:0".parse()?,
                 notify_service,
                 notify_listener_config,

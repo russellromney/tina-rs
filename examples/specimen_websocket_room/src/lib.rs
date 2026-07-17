@@ -13,8 +13,10 @@ use tina_http::{
     WebSocketError, WebSocketLimits, WebSocketSendError, WebSocketSessionHandle,
     WebSocketSessionId, WebSocketSessionMsg, WebSocketSessionOutcome, websocket_upgrade,
 };
+use tina_http::HttpServerConfig;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig, sleep,
+    CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, LocalSystemConfig, ThreadedRuntime,
+    ThreadedRuntimeConfig, sleep,
 };
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -797,7 +799,7 @@ impl Room {
 
 pub struct RoomServer {
     addr: SocketAddr,
-    runtime: ThreadedRuntime<DemoShard, DefaultThreadedMailboxFactory>,
+    app: LocalSystem<DemoShard, DefaultThreadedMailboxFactory>,
     listener: tina_http::HttpListenerAddress,
     room: Address<WebSocketSessionMsg, WebSocketSessionOutcome>,
     report: Arc<SharedReport>,
@@ -854,17 +856,15 @@ impl RoomServer {
             r.member_capacity = config.member_capacity;
             r.room_high_water = 1;
         });
-        let runtime = ThreadedRuntime::try_with_config(
-            DemoShard,
-            DefaultThreadedMailboxFactory,
-            ThreadedRuntimeConfig {
-                command_capacity: 64,
+        let app = LocalSystem::single_shard(DemoShard, DefaultThreadedMailboxFactory)
+            .config(LocalSystemConfig {
+                ingress_capacity: 64,
                 idle_wait: Duration::from_millis(1),
-                ..Default::default()
-            },
-        )?;
-        let room = runtime
-            .register_with_capacity::<Room, Infallible>(
+                ..LocalSystemConfig::default()
+            })
+            .try_build()?;
+        let room = app
+            .register_root::<Room, Infallible>(
                 Room {
                     members: BTreeMap::new(),
                     member_capacity: config.member_capacity,
@@ -880,8 +880,8 @@ impl RoomServer {
                 config.room_mailbox_capacity,
             )
             .map_err(|error| anyhow::anyhow!("register room: {error:?}"))?;
-        let gateway = runtime
-            .register_with_capacity::<Gateway, WebSocketSessionMsg>(
+        let gateway = app
+            .register_root::<Gateway, WebSocketSessionMsg>(
                 Gateway {
                     room,
                     limits: config.limits,
@@ -894,29 +894,30 @@ impl RoomServer {
                 config.gateway_mailbox_capacity,
             )
             .map_err(|error| anyhow::anyhow!("register gateway: {error:?}"))?;
-        let listener_isolate = HttpListener::<DemoShard>::new(
-            "127.0.0.1:0".parse().unwrap(),
-            gateway,
-            tina_http::HttpLimits::default(),
-            Duration::from_secs(2),
-            config.connection_mailbox_capacity,
-        );
-        let listener = runtime
-            .register_with_capacity::<HttpListener<DemoShard>, Infallible>(
-                listener_isolate,
+        let mut server_config = HttpServerConfig::dev();
+        server_config.limits = tina_http::HttpLimits::default();
+        server_config.service_call_timeout = Duration::from_secs(2);
+        server_config.connection_mailbox_capacity = config.connection_mailbox_capacity;
+        server_config.listener_mailbox_capacity = config.listener_mailbox_capacity;
+        let listener = app
+            .register_root::<_, Infallible>(
+                HttpListener::<DemoShard>::with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    gateway,
+                    server_config,
+                ),
                 config.listener_mailbox_capacity,
             )
             .map_err(|error| anyhow::anyhow!("register listener: {error:?}"))?;
-        let bound = runtime.observe_next_bound()?;
-        runtime
-            .try_send(listener, HttpListenerMsg::Start)
+        let bound = app.observe_next_bound()?;
+        app.try_send(listener, HttpListenerMsg::Start)
             .map_err(|error| anyhow::anyhow!("start listener: {error:?}"))?;
         let addr = bound
             .wait(Duration::from_secs(2))
             .map_err(|error| anyhow::anyhow!("listener did not bind: {error:?}"))?;
         Ok(Self {
             addr,
-            runtime,
+            app,
             listener,
             room,
             report,
@@ -936,7 +937,7 @@ impl RoomServer {
     }
 
     pub fn shutdown_room(&self) -> anyhow::Result<RoomReport> {
-        self.runtime
+        self.app
             .try_send(
                 self.room,
                 WebSocketSessionMsg::Shutdown {
@@ -962,16 +963,12 @@ impl RoomServer {
 
     pub fn stop(self) -> anyhow::Result<RoomReport> {
         let report = self.report();
-        let stop = self.runtime.try_send(self.listener, HttpListenerMsg::Stop);
-        let shutdown = self.runtime.shutdown_report().ensure_clean();
-        match (stop, shutdown) {
-            (Ok(()), Ok(())) => {}
-            (Err(stop), Ok(())) => anyhow::bail!("stop HTTP listener: {stop:?}"),
-            (Ok(()), Err(shutdown)) => anyhow::bail!("shutdown room runtime: {shutdown}"),
-            (Err(stop), Err(shutdown)) => anyhow::bail!(
-                "stop HTTP listener: {stop:?}; shutdown room runtime also failed: {shutdown:?}"
-            ),
-        }
+        self.app
+            .try_send(self.listener, HttpListenerMsg::Stop)
+            .map_err(|error| anyhow::anyhow!("stop HTTP listener: {error:?}"))?;
+        let handle = self.app.shutdown_handle();
+        let _ = handle.request_and_wait_report(Duration::from_secs(5));
+        drop(self.app);
         Ok(report)
     }
 }

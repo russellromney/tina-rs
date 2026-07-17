@@ -43,6 +43,15 @@ short body  -> client disconnect -> cancel scope (ClientDisconnect)
 
 ## Run
 
+Public runner (LocalSystem host, typed split-service HTTP handle, actor-owned
+terminal report via `stop_with` / `observe_result`):
+
+```sh
+cargo test --manifest-path examples/systems/system_scoped_request_tree/Cargo.toml --test public_smoke public_smoke -- --exact
+```
+
+Focused smoke:
+
 ```sh
 cargo test --manifest-path examples/systems/system_scoped_request_tree/Cargo.toml --test smoke
 ```

@@ -3,6 +3,12 @@
 Copy this when you need a production-shaped Tina service skeleton, not a web
 framework.
 
+## Public proof
+
+```sh
+cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test public_smoke public_smoke -- --exact
+```
+
 ## Copyable Entrypoint
 
 `serve` is the run-forever `main()` an adopter copies:
