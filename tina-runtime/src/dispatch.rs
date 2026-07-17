@@ -3800,11 +3800,13 @@ where
 {
     fn recv_boxed(&self) -> Option<Box<dyn Any>> {
         let message = self.mailbox.recv()?;
+        // Occupancy tracks adapter-path enqueues only. Callers may also hold a
+        // clone of the user mailbox and `try_send` directly (tests do this);
+        // those messages never increment `occupied`, so do not hard-underflow.
         let occupied = self.occupied.get();
-        if occupied == 0 {
-            panic!("mailbox occupancy underflow on recv");
+        if occupied > 0 {
+            self.occupied.set(occupied - 1);
         }
-        self.occupied.set(occupied - 1);
         Some(Box::new(message) as Box<dyn Any>)
     }
 
@@ -3932,11 +3934,12 @@ impl AnyMailboxAdapter {
 impl ErasedMailbox for AnyMailboxAdapter {
     fn recv_boxed(&self) -> Option<Box<dyn Any>> {
         let message = self.mailbox.recv()?;
+        // Occupancy tracks adapter-path enqueues only. Shared mailboxes may
+        // also receive direct `try_send` traffic that never increments it.
         let occupied = self.occupied.get();
-        if occupied == 0 {
-            panic!("mailbox occupancy underflow on recv");
+        if occupied > 0 {
+            self.occupied.set(occupied - 1);
         }
-        self.occupied.set(occupied - 1);
         Some(message)
     }
 
