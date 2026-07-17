@@ -202,6 +202,42 @@ pub struct SoakConfig {
     pub connect_timeout: std::time::Duration,
 }
 
+/// Why a soak config was refused before the service starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoakConfigError {
+    ZeroWorkers,
+    ZeroOps,
+    ZeroConnectTimeout,
+}
+
+impl std::fmt::Display for SoakConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroWorkers => write!(f, "soak workers must be greater than zero"),
+            Self::ZeroOps => write!(f, "soak op_count must be greater than zero"),
+            Self::ZeroConnectTimeout => write!(f, "soak connect_timeout must be greater than zero"),
+        }
+    }
+}
+
+impl std::error::Error for SoakConfigError {}
+
+impl SoakConfig {
+    /// Reject zero workers/ops/timeout before any runtime, socket, or worker starts.
+    pub fn validate(self) -> Result<Self, SoakConfigError> {
+        if self.workers == 0 {
+            return Err(SoakConfigError::ZeroWorkers);
+        }
+        if self.op_count == 0 {
+            return Err(SoakConfigError::ZeroOps);
+        }
+        if self.connect_timeout.is_zero() {
+            return Err(SoakConfigError::ZeroConnectTimeout);
+        }
+        Ok(self)
+    }
+}
+
 impl Default for SoakConfig {
     fn default() -> Self {
         Self {
@@ -240,6 +276,7 @@ impl SoakReport {
 /// Drive a small load/soak workload against the service and report a
 /// typed [`SoakReport`].
 pub fn run_soak(config: SoakConfig) -> anyhow::Result<SoakReport> {
+    let config = config.validate()?;
     tina_impl::run_soak(config)
 }
 

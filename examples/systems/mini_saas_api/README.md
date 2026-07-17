@@ -3,6 +3,12 @@
 Copy this when you need a production-shaped Tina service skeleton, not a web
 framework.
 
+## Public proof
+
+```sh
+cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test public_smoke public_smoke -- --exact
+```
+
 ## Copyable Entrypoint
 
 `serve` is the run-forever `main()` an adopter copies:
@@ -173,7 +179,8 @@ resource closed.
    records the `ResourceCloseReport` (kind=`bridge`, admission=`drain`).
 7. Probe readiness so `db_closed` is visible.
 8. `CloseResource outbound.pool` — drain and stop the outbound keepalive
-   pool with `shutdown_keepalive_pool`. The `KeepalivePoolShutdownReport`
+   pool with `InstalledKeepalivePool::close_and_drain` (installed via
+   `LocalSystem::install_keepalive_pool`). The settled/timeout report
    numbers are folded into the `ResourceCloseReport` details string.
 9. `CloseResource notify.listener` and `CloseResource main.listener` —
    stop both HTTP listeners.
@@ -386,7 +393,7 @@ What felt good:
   shutdown sequence into one builder that records typed step kinds,
   per-resource close reports, and ordering violations. The shutdown loop
   in `tina_impl.rs` reads top-to-bottom instead of being a string of
-  unrelated `try_send`/`shutdown_keepalive_pool` calls with a hand-built
+  unrelated `try_send`/`close_and_drain` calls with a hand-built
   terminal line at the end. The typed `ServiceShutdownReport` lives on
   `RunReport::shutdown_report` and the smoke test pattern-matches on it
   instead of grepping `terminal_line`.

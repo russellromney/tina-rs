@@ -25,6 +25,12 @@ The browser smoke requests `tina.room.v1`; the gateway selects that
 subprotocol when offered and omits it otherwise. Unsupported extension offers
 such as `permessage-deflate` remain ignored rather than negotiated.
 
+Public runner:
+
+```sh
+cargo test --manifest-path examples/specimen_websocket_room/Cargo.toml --test public_smoke public_smoke -- --exact
+```
+
 Run the Rust e2e checks with:
 
 ```sh
@@ -51,13 +57,19 @@ members, rejects new upgrades, and leaves stored stale handles unable to hit a
 later recreated session. Create reopens that named room. Idle expiry uses a
 Tina-owned timer and deletes the room when it has no live members.
 
+Hosted on `LocalSystem` (plain and TLS). The room is a typed split WebSocket
+service (`accept_split_service` / `accept_split_service_subprotocol`). Terminal
+report counters are actor-owned; the host snapshots them with a request-lane
+call (`AppControl(Tick(SNAPSHOT))`) and polls for mid-run waits — no
+`SharedReport` on the public host path.
+
 The room stores `WebSocketSessionHandle` values in a fixed-capacity member
 table. Broadcast, shutdown, and per-session reports use only public API:
 
 ```rust
-handle.text_effect::<Room>("room:hello", timeout)
-handle.close_effect::<Room>(Some(WebSocketCloseCode(1001)), "server shutdown", timeout)
-handle.report_effect::<Room>(timeout)
+handle.text_effect_service_event::<Room, _, _, _>("room:hello", timeout, WebSocketSessionMsg::SendOutcome)
+handle.close_effect_service_event::<Room, _, _, _>(Some(WebSocketCloseCode(1001)), "server shutdown", timeout, WebSocketSessionMsg::SendOutcome)
+handle.report_effect_service_event::<Room, _, _, _>(timeout, WebSocketSessionMsg::SessionReport)
 ```
 
 That message routes back through the one connection isolate that owns the

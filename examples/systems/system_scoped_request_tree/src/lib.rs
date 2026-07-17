@@ -22,26 +22,29 @@
 //! No fake cancellation: external work that already started is not
 //! "un-started"; the report names what was cancelled, what had settled,
 //! and how much capacity came back.
+//!
+//! Hosting uses [`LocalSystem`] with a typed split-service HTTP handle.
+//! Observations live inside the tree actor and leave through
+//! [`stop_with`] / host `observe_result` — no shared result mutex.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use http::StatusCode;
 use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::prelude::*;
 use tina::{RequestContext, reply_to};
 use tina_http::{
-    HttpConnectionMsg, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpRequestBody,
-    HttpResponse, RequestChunkReply,
+    HttpConnectionMsg, HttpListener, HttpListenerMsg, HttpRequest, HttpRequestBody, HttpResponse,
+    HttpServerConfig, RequestChunkReply,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, EventId, RequestScope, RequestScopeId,
-    RequestScopeSet, RuntimeEvent, ScopeCancelCause, ScopedRequestReport, ScopedTimer,
-    ScopedTimerFire, ScopedTimerId, ScopedTimerSet, ThreadedRuntime, ThreadedRuntimeConfig, call,
+    CallOutcome, DefaultThreadedMailboxFactory, EventId, LocalSystem, LocalSystemConfig,
+    RequestScope, RequestScopeId, RequestScopeSet, RuntimeEvent, ScopeCancelCause,
+    ScopedRequestReport, ScopedTimer, ScopedTimerFire, ScopedTimerId, ScopedTimerSet, call,
     call_cancelable, sleep,
 };
 use tina_sim::dst::{
@@ -71,6 +74,8 @@ const SCOPE_CHILD_CAP: usize = 1;
 /// requests faster than the deadline, so several tombstones coexist;
 /// size the cap with headroom for that, not just for one live timer.
 const TIMER_CAP: usize = 8;
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const HOST_CALL_TIMEOUT: Duration = Duration::from_secs(3);
 
 type RequestId = u64;
 
@@ -122,9 +127,11 @@ impl ScopedTreeReport {
     }
 }
 
-// ---- Observations shared with the host thread ----
+// ---- Actor-owned observations (terminal report payload) ----
 
-#[derive(Debug, Default)]
+/// Facts the tree actor accumulates privately and publishes once via
+/// [`stop_with`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct TreeObs {
     clean_completions: usize,
     disconnect_reports: Vec<ScopedRequestReport>,
@@ -133,6 +140,9 @@ struct TreeObs {
     late_results: usize,
     /// Per-rail cancel acks the scope produced: (label, outcome).
     child_cancel_acks: Vec<(&'static str, CancelOutcome)>,
+    /// Wire-side 504 observed by the host and recorded into the terminal
+    /// report when the tree finishes.
+    timeout_replied_504: bool,
 }
 
 // ---- Enrich worker: one cancelable child rail. ----
@@ -200,31 +210,35 @@ struct PendingTree {
     enrich_done: bool,
 }
 
-/// Split-service request: the only inbound authority this tree ever sees
-/// is one HTTP request. `TreeRequest` is local to this crate, so
-/// `From<HttpRequest>` on it is an ordinary, orphan-legal impl — unlike
-/// `tina::ServiceMessage<TreeEvent, TreeRequest>`, which is foreign on
-/// both sides (defined in `tina`, built from `tina_http::HttpRequest`) and
-/// could never be `impl From<HttpRequest> for ..` here. `tina_http`
-/// supplies that half generically (see `FromHttpRequest`), so
-/// `HttpListener<SingleShard, ServiceMessage<TreeEvent, TreeRequest>>`
-/// only needs this plain impl below to wire up.
-struct TreeRequest(HttpRequest);
+/// Split-service request lane. HTTP wire traffic becomes
+/// [`TreeRequest::Http`]; host control uses the remaining variants through
+/// the typed request handle (not the wire).
+enum TreeRequest {
+    Http(Box<HttpRequest>),
+    /// Park until the actor has recorded a disconnect teardown.
+    WaitDisconnect,
+    /// Park until at least one tombstoned timer was ignored late.
+    WaitTimerIgnored,
+    /// Record the host-observed wire 504 flag (does not finish the actor).
+    NoteTimeout504(bool),
+}
 
 impl From<HttpRequest> for TreeRequest {
     fn from(request: HttpRequest) -> Self {
-        Self(request)
+        Self::Http(Box::new(request))
     }
 }
 
 /// Split-service events: every async continuation the tree reports to
-/// itself. None of these carry caller authority.
+/// itself, plus the terminal finish signal from the host.
 enum TreeEvent {
     Chunk(RequestId, CallOutcome<RequestChunkReply>),
     EnrichDone(RequestId, CallOutcome<EnrichReply>),
     EnrichReleased,
     Deadline(RequestId, ScopedTimerId),
     ChildCancelled(&'static str, CancelOutcome),
+    /// Host finished the network walk; publish the terminal report.
+    Finish,
 }
 
 struct Tree {
@@ -233,7 +247,9 @@ struct Tree {
     timers: ScopedTimerSet,
     pending: HashMap<RequestId, PendingTree>,
     next_id: RequestId,
-    obs: Arc<Mutex<TreeObs>>,
+    obs: TreeObs,
+    disconnect_waiters: Vec<DeferredReply<HttpResponse>>,
+    timer_waiters: Vec<DeferredReply<HttpResponse>>,
 }
 
 #[tina_runtime::isolate(event = TreeEvent, request = TreeRequest, reply = HttpResponse)]
@@ -249,13 +265,10 @@ impl Tree {
             TreeEvent::EnrichReleased => noop(),
             TreeEvent::Deadline(id, timer_id) => self.on_deadline(id, timer_id),
             TreeEvent::ChildCancelled(label, outcome) => {
-                self.obs
-                    .lock()
-                    .expect("obs")
-                    .child_cancel_acks
-                    .push((label, outcome));
+                self.obs.child_cancel_acks.push((label, outcome));
                 noop()
             }
+            TreeEvent::Finish => stop_with(self.obs.clone()),
         }
     }
 
@@ -264,11 +277,55 @@ impl Tree {
         request: TreeRequest,
         call: RequestCall<'_, Self>,
     ) -> RequestEffect<Self> {
-        self.on_inbound(request.0, call)
+        match request {
+            TreeRequest::Http(http) => self.on_inbound(*http, call),
+            TreeRequest::WaitDisconnect => {
+                if !self.obs.disconnect_reports.is_empty() {
+                    call.reply(text(StatusCode::OK, "disconnect_ready\n"))
+                } else {
+                    call.capture(|req| {
+                        self.disconnect_waiters
+                            .push(req.into_deferred());
+                        noop()
+                    })
+                }
+            }
+            TreeRequest::WaitTimerIgnored => {
+                if self.obs.timers_ignored_late >= 1 {
+                    call.reply(text(StatusCode::OK, "timer_ready\n"))
+                } else {
+                    call.capture(|req| {
+                        self.timer_waiters.push(req.into_deferred());
+                        noop()
+                    })
+                }
+            }
+            TreeRequest::NoteTimeout504(flag) => {
+                self.obs.timeout_replied_504 = flag;
+                call.reply(text(StatusCode::OK, "noted\n"))
+            }
+        }
     }
 }
 
 impl Tree {
+    fn wake_disconnect_waiters(&mut self) -> Vec<Effect<Self>> {
+        self.disconnect_waiters
+            .drain(..)
+            .map(|slot| reply_to(slot, text(StatusCode::OK, "disconnect_ready\n")))
+            .collect()
+    }
+
+    fn wake_timer_waiters(&mut self) -> Vec<Effect<Self>> {
+        if self.obs.timers_ignored_late < 1 {
+            return Vec::new();
+        }
+        self.timer_waiters
+            .drain(..)
+            .map(|slot| reply_to(slot, text(StatusCode::OK, "timer_ready\n")))
+            .collect()
+    }
+
     fn on_inbound(
         &mut self,
         request: HttpRequest,
@@ -384,9 +441,11 @@ impl Tree {
         let Some(tree) = self.pending.get_mut(&id) else {
             // Scope already cancelled and removed: this is a late result.
             // It is a rejected trace fact, never delivered to the caller.
-            self.obs.lock().expect("obs").late_results += 1;
+            self.obs.late_results += 1;
             return noop();
         };
+        // Exhaustive enrich outcomes: success continues; every other terminal
+        // tears the request down without inventing a success path.
         match outcome {
             CallOutcome::Replied(EnrichReply) => {
                 tree.enrich_done = true;
@@ -396,7 +455,10 @@ impl Tree {
                     noop()
                 }
             }
-            _ => self.teardown(id, ScopeCancelCause::User, None),
+            CallOutcome::Full
+            | CallOutcome::Closed
+            | CallOutcome::Timeout
+            | CallOutcome::Rejected(_) => self.teardown(id, ScopeCancelCause::User, None),
         }
     }
 
@@ -411,8 +473,13 @@ impl Tree {
                 )
             }
             ScopedTimerFire::IgnoredLate { .. } => {
-                self.obs.lock().expect("obs").timers_ignored_late = self.timers.ignored_late();
-                noop()
+                self.obs.timers_ignored_late = self.timers.ignored_late();
+                let effects = self.wake_timer_waiters();
+                if effects.is_empty() {
+                    noop()
+                } else {
+                    batch(effects)
+                }
             }
             ScopedTimerFire::Unknown => noop(),
         }
@@ -426,7 +493,7 @@ impl Tree {
         // sleep may still fire and must be ignored.
         let _ = self.timers.cancel(tree.timer.id());
         let _ = self.scopes.remove(&id);
-        self.obs.lock().expect("obs").clean_completions += 1;
+        self.obs.clean_completions += 1;
         match tree.req.take() {
             Some(req) => reply_to(req, text(StatusCode::OK, "tree_ok\n")),
             None => noop(),
@@ -456,12 +523,9 @@ impl Tree {
         let _ = self.scopes.remove(&id);
         let capacity = self.scopes.capacity_report();
         let report = ScopedRequestReport::new(cancel_report, capacity);
-        {
-            let mut obs = self.obs.lock().expect("obs");
-            match cause {
-                ScopeCancelCause::Timeout => obs.timeout_reports.push(report),
-                _ => obs.disconnect_reports.push(report),
-            }
+        match cause {
+            ScopeCancelCause::Timeout => self.obs.timeout_reports.push(report),
+            _ => self.obs.disconnect_reports.push(report),
         }
         // Answer the caller if we still owe a reply (timeout path); a
         // disconnected caller is gone, so the request context is dropped.
@@ -469,7 +533,9 @@ impl Tree {
             (Some(response), Some(req)) => reply_to(req, response),
             _ => noop(),
         };
-        batch(vec![cancel_effect, answer])
+        let mut effects = vec![cancel_effect, answer];
+        effects.extend(self.wake_disconnect_waiters());
+        batch(effects)
     }
 }
 
@@ -485,55 +551,59 @@ fn text(status: StatusCode, body: impl Into<String>) -> HttpResponse {
 // ---- Host: drive one clean upload + one mid-body disconnect. ----
 
 /// Run the specimen: drive one clean streamed upload and one mid-body
-/// disconnect, then report what the request tree did.
+/// disconnect, then publish the actor-owned terminal report.
 pub fn run() -> anyhow::Result<ScopedTreeReport> {
-    let obs = Arc::new(Mutex::new(TreeObs::default()));
-    let runtime = ThreadedRuntime::try_with_config(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-        ThreadedRuntimeConfig {
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+        .config(LocalSystemConfig {
             idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    )?;
-    let enrich = runtime
-        .register_with_capacity::<_, Infallible>(Enrich::default(), 8)
+            ..LocalSystemConfig::default()
+        })
+        .try_build()?;
+    Ok(app.run_to_shutdown_reported(SHUTDOWN_TIMEOUT, run_application)?)
+}
+
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+) -> anyhow::Result<ScopedTreeReport> {
+    let enrich = app
+        .register_root::<_, Infallible>(Enrich::default(), 8)
         .map_err(|e| anyhow::anyhow!("register enrich: {e:?}"))?;
-    let controller = runtime
-        .register_with_capacity::<_, Infallible>(
+
+    let tree = app
+        .register_split_service::<Tree, TreeEvent, TreeRequest, Infallible>(
             Tree {
                 enrich,
                 scopes: RequestScopeSet::with_capacity(SCOPE_SET_CAPACITY),
                 timers: ScopedTimerSet::with_capacity(TIMER_CAP),
                 pending: HashMap::new(),
                 next_id: 1,
-                obs: obs.clone(),
+                obs: TreeObs::default(),
+                disconnect_waiters: Vec::new(),
+                timer_waiters: Vec::new(),
             },
             16,
         )
-        .map_err(|e| anyhow::anyhow!("register controller: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("register tree: {e:?}"))?;
 
-    let limits = HttpLimits {
-        inbound_stream_chunk_size: Some(CHUNK_SIZE),
-        ..HttpLimits::default()
-    };
+    let tree_result = app
+        .observe_result::<TreeObs, _, _>(tree.address())
+        .map_err(|e| anyhow::anyhow!("observe tree result: {e:?}"))?;
+
+    let mut config = HttpServerConfig::pressure();
+    config.limits.inbound_stream_chunk_size = Some(CHUNK_SIZE);
+    config.service_call_timeout = Duration::from_secs(5);
+    config.connection_mailbox_capacity = 16;
+    config.listener_mailbox_capacity = 8;
+
     let bind: SocketAddr = "127.0.0.1:0".parse()?;
-    type TreeMessage = tina::ServiceMessage<TreeEvent, TreeRequest>;
-    let listener = runtime
-        .register_with_capacity::<HttpListener<SingleShard, TreeMessage>, _>(
-            HttpListener::<SingleShard, TreeMessage>::new(
-                bind,
-                controller,
-                limits,
-                Duration::from_secs(5),
-                16,
-            ),
+    let listener = app
+        .register_root::<_, Infallible>(
+            HttpListener::<SingleShard, _>::for_split_service(bind, tree, config),
             8,
         )
         .map_err(|e| anyhow::anyhow!("register listener: {e:?}"))?;
-    let bound = runtime.observe_next_bound()?;
-    runtime
-        .try_send(listener, HttpListenerMsg::Start)
+    let bound = app.observe_next_bound()?;
+    app.try_send(listener, HttpListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start listener: {e:?}"))?;
     let addr = bound
         .wait(Duration::from_secs(2))
@@ -546,19 +616,15 @@ pub fn run() -> anyhow::Result<ScopedTreeReport> {
         happy.starts_with("HTTP/1.1 200"),
         "happy upload expected 200, got: {happy}"
     );
-    wait_for(Duration::from_secs(2), || {
-        obs.lock().expect("obs").clean_completions >= 1
-    });
 
     // 2. Mid-body disconnect: declare 64 bytes, send 8, drop the socket.
+    //    Wait on the actor (typed request), not a shared mutex.
     upload_then_disconnect(addr, 64, 8)?;
-    let saw_disconnect = wait_for(Duration::from_secs(2), || {
-        !obs.lock().expect("obs").disconnect_reports.is_empty()
-    });
-    anyhow::ensure!(
-        saw_disconnect,
-        "controller never recorded a disconnect report"
-    );
+    match app.call_blocking_request(tree.requests, TreeRequest::WaitDisconnect, HOST_CALL_TIMEOUT)?
+    {
+        CallOutcome::Replied(response) if response.status == StatusCode::OK => {}
+        other => anyhow::bail!("wait disconnect failed: {other:?}"),
+    }
 
     // 3. Deadline timeout: send an incomplete body and hold the socket
     //    open. The request can never finish, so its live deadline fires
@@ -566,20 +632,32 @@ pub fn run() -> anyhow::Result<ScopedTreeReport> {
     //    race-free: the request is structurally stuck until the deadline.
     let timeout_response = upload_incomplete_and_read(addr, 64, 8);
     let timeout_replied_504 = timeout_response.starts_with("HTTP/1.1 504");
+    match app.call_blocking_request(
+        tree.requests,
+        TreeRequest::NoteTimeout504(timeout_replied_504),
+        HOST_CALL_TIMEOUT,
+    )? {
+        CallOutcome::Replied(_) => {}
+        other => anyhow::bail!("note timeout failed: {other:?}"),
+    }
 
     // 4. Wait for the tombstoned deadline timers to fire and be ignored.
-    wait_for(Duration::from_secs(2), || {
-        obs.lock().expect("obs").timers_ignored_late >= 1
-    });
+    match app
+        .call_blocking_request(tree.requests, TreeRequest::WaitTimerIgnored, HOST_CALL_TIMEOUT)?
+    {
+        CallOutcome::Replied(response) if response.status == StatusCode::OK => {}
+        other => anyhow::bail!("wait timer ignored failed: {other:?}"),
+    }
 
-    let listener_shutdown = runtime
-        .try_send(listener, HttpListenerMsg::Stop)
-        .map_err(|error| anyhow::anyhow!("stop listener: {error:?}"));
-    let runtime_shutdown = runtime.shutdown_report().ensure_clean();
-    listener_shutdown?;
-    runtime_shutdown?;
+    app.try_send(listener, HttpListenerMsg::Stop)
+        .map_err(|error| anyhow::anyhow!("stop listener: {error:?}"))?;
+    app.try_send_event(tree.events, TreeEvent::Finish)
+        .map_err(|error| anyhow::anyhow!("finish tree: {error:?}"))?;
 
-    let snapshot = obs.lock().expect("obs");
+    let snapshot = tree_result
+        .wait(HOST_CALL_TIMEOUT)
+        .map_err(|e| anyhow::anyhow!("tree terminal report: {e:?}"))?;
+
     let disconnect = snapshot
         .disconnect_reports
         .first()
@@ -598,7 +676,7 @@ pub fn run() -> anyhow::Result<ScopedTreeReport> {
         disconnect_report_clean: disconnect.is_clean(),
         timers_ignored_late: snapshot.timers_ignored_late,
         scope_capacity_reclaimed: disconnect.unreleased_capacity() == 0,
-        timeout_replied_504,
+        timeout_replied_504: snapshot.timeout_replied_504,
         late_results: snapshot.late_results,
         enrich_cancel_ack_cancelled,
         disconnect_report_line: disconnect.summary_line(),
@@ -662,17 +740,6 @@ fn upload_incomplete_and_read(addr: SocketAddr, declared: usize, send_bytes: usi
     let mut response = Vec::new();
     let _ = stream.read_to_end(&mut response);
     String::from_utf8_lossy(&response).into_owned()
-}
-
-fn wait_for(total: Duration, mut cond: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + total;
-    while Instant::now() < deadline {
-        if cond() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    cond()
 }
 
 // ---- Sim/replay agreement for the request-scope-set surface. ----

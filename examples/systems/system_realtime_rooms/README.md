@@ -40,6 +40,13 @@ slow-peer handling, explicit shutdown, and member-table pressure.
 
 ## Run
 
+Public runner:
+
+```sh
+cargo test --manifest-path examples/systems/system_realtime_rooms/Cargo.toml --test public_smoke public_smoke -- --exact
+```
+
+
 ```
 # Smoke (join + tick, overflow, shutdown):
 cargo test --manifest-path examples/systems/system_realtime_rooms/Cargo.toml --test smoke
