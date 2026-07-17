@@ -3177,21 +3177,41 @@ where
             return None;
         };
 
-        let Some(message) = mapper(result) else {
-            if had_reservation {
-                self.release_terminal_slot(parent);
+        let mapped = catch_unwind(AssertUnwindSafe(|| mapper(result)));
+        let message = match mapped {
+            Ok(Some(message)) => message,
+            Ok(None) => {
+                if had_reservation {
+                    self.release_terminal_slot(parent);
+                }
+                self.push_event(
+                    parent,
+                    Some(cause),
+                    RuntimeEventKind::ChildTerminalDisposed {
+                        child_ordinal,
+                        child_isolate: child.isolate,
+                        child_generation: child.generation,
+                        reason: ChildTerminalDisposedReason::TypeMismatch,
+                    },
+                );
+                return None;
             }
-            self.push_event(
-                parent,
-                Some(cause),
-                RuntimeEventKind::ChildTerminalDisposed {
-                    child_ordinal,
-                    child_isolate: child.isolate,
-                    child_generation: child.generation,
-                    reason: ChildTerminalDisposedReason::TypeMismatch,
-                },
-            );
-            return None;
+            Err(_) => {
+                if had_reservation {
+                    self.release_terminal_slot(parent);
+                }
+                self.push_event(
+                    parent,
+                    Some(cause),
+                    RuntimeEventKind::ChildTerminalDisposed {
+                        child_ordinal,
+                        child_isolate: child.isolate,
+                        child_generation: child.generation,
+                        reason: ChildTerminalDisposedReason::MapperPanicked,
+                    },
+                );
+                return None;
+            }
         };
 
         let Some(parent_index) = self.entry_indexes.get(&parent).copied() else {

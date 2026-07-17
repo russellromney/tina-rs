@@ -456,6 +456,8 @@ pub enum ChildTerminalDisposedReason {
     StoppedWithoutResult,
     /// The `stop_with` payload type did not match the parent's terminal mapper.
     TypeMismatch,
+    /// The parent's terminal mapper panicked while translating the payload.
+    MapperPanicked,
     /// A terminal observation for an older generation arrived after replacement.
     StaleGeneration,
     /// A second terminal settlement was attempted for the same generation.
@@ -1666,6 +1668,7 @@ fn child_terminal_disposed_tag(reason: ChildTerminalDisposedReason) -> u8 {
         ChildTerminalDisposedReason::ParentMailboxClosed => 6,
         ChildTerminalDisposedReason::ParentStopped => 7,
         ChildTerminalDisposedReason::Shutdown => 8,
+        ChildTerminalDisposedReason::MapperPanicked => 9,
     }
 }
 

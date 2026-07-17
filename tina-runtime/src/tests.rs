@@ -4667,6 +4667,42 @@ fn default_threaded_mailbox_factory_physically_holds_reserved_capacity() {
     assert!(!mailbox.release_reserved());
 }
 
+fn assert_default_mailbox_reservation_parity(mailbox: Box<dyn Mailbox<&'static str>>) {
+    assert_eq!(mailbox.try_reserve(), Ok(()));
+    assert_eq!(mailbox.try_reserve(), Ok(()));
+    assert_eq!(mailbox.try_send("ordinary-1"), Ok(()));
+    assert_eq!(mailbox.try_send("full"), Err(TrySendError::Full("full")));
+    assert_eq!(mailbox.recv(), Some("ordinary-1"));
+    assert_eq!(mailbox.try_send("ordinary-2"), Ok(()));
+    assert_eq!(
+        mailbox.try_send("still-full"),
+        Err(TrySendError::Full("still-full"))
+    );
+    assert_eq!(mailbox.try_send_reserved("terminal-1"), Ok(()));
+    assert_eq!(
+        mailbox.try_send("reserved-full"),
+        Err(TrySendError::Full("reserved-full"))
+    );
+    assert_eq!(mailbox.try_send_reserved("terminal-2"), Ok(()));
+    assert!(!mailbox.release_reserved());
+    assert_eq!(mailbox.recv(), Some("ordinary-2"));
+    assert_eq!(mailbox.recv(), Some("terminal-1"));
+    assert_eq!(mailbox.recv(), Some("terminal-2"));
+    assert_eq!(mailbox.recv(), None);
+    mailbox.close();
+    assert_eq!(mailbox.try_reserve(), Err(MailboxReservationError::Closed));
+    assert_eq!(
+        mailbox.try_send("closed"),
+        Err(TrySendError::Closed("closed"))
+    );
+}
+
+#[test]
+fn default_mailboxes_have_identical_reservation_semantics() {
+    assert_default_mailbox_reservation_parity(DefaultMailboxFactory.create(3));
+    assert_default_mailbox_reservation_parity(DefaultThreadedMailboxFactory.create(3));
+}
+
 #[test]
 fn default_threaded_mailbox_factory_close_is_idempotent() {
     let factory = DefaultThreadedMailboxFactory;

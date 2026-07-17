@@ -70,6 +70,7 @@ impl Isolate for Child {
 #[derive(Debug)]
 enum ParentEvent {
     Start,
+    StartWithPanickingMapper,
     StartWhenFull,
     Fill,
     ChildStarted(Result<ChildRef<ChildEvent>, SpawnObservedError>),
@@ -111,6 +112,14 @@ impl Isolate for Parent {
                 let drops = Arc::clone(&self.probe_drops);
                 spawn_observed(ChildDefinition::new(Child { probe_drops: drops }, 4))
                     .then_service_result(ParentEvent::ChildDone)
+                    .then_service_event(ParentEvent::ChildStarted)
+            }
+            ParentEvent::StartWithPanickingMapper => {
+                let drops = Arc::clone(&self.probe_drops);
+                spawn_observed(ChildDefinition::new(Child { probe_drops: drops }, 4))
+                    .then_service_result(|_: ChildTerminal| -> ParentEvent {
+                        panic!("terminal mapper panic")
+                    })
                     .then_service_event(ParentEvent::ChildStarted)
             }
             ParentEvent::StartWhenFull => {
@@ -168,6 +177,47 @@ fn sim_delivers_typed_child_terminal_to_parent() {
             .iter()
             .any(|e| { matches!(e.kind(), RuntimeEventKind::ChildTerminalDelivered { .. }) })
     );
+}
+
+#[test]
+fn sim_panicking_terminal_mapper_is_disposed_and_progress_continues() {
+    let mut sim = Simulator::new(SingleShard, SimulatorConfig::default());
+    let child = Rc::new(RefCell::new(None));
+    let parent = sim.register_with_mailbox_capacity(
+        Parent {
+            child: Rc::clone(&child),
+            errors: Rc::new(RefCell::new(Vec::new())),
+            terminals: Rc::new(RefCell::new(Vec::new())),
+            probe_drops: Arc::new(AtomicUsize::new(0)),
+        },
+        2,
+    );
+    assert!(
+        sim.try_send(
+            parent,
+            ServiceMessage::Event(ParentEvent::StartWithPanickingMapper),
+        )
+        .is_ok()
+    );
+    assert_eq!(sim.step(), 1);
+    assert_eq!(sim.step(), 1);
+    let child = child.borrow().expect("child");
+    assert!(sim.try_send(child.address, ChildEvent::Report(44)).is_ok());
+    assert_eq!(sim.step(), 1);
+    assert!(sim.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::ChildTerminalDisposed {
+                reason: ChildTerminalDisposedReason::MapperPanicked,
+                ..
+            }
+        )
+    }));
+    assert!(
+        sim.try_send(parent, ServiceMessage::Event(ParentEvent::Fill))
+            .is_ok()
+    );
+    assert_eq!(sim.step(), 1);
 }
 
 #[test]

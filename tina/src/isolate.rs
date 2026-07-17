@@ -202,6 +202,11 @@ pub trait Mailbox<T> {
 
     /// Consumes one physical reservation and enqueues `message`.
     ///
+    /// The implementation must consume exactly one reservation on every
+    /// return path, including `Full` and `Closed`. The runtime clears its
+    /// ownership flag before calling this method and will not release the
+    /// reservation a second time after an error.
+    ///
     /// A correct reservation-capable mailbox cannot return `Full` here. The
     /// result remains typed so a faulty custom implementation cannot turn a
     /// runtime settlement path into a panic.
