@@ -43,3 +43,27 @@ blast-radius proof, and post-merge workflow result here.
 - I0A: re-run independent adversarial review on #364 head e4d38cbe, then merge
 - I0B: re-run independent adversarial review on #366 head 63d34b5b, then merge
 - After I0A/I0B merge + green main: D1, F1 (after I0A), F2, F3, F4, M2, M3, M5 may proceed per dependency graph
+
+## I0A — PR #364 merged
+
+- Work code: I0A restart continuation
+- Reviewed head: e4d38cbeb55d9d8c2a40dbe36263c703c0c438a7
+- Independent adversarial review: APPROVE (no FIX REQUIRED)
+  - Reviewer session: 019f6e1b-1de9-7973-9186-d2c3317d2c8e
+  - Residual risks only (bootstrap panic untested, sim Closed missing, alias guard lexical)
+- PR CI (pre-merge): https://github.com/russellromney/tina-rs/actions/runs/29372706170 SUCCESS
+- Merge commit: 96383353ab4b6897010b2f85ed37c09481cbb5c8
+- Merged at: 2026-07-17T03:28:23Z
+- Post-merge main workflow: https://github.com/russellromney/tina-rs/actions/runs/29552464602 SUCCESS
+- origin/main after merge: 96383353ab4b6897010b2f85ed37c09481cbb5c8
+
+### Direct proof (I0A)
+- supervised worker uses then_service_event_with_restarts without ServiceMessage construction
+- FactoryPanicked for initial factories live/sim/cross-shard
+- Full/Closed replacement rejection without hidden queue + DropProbe settlement
+- replacement factory panic = RestartSkippedReason::FactoryPanicked
+
+### Next eligible after I0A
+- F1 terminal observation (framework-only) unblocked
+- I0B still open; needs rebase onto 96383353 then merge
+- D1, F2, F3, F4, M2, M3, M5 remain eligible after I0B or independently as graph allows
