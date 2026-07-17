@@ -27,7 +27,9 @@ use crate::budget::BODY_CAP_BYTES;
 use crate::{RunMode, RunReport, UserObservation, get, post, put};
 
 use super::controller::{Controller, ControllerMsg, NotifyEvent, NotifyRequest, NotifySink};
-use super::shutdown::{keepalive_close_report, settle_after_owner_shutdown};
+use super::shutdown::{
+    keepalive_close_report, prove_owner_terminal, settle_after_owner_shutdown,
+};
 use super::{
     REQUEST_TIMEOUT, ScopeSetMetrics, build_startup_summary, listener_config, response_body_text,
     seed_db,
@@ -304,8 +306,9 @@ pub fn run(mode: RunMode) -> anyhow::Result<RunReport> {
     );
     let t_runtime = Instant::now();
     let terminal = runtime.into_threaded_runtime().shutdown_report();
+    let owner_terminal = prove_owner_terminal(&terminal)?;
     let _post_owner_outbound = retained_outbound
-        .map(|authority| settle_after_owner_shutdown(authority, &terminal));
+        .map(|authority| settle_after_owner_shutdown(authority, owner_terminal));
     terminal.ensure_clean()?;
     choreo.record(
         ShutdownStep::StopOwner,
@@ -495,8 +498,9 @@ pub fn prove_drain_cancels_active_scope() -> anyhow::Result<crate::DrainActiveRe
         Duration::from_secs(2),
     );
     let terminal = runtime.into_threaded_runtime().shutdown_report();
+    let owner_terminal = prove_owner_terminal(&terminal)?;
     let _post_owner_outbound = retained_outbound
-        .map(|authority| settle_after_owner_shutdown(authority, &terminal));
+        .map(|authority| settle_after_owner_shutdown(authority, owner_terminal));
     let runtime_shutdown = terminal.ensure_clean();
 
     let slow_aborted = match slow.join() {
@@ -1006,8 +1010,9 @@ pub fn run_soak(config: crate::SoakConfig) -> anyhow::Result<crate::SoakReport> 
         .map_err(|e| anyhow::anyhow!("stop main listener: {e:?}"))?;
     sqlite.closer.close();
     let terminal = runtime.into_threaded_runtime().shutdown_report();
+    let owner_terminal = prove_owner_terminal(&terminal)?;
     let _post_owner_outbound = retained_outbound
-        .map(|authority| settle_after_owner_shutdown(authority, &terminal));
+        .map(|authority| settle_after_owner_shutdown(authority, owner_terminal));
     terminal.ensure_clean()?;
     let pressure = tina_runtime::pressure::PressureSummary::from_events(terminal.trace());
     let shutdown_clean = outbound_shutdown.clean();

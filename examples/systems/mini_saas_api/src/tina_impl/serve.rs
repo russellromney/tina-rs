@@ -22,7 +22,9 @@ use tina_sqlite_bridge::{InstalledSqliteBridge, SqliteConfig, SqliteWorker};
 
 use super::controller::{Controller, ControllerMsg, NotifyEvent, NotifyRequest, NotifySink};
 use super::harness::wait_for_capacity;
-use super::shutdown::{keepalive_close_report, settle_after_owner_shutdown};
+use super::shutdown::{
+    keepalive_close_report, prove_owner_terminal, settle_after_owner_shutdown,
+};
 use super::{
     REQUEST_TIMEOUT, ScopeSetMetrics, StartupSummary, build_startup_summary, listener_config,
     response_body_text, seed_db,
@@ -424,8 +426,9 @@ impl ServiceInstance {
 
         let t_runtime = Instant::now();
         let terminal = self.runtime.into_threaded_runtime().shutdown_report();
+        let owner_terminal = prove_owner_terminal(&terminal)?;
         let _post_owner_outbound = retained_outbound
-            .map(|authority| settle_after_owner_shutdown(authority, &terminal));
+            .map(|authority| settle_after_owner_shutdown(authority, owner_terminal));
         terminal.ensure_clean()?;
         choreo.record(
             ShutdownStep::StopOwner,

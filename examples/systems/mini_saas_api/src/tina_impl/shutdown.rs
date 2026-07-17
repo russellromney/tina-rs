@@ -8,7 +8,7 @@ use tina_http::{
 use tina_runtime::lifecycle::{
     CloseAdmission, CloseOutcome, ResourceCloseReport, ResourceKind,
 };
-use tina_runtime::{LocalSystemTerminalReport, MailboxFactory};
+use tina_runtime::{LocalSystemState, LocalSystemTerminalReport, MailboxFactory};
 
 const POST_OWNER_SETTLE_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -22,6 +22,7 @@ pub(crate) struct OutboundDrainSummary {
     pub rejected: usize,
     pub already_closed: usize,
     pub failures: usize,
+    pub pending: Option<KeepalivePendingCounts>,
 }
 
 impl OutboundDrainSummary {
@@ -38,7 +39,8 @@ impl OutboundDrainSummary {
         format!(
             "outbound.drain={:?} outbound.stop_requested={} outbound.stop_stopped={} \
              outbound.stop_timed_out={} outbound.stop_rejected={} \
-             outbound.stop_already_closed={} outbound.stop_failures={}",
+             outbound.stop_already_closed={} outbound.stop_failures={} \
+             outbound.pending={:?}",
             self.drain,
             self.requested,
             self.stopped,
@@ -46,6 +48,7 @@ impl OutboundDrainSummary {
             self.rejected,
             self.already_closed,
             self.failures,
+            self.pending,
         )
     }
 }
@@ -95,22 +98,23 @@ where
                 rejected: 0,
                 already_closed: report.already_closed,
                 failures: 0,
+                pending: None,
             };
             let close = pool_settled_to_close_report("outbound.pool", &report, elapsed);
             (summary, close, None)
         }
         KeepaliveCloseAndDrain::TimedOut { pool, pending } => {
-            let connections = pool.connections().len();
             let summary = OutboundDrainSummary {
                 drain: KeepalivePoolDrainOutcome::TimedOut {
                     leased: pending.leased,
                 },
-                requested: connections,
+                requested: 0,
                 stopped: 0,
-                timed_out: 1,
+                timed_out: 0,
                 rejected: 0,
                 already_closed: 0,
                 failures: 0,
+                pending: Some(pending),
             };
             let close = ResourceCloseReport {
                 name: "outbound.pool".to_owned(),
@@ -140,15 +144,15 @@ where
             error,
             pending,
         } => {
-            let connections = pool.connections().len();
             let summary = OutboundDrainSummary {
                 drain: KeepalivePoolDrainOutcome::NotRequested,
-                requested: connections,
+                requested: 0,
                 stopped: 0,
                 timed_out: 0,
-                rejected: 1,
+                rejected: 0,
                 already_closed: 0,
-                failures: 1,
+                failures: 0,
+                pending: Some(pending),
             };
             let close = ResourceCloseReport {
                 name: "outbound.pool".to_owned(),
@@ -172,12 +176,13 @@ where
         KeepaliveCloseAndDrain::Shutdown(settlement) => {
             let summary = OutboundDrainSummary {
                 drain: settlement.drain,
-                requested: settlement.pending.connections_live,
+                requested: 0,
                 stopped: 0,
                 timed_out: 0,
                 rejected: 0,
-                already_closed: 1,
+                already_closed: 0,
                 failures: 0,
+                pending: Some(settlement.pending),
             };
             let close = ResourceCloseReport {
                 name: "outbound.pool".to_owned(),
@@ -213,9 +218,33 @@ pub(crate) enum PostOwnerKeepaliveSettlement {
     },
 }
 
+/// Evidence that the local owner reached one of its documented terminal states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OwnerTerminalProof(());
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OwnerNotTerminal(LocalSystemState);
+
+impl std::fmt::Display for OwnerNotTerminal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "owner report is not terminal: {:?}", self.0)
+    }
+}
+
+impl std::error::Error for OwnerNotTerminal {}
+
+pub(crate) fn prove_owner_terminal(
+    report: &LocalSystemTerminalReport,
+) -> Result<OwnerTerminalProof, OwnerNotTerminal> {
+    match report.state() {
+        LocalSystemState::Closed | LocalSystemState::Failed => Ok(OwnerTerminalProof(())),
+        state => Err(OwnerNotTerminal(state)),
+    }
+}
+
 pub(crate) fn settle_after_owner_shutdown<S, F>(
     authority: RetainedKeepaliveAuthority<S, F>,
-    _owner_terminal: &LocalSystemTerminalReport,
+    _owner_terminal: OwnerTerminalProof,
 ) -> PostOwnerKeepaliveSettlement
 where
     S: Shard + Send + 'static,
@@ -379,7 +408,8 @@ mod conversion_tests {
             .shutdown_handle()
             .request_and_wait_report(Duration::from_secs(2))
             .expect("owner shutdown");
-        let settlement = settle_after_owner_shutdown(authority, &terminal);
+        let proof = prove_owner_terminal(&terminal).expect("terminal proof");
+        let settlement = settle_after_owner_shutdown(authority, proof);
         let _ = app.shutdown().join();
         settlement
     }
@@ -398,6 +428,12 @@ mod conversion_tests {
             DefaultThreadedMailboxFactory,
         >(KeepaliveCloseAndDrain::Drained(drained), Duration::ZERO);
         assert!(retained.is_none());
+
+        let nonterminal = LocalSystemTerminalReport::new(LocalSystemState::Accepting, Vec::new());
+        assert_eq!(
+            prove_owner_terminal(&nonterminal),
+            Err(OwnerNotTerminal(LocalSystemState::Accepting))
+        );
 
         let shutdown = KeepaliveShutdownSettlement {
             pool_close: KeepalivePoolCloseOutcome::AlreadyClosed,
@@ -420,10 +456,14 @@ mod conversion_tests {
             admission_closed: true,
         };
         let (app, pool) = installed_pool(9);
-        let (_, _, timed_out) = keepalive_close_report(
+        let (summary, close, timed_out) = keepalive_close_report(
             KeepaliveCloseAndDrain::TimedOut { pool, pending },
             Duration::from_millis(1),
         );
+        assert_eq!(summary.requested, 0);
+        assert_eq!(summary.timed_out, 0);
+        assert_eq!(summary.pending, Some(pending));
+        assert!(close.details.contains("connections_live=1"));
         let timed_out = timed_out.expect("timeout retains authority");
         assert!(matches!(
             &timed_out.reason,
@@ -435,7 +475,7 @@ mod conversion_tests {
         ));
 
         let (app, pool) = installed_pool(10);
-        let (_, _, owner_failed) = keepalive_close_report(
+        let (summary, close, owner_failed) = keepalive_close_report(
             KeepaliveCloseAndDrain::OwnerFailed {
                 pool,
                 error: ThreadedRuntimeError::CommandFull,
@@ -443,6 +483,11 @@ mod conversion_tests {
             },
             Duration::from_millis(1),
         );
+        assert_eq!(summary.requested, 0);
+        assert_eq!(summary.rejected, 0);
+        assert_eq!(summary.failures, 0);
+        assert_eq!(summary.pending, Some(pending));
+        assert!(close.details.contains("connections_live: 1"));
         let owner_failed = owner_failed.expect("owner failure retains authority");
         assert!(matches!(
             &owner_failed.reason,
