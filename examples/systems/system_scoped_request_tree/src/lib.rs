@@ -214,7 +214,7 @@ struct PendingTree {
 /// [`TreeRequest::Http`]; host control uses the remaining variants through
 /// the typed request handle (not the wire).
 enum TreeRequest {
-    Http(HttpRequest),
+    Http(Box<HttpRequest>),
     /// Park until the actor has recorded a disconnect teardown.
     WaitDisconnect,
     /// Park until at least one tombstoned timer was ignored late.
@@ -225,7 +225,7 @@ enum TreeRequest {
 
 impl From<HttpRequest> for TreeRequest {
     fn from(request: HttpRequest) -> Self {
-        Self::Http(request)
+        Self::Http(Box::new(request))
     }
 }
 
@@ -278,7 +278,7 @@ impl Tree {
         call: RequestCall<'_, Self>,
     ) -> RequestEffect<Self> {
         match request {
-            TreeRequest::Http(http) => self.on_inbound(http, call),
+            TreeRequest::Http(http) => self.on_inbound(*http, call),
             TreeRequest::WaitDisconnect => {
                 if !self.obs.disconnect_reports.is_empty() {
                     call.reply(text(StatusCode::OK, "disconnect_ready\n"))
