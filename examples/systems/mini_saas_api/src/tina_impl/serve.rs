@@ -4,25 +4,25 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use http::StatusCode;
-use tina::pool::{CloseMode, PoolConfig};
+use tina::pool::PoolConfig;
 use tina::prelude::*;
 use tina_http::{
     BodyMetrics, HttpClientConfig, HttpListener, HttpListenerMsg, HttpReady, HttpResponse,
-    HttpStartupError, HttpTarget, KeepalivePoolDrainOutcome, KeepalivePoolHandles,
-    build_keepalive_pool, shutdown_keepalive_pool,
+    HttpStartupError, HttpTarget, InstallKeepalivePool, InstalledKeepalivePool,
+    KeepalivePoolInstallConfig,
 };
 use tina_runtime::lifecycle::{
     CloseAdmission, ResourceCloseReport, ResourceKind, ServiceShutdownReport, ShutdownChoreography,
     ShutdownStep, StepOutcome,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, SignalWaitReply, ThreadedRuntime, signal_wait,
+    CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, SignalWaitReply, signal_wait,
 };
 use tina_sqlite_bridge::{InstalledSqliteBridge, SqliteConfig, SqliteWorker};
 
 use super::controller::{Controller, ControllerMsg, NotifyEvent, NotifyRequest, NotifySink};
 use super::harness::wait_for_capacity;
-use super::shutdown::pool_shutdown_to_close_report;
+use super::shutdown::keepalive_close_report;
 use super::{
     REQUEST_TIMEOUT, ScopeSetMetrics, StartupSummary, build_startup_summary, listener_config,
     response_body_text, seed_db,
@@ -39,7 +39,7 @@ const SIGNAL_REARM_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 /// caps a wedged request.
 const SERVE_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 
-type ServiceRuntime = ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>;
+type ServiceRuntime = LocalSystem<SingleShard, DefaultThreadedMailboxFactory>;
 type ControllerAddr = Address<ControllerMsg, HttpResponse>;
 type ListenerAddr = Address<HttpListenerMsg, Result<HttpReady, HttpStartupError>>;
 
@@ -145,7 +145,7 @@ pub(crate) struct ServiceInstance {
     runtime: ServiceRuntime,
     controller: ControllerAddr,
     sqlite: InstalledSqliteBridge<SingleShard>,
-    outbound: KeepalivePoolHandles,
+    outbound: InstalledKeepalivePool<SingleShard, DefaultThreadedMailboxFactory>,
     notify_listener: ListenerAddr,
     main_listener: ListenerAddr,
     /// Live notify-scope counters. The drain waits on `in_use` reaching zero
@@ -181,8 +181,8 @@ impl ServiceInstance {
         let db_path = dir.path().join("mini-saas.sqlite");
         seed_db(&db_path)?;
 
-        let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
-        let sqlite = SqliteWorker::<SingleShard>::install(
+        let runtime = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+        let sqlite = SqliteWorker::<SingleShard>::install_local(
             &runtime,
             SqliteConfig::path(&db_path)
                 .with_default_timeout(Duration::from_secs(2))
@@ -197,7 +197,7 @@ impl ServiceInstance {
             .map_err(|e| anyhow::anyhow!("register notify sink: {e:?}"))?;
         let notify_listener_config = listener_config(caps.notify_body);
         let notify_listener = runtime
-            .register_with_capacity::<_, Infallible>(
+            .register_root::<_, Infallible>(
                 HttpListener::<SingleShard, _>::for_split_service(
                     "127.0.0.1:0".parse()?,
                     notify_service,
@@ -214,24 +214,24 @@ impl ServiceInstance {
             .wait(Duration::from_secs(2))
             .map_err(|e| anyhow::anyhow!("bind notify listener: {e:?}"))?;
 
-        let outbound = build_keepalive_pool(
-            &runtime,
-            HttpTarget::http_with_host(notify_addr, "notify.local"),
-            HttpClientConfig::pressure(),
-            PoolConfig::new(caps.outbound_pool, 0),
-            caps.outbound_connection_mailbox,
-            caps.outbound_pool_mailbox,
-        )
-        .map_err(|e| anyhow::anyhow!("build outbound keepalive pool: {e:?}"))?;
+        let outbound = runtime
+            .install_keepalive_pool(KeepalivePoolInstallConfig::new(
+                HttpTarget::http_with_host(notify_addr, "notify.local"),
+                HttpClientConfig::pressure(),
+                PoolConfig::new(caps.outbound_pool, 0),
+                caps.outbound_connection_mailbox,
+                caps.outbound_pool_mailbox,
+            ))
+            .map_err(|e| anyhow::anyhow!("install outbound keepalive pool: {e:?}"))?;
 
         let public_body_metrics = BodyMetrics::default();
         let scope_metrics = ScopeSetMetrics::with_capacity(caps.request_scope_set);
         let controller = runtime
-            .register_with_capacity::<_, Infallible>(
+            .register_root::<_, Infallible>(
                 Controller::new(
                     sqlite.address,
                     sqlite.metrics.clone(),
-                    outbound.pool,
+                    outbound.pool(),
                     public_body_metrics.clone(),
                     caps.body,
                     caps.controller_mailbox,
@@ -246,7 +246,7 @@ impl ServiceInstance {
         let mut main_listener_config = listener_config(caps.body);
         main_listener_config.listener_mailbox_capacity = caps.main_listener_mailbox;
         let main_listener = runtime
-            .register_with_capacity::<_, Infallible>(
+            .register_root::<_, Infallible>(
                 HttpListener::<SingleShard, ControllerMsg>::with_config(
                     addr,
                     controller,
@@ -391,17 +391,9 @@ impl ServiceInstance {
         let db_pressure = self.sqlite.metrics.pressure_report();
 
         let t_pool = Instant::now();
-        let outbound_shutdown = shutdown_keepalive_pool(
-            &self.runtime,
-            &self.outbound,
-            CloseMode::Drain,
-            Duration::from_secs(2),
-        )
-        .map_err(|e| anyhow::anyhow!("shutdown keepalive pool: {e:?}"))?;
-        choreo.record_close(
-            &pool_shutdown_to_close_report("outbound.pool", &outbound_shutdown, t_pool.elapsed()),
-            "close_outbound_pool",
-        );
+        let (outbound_shutdown, pool_close_report) =
+            keepalive_close_report(self.outbound.close_and_drain(Duration::from_secs(2)), t_pool.elapsed());
+        choreo.record_close(&pool_close_report, "close_outbound_pool");
 
         let t_notify_listener = Instant::now();
         self.runtime
@@ -431,7 +423,7 @@ impl ServiceInstance {
         );
 
         let t_runtime = Instant::now();
-        let terminal = self.runtime.shutdown_report();
+        let terminal = self.runtime.into_threaded_runtime().shutdown_report();
         terminal.ensure_clean()?;
         choreo.record(
             ShutdownStep::StopOwner,
@@ -442,27 +434,13 @@ impl ServiceInstance {
         let pressure = tina_runtime::pressure::PressureSummary::from_events(terminal.trace());
 
         let shutdown_report = choreo.finish();
-        let shutdown_clean = matches!(outbound_shutdown.drain, KeepalivePoolDrainOutcome::Drained)
-            && outbound_shutdown.requested == outbound_shutdown.stopped
-            && outbound_shutdown.timed_out == 0
-            && outbound_shutdown.rejected == 0
-            && outbound_shutdown.already_closed == 0
-            && outbound_shutdown.connection_failures.is_empty()
-            && shutdown_report.clean;
+        let shutdown_clean = outbound_shutdown.clean() && shutdown_report.clean;
 
         let terminal_line = format!(
-            "terminal db.capacity={} db.closed={} outbound.drain={:?} outbound.stop_requested={} \
-             outbound.stop_stopped={} outbound.stop_timed_out={} outbound.stop_rejected={} \
-             outbound.stop_already_closed={} outbound.stop_failures={} trace_pressure={}",
+            "terminal db.capacity={} db.closed={} {} trace_pressure={}",
             db_pressure.capacity,
             db_pressure.closed_count,
-            outbound_shutdown.drain,
-            outbound_shutdown.requested,
-            outbound_shutdown.stopped,
-            outbound_shutdown.timed_out,
-            outbound_shutdown.rejected,
-            outbound_shutdown.already_closed,
-            outbound_shutdown.connection_failures.len(),
+            outbound_shutdown.terminal_fragment(),
             pressure,
         );
 
@@ -495,7 +473,7 @@ pub fn serve(addr: SocketAddr) -> anyhow::Result<()> {
     let trip = Arc::new(ShutdownTrip::default());
     let watcher = instance
         .runtime
-        .register_with_capacity::<_, Infallible>(
+        .register_root::<_, Infallible>(
             SignalWatcher {
                 trip: Arc::clone(&trip),
             },
