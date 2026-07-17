@@ -28,11 +28,9 @@
 //! Read this top-to-bottom: `Op` → live → sim case → sim runner →
 //! shrink → `run()` ties them together.
 
-use std::cell::RefCell;
 use std::convert::Infallible;
 use std::path::PathBuf;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tina::capacity::{CapacityMode, CapacitySurfaceReport};
@@ -130,6 +128,9 @@ pub struct SavedCase {
 #[derive(Debug, Clone, Copy)]
 enum ProducerMsg {
     Tick(u32),
+    /// Host has finished the workload. Forwarded after every prior Tick so
+    /// the sink can settle its private receive list and `stop_with` the count.
+    Finish,
 }
 
 struct LiveProducer {
@@ -145,6 +146,7 @@ impl LiveProducer {
     ) -> Effect<Self> {
         match msg {
             ProducerMsg::Tick(value) => send(self.sink, SinkMsg::Got(value)),
+            ProducerMsg::Finish => send(self.sink, SinkMsg::Finish),
         }
     }
 }
@@ -152,11 +154,14 @@ impl LiveProducer {
 #[derive(Debug, Clone, Copy)]
 enum SinkMsg {
     Got(u32),
+    Finish,
 }
 
-#[derive(Default)]
 struct LiveSink {
-    received: Arc<Mutex<Vec<u32>>>,
+    received: Vec<u32>,
+    /// Whether the workload history included a poison value. Set by the host
+    /// via the final Finish path so the terminal report matches the sim fact.
+    poison_sent: bool,
 }
 
 #[tina_runtime::isolate(message = SinkMsg)]
@@ -176,9 +181,13 @@ impl LiveSink {
                 noop()
             }
             SinkMsg::Got(value) => {
-                self.received.lock().expect("live sink lock").push(value);
+                self.received.push(value);
                 noop()
             }
+            SinkMsg::Finish => stop_with(Output {
+                messages_received: self.received.len(),
+                poison_sent: self.poison_sent,
+            }),
         }
     }
 }
@@ -190,6 +199,7 @@ impl LiveSink {
 #[derive(Debug, Clone, Copy)]
 enum SimProducerMsg {
     Tick(u32),
+    Finish,
 }
 
 struct SimProducer {
@@ -205,6 +215,7 @@ impl SimProducer {
     ) -> Effect<Self> {
         match msg {
             SimProducerMsg::Tick(value) => send(self.sink, SimSinkMsg::Got(value)),
+            SimProducerMsg::Finish => send(self.sink, SimSinkMsg::Finish),
         }
     }
 }
@@ -212,11 +223,12 @@ impl SimProducer {
 #[derive(Debug, Clone, Copy)]
 enum SimSinkMsg {
     Got(u32),
+    Finish,
 }
 
-#[derive(Default)]
 struct SimSink {
-    received: Rc<RefCell<Vec<u32>>>,
+    received: Vec<u32>,
+    poison_sent: bool,
 }
 
 #[tina_runtime::isolate(message = SimSinkMsg)]
@@ -229,9 +241,13 @@ impl SimSink {
         match msg {
             SimSinkMsg::Got(value) if value == POISON_VALUE => noop(),
             SimSinkMsg::Got(value) => {
-                self.received.borrow_mut().push(value);
+                self.received.push(value);
                 noop()
             }
+            SimSinkMsg::Finish => stop_with(Output {
+                messages_received: self.received.len(),
+                poison_sent: self.poison_sent,
+            }),
         }
     }
 }
@@ -239,11 +255,12 @@ impl SimSink {
 /// Saved seed for the canonical sim case.
 pub const SAVED_SEED: u64 = 108;
 
-/// Pinned constants (filled in by [`run`] on first use via
-/// `observe_replay_case`). When the case is exercised again later the
-/// pinned values let `assert_replay_case` fail loudly on drift.
-const SAVED_EVENT_COUNT: usize = 54;
-const SAVED_TRACE_HASH: u64 = 0x95fc_22d4_ad72_5d33;
+/// Pinned constants for the canonical sim case including the post-history
+/// `Finish` settlement that mirrors the live `observe_result` path. When the
+/// case is exercised again later the pinned values let `assert_replay_case`
+/// fail loudly on drift.
+const SAVED_EVENT_COUNT: usize = 63;
+const SAVED_TRACE_HASH: u64 = 0xa3e8_b8cf_1de3_94fd;
 
 fn faults() -> FaultConfig {
     FaultConfig {
@@ -296,13 +313,21 @@ fn run_case_with_events(
     case: &ReplayCase<Op>,
 ) -> (ReplayReport<Output>, Vec<tina_runtime::RuntimeEvent>) {
     let mut sim = Simulator::new(SingleShard, case.simulator_config());
-    let received = Rc::new(RefCell::new(Vec::new()));
+    let poison_sent = case
+        .history
+        .operations()
+        .iter()
+        .any(|op| matches!(op, Op::Send(v) if *v == POISON_VALUE));
     let sink = sim.register_with_mailbox_capacity(
         SimSink {
-            received: Rc::clone(&received),
+            received: Vec::new(),
+            poison_sent,
         },
         case.config.mailbox(SINK_ROLE),
     );
+    let waiter = sim
+        .observe_result::<Output, _, _>(sink)
+        .expect("claim sink result before workload");
     let producer = sim
         .register_with_mailbox_capacity(SimProducer { sink }, case.config.mailbox(PRODUCER_ROLE));
     for op in case.history.operations() {
@@ -316,24 +341,18 @@ fn run_case_with_events(
             }
         }
     }
+    // Settlement is outside the named history ops but is part of the runner
+    // contract: same Finish path the live host uses for observe_result.
+    sim.try_send(producer, SimProducerMsg::Finish)
+        .expect("producer finish accepted");
     sim.run_until_quiescent();
 
-    let messages_received = received.borrow().len();
+    let output = waiter
+        .wait(Duration::ZERO)
+        .expect("sink settled after Finish");
     let events = sim.trace().to_vec();
-    let poison_sent = case
-        .history
-        .operations()
-        .iter()
-        .any(|op| matches!(op, Op::Send(v) if *v == POISON_VALUE));
     (
-        ReplayReport::from_case_and_events(
-            case,
-            &events,
-            Output {
-                messages_received,
-                poison_sent,
-            },
-        ),
+        ReplayReport::from_case_and_events(case, &events, output),
         events,
     )
 }
@@ -367,7 +386,7 @@ fn run_captured_case(
 pub fn run() -> anyhow::Result<BugboxReport> {
     // 1) Live capture. ThreadedRuntime + LiveTrace observer.
     let live_trace = LiveTrace::new();
-    let runtime = ThreadedRuntime::try_with_config_and_trace_observer(
+    let runtime = Arc::new(ThreadedRuntime::try_with_config_and_trace_observer(
         SingleShard,
         DefaultThreadedMailboxFactory,
         ThreadedRuntimeConfig {
@@ -376,21 +395,34 @@ pub fn run() -> anyhow::Result<BugboxReport> {
             ..Default::default()
         },
         live_trace.observer(),
-    )?;
-    let live_received = Arc::new(Mutex::new(Vec::<u32>::new()));
+    )?);
+    let shutdown = runtime.shutdown_handle();
+
+    let live_case = case();
+    let poison_sent = live_case
+        .history
+        .operations()
+        .iter()
+        .any(|op| matches!(op, Op::Send(v) if *v == POISON_VALUE));
+
     let sink = runtime
         .register_with_capacity::<_, Infallible>(
             LiveSink {
-                received: Arc::clone(&live_received),
+                received: Vec::new(),
+                poison_sent,
             },
             16,
         )
         .map_err(|e| anyhow::anyhow!("register live sink: {e:?}"))?;
+    // Claim the terminal receive report before any workload message can stop
+    // the sink.
+    let waiter = runtime
+        .observe_result::<Output, _, _>(sink)
+        .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
     let producer = runtime
         .register_with_capacity::<_, SinkMsg>(LiveProducer { sink }, 16)
         .map_err(|e| anyhow::anyhow!("register live producer: {e:?}"))?;
 
-    let live_case = case();
     for op in live_case.history.operations() {
         if let Op::Send(value) = *op {
             runtime
@@ -398,26 +430,20 @@ pub fn run() -> anyhow::Result<BugboxReport> {
                 .map_err(|e| anyhow::anyhow!("live ingress failed: {e:?}"))?;
         }
     }
+    // Finish is ordered after every Tick in the producer mailbox, so every
+    // Got reaches the sink before the sink settles its terminal report.
+    runtime
+        .try_send(producer, ProducerMsg::Finish)
+        .map_err(|e| anyhow::anyhow!("live finish failed: {e:?}"))?;
 
-    // The live runtime drains continuously; wait until the sink has
-    // received every non-poison value or a short ceiling elapses.
-    let expected_non_poison: usize = live_case
-        .history
-        .operations()
-        .iter()
-        .filter(|op| matches!(op, Op::Send(v) if *v != POISON_VALUE))
-        .count();
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while std::time::Instant::now() < deadline {
-        let len = live_received.lock().expect("live sink lock").len();
-        if len >= expected_non_poison {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    let live_output = waiter
+        .wait(Duration::from_secs(2))
+        .map_err(|e| anyhow::anyhow!("live sink did not settle: {e:?}"))?;
+    let live_received_count = live_output.messages_received;
 
-    runtime.shutdown_report().ensure_clean()?;
-    let live_received_count = live_received.lock().expect("live sink lock").len();
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
     let live_shape = live_trace.snapshot();
     let live_events = live_trace.events();
     let live_pressure = live_trace.pressure_summary();
@@ -458,9 +484,14 @@ pub fn run() -> anyhow::Result<BugboxReport> {
     let capture_summary = capture.summary();
 
     let path = std::env::temp_dir().join(format!(
-        "system-live-replay-bugbox-{}-{}.case",
+        "system-live-replay-bugbox-{}-{}-{}.case",
         std::process::id(),
-        capture.expected.trace_hash
+        capture.expected.trace_hash,
+        // Parallel tests in one process share pid + hash; uniquify the path.
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
     ));
     let bugbox_save = save_overload_bug(&path, &capture, encode_op)?;
     let saved = read_saved_replay_case(&path, decode_op)?;

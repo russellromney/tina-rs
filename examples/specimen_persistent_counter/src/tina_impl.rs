@@ -3,112 +3,107 @@
 //! of `journal_*` / `snapshot_*` runtime calls — no hand-rolled byte
 //! framing, no fsync decisions per call site.
 //!
-//! The host correlates "did my op finish?" via a `u64` op id
-//! threaded through every continuation message and read back from a
-//! shared `Observation` slot. App-specific data the runtime can't
-//! know about; `FINDINGS.md` tracks this as typed isolate result
-//! waiter work.
+//! Each host op is a typed request. The isolate privately sequences the
+//! IO continuations and replies with the current value when the op
+//! settles. No shared observation slot, no host spin loop.
 
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tempfile::TempDir;
 use tina::prelude::*;
 use tina_runtime::{
-    DefaultThreadedMailboxFactory, JournalAppendReply, JournalReplayReply, SnapshotCommitReply,
-    SnapshotLoadReply, ThreadedRuntime, journal_append, journal_replay, snapshot_commit,
-    snapshot_load,
+    CallOutcome, DefaultThreadedMailboxFactory, JournalAppendReply, JournalReplayReply,
+    SnapshotCommitReply, SnapshotLoadReply, ThreadedRuntime, journal_append, journal_replay,
+    snapshot_commit, snapshot_load,
 };
 
 use crate::{PHASE_A_INCREMENTS, PHASE_B_INCREMENTS, Report};
 
-/// Side channel between the Counter isolate and the host. Each
-/// completed op writes its id, value, and journal index here. Host
-/// loops on `last_completed_op` to know an op finished.
-#[derive(Debug, Default)]
-struct Observation {
-    last_completed_op: AtomicU64,
-    last_value: AtomicU64,
-    journal_records_observed: AtomicU64,
+const OP_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CounterRequest {
+    Recover,
+    Increment,
+    CommitSnapshot,
 }
 
-#[derive(Debug, Clone)]
-enum CounterMsg {
-    Recover {
-        op: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CounterReply {
+    /// Op settled; `value` is the counter after the op, `journal_records`
+    /// is how many durable appends this isolate has completed so far.
+    Ok {
+        value: u64,
+        journal_records: u64,
     },
+    Failed,
+}
+
+#[derive(Debug)]
+enum CounterEvent {
     SnapshotLoaded {
-        op: u64,
+        req: RequestContext<CounterReply>,
         result: SnapshotLoadReply,
     },
     JournalLoaded {
-        op: u64,
+        req: RequestContext<CounterReply>,
         result: JournalReplayReply,
     },
-    Increment {
-        op: u64,
-    },
     AppendDurable {
-        op: u64,
+        req: RequestContext<CounterReply>,
         index: u64,
         value: u64,
         result: JournalAppendReply,
     },
-    CommitSnapshot {
-        op: u64,
-    },
     SnapshotCommitted {
-        op: u64,
+        req: RequestContext<CounterReply>,
         result: SnapshotCommitReply,
     },
 }
 
 /// Persisted state: zero on construction, recovered from disk by
-/// the first `Recover` op. Lives in its own `Default`-derived
-/// sub-struct so the spawn site doesn't manually zero each field.
+/// the first `Recover` op.
 #[derive(Debug, Default)]
 struct CounterState {
     value: u64,
     last_journal_index: u64,
+    journal_records: u64,
 }
 
 struct Counter {
     snapshot_path: PathBuf,
     journal_path: PathBuf,
-    observation: Arc<Observation>,
     state: CounterState,
 }
 
-#[tina_runtime::isolate(message = CounterMsg)]
+#[tina_runtime::isolate(event = CounterEvent, request = CounterRequest, reply = CounterReply)]
 impl Counter {
-    fn handle(
+    fn handle_event(
         &mut self,
-        msg: CounterMsg,
+        event: CounterEvent,
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
-        match msg {
-            CounterMsg::Recover { op } => snapshot_load(self.snapshot_path.clone())
-                .then(move |result| CounterMsg::SnapshotLoaded { op, result }),
-            CounterMsg::SnapshotLoaded {
-                op,
+        match event {
+            CounterEvent::SnapshotLoaded {
+                req,
                 result: Ok(Some(snapshot)),
             } => {
                 self.state.value = decode_u64(&snapshot.bytes);
                 self.state.last_journal_index = snapshot.last_journal_index;
-                journal_replay(self.journal_path.clone())
-                    .then(move |result| CounterMsg::JournalLoaded { op, result })
+                journal_replay(self.journal_path.clone()).then_service_event(move |result| {
+                    CounterEvent::JournalLoaded { req, result }
+                })
             }
-            CounterMsg::SnapshotLoaded {
-                op,
+            CounterEvent::SnapshotLoaded {
+                req,
                 result: Ok(None),
             } => journal_replay(self.journal_path.clone())
-                .then(move |result| CounterMsg::JournalLoaded { op, result }),
-            CounterMsg::JournalLoaded {
-                op,
+                .then_service_event(move |result| CounterEvent::JournalLoaded { req, result }),
+            CounterEvent::JournalLoaded {
+                req,
                 result: Ok(replay),
             } => {
                 for record in replay.records {
@@ -117,72 +112,80 @@ impl Counter {
                         self.state.last_journal_index = record.index;
                     }
                 }
-                self.publish(op);
-                noop()
+                reply_to(req, self.ok_reply())
             }
-            CounterMsg::Increment { op } => {
-                let next_index = self.state.last_journal_index + 1;
-                let next_value = self.state.value + 1;
-                journal_append(
-                    self.journal_path.clone(),
-                    next_index,
-                    encode_u64(next_value),
-                )
-                .then(move |result| CounterMsg::AppendDurable {
-                    op,
-                    index: next_index,
-                    value: next_value,
-                    result,
-                })
-            }
-            CounterMsg::AppendDurable {
-                op,
+            CounterEvent::AppendDurable {
+                req,
                 index,
                 value,
                 result: Ok(()),
             } => {
                 self.state.value = value;
                 self.state.last_journal_index = index;
-                self.observation
-                    .journal_records_observed
-                    .fetch_add(1, Ordering::Relaxed);
-                self.publish(op);
-                noop()
+                self.state.journal_records += 1;
+                reply_to(req, self.ok_reply())
             }
-            CounterMsg::CommitSnapshot { op } => {
+            CounterEvent::SnapshotCommitted {
+                req,
+                result: Ok(()),
+            } => reply_to(req, self.ok_reply()),
+            CounterEvent::SnapshotLoaded { req, result: Err(_) }
+            | CounterEvent::JournalLoaded { req, result: Err(_) }
+            | CounterEvent::AppendDurable {
+                req, result: Err(_), ..
+            }
+            | CounterEvent::SnapshotCommitted { req, result: Err(_) } => {
+                reply_to(req, CounterReply::Failed)
+            }
+        }
+    }
+
+    fn handle_request(
+        &mut self,
+        request: CounterRequest,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        match request {
+            CounterRequest::Recover => call.capture(|req| {
+                snapshot_load(self.snapshot_path.clone()).then_service_event(move |result| {
+                    CounterEvent::SnapshotLoaded { req, result }
+                })
+            }),
+            CounterRequest::Increment => {
+                let next_index = self.state.last_journal_index + 1;
+                let next_value = self.state.value + 1;
+                let path = self.journal_path.clone();
+                call.capture(move |req| {
+                    journal_append(path, next_index, encode_u64(next_value)).then_service_event(
+                        move |result| CounterEvent::AppendDurable {
+                            req,
+                            index: next_index,
+                            value: next_value,
+                            result,
+                        },
+                    )
+                })
+            }
+            CounterRequest::CommitSnapshot => {
                 let last_index = self.state.last_journal_index;
                 let value = self.state.value;
-                snapshot_commit(self.snapshot_path.clone(), encode_u64(value), last_index)
-                    .then(move |result| CounterMsg::SnapshotCommitted { op, result })
-            }
-            CounterMsg::SnapshotCommitted { op, result: Ok(()) } => {
-                self.publish(op);
-                noop()
-            }
-            // All Err arms (and the snapshot-load Err arm) just publish so
-            // the host's wait_op completes; the failure is observable via
-            // the unchanged `last_value` if the caller cares.
-            CounterMsg::SnapshotLoaded { op, result: Err(_) }
-            | CounterMsg::JournalLoaded { op, result: Err(_) }
-            | CounterMsg::AppendDurable {
-                op, result: Err(_), ..
-            }
-            | CounterMsg::SnapshotCommitted { op, result: Err(_) } => {
-                self.publish(op);
-                noop()
+                let path = self.snapshot_path.clone();
+                call.capture(move |req| {
+                    snapshot_commit(path, encode_u64(value), last_index).then_service_event(
+                        move |result| CounterEvent::SnapshotCommitted { req, result },
+                    )
+                })
             }
         }
     }
 }
 
 impl Counter {
-    fn publish(&self, op: u64) {
-        self.observation
-            .last_value
-            .store(self.state.value, Ordering::Relaxed);
-        self.observation
-            .last_completed_op
-            .store(op, Ordering::Release);
+    fn ok_reply(&self) -> CounterReply {
+        CounterReply::Ok {
+            value: self.state.value,
+            journal_records: self.state.journal_records,
+        }
     }
 }
 
@@ -195,6 +198,19 @@ fn decode_u64(bytes: &[u8]) -> u64 {
         .try_into()
         .expect("counter snapshot/journal payload is 8 bytes");
     u64::from_le_bytes(arr)
+}
+
+type CounterHandle = tina::ServiceRequestAddress<CounterEvent, CounterRequest, CounterReply>;
+
+fn call_counter(
+    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
+    counter: CounterHandle,
+    request: CounterRequest,
+) -> anyhow::Result<CounterReply> {
+    match runtime.call_blocking_request(counter, request, OP_TIMEOUT)? {
+        CallOutcome::Replied(reply) => Ok(reply),
+        other => anyhow::bail!("counter call {request:?} failed: {other:?}"),
+    }
 }
 
 pub fn run() -> anyhow::Result<Report> {
@@ -237,62 +253,58 @@ fn run_phase(
     increments: u64,
     take_snapshot: bool,
 ) -> anyhow::Result<PhaseReport> {
-    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
-    let observation = Arc::new(Observation::default());
+    let runtime = Arc::new(ThreadedRuntime::try_new(
+        SingleShard,
+        DefaultThreadedMailboxFactory,
+    )?);
+    let shutdown = runtime.shutdown_handle();
+
     let counter = runtime
-        .register_with_capacity::<_, Infallible>(
+        .register_split_service::<Counter, CounterEvent, CounterRequest, Infallible>(
             Counter {
                 snapshot_path,
                 journal_path,
-                observation: Arc::clone(&observation),
                 state: CounterState::default(),
             },
             16,
         )
-        .map_err(|e| anyhow::anyhow!("register counter: {e:?}"))?;
+        .map_err(|e| anyhow::anyhow!("register counter: {e:?}"))?
+        .requests;
 
-    let mut next_op = 1u64;
-    let wait_op = |runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
-                   msg: CounterMsg,
-                   op: u64|
-     -> anyhow::Result<()> {
-        runtime
-            .try_send(counter, msg)
-            .map_err(|e| anyhow::anyhow!("send op: {e:?}"))?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while observation.last_completed_op.load(Ordering::Acquire) < op {
-            if Instant::now() > deadline {
-                anyhow::bail!("timed out waiting for op {op}");
-            }
-            thread::yield_now();
-        }
-        Ok(())
+    let recovered = match call_counter(&runtime, counter, CounterRequest::Recover)? {
+        CounterReply::Ok { value, .. } => value,
+        CounterReply::Failed => anyhow::bail!("recover failed"),
     };
 
-    let op = next_op;
-    next_op += 1;
-    wait_op(&runtime, CounterMsg::Recover { op }, op)?;
-    let recovered_value = observation.last_value.load(Ordering::Relaxed);
-
+    let mut final_value = recovered;
+    let mut journal_records_written = 0u64;
     for _ in 0..increments {
-        let op = next_op;
-        next_op += 1;
-        wait_op(&runtime, CounterMsg::Increment { op }, op)?;
+        match call_counter(&runtime, counter, CounterRequest::Increment)? {
+            CounterReply::Ok {
+                value,
+                journal_records,
+            } => {
+                final_value = value;
+                journal_records_written = journal_records;
+            }
+            CounterReply::Failed => anyhow::bail!("increment failed"),
+        }
     }
-    let final_value = observation.last_value.load(Ordering::Relaxed);
 
     let mut snapshot_committed = false;
     if take_snapshot {
-        let op = next_op;
-        wait_op(&runtime, CounterMsg::CommitSnapshot { op }, op)?;
-        snapshot_committed = true;
+        match call_counter(&runtime, counter, CounterRequest::CommitSnapshot)? {
+            CounterReply::Ok { .. } => snapshot_committed = true,
+            CounterReply::Failed => anyhow::bail!("commit snapshot failed"),
+        }
     }
-    let journal_records_written = observation.journal_records_observed.load(Ordering::Relaxed);
 
-    runtime.shutdown_report().ensure_clean()?;
+    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
+    drop(runtime);
+    terminal.ensure_clean()?;
 
     Ok(PhaseReport {
-        recovered_value,
+        recovered_value: recovered,
         final_value,
         snapshot_committed,
         journal_records_written,

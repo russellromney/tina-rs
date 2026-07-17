@@ -11,8 +11,7 @@
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
-use std::sync::Arc;
-use std::sync::{Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
 
@@ -183,10 +182,13 @@ pub enum ShipperEvent {
 pub enum ShipperRequest {
     Submit { event: Event },
     Stats,
+    /// Hold the reply until `events_delivered + events_lost_on_flush >= target`.
+    /// Replaces a host sleep-poll on stats for "has the burst settled?".
+    AwaitRouted { target: u64 },
     Stop,
 }
 
-/// Split-service envelope for [`Shipper`].
+/// Split-service envelope for the shipper isolate.
 pub type ShipperMsg = tina::ServiceMessage<ShipperEvent, ShipperRequest>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +197,8 @@ pub enum ShipperReply {
     Dropped,
     Stopping,
     Stats(ShipperStats),
+    /// [`ShipperRequest::AwaitRouted`] resolved; `routed` is delivered + lost.
+    Routed { routed: u64 },
     Stopped {
         flushed_on_drain: usize,
         drained_batches: usize,
@@ -245,6 +249,10 @@ struct Shipper {
     /// admission/completion counters used by Tina's capacity-aware registration helper.
     drain: DrainState,
     pending_stop: Option<RequestContext<ShipperReply>>,
+    /// Host wait for "burst has reached the sink (or been lost)".
+    pending_await: Option<(u64, RequestContext<ShipperReply>)>,
+    /// Events successfully delivered to the sink (Ack path).
+    events_delivered: u64,
     drained_events: usize,
     drained_batches: usize,
     stats: ShipperStats,
@@ -277,6 +285,7 @@ impl Shipper {
         match request {
             ShipperRequest::Submit { event } => self.on_submit(event, call),
             ShipperRequest::Stats => call.reply(ShipperReply::Stats(self.snapshot())),
+            ShipperRequest::AwaitRouted { target } => self.on_await_routed(target, call),
             ShipperRequest::Stop => self.on_stop(call),
         }
     }
@@ -296,6 +305,8 @@ impl Shipper {
                 .catch_up(RecurringCatchUp::Skip),
             drain: DrainState::new(),
             pending_stop: None,
+            pending_await: None,
+            events_delivered: 0,
             drained_events: 0,
             drained_batches: 0,
             stats: ShipperStats {
@@ -303,6 +314,47 @@ impl Shipper {
                 ..ShipperStats::default()
             },
         }
+    }
+
+    fn routed_total(&self) -> u64 {
+        self.events_delivered + self.stats.events_lost_on_flush
+    }
+
+    fn on_await_routed(
+        &mut self,
+        target: u64,
+        call: RequestCall<'_, Self>,
+    ) -> RequestEffect<Self> {
+        if self.routed_total() >= target {
+            return call.reply(ShipperReply::Routed {
+                routed: self.routed_total(),
+            });
+        }
+        if self.pending_await.is_some() {
+            // Specimen hosts issue one await at a time; a second waiter is a
+            // real policy reject rather than a silent overwrite.
+            return call.reject(tina::CallRejectedReason::UnsupportedMessage);
+        }
+        call.capture(|req| {
+            self.pending_await = Some((target, req));
+            noop()
+        })
+    }
+
+    fn maybe_complete_await(&mut self) -> Effect<Self> {
+        let Some((target, req)) = self.pending_await.take() else {
+            return noop();
+        };
+        if self.routed_total() >= target {
+            return reply_to(
+                req,
+                ShipperReply::Routed {
+                    routed: self.routed_total(),
+                },
+            );
+        }
+        self.pending_await = Some((target, req));
+        noop()
     }
 
     fn on_submit(&mut self, event: Event, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
@@ -400,6 +452,7 @@ impl Shipper {
         let succeeded = matches!(outcome, CallOutcome::Replied(SinkReply::Ack));
         if succeeded {
             self.drain.record_complete();
+            self.events_delivered += count as u64;
             match kind {
                 FlushKind::Size => self.stats.batches_flushed_by_size += 1,
                 FlushKind::Time => self.stats.batches_flushed_by_time += 1,
@@ -415,7 +468,8 @@ impl Shipper {
             self.stats.events_lost_on_flush += count as u64;
         }
 
-        let drain_done = !self.drain.is_open() && self.buffer.is_empty();
+        let drain_done =
+            !self.drain.is_open() && self.buffer.is_empty() && self.flush_gate.is_idle();
         if drain_done {
             if let Some(req) = self.pending_stop.take() {
                 self.drain.finish();
@@ -423,24 +477,28 @@ impl Shipper {
                     flushed_on_drain: self.drained_events,
                     drained_batches: self.drained_batches,
                 };
-                return reply_to(req, reply);
+                // Also release any host await so it does not hang across stop.
+                let await_effect = self.maybe_complete_await();
+                return batch(vec![reply_to(req, reply), await_effect]);
             }
-            return noop();
+            return self.maybe_complete_await();
         }
+
+        let await_effect = self.maybe_complete_await();
 
         if !self.buffer.is_empty() {
             if !self.drain.is_open() {
-                return self.start_flush(FlushKind::Drain);
+                return batch(vec![await_effect, self.start_flush(FlushKind::Drain)]);
             }
             if self.buffer.len() >= self.batch_size {
-                return self.start_flush(FlushKind::Size);
+                return batch(vec![await_effect, self.start_flush(FlushKind::Size)]);
             }
             // Smaller leftover after a flush: re-arm time window.
             if self.flush_tick.next_due().is_none() {
-                return self.arm_tick(now);
+                return batch(vec![await_effect, self.arm_tick(now)]);
             }
         }
-        noop()
+        await_effect
     }
 
     fn start_flush(&mut self, kind: FlushKind) -> Effect<Self> {
@@ -1017,44 +1075,43 @@ impl World {
             return Ok(outcomes);
         }
         let barrier = Arc::new(Barrier::new(callers + 1));
-        let outcomes = Arc::new(Mutex::new(Vec::with_capacity(events)));
         let per_caller = events.div_ceil(callers);
         let mut threads = Vec::with_capacity(callers);
         for caller in 0..callers {
             let rt = Arc::clone(&self.runtime);
             let gate = Arc::clone(&barrier);
-            let bucket = Arc::clone(&outcomes);
             let timeout = self.call_timeout;
             let shipper = self.shipper;
             let start = caller * per_caller;
             let end = ((caller + 1) * per_caller).min(events);
-            threads.push(thread::spawn(move || -> anyhow::Result<()> {
-                gate.wait();
-                for i in start..end {
-                    let event = Event {
-                        key: format!("k{i}"),
-                        value: i as i64,
-                    };
-                    let outcome = rt.call_blocking(
-                        shipper,
-                        ShipperMsg::Request(ShipperRequest::Submit { event }),
-                        timeout,
-                    )?;
-                    bucket.lock().expect("outcomes lock").push(outcome);
-                }
-                Ok(())
-            }));
+            threads.push(thread::spawn(
+                move || -> anyhow::Result<Vec<CallOutcome<ShipperReply>>> {
+                    gate.wait();
+                    let mut local = Vec::with_capacity(end.saturating_sub(start));
+                    for i in start..end {
+                        let event = Event {
+                            key: format!("k{i}"),
+                            value: i as i64,
+                        };
+                        let outcome = rt.call_blocking(
+                            shipper,
+                            ShipperMsg::Request(ShipperRequest::Submit { event }),
+                            timeout,
+                        )?;
+                        local.push(outcome);
+                    }
+                    Ok(local)
+                },
+            ));
         }
         barrier.wait();
+        let mut outcomes = Vec::with_capacity(events);
         for handle in threads {
-            handle
+            let local = handle
                 .join()
                 .map_err(|_| anyhow::anyhow!("submit thread panicked"))??;
+            outcomes.extend(local);
         }
-        let outcomes = Arc::try_unwrap(outcomes)
-            .map_err(|_| anyhow::anyhow!("outcomes arc still shared"))?
-            .into_inner()
-            .map_err(|_| anyhow::anyhow!("outcomes poisoned"))?;
         Ok(outcomes)
     }
 
@@ -1087,24 +1144,17 @@ impl World {
         target_accepted: usize,
         timeout: Duration,
     ) -> anyhow::Result<()> {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            let stats = self.shipper_stats()?;
-            let sink = self.sink_stats()?;
-            let routed = sink.events_received + stats.events_lost_on_flush;
-            if routed >= target_accepted as u64 {
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                anyhow::bail!(
-                    "timed out waiting for routed >= {target_accepted}: \
-                     sink.events={} shipper.lost={} shipper.high_water={}",
-                    sink.events_received,
-                    stats.events_lost_on_flush,
-                    stats.buffer_high_water
-                );
-            }
-            thread::sleep(Duration::from_millis(2));
+        match self.runtime.call_blocking(
+            self.shipper,
+            ShipperMsg::Request(ShipperRequest::AwaitRouted {
+                target: target_accepted as u64,
+            }),
+            timeout,
+        )? {
+            CallOutcome::Replied(ShipperReply::Routed { .. }) => Ok(()),
+            other => anyhow::bail!(
+                "expected Routed reply for target={target_accepted}, got {other:?}"
+            ),
         }
     }
 

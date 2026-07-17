@@ -46,18 +46,20 @@ is shared via `Arc<AtomicU32>` counters and `Arc<AtomicBool>` flags.
 Three isolates, one job each:
 
 - **`Producer`** — `Tick → sleep → TimerFired → batch(send(consumer,
-  Item) + sleep)`. Carries a `stopped: bool`. On `Stop`, just sets
-  the flag; existing in-flight `TimerFired`s see it and bail.
-- **`Consumer`** — `Item → sleep(work) → Done`, increments
-  `processed` on `Done(Ok)`.
+  Item) + sleep)`. Carries a `stopped: bool`. On `Stop`, sets the
+  flag and sends `ProducerDone { produced, signal_received }` to the
+  consumer; existing in-flight `TimerFired`s see the flag and bail.
+- **`Consumer`** — `Item → sleep(work) → Done`, tracks `processed`
+  privately. After `ProducerDone`, drains until `processed >= produced`
+  and `stop_with(Report)`.
 - **`SignalWatcher`** — `Begin → signal_wait("sigint", t).reply →
   Received(Ok(_)) → send(producer, Stop)`. The runtime owns the
   signal handler installation; the watcher just `await`s the named
   signal.
 
-The host thread polls a shared `Telemetry` slot for
-`signal_received && producer_stopped && processed >= produced` and
-then shuts down.
+The host claims `observe_result::<Report>(consumer)` **before** start
+and waits for the consumer's terminal drain report. No shared
+telemetry slot, no host spin loop.
 
 ## Discussion
 
@@ -71,15 +73,13 @@ What feels better:
   and bail. The Tokio version's "produce or quit" race lives inside
   a `select!` block, which means the signal observation is tangled
   with the production loop.
-- **Counters and flags live in one `Telemetry` struct.** Same
-  ownership shape as the other examples.
+- **Drain truth is a terminal report.** The consumer owns the
+  produced/processed arithmetic and publishes it once via
+  `stop_with`; the host's `observe_result` claim is registered
+  before start.
 
 What feels worse:
 
-- **The host's drain-wait is a poll loop on `Telemetry`.** Same
-  app-data side channel pattern as `specimen_outbound_fetch`,
-  `specimen_persistent_counter`, etc. A typed observation handle
-  for "this isolate's work has settled" would close it.
 - **No `both` mode.** Tokio's `tokio::signal::ctrl_c` and
   `tina_runtime::signal_wait` both install process-wide handlers
   that don't cleanly coexist (`FINDINGS_HISTORY.md` has the long
@@ -94,6 +94,3 @@ What this suggests:
   only affects examples that compare signal-handling shape directly.
   Documented; not a blocker for either runtime in production
   (you'd typically pick one or the other, not both).
-- The per-isolate-completion observation handle would close several
-  side-channel patterns at once: arrival logs, op correlators,
-  drain-status telemetry. Worth tracking as an ergonomics frontier.
