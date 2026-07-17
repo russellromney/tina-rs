@@ -6,7 +6,7 @@
 
 use system_job_queue::{
     JobOutcome, QueueReply, RunConfig, run, run_caller_gone, run_cancel_in_flight, run_overflow,
-    run_poison_crash, run_respawn_then_admit,
+    run_poison_crash, run_quiescent_waiter_replacement, run_respawn_then_admit,
 };
 
 fn default_config() -> RunConfig {
@@ -100,4 +100,22 @@ fn public_characterization() {
 #[test]
 fn public_smoke() {
     assert_queue_report(run(default_config()).expect("run succeeds"));
+}
+
+/// A caller that abandons a parked waiter cannot monopolize its slot.
+#[test]
+fn public_correction() {
+    let report = run_quiescent_waiter_replacement(default_config()).expect("replacement succeeds");
+    assert!(matches!(
+        report.abandoned_waiter,
+        tina_runtime::CallOutcome::Timeout
+    ));
+    assert!(matches!(
+        report.replacement_waiter,
+        tina_runtime::CallOutcome::Replied(QueueReply::Quiescent)
+    ));
+    assert!(matches!(
+        report.submit_outcome,
+        JobOutcome::Completed { value: 42, .. }
+    ));
 }
