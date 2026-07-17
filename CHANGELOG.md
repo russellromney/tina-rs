@@ -4,6 +4,18 @@ This file records completed work.
 
 ## Unreleased
 
+### Typed child terminal observation
+
+- `spawn_observed(...).then_result(...)` / `.then_service_result(...)` map a
+  child's `stop_with` payload into a parent event after the existing initial
+  (and optional replacement) continuations.
+- Admission reserves one parent mailbox slot per generation for terminal
+  delivery. Full or closed reservation fails spawn/restart admission with a
+  typed outcome; there is no hidden lifecycle queue.
+- Live runtime and simulator settle terminal results exactly once:
+  deliver on type match, or dispose with a typed trace reason on plain stop,
+  type mismatch, stale/duplicate settlement, parent stop, or shutdown.
+
 ### Envelope-free split-service bootstrap
 
 - Add `register_split_service_with_bootstrap[_on]` across explicit,

@@ -1086,3 +1086,465 @@ fn identical_runs_produce_identical_spawn_sequences_and_causal_links() {
 
     assert_eq!(run_once(), run_once());
 }
+
+// ---------------------------------------------------------------------------
+// Typed child terminal observation
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChildTerminal(u32);
+
+#[derive(Debug)]
+#[allow(dead_code)]
+enum TerminalParentEvent {
+    Start,
+    StartWhenFull,
+    Fill,
+    ChildStarted(Result<ChildRef<ChildEvent>, SpawnObservedError>),
+    ChildDone(ChildTerminal, DropProbe),
+}
+
+#[allow(dead_code)]
+struct TerminalParent {
+    child_ref: Rc<RefCell<Option<ChildRef<ChildEvent>>>>,
+    spawn_errors: Rc<RefCell<Vec<SpawnObservedError>>>,
+    terminals: Rc<RefCell<Vec<ChildTerminal>>>,
+    terminal_drops: Rc<Cell<usize>>,
+    result_authority_drops: Rc<Cell<usize>>,
+}
+
+impl Isolate for TerminalParent {
+    tina::isolate_types! {
+        message: TerminalParentEvent,
+        reply: (),
+        send: Outbound<TerminalParentEvent>,
+        spawn: ChildDefinition<Child>,
+        spawn_observed: tina::SpawnObserved<ChildDefinition<Child>, TerminalParentEvent, ChildEvent>,
+        io: Infallible,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            TerminalParentEvent::Start => {
+                let child_seen = Rc::new(RefCell::new(Vec::new()));
+                let order_log = Rc::new(RefCell::new(Vec::new()));
+                let terminal_drops = Rc::clone(&self.terminal_drops);
+                spawn_observed(ChildDefinition::new(
+                    Child {
+                        seen: child_seen,
+                        order_log,
+                    },
+                    4,
+                ))
+                .then_result(move |value: ChildTerminal| {
+                    TerminalParentEvent::ChildDone(value, DropProbe(Rc::clone(&terminal_drops)))
+                })
+                .then(TerminalParentEvent::ChildStarted)
+            }
+            TerminalParentEvent::StartWhenFull => {
+                batch([send(ctx.me(), TerminalParentEvent::Fill), {
+                    let child_seen = Rc::new(RefCell::new(Vec::new()));
+                    let order_log = Rc::new(RefCell::new(Vec::new()));
+                    let terminal_drops = Rc::clone(&self.terminal_drops);
+                    spawn_observed(ChildDefinition::new(
+                        Child {
+                            seen: child_seen,
+                            order_log,
+                        },
+                        4,
+                    ))
+                    .then_result(move |value: ChildTerminal| {
+                        TerminalParentEvent::ChildDone(value, DropProbe(Rc::clone(&terminal_drops)))
+                    })
+                    .then(TerminalParentEvent::ChildStarted)
+                }])
+            }
+            TerminalParentEvent::Fill => noop(),
+            TerminalParentEvent::ChildStarted(Ok(child)) => {
+                *self.child_ref.borrow_mut() = Some(child);
+                noop()
+            }
+            TerminalParentEvent::ChildStarted(Err(error)) => {
+                self.spawn_errors.borrow_mut().push(error);
+                noop()
+            }
+            TerminalParentEvent::ChildDone(terminal, probe) => {
+                self.terminals.borrow_mut().push(terminal);
+                drop(probe);
+                noop()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResultChildEvent {
+    Report(u32),
+    StopPlain,
+}
+
+struct ResultChild;
+
+impl Isolate for ResultChild {
+    tina::isolate_types! {
+        message: ResultChildEvent,
+        reply: (),
+        send: Outbound<NeverOutbound>,
+        spawn: Infallible,
+        io: Infallible,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            ResultChildEvent::Report(value) => stop_with(ChildTerminal(value)),
+            ResultChildEvent::StopPlain => stop(),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum TerminalProbeParentEvent {
+    Start,
+    ChildStarted(Result<ChildRef<ResultChildEvent>, SpawnObservedError>),
+    ChildDone(ChildTerminal, DropProbe),
+}
+
+struct TerminalProbeParent {
+    child_ref: Rc<RefCell<Option<ChildRef<ResultChildEvent>>>>,
+    spawn_errors: Rc<RefCell<Vec<SpawnObservedError>>>,
+    terminals: Rc<RefCell<Vec<ChildTerminal>>>,
+    terminal_drops: Rc<Cell<usize>>,
+}
+
+impl Isolate for TerminalProbeParent {
+    tina::isolate_types! {
+        message: TerminalProbeParentEvent,
+        reply: (),
+        send: Outbound<ResultChildEvent>,
+        spawn: ChildDefinition<ResultChild>,
+        spawn_observed: tina::SpawnObserved<ChildDefinition<ResultChild>, TerminalProbeParentEvent, ResultChildEvent>,
+        io: Infallible,
+        shard: TestShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: Self::Message,
+        _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            TerminalProbeParentEvent::Start => {
+                let terminal_drops = Rc::clone(&self.terminal_drops);
+                spawn_observed(ChildDefinition::new(ResultChild, 4))
+                    .then_result(move |value: ChildTerminal| {
+                        TerminalProbeParentEvent::ChildDone(
+                            value,
+                            DropProbe(Rc::clone(&terminal_drops)),
+                        )
+                    })
+                    .then(TerminalProbeParentEvent::ChildStarted)
+            }
+            TerminalProbeParentEvent::ChildStarted(Ok(child)) => {
+                *self.child_ref.borrow_mut() = Some(child);
+                noop()
+            }
+            TerminalProbeParentEvent::ChildStarted(Err(error)) => {
+                self.spawn_errors.borrow_mut().push(error);
+                noop()
+            }
+            TerminalProbeParentEvent::ChildDone(value, probe) => {
+                self.terminals.borrow_mut().push(value);
+                drop(probe);
+                noop()
+            }
+        }
+    }
+}
+
+#[test]
+fn observed_child_terminal_result_is_delivered_once_to_parent() {
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let child_ref = Rc::new(RefCell::new(None));
+    let terminals = Rc::new(RefCell::new(Vec::new()));
+    let terminal_drops = Rc::new(Cell::new(0));
+    let parent = runtime.register(
+        TerminalProbeParent {
+            child_ref: Rc::clone(&child_ref),
+            spawn_errors: Rc::new(RefCell::new(Vec::new())),
+            terminals: Rc::clone(&terminals),
+            terminal_drops: Rc::clone(&terminal_drops),
+        },
+        TestMailbox::new(8),
+    );
+
+    assert!(
+        runtime
+            .try_send(parent, TerminalProbeParentEvent::Start)
+            .is_ok()
+    );
+    assert_eq!(runtime.step(), 1, "spawn effect");
+    assert_eq!(runtime.step(), 1, "child-started continuation");
+    let child = child_ref.borrow().expect("child started");
+
+    assert!(
+        runtime
+            .try_send(child.address, ResultChildEvent::Report(42))
+            .is_ok()
+    );
+    assert_eq!(runtime.step(), 1, "child stop_with");
+    assert!(
+        terminals.borrow().is_empty(),
+        "delivery is next parent step"
+    );
+    assert_eq!(runtime.step(), 1, "parent receives terminal");
+    assert_eq!(terminals.borrow().as_slice(), &[ChildTerminal(42)]);
+    assert_eq!(terminal_drops.get(), 1);
+    assert!(runtime.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::ChildTerminalDelivered { .. }
+        )
+    }));
+}
+
+#[test]
+fn observed_child_plain_stop_disposes_reservation_without_parent_event() {
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let child_ref = Rc::new(RefCell::new(None));
+    let terminals = Rc::new(RefCell::new(Vec::new()));
+    let parent = runtime.register(
+        TerminalProbeParent {
+            child_ref: Rc::clone(&child_ref),
+            spawn_errors: Rc::new(RefCell::new(Vec::new())),
+            terminals: Rc::clone(&terminals),
+            terminal_drops: Rc::new(Cell::new(0)),
+        },
+        TestMailbox::new(8),
+    );
+
+    assert!(
+        runtime
+            .try_send(parent, TerminalProbeParentEvent::Start)
+            .is_ok()
+    );
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 1);
+    let child = child_ref.borrow().expect("child started");
+
+    assert!(
+        runtime
+            .try_send(child.address, ResultChildEvent::StopPlain)
+            .is_ok()
+    );
+    assert_eq!(runtime.step(), 1);
+    assert!(terminals.borrow().is_empty());
+    assert!(runtime.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::ChildTerminalDisposed {
+                reason: tina_runtime::ChildTerminalDisposedReason::StoppedWithoutResult,
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn terminal_reservation_full_rejects_spawn_admission() {
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let spawn_errors = Rc::new(RefCell::new(Vec::new()));
+    let child_ref = Rc::new(RefCell::new(None));
+    let parent = runtime.register(
+        TerminalParent {
+            child_ref: Rc::clone(&child_ref),
+            spawn_errors: Rc::clone(&spawn_errors),
+            terminals: Rc::new(RefCell::new(Vec::new())),
+            terminal_drops: Rc::new(Cell::new(0)),
+            result_authority_drops: Rc::new(Cell::new(0)),
+        },
+        TestMailbox::new(1),
+    );
+
+    // Capacity 1: StartWhenFull enqueues Fill (occupies the only free slot),
+    // then terminal reservation fails Full. No child is admitted. The typed
+    // error continuation also cannot enter the full mailbox — that is the
+    // ordinary traced Full path, not a hidden lifecycle queue.
+    assert!(
+        runtime
+            .try_send(parent, TerminalParentEvent::StartWhenFull)
+            .is_ok()
+    );
+    assert_eq!(runtime.step(), 1);
+    assert!(child_ref.borrow().is_none());
+    assert!(
+        !runtime
+            .trace()
+            .iter()
+            .any(|event| matches!(event.kind(), RuntimeEventKind::Spawned { .. })),
+        "spawn must not be admitted when terminal reservation is Full"
+    );
+    assert!(
+        runtime.trace().iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::SendRejected {
+                    reason: tina_runtime::SendRejectedReason::Full,
+                    ..
+                }
+            )
+        }),
+        "typed ParentMailboxFull continuation uses the ordinary Full send path"
+    );
+    let _ = spawn_errors;
+}
+
+#[test]
+fn parent_stop_disposes_child_terminal_reservation() {
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    enum StopParentEvent {
+        StartThenStop,
+        ChildStarted(Result<ChildRef<ResultChildEvent>, SpawnObservedError>),
+        ChildDone(ChildTerminal),
+    }
+
+    struct StopParent;
+
+    impl Isolate for StopParent {
+        tina::isolate_types! {
+            message: StopParentEvent,
+            reply: (),
+            send: Outbound<ResultChildEvent>,
+            spawn: ChildDefinition<ResultChild>,
+            spawn_observed: tina::SpawnObserved<ChildDefinition<ResultChild>, StopParentEvent, ResultChildEvent>,
+            io: Infallible,
+            shard: TestShard,
+        }
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                StopParentEvent::StartThenStop => batch([
+                    spawn_observed(ChildDefinition::new(ResultChild, 4))
+                        .then_result(StopParentEvent::ChildDone)
+                        .then(StopParentEvent::ChildStarted),
+                    stop(),
+                ]),
+                StopParentEvent::ChildStarted(_) | StopParentEvent::ChildDone(_) => noop(),
+            }
+        }
+    }
+
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let parent = runtime.register(StopParent, TestMailbox::new(8));
+
+    assert!(
+        runtime
+            .try_send(parent, StopParentEvent::StartThenStop)
+            .is_ok()
+    );
+    assert_eq!(runtime.step(), 1);
+    assert!(runtime.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::ChildTerminalDisposed {
+                reason: tina_runtime::ChildTerminalDisposedReason::ParentStopped,
+                ..
+            }
+        )
+    }));
+}
+
+#[test]
+fn terminal_type_mismatch_disposes_without_wrong_delivery() {
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    enum WrongParentEvent {
+        Start,
+        ChildStarted(Result<ChildRef<ResultChildEvent>, SpawnObservedError>),
+        ChildDone(String),
+    }
+
+    struct WrongParent {
+        child_ref: Rc<RefCell<Option<ChildRef<ResultChildEvent>>>>,
+        done: Rc<Cell<bool>>,
+    }
+
+    impl Isolate for WrongParent {
+        tina::isolate_types! {
+            message: WrongParentEvent,
+            reply: (),
+            send: Outbound<ResultChildEvent>,
+            spawn: ChildDefinition<ResultChild>,
+            spawn_observed: tina::SpawnObserved<ChildDefinition<ResultChild>, WrongParentEvent, ResultChildEvent>,
+            io: Infallible,
+            shard: TestShard,
+        }
+
+        fn handle(
+            &mut self,
+            msg: Self::Message,
+            _ctx: &mut Context<'_, Self::Shard, Self::Reply>,
+        ) -> Effect<Self> {
+            match msg {
+                WrongParentEvent::Start => spawn_observed(ChildDefinition::new(ResultChild, 4))
+                    .then_result(|_value: String| WrongParentEvent::ChildDone("nope".into()))
+                    .then(WrongParentEvent::ChildStarted),
+                WrongParentEvent::ChildStarted(Ok(child)) => {
+                    *self.child_ref.borrow_mut() = Some(child);
+                    noop()
+                }
+                WrongParentEvent::ChildStarted(Err(_)) => noop(),
+                WrongParentEvent::ChildDone(_) => {
+                    self.done.set(true);
+                    noop()
+                }
+            }
+        }
+    }
+
+    let mut runtime = Runtime::new(TestShard, TestMailboxFactory);
+    let child_ref = Rc::new(RefCell::new(None));
+    let done = Rc::new(Cell::new(false));
+    let parent = runtime.register(
+        WrongParent {
+            child_ref: Rc::clone(&child_ref),
+            done: Rc::clone(&done),
+        },
+        TestMailbox::new(8),
+    );
+
+    assert!(runtime.try_send(parent, WrongParentEvent::Start).is_ok());
+    assert_eq!(runtime.step(), 1);
+    assert_eq!(runtime.step(), 1);
+    let child = child_ref.borrow().expect("child");
+    assert!(
+        runtime
+            .try_send(child.address, ResultChildEvent::Report(7))
+            .is_ok()
+    );
+    assert_eq!(runtime.step(), 1);
+    assert!(!done.get());
+    assert!(runtime.trace().iter().any(|event| {
+        matches!(
+            event.kind(),
+            RuntimeEventKind::ChildTerminalDisposed {
+                reason: tina_runtime::ChildTerminalDisposedReason::TypeMismatch,
+                ..
+            }
+        )
+    }));
+}
