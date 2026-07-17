@@ -4,6 +4,17 @@ This file records completed work.
 
 ## Unreleased
 
+### HTTP service-call peer disconnects
+
+- Fully buffered plain-TCP HTTP/1 service calls now observe peer EOF
+  concurrently, so a disconnected client stops the connection owner and
+  closes downstream caller authority without waiting for the service-call
+  timeout.
+- The bounded monitor preserves a one-byte early keepalive read for the next
+  request. TLS and streaming bodies retain their serialized or pull-driven
+  behavior, and connection mailbox capacities below three retain the previous
+  service-completion path without peer monitoring.
+
 ### Exact SQLite specimen terminals
 
 - The SQLite counter root now publishes `Result<Report, CounterFailure>`.
