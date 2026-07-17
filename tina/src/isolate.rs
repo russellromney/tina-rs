@@ -178,6 +178,36 @@ pub trait Mailbox<T> {
     fn is_closed(&self) -> bool {
         false
     }
+
+    /// Reserves one physical capacity slot for a later
+    /// [`try_send_reserved`](Self::try_send_reserved).
+    ///
+    /// Implementations that support this capability must account for the
+    /// reservation in every `try_send` path, including sends through clones.
+    /// Support must remain stable for the lifetime of the mailbox. The default
+    /// keeps existing custom mailboxes source-compatible and lets runtimes
+    /// reject observed-child admission before creating the child.
+    fn try_reserve(&self) -> Result<(), MailboxReservationError> {
+        Err(MailboxReservationError::Unsupported)
+    }
+
+    /// Releases one capacity reservation without sending a message.
+    ///
+    /// Returns `true` only when a reservation was consumed. Implementations
+    /// that return `Ok(())` from [`try_reserve`](Self::try_reserve) must provide
+    /// this operation.
+    fn release_reserved(&self) -> bool {
+        false
+    }
+
+    /// Consumes one physical reservation and enqueues `message`.
+    ///
+    /// A correct reservation-capable mailbox cannot return `Full` here. The
+    /// result remains typed so a faulty custom implementation cannot turn a
+    /// runtime settlement path into a panic.
+    fn try_send_reserved(&self, message: T) -> Result<(), TrySendError<T>> {
+        Err(TrySendError::Full(message))
+    }
 }
 
 impl<T> Mailbox<T> for Box<dyn Mailbox<T>> {
@@ -204,6 +234,29 @@ impl<T> Mailbox<T> for Box<dyn Mailbox<T>> {
     fn is_closed(&self) -> bool {
         (**self).is_closed()
     }
+
+    fn try_reserve(&self) -> Result<(), MailboxReservationError> {
+        (**self).try_reserve()
+    }
+
+    fn release_reserved(&self) -> bool {
+        (**self).release_reserved()
+    }
+
+    fn try_send_reserved(&self, message: T) -> Result<(), TrySendError<T>> {
+        (**self).try_send_reserved(message)
+    }
+}
+
+/// Why a mailbox could not reserve physical capacity for a future delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MailboxReservationError {
+    /// The mailbox has no unoccupied, unreserved slot.
+    Full,
+    /// The mailbox is closed.
+    Closed,
+    /// The mailbox does not implement physical capacity reservations.
+    Unsupported,
 }
 
 /// Error returned by [`Mailbox::try_send`] when a bounded mailbox cannot accept
@@ -644,6 +697,10 @@ pub enum SpawnObservedError {
     /// The parent's mailbox is closed, so a terminal-delivery reservation
     /// cannot be taken. No child was created.
     ParentMailboxClosed,
+
+    /// The parent's custom mailbox does not implement physical capacity
+    /// reservations. No child was created.
+    ParentMailboxReservationsUnsupported,
 }
 
 /// Type-level child address information carried by supported spawn requests.

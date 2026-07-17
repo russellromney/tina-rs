@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 use tina::{
     Address, AddressGeneration, CallContext, CallRejectedReason, CallRouting, ChildRef,
     ChildRelation, Context, DeferredReplyHandle, DeferredSlotState, Effect, Isolate, IsolateId,
-    Mailbox, MessageCaller, Outbound as TinaOutbound, RestartBudgetState, Shard, ShardId,
-    SpawnObservedError, StopResult, TrySendError,
+    Mailbox, MailboxReservationError, MessageCaller, Outbound as TinaOutbound, RestartBudgetState,
+    Shard, ShardId, SpawnObservedError, StopResult, TrySendError,
 };
 
 use crate::call::{
@@ -3035,12 +3035,12 @@ where
     pub(crate) fn try_reserve_terminal_slot(
         &self,
         parent: IsolateId,
-    ) -> Result<(), SendRejectedReason> {
+    ) -> Result<(), TerminalSlotReservationError> {
         let Some(entry) = self.entry_by_isolate(parent) else {
-            return Err(SendRejectedReason::Closed);
+            return Err(TerminalSlotReservationError::Closed);
         };
         if entry.stopped.get() {
-            return Err(SendRejectedReason::Closed);
+            return Err(TerminalSlotReservationError::Closed);
         }
         entry.mailbox.try_reserve_slot()
     }
@@ -3503,10 +3503,14 @@ where
                 Err(reason) => {
                     self.child_records[child_record_index].restart_recipe = Some(recipe);
                     let skipped = match reason {
-                        SendRejectedReason::Full => RestartSkippedReason::ParentMailboxFull,
-                        SendRejectedReason::Closed => RestartSkippedReason::ParentMailboxClosed,
-                        SendRejectedReason::ForeignSystem { .. } => {
+                        TerminalSlotReservationError::Full => {
+                            RestartSkippedReason::ParentMailboxFull
+                        }
+                        TerminalSlotReservationError::Closed => {
                             RestartSkippedReason::ParentMailboxClosed
+                        }
+                        TerminalSlotReservationError::Unsupported => {
+                            RestartSkippedReason::ParentMailboxReservationsUnsupported
                         }
                     };
                     self.push_event(
@@ -3750,7 +3754,7 @@ pub(crate) trait ErasedMailbox {
     fn close(&self);
     /// Reserves one future delivery slot against this mailbox's capacity.
     /// Ordinary sends cannot consume a reserved slot.
-    fn try_reserve_slot(&self) -> Result<(), SendRejectedReason>;
+    fn try_reserve_slot(&self) -> Result<(), TerminalSlotReservationError>;
     /// Releases one previously reserved slot without delivering a message.
     fn release_reserved_slot(&self);
     /// Consumes one reservation and enqueues `message`.
@@ -3760,14 +3764,18 @@ pub(crate) trait ErasedMailbox {
     ) -> Result<(), TrySendError<Box<dyn Any>>>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalSlotReservationError {
+    Full,
+    Closed,
+    Unsupported,
+}
+
 pub(crate) struct MailboxAdapter<M, Msg>
 where
     M: Mailbox<Msg>,
 {
     pub(crate) mailbox: M,
-    pub(crate) capacity: usize,
-    pub(crate) occupied: Cell<usize>,
-    pub(crate) reserved: Cell<usize>,
     pub(crate) closed: Cell<bool>,
     pub(crate) marker: PhantomData<fn(Msg) -> Msg>,
 }
@@ -3777,19 +3785,11 @@ where
     M: Mailbox<Msg>,
 {
     pub(crate) fn new(mailbox: M) -> Self {
-        let capacity = mailbox.capacity();
         Self {
             mailbox,
-            capacity,
-            occupied: Cell::new(0),
-            reserved: Cell::new(0),
             closed: Cell::new(false),
             marker: PhantomData,
         }
-    }
-
-    fn has_free_slot(&self) -> bool {
-        self.occupied.get().saturating_add(self.reserved.get()) < self.capacity
     }
 }
 
@@ -3800,13 +3800,6 @@ where
 {
     fn recv_boxed(&self) -> Option<Box<dyn Any>> {
         let message = self.mailbox.recv()?;
-        // Occupancy tracks adapter-path enqueues only. Callers may also hold a
-        // clone of the user mailbox and `try_send` directly (tests do this);
-        // those messages never increment `occupied`, so do not hard-underflow.
-        let occupied = self.occupied.get();
-        if occupied > 0 {
-            self.occupied.set(occupied - 1);
-        }
         Some(Box::new(message) as Box<dyn Any>)
     }
 
@@ -3821,15 +3814,8 @@ where
         if self.closed.get() {
             return Err(TrySendError::Closed(Box::new(*message) as Box<dyn Any>));
         }
-        if !self.has_free_slot() {
-            // Reserved terminal slots hold capacity against ordinary sends.
-            return Err(TrySendError::Full(Box::new(*message) as Box<dyn Any>));
-        }
         match self.mailbox.try_send(*message) {
-            Ok(()) => {
-                self.occupied.set(self.occupied.get() + 1);
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(TrySendError::Full(message)) => {
                 Err(TrySendError::Full(Box::new(message) as Box<dyn Any>))
             }
@@ -3845,54 +3831,39 @@ where
         self.mailbox.close();
     }
 
-    fn try_reserve_slot(&self) -> Result<(), SendRejectedReason> {
+    fn try_reserve_slot(&self) -> Result<(), TerminalSlotReservationError> {
         if self.closed.get() || self.mailbox.is_closed() {
             self.closed.set(true);
-            return Err(SendRejectedReason::Closed);
+            return Err(TerminalSlotReservationError::Closed);
         }
-        if !self.has_free_slot() {
-            return Err(SendRejectedReason::Full);
+        match self.mailbox.try_reserve() {
+            Ok(()) => Ok(()),
+            Err(MailboxReservationError::Full) => Err(TerminalSlotReservationError::Full),
+            Err(MailboxReservationError::Closed) => {
+                self.closed.set(true);
+                Err(TerminalSlotReservationError::Closed)
+            }
+            Err(MailboxReservationError::Unsupported) => {
+                Err(TerminalSlotReservationError::Unsupported)
+            }
         }
-        self.reserved.set(self.reserved.get() + 1);
-        Ok(())
     }
 
     fn release_reserved_slot(&self) {
-        let reserved = self.reserved.get();
-        if reserved == 0 {
-            panic!("release_reserved_slot without a reservation");
-        }
-        self.reserved.set(reserved - 1);
+        let _ = self.mailbox.release_reserved();
     }
 
     fn try_send_reserved_boxed(
         &self,
         message: Box<dyn Any>,
     ) -> Result<(), TrySendError<Box<dyn Any>>> {
-        let reserved = self.reserved.get();
-        if reserved == 0 {
-            panic!("try_send_reserved_boxed without a reservation");
-        }
-        self.reserved.set(reserved - 1);
         let message = message.downcast::<Msg>().unwrap_or_else(|_| {
             panic!("runtime attempted to deliver a message to a mailbox with the wrong type")
         });
-        if self.closed.get() || self.mailbox.is_closed() {
-            self.closed.set(true);
-            return Err(TrySendError::Closed(Box::new(*message) as Box<dyn Any>));
-        }
-        match self.mailbox.try_send(*message) {
-            Ok(()) => {
-                self.occupied.set(self.occupied.get() + 1);
-                Ok(())
-            }
-            Err(TrySendError::Full(_message)) => {
-                panic!(
-                    "reserved terminal delivery found mailbox full (occupied={}, reserved={}, capacity={})",
-                    self.occupied.get(),
-                    self.reserved.get(),
-                    self.capacity
-                );
+        match self.mailbox.try_send_reserved(*message) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(message)) => {
+                Err(TrySendError::Full(Box::new(message) as Box<dyn Any>))
             }
             Err(TrySendError::Closed(message)) => {
                 self.closed.set(true);
@@ -3904,43 +3875,21 @@ where
 
 pub(crate) struct AnyMailboxAdapter {
     pub(crate) mailbox: Box<dyn Mailbox<Box<dyn Any>>>,
-    pub(crate) capacity: usize,
-    pub(crate) occupied: Cell<usize>,
-    pub(crate) reserved: Cell<usize>,
     pub(crate) closed: Cell<bool>,
 }
 
 impl AnyMailboxAdapter {
     pub(crate) fn new(mailbox: Box<dyn Mailbox<Box<dyn Any>>>) -> Self {
-        Self::with_occupied(mailbox, 0)
-    }
-
-    pub(crate) fn with_occupied(mailbox: Box<dyn Mailbox<Box<dyn Any>>>, occupied: usize) -> Self {
-        let capacity = mailbox.capacity();
         Self {
             mailbox,
-            capacity,
-            occupied: Cell::new(occupied),
-            reserved: Cell::new(0),
             closed: Cell::new(false),
         }
-    }
-
-    fn has_free_slot(&self) -> bool {
-        self.occupied.get().saturating_add(self.reserved.get()) < self.capacity
     }
 }
 
 impl ErasedMailbox for AnyMailboxAdapter {
     fn recv_boxed(&self) -> Option<Box<dyn Any>> {
-        let message = self.mailbox.recv()?;
-        // Occupancy tracks adapter-path enqueues only. Shared mailboxes may
-        // also receive direct `try_send` traffic that never increments it.
-        let occupied = self.occupied.get();
-        if occupied > 0 {
-            self.occupied.set(occupied - 1);
-        }
-        Some(message)
+        self.mailbox.recv()
     }
 
     fn is_empty(&self) -> bool {
@@ -3951,15 +3900,8 @@ impl ErasedMailbox for AnyMailboxAdapter {
         if self.closed.get() {
             return Err(TrySendError::Closed(message));
         }
-        if !self.has_free_slot() {
-            // Reserved terminal slots hold capacity against ordinary sends.
-            return Err(TrySendError::Full(message));
-        }
         match self.mailbox.try_send(message) {
-            Ok(()) => {
-                self.occupied.set(self.occupied.get() + 1);
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(TrySendError::Full(message)) => Err(TrySendError::Full(message)),
             Err(TrySendError::Closed(message)) => {
                 self.closed.set(true);
@@ -3973,52 +3915,35 @@ impl ErasedMailbox for AnyMailboxAdapter {
         self.mailbox.close();
     }
 
-    fn try_reserve_slot(&self) -> Result<(), SendRejectedReason> {
+    fn try_reserve_slot(&self) -> Result<(), TerminalSlotReservationError> {
         if self.closed.get() || self.mailbox.is_closed() {
             self.closed.set(true);
-            return Err(SendRejectedReason::Closed);
+            return Err(TerminalSlotReservationError::Closed);
         }
-        if !self.has_free_slot() {
-            return Err(SendRejectedReason::Full);
+        match self.mailbox.try_reserve() {
+            Ok(()) => Ok(()),
+            Err(MailboxReservationError::Full) => Err(TerminalSlotReservationError::Full),
+            Err(MailboxReservationError::Closed) => {
+                self.closed.set(true);
+                Err(TerminalSlotReservationError::Closed)
+            }
+            Err(MailboxReservationError::Unsupported) => {
+                Err(TerminalSlotReservationError::Unsupported)
+            }
         }
-        self.reserved.set(self.reserved.get() + 1);
-        Ok(())
     }
 
     fn release_reserved_slot(&self) {
-        let reserved = self.reserved.get();
-        if reserved == 0 {
-            panic!("release_reserved_slot without a reservation");
-        }
-        self.reserved.set(reserved - 1);
+        let _ = self.mailbox.release_reserved();
     }
 
     fn try_send_reserved_boxed(
         &self,
         message: Box<dyn Any>,
     ) -> Result<(), TrySendError<Box<dyn Any>>> {
-        let reserved = self.reserved.get();
-        if reserved == 0 {
-            panic!("try_send_reserved_boxed without a reservation");
-        }
-        self.reserved.set(reserved - 1);
-        if self.closed.get() || self.mailbox.is_closed() {
-            self.closed.set(true);
-            return Err(TrySendError::Closed(message));
-        }
-        match self.mailbox.try_send(message) {
-            Ok(()) => {
-                self.occupied.set(self.occupied.get() + 1);
-                Ok(())
-            }
-            Err(TrySendError::Full(_)) => {
-                panic!(
-                    "reserved terminal delivery found mailbox full (occupied={}, reserved={}, capacity={})",
-                    self.occupied.get(),
-                    self.reserved.get(),
-                    self.capacity
-                );
-            }
+        match self.mailbox.try_send_reserved(message) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(message)) => Err(TrySendError::Full(message)),
             Err(TrySendError::Closed(message)) => {
                 self.closed.set(true);
                 Err(TrySendError::Closed(message))
@@ -4700,22 +4625,28 @@ where
         if terminal_erased.is_some() {
             match runtime.try_reserve_terminal_slot(parent) {
                 Ok(()) => terminal_slot_reserved = true,
-                Err(SendRejectedReason::Full) => {
+                Err(TerminalSlotReservationError::Full) => {
                     let message = continuation(Err(SpawnObservedError::ParentMailboxFull));
                     return SpawnObservedOutcome {
                         spawn: None,
                         continuation: Some(ErasedMessage::Local(Box::new(message))),
                     };
                 }
-                Err(SendRejectedReason::Closed) => {
+                Err(TerminalSlotReservationError::Closed) => {
                     let message = continuation(Err(SpawnObservedError::ParentMailboxClosed));
                     return SpawnObservedOutcome {
                         spawn: None,
                         continuation: Some(ErasedMessage::Local(Box::new(message))),
                     };
                 }
-                Err(SendRejectedReason::ForeignSystem { .. }) => {
-                    panic!("terminal reservation against local parent cannot be foreign")
+                Err(TerminalSlotReservationError::Unsupported) => {
+                    let message = continuation(Err(
+                        SpawnObservedError::ParentMailboxReservationsUnsupported,
+                    ));
+                    return SpawnObservedOutcome {
+                        spawn: None,
+                        continuation: Some(ErasedMessage::Local(Box::new(message))),
+                    };
                 }
             }
         }

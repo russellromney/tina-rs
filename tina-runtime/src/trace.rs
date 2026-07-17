@@ -442,6 +442,10 @@ pub enum RestartSkippedReason {
     /// The parent's mailbox is closed, so a terminal-delivery reservation for
     /// the replacement generation cannot be taken.
     ParentMailboxClosed,
+
+    /// The parent's custom mailbox cannot physically reserve capacity for a
+    /// replacement generation's terminal result.
+    ParentMailboxReservationsUnsupported,
 }
 
 /// Why a reserved child terminal result was disposed instead of delivered.
@@ -1648,6 +1652,7 @@ fn restart_skipped_tag(reason: RestartSkippedReason) -> u8 {
         RestartSkippedReason::RemoteNotRestartable => 3,
         RestartSkippedReason::ParentMailboxFull => 4,
         RestartSkippedReason::ParentMailboxClosed => 5,
+        RestartSkippedReason::ParentMailboxReservationsUnsupported => 6,
     }
 }
 
