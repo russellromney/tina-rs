@@ -114,7 +114,10 @@ want to compare only protocol behaviour rather than full trace shape.
 
 What felt good:
 - `LiveTrace::new()` → `observer()` → `try_with_config_and_trace_observer`
-  is a one-line "wire the live trace" — no `Arc<Mutex<_>>` plumbing.
+  is a one-line "wire the live trace".
+- Live and sim sinks privately accumulate receives and settle with
+  `stop_with(Output)` after a post-history `Finish`. The host claims
+  `observe_result` before start — no shared receive vec, no sleep-poll.
 - `assert_replay_case` panics with the full case history, the
   expected vs actual count + hash, and the next review step — enough
   for a coding agent to make a decision from the panic alone.
