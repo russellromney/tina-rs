@@ -11,11 +11,13 @@ use std::time::{Duration, Instant};
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, RuntimeCall, ThreadedRuntime, ThreadedRuntimeConfig,
+    CallOutcome, DefaultThreadedMailboxFactory, DeferredReplyRejectedReason, RuntimeCall,
+    RuntimeEventKind, ThreadedRuntime, ThreadedRuntimeConfig,
 };
 use tina_sqlite_bridge::{
-    InstalledSqliteBridge, SqliteAddress, SqliteCallOutcome, SqliteConfig, SqliteConfigError,
-    SqliteError, SqliteRequest, SqliteResponse, SqliteValue, SqliteWorker, send_request,
+    InstalledSqliteBridge, SqliteAddress, SqliteCallOutcome, SqliteCloseOutcome, SqliteConfig,
+    SqliteConfigError, SqliteError, SqliteProtocolError, SqliteRequest, SqliteResponse,
+    SqliteValue, SqliteWorker, send_request,
 };
 
 #[derive(Default)]
@@ -79,6 +81,51 @@ struct CallerIsolate {
     worker: SqliteAddress,
     timeout: Duration,
     sink: Arc<Sink>,
+}
+
+#[derive(Debug)]
+enum GoneCallerMsg {
+    Run,
+    Stop,
+    Done(SqliteCallOutcome),
+}
+
+struct GoneCaller {
+    worker: SqliteAddress,
+}
+
+impl Isolate for GoneCaller {
+    tina::isolate_types! {
+        message: GoneCallerMsg,
+        reply: (),
+        send: tina::Outbound<Infallible>,
+        spawn: Infallible,
+        io: RuntimeCall<GoneCallerMsg>,
+        shard: SingleShard,
+    }
+
+    fn handle(
+        &mut self,
+        msg: GoneCallerMsg,
+        _ctx: &mut Context<'_, SingleShard, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            GoneCallerMsg::Run => send_request(
+                self.worker,
+                SqliteRequest::QueryRows {
+                    sql: HEAVY_QUERY.into(),
+                    params: vec![],
+                    max_rows: 1,
+                },
+                Duration::from_secs(15),
+            )
+            .then(GoneCallerMsg::Done),
+            GoneCallerMsg::Stop => stop(),
+            GoneCallerMsg::Done(outcome) => {
+                panic!("a stopped caller cannot receive completion: {outcome:?}")
+            }
+        }
+    }
 }
 
 impl Isolate for CallerIsolate {
@@ -776,15 +823,20 @@ fn bridge_attempt_timeout_surfaces_and_late_result_is_recorded() {
         other => panic!("expected Full while timed-out work still runs, got {other:?}"),
     }
 
-    // Wait for the worker to finish and bump late_results.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if bridge.metrics.snapshot().late_results >= 1 {
-            break;
+    match bridge.close_and_wait(Duration::ZERO) {
+        SqliteCloseOutcome::TimedOut(metrics) => {
+            assert_eq!(metrics.current_in_flight, 1, "{metrics:?}");
+            assert_eq!(metrics.timeouts, 1, "{metrics:?}");
         }
-        std::thread::sleep(Duration::from_millis(20));
+        SqliteCloseOutcome::Drained(metrics) => {
+            panic!("zero-budget close must not invent early settlement: {metrics:?}")
+        }
     }
-    let snap = bridge.metrics.snapshot();
+
+    let snap = match bridge.close_and_wait(Duration::from_secs(30)) {
+        SqliteCloseOutcome::Drained(metrics) => metrics,
+        SqliteCloseOutcome::TimedOut(metrics) => panic!("worker did not settle: {metrics:?}"),
+    };
     assert_eq!(
         snap.late_results, 1,
         "late_results == 1 (no double): {snap:?}"
@@ -794,6 +846,61 @@ fn bridge_attempt_timeout_surfaces_and_late_result_is_recorded() {
     assert_eq!(snap.timeouts, 1);
 
     shutdown_runtime(runtime);
+}
+
+#[test]
+fn caller_gone_is_traced_exactly_and_worker_resources_settle() {
+    let runtime = make_runtime();
+    let bridge = install_bridge(
+        &runtime,
+        test_config().with_default_timeout(Duration::from_secs(10)),
+    );
+    let caller = runtime
+        .register_with_capacity::<_, Infallible>(
+            GoneCaller {
+                worker: bridge.address,
+            },
+            8,
+        )
+        .expect("register caller");
+    runtime
+        .try_send(caller, GoneCallerMsg::Run)
+        .expect("start and stop caller");
+    runtime
+        .try_send(caller, GoneCallerMsg::Stop)
+        .expect("stop caller with request in flight");
+    wait_admitted(&bridge, 1, Duration::from_secs(5));
+    let metrics = match bridge.close_and_wait(Duration::from_secs(30)) {
+        SqliteCloseOutcome::Drained(metrics) => metrics,
+        SqliteCloseOutcome::TimedOut(metrics) => panic!("worker did not settle: {metrics:?}"),
+    };
+    assert_eq!(metrics.admitted, 1, "{metrics:?}");
+    assert_eq!(metrics.worker_rows, 1, "{metrics:?}");
+    assert_eq!(metrics.current_in_flight, 0, "{metrics:?}");
+    assert_eq!(metrics.late_results, 0, "{metrics:?}");
+
+    let terminal = runtime
+        .shutdown_handle()
+        .request_and_wait_report(Duration::from_secs(5))
+        .expect("runtime terminal report");
+    drop(runtime);
+    terminal.ensure_clean().expect("clean runtime shutdown");
+    let trace = terminal.trace();
+    let owner_stopped_rejections = trace
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::DeferredReplyRejected {
+                    reason: DeferredReplyRejectedReason::OwnerStopped,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(owner_stopped_rejections, 1, "{trace:?}");
+
+    assert!(bridge.closer.is_closed());
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,16 +1135,10 @@ fn slot_is_conserved_under_mailbox_saturation() {
     );
 
     // Drain to idle: the single slot must return to free.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while bridge.metrics.snapshot().current_in_flight != 0 {
-        if Instant::now() >= deadline {
-            panic!(
-                "in_flight never returned to 0: {:?}",
-                bridge.metrics.snapshot()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
+    assert!(matches!(
+        bridge.close_and_wait(Duration::from_secs(10)),
+        SqliteCloseOutcome::Drained(_)
+    ));
 
     shutdown_runtime(runtime);
 }
@@ -1427,12 +1528,27 @@ fn error_display_includes_payload() {
         ),
         (SqliteError::Io("disk".into()), "io error: disk"),
         (SqliteError::Sqlite("syntax".into()), "sqlite error: syntax"),
+        (
+            SqliteError::Protocol(SqliteProtocolError::QueryReturnedExecuted),
+            "protocol error: query call returned executed",
+        ),
         (SqliteError::Internal("bug".into()), "internal: bug"),
     ];
     for (err, fragment) in cases {
         let s = format!("{err}");
         assert!(s.contains(fragment), "{s} missing {fragment}");
     }
+}
+
+#[test]
+fn protocol_error_preserves_its_typed_source() {
+    let error = SqliteError::Protocol(SqliteProtocolError::ExecuteReturnedRows);
+    assert!(matches!(
+        error
+            .source()
+            .and_then(|source| source.downcast_ref::<SqliteProtocolError>()),
+        Some(SqliteProtocolError::ExecuteReturnedRows)
+    ));
 }
 
 #[test]

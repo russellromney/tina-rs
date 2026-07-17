@@ -4,6 +4,22 @@ This file records completed work.
 
 ## Unreleased
 
+### Exact SQLite specimen terminals
+
+- The SQLite counter root now publishes `Result<Report, CounterFailure>`.
+  Database, bridge delivery, runtime rejection, and counter protocol failures
+  remain typed; failed runs no longer return a clean-looking partial report.
+- Typed SQLite helpers expose response-shape violations as
+  `SqliteError::Protocol(SqliteProtocolError)` and preserve runtime rejection
+  reasons in `SqliteFatalReason::Rejected` rather than stringifying either.
+- Public correction coverage proves malformed SQL, closed bridge, worker
+  timeout plus late completion, wrong SQLite value type, observer type
+  mismatch, caller disappearance, clean shutdown, and exact in-flight
+  settlement.
+- `execute_blocking` / `query_blocking` keep raw bridge envelopes out of
+  `LocalSystem` hosts, and `InstalledSqliteBridge::close_and_wait` provides a
+  typed `Drained` / `TimedOut` resource-settlement outcome.
+
 ### Typed WebSocket delivery and lane correctness
 
 - WebSocket upgrade accept now takes capability-typed handles:

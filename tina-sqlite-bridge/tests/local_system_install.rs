@@ -7,8 +7,8 @@ use std::time::Duration;
 use tina::prelude::*;
 use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, ThreadedRuntimeError};
 use tina_sqlite_bridge::{
-    InstallError, SqliteConfig, SqliteConfigError, SqliteMsg, SqliteRequest, SqliteResponse,
-    SqliteWorker,
+    InstallError, SqliteCloseOutcome, SqliteConfig, SqliteConfigError, SqliteWorker,
+    execute_blocking,
 };
 
 fn system() -> LocalSystem<SingleShard, DefaultThreadedMailboxFactory> {
@@ -51,24 +51,23 @@ fn install_local_returns_callable_address_closer_metrics_and_clean_shutdown() {
     )
     .expect("install sqlite bridge");
 
-    let outcome = app
-        .call_blocking(
-            bridge.address.address(),
-            SqliteMsg::Request(SqliteRequest::execute(
-                "CREATE TABLE local_test (id INTEGER)",
-            )),
-            Duration::from_secs(2),
-        )
-        .expect("host call reaches bridge");
-    assert!(matches!(
-        outcome,
-        CallOutcome::Replied(Ok(SqliteResponse::Executed { rows_changed: 0 }))
-    ));
+    let outcome = execute_blocking(
+        &app,
+        bridge.address,
+        "CREATE TABLE local_test (id INTEGER)",
+        vec![],
+        Duration::from_secs(2),
+    )
+    .expect("host call reaches bridge");
+    assert!(matches!(outcome, CallOutcome::Replied(Ok(0))));
     let metrics = bridge.metrics.snapshot();
     assert_eq!(metrics.admitted, 1);
     assert_eq!(metrics.worker_executed, 1);
     assert!(!bridge.closer.is_closed());
-    bridge.closer.close();
+    assert!(matches!(
+        bridge.close_and_wait(Duration::from_secs(2)),
+        SqliteCloseOutcome::Drained(_)
+    ));
     assert!(bridge.closer.is_closed());
 
     app.shutdown()

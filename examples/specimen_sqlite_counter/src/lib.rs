@@ -48,6 +48,94 @@ pub struct Report {
     pub exit_clean: bool,
 }
 
+/// Terminal failure produced by the Tina counter isolate.
+///
+/// A failed script never returns a [`Report`]. The database/worker layer,
+/// runtime delivery layer, and counter protocol layer remain separate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CounterFailure {
+    /// The bridge replied with a typed SQLite/worker failure.
+    Sqlite(tina_sqlite_bridge::SqliteError),
+    /// The runtime could not complete the call to the bridge.
+    Delivery(BridgeDeliveryFailure),
+    /// The bridge succeeded, but the reply violated the counter protocol.
+    Protocol(CounterProtocolFailure),
+}
+
+/// Runtime-layer terminal for one bridge call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeDeliveryFailure {
+    /// The bridge isolate mailbox could not admit the call.
+    Full,
+    /// The bridge isolate was closed, stale, or unavailable.
+    Closed,
+    /// The isolate-call deadline elapsed.
+    Timeout,
+    /// The runtime rejected the call without an application reply.
+    Rejected(tina::CallRejectedReason),
+}
+
+/// Counter-specific protocol violation after a successful bridge reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CounterProtocolFailure {
+    /// One UPDATE changed a number of rows other than one.
+    UnexpectedRowsChanged {
+        /// Expected rows changed.
+        expected: u64,
+        /// Actual rows changed.
+        actual: u64,
+    },
+    /// The final query returned a number of rows other than one.
+    UnexpectedRowCount {
+        /// Actual row count.
+        actual: usize,
+    },
+    /// The final query's only row returned a number of columns other than one.
+    UnexpectedColumnCount {
+        /// Actual column count.
+        actual: usize,
+    },
+    /// The final value had the wrong SQLite value kind.
+    UnexpectedValueKind {
+        /// Actual SQLite value kind.
+        actual: SqliteValueKind,
+    },
+    /// SQLite returned a negative value for the unsigned counter.
+    NegativeFinalValue {
+        /// Signed value returned by SQLite.
+        actual: i64,
+    },
+}
+
+/// Stable value-kind vocabulary used by [`CounterProtocolFailure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqliteValueKind {
+    Null,
+    Integer,
+    Real,
+    Text,
+    Blob,
+}
+
+impl std::fmt::Display for CounterFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sqlite(error) => write!(formatter, "sqlite failure: {error}"),
+            Self::Delivery(error) => write!(formatter, "bridge delivery failure: {error:?}"),
+            Self::Protocol(error) => write!(formatter, "counter protocol failure: {error:?}"),
+        }
+    }
+}
+
+impl std::error::Error for CounterFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Sqlite(error) => Some(error),
+            Self::Delivery(_) | Self::Protocol(_) => None,
+        }
+    }
+}
+
 /// Expected counts after running the script. Both sides should land
 /// on `final_value = INCREMENTS` with matching query/update metrics.
 pub fn expected_report() -> Report {

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags, types::ValueRef};
 use tina::prelude::*;
@@ -51,6 +51,7 @@ fn admission_reason_name(err: &SqliteError) -> &'static str {
         SqliteError::Closed => "Closed",
         SqliteError::InvalidRequest(_) => "InvalidRequest",
         SqliteError::Internal(_) => "Internal",
+        SqliteError::Protocol(_) => "Protocol",
         // Worker-class errors never fire from admission. Fall through
         // to a stable string so a future variant doesn't silently log
         // an empty reason.
@@ -101,6 +102,7 @@ fn emit_replied(result: &SqliteResult, request_kind: &'static str) {
             let reason = worker_reason_name(err);
             let level = match err {
                 SqliteError::Internal(_) => Level::ERROR,
+                SqliteError::Protocol(_) => Level::ERROR,
                 _ => Level::WARN,
             };
             // tracing::event! bakes the level into static callsite
@@ -205,6 +207,40 @@ pub struct InstalledSqliteBridge<S: Shard + 'static> {
     /// Metrics handle.
     pub metrics: SqliteMetricsHandle,
     _shard: PhantomData<S>,
+}
+
+/// Result of closing SQLite admission and waiting for accepted work to settle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqliteCloseOutcome {
+    /// Admission is closed and no worker operation remains in flight.
+    Drained(crate::SqliteMetrics),
+    /// The deadline elapsed. The snapshot preserves exact remaining work.
+    TimedOut(crate::SqliteMetrics),
+}
+
+impl<S: Shard + 'static> InstalledSqliteBridge<S> {
+    /// Close future admission and wait up to `timeout` for accepted work.
+    ///
+    /// SQLite C calls are not cancelled. A timeout therefore reports truthful
+    /// remaining work and this same installed handle may be retried later.
+    pub fn close_and_wait(&self, timeout: Duration) -> SqliteCloseOutcome {
+        self.closer.close();
+        let started = std::time::Instant::now();
+        loop {
+            let metrics = self.metrics.snapshot();
+            if metrics.current_in_flight == 0 {
+                return SqliteCloseOutcome::Drained(metrics);
+            }
+            if started.elapsed() >= timeout {
+                return SqliteCloseOutcome::TimedOut(metrics);
+            }
+            thread::sleep(
+                timeout
+                    .saturating_sub(started.elapsed())
+                    .min(Duration::from_millis(1)),
+            );
+        }
+    }
 }
 
 /// Cloneable closer. Non-blocking. Flips the closed flag; new

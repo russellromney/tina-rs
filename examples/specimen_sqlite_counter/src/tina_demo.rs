@@ -375,7 +375,7 @@ pub fn demo_retry() -> anyhow::Result<()> {
 
 /// Point-in-time inspection demo: seed a value, then read it back
 /// through the bridge's existing typed query request (host
-/// `call_blocking` of `SqliteRequest::query_rows`). No result sidecar.
+/// `query_blocking`). No result sidecar or bridge envelope.
 pub fn demo_point_in_time_query() -> anyhow::Result<()> {
     with_app(|app| {
         let bridge = install(app, SqliteConfig::memory());
@@ -402,4 +402,3 @@ pub fn demo_point_in_time_query() -> anyhow::Result<()> {
         Ok(())
     })
 }
-
