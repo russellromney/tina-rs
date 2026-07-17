@@ -184,3 +184,19 @@ blast-radius proof, and post-merge workflow result here.
 
 ### Still todo
 - F4 WebSocket, M4 network systems, M6 residual, C1 certification
+
+## Checkpoint 3 — framework + core migrations
+
+### Merged
+- F1 #368 merge 0f1d9c2d (terminal observation)
+- F2 #371 merge 38c2ebf6 (keepalive install)
+- F3 #373 merge 7dd60291 (typed HTTP delivery)
+- F4 #375 merge (typed WebSocket delivery) — see tip after fetch
+- M1 #374 merge 9f05cb62 (real_io_chat + job_queue)
+- M5 #372 merge c18ec119 (session auth)
+- D1 #367, M2 #370, M3 #369, I0A #364, I0B #366 earlier
+
+### Next
+- M4 network systems (mini_saas, scoped_request_tree, realtime_rooms, websocket_room)
+- M6 residual hosts
+- C1 final certification + FINDINGS.md + guards
