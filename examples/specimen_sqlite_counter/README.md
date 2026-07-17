@@ -117,8 +117,8 @@ let report = waiter.wait(Duration::from_secs(10))??;
 ```
 
 Point-in-time inspection of the live database uses the existing typed
-query request (host `call_blocking` of `SqliteRequest::query_rows`, or
-`query_call` from another isolate). Application metrics for the full
+query request (host `query_blocking`, or `query_call` from another isolate).
+Application metrics for the full
 script arrive only through the terminal report.
 
 The service-isolate helpers `execute_call(...)` and `query_call(...)`

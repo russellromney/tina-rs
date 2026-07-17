@@ -9,10 +9,11 @@
 //!
 //! # Use
 //!
-//! Typed-helper path is the obvious one: [`execute_call`] projects
-//! away the response enum and surfaces `Result<u64, SqliteError>` at
-//! the call site. The full-truth [`send_request`] path stays
-//! available — use it when you want the response enum visible.
+//! Typed-helper path is the obvious one: [`execute_call`] / [`query_call`]
+//! serve isolate continuations, while [`execute_blocking`] / [`query_blocking`]
+//! serve `LocalSystem` hosts without exposing [`SqliteMsg`] envelopes. The
+//! full-truth [`send_request`] path stays available when the response enum is
+//! intentionally part of application logic.
 //!
 //! ```no_run
 //! use std::convert::Infallible;
@@ -117,7 +118,9 @@
 //!
 //! [`SqliteWorker::install_local`] is the application-facade counterpart to
 //! [`SqliteWorker::install`]. Both return the same callable address, closer,
-//! metrics, and typed setup/registration errors.
+//! metrics, and typed setup/registration errors. Installed bridges expose
+//! [`InstalledSqliteBridge::close_and_wait`] for bounded, retryable settlement
+//! of accepted synchronous work.
 //!
 //! # Pressure rule
 //!
@@ -153,8 +156,8 @@ mod worker;
 pub use helpers::{
     ExecuteCall, QueryCall, Row, SqliteAddress, SqliteCallOutcome, SqliteExecutedOutcome,
     SqliteFatalReason, SqliteOutcomeClass, SqliteOutcomeExt, SqliteResult, SqliteRows,
-    SqliteRowsOutcome, SqliteTransientReason, execute_call, query_call, send_request,
-    sqlite_bridge_class,
+    SqliteRowsOutcome, SqliteTransientReason, execute_blocking, execute_call, query_blocking,
+    query_call, send_request, sqlite_bridge_class,
 };
 pub use metrics::{
     SQLITE_BRIDGE_SURFACE, SqliteMetrics, SqliteMetricsHandle, SqlitePressureReport,
@@ -167,4 +170,6 @@ pub use types::{
     InstallError, SqliteConfig, SqliteConfigError, SqliteError, SqlitePath, SqliteProtocolError,
     SqliteRequest, SqliteResponse, SqliteValue, U64TooLarge,
 };
-pub use worker::{InstalledSqliteBridge, SqliteCloser, SqliteMsg, SqliteWorker};
+pub use worker::{
+    InstalledSqliteBridge, SqliteCloseOutcome, SqliteCloser, SqliteMsg, SqliteWorker,
+};

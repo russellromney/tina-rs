@@ -391,7 +391,23 @@ impl std::fmt::Display for SqliteProtocolError {
 
 impl std::error::Error for SqliteProtocolError {}
 
-impl std::error::Error for SqliteError {}
+impl std::error::Error for SqliteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Protocol(error) => Some(error),
+            Self::Full
+            | Self::Closed
+            | Self::Timeout
+            | Self::InvalidRequest(_)
+            | Self::ResponseTooLarge
+            | Self::Busy
+            | Self::Constraint(_)
+            | Self::Io(_)
+            | Self::Sqlite(_)
+            | Self::Internal(_) => None,
+        }
+    }
+}
 
 /// Where the worker opens its connection.
 #[derive(Debug, Clone)]

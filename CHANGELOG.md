@@ -16,6 +16,9 @@ This file records completed work.
   timeout plus late completion, wrong SQLite value type, observer type
   mismatch, caller disappearance, clean shutdown, and exact in-flight
   settlement.
+- `execute_blocking` / `query_blocking` keep raw bridge envelopes out of
+  `LocalSystem` hosts, and `InstalledSqliteBridge::close_and_wait` provides a
+  typed `Drained` / `TimedOut` resource-settlement outcome.
 
 ### Typed WebSocket delivery and lane correctness
 

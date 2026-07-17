@@ -297,6 +297,62 @@ pub fn query_call(
     }
 }
 
+/// Execute one SQL statement from a [`tina_runtime::LocalSystem`] host.
+///
+/// This is the host counterpart to [`execute_call`]. It keeps the private
+/// [`SqliteMsg`] request envelope out of application code while preserving
+/// both runtime-host failure and the full typed call outcome.
+pub fn execute_blocking<S, F>(
+    app: &tina_runtime::LocalSystem<S, F>,
+    addr: SqliteAddress,
+    sql: impl Into<String>,
+    params: Vec<SqliteValue>,
+    timeout: Duration,
+) -> Result<SqliteExecutedOutcome, tina_runtime::ThreadedRuntimeError>
+where
+    S: tina::Shard + Send + 'static,
+    F: tina_runtime::MailboxFactory + Send + 'static,
+{
+    let outcome = app.call_blocking(
+        addr.address(),
+        SqliteMsg::Request(SqliteRequest::Execute {
+            sql: sql.into(),
+            params,
+        }),
+        timeout,
+    )?;
+    Ok(project_executed(outcome))
+}
+
+/// Query buffered rows from a [`tina_runtime::LocalSystem`] host.
+///
+/// This is the host counterpart to [`query_call`]. Response-shape violations
+/// remain [`SqliteError::Protocol`] and runtime rejection remains in the outer
+/// [`CallOutcome`].
+pub fn query_blocking<S, F>(
+    app: &tina_runtime::LocalSystem<S, F>,
+    addr: SqliteAddress,
+    sql: impl Into<String>,
+    params: Vec<SqliteValue>,
+    max_rows: usize,
+    timeout: Duration,
+) -> Result<SqliteRowsOutcome, tina_runtime::ThreadedRuntimeError>
+where
+    S: tina::Shard + Send + 'static,
+    F: tina_runtime::MailboxFactory + Send + 'static,
+{
+    let outcome = app.call_blocking(
+        addr.address(),
+        SqliteMsg::Request(SqliteRequest::QueryRows {
+            sql: sql.into(),
+            params,
+            max_rows,
+        }),
+        timeout,
+    )?;
+    Ok(project_rows(outcome))
+}
+
 fn project_executed(outcome: SqliteCallOutcome) -> SqliteExecutedOutcome {
     match outcome {
         CallOutcome::Replied(Ok(SqliteResponse::Executed { rows_changed })) => {

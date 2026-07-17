@@ -5,7 +5,7 @@
 //! runs SQLite.
 //!
 //! Point-in-time inspection of the database uses the bridge's existing
-//! typed query request (`query_call` / host `call_blocking_typed`).
+//! typed query request (`query_call` / host `query_blocking`).
 //! There is no result mutex, condvar, atomic completion flag, or
 //! sleep-poll loop for application results.
 
@@ -20,8 +20,9 @@ use tina_runtime::{
     StartupError, ThreadedRuntimeError, ThreadedTrySendError,
 };
 use tina_sqlite_bridge::{
-    InstallError, SqliteAddress, SqliteConfig, SqliteError, SqliteExecutedOutcome,
-    SqliteRowsOutcome, SqliteValue, SqliteWorker, execute_call, query_call,
+    InstallError, SqliteAddress, SqliteCloseOutcome, SqliteConfig, SqliteError,
+    SqliteExecutedOutcome, SqliteRowsOutcome, SqliteValue, SqliteWorker, execute_call,
+    query_blocking, query_call,
 };
 
 use crate::{
@@ -144,7 +145,16 @@ impl std::fmt::Display for TinaRunError {
     }
 }
 
-impl std::error::Error for TinaRunError {}
+impl std::error::Error for TinaRunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TempDir(error) => Some(error),
+            Self::Seed(error) => Some(error),
+            Self::Startup(error) => Some(error),
+            Self::Run(error) => Some(error),
+        }
+    }
+}
 
 impl std::fmt::Display for TinaWorkloadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -274,26 +284,30 @@ fn run_correction_application(
         }
     };
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let metrics = bridge.metrics.snapshot();
-        if metrics.current_in_flight == 0 {
-            bridge.closer.close();
-            return Ok(CorrectionReport {
-                outcome,
-                metrics,
-                bridge_closed: bridge.closer.is_closed(),
-            });
-        }
-        if std::time::Instant::now() >= deadline {
-            bridge.closer.close();
+    let metrics = match bridge.close_and_wait(Duration::from_secs(5)) {
+        SqliteCloseOutcome::Drained(metrics) => metrics,
+        SqliteCloseOutcome::TimedOut(metrics) => {
             return Err(TinaWorkloadError::SettlementTimeout(metrics));
         }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    };
+    Ok(CorrectionReport {
+        outcome,
+        metrics,
+        bridge_closed: bridge.closer.is_closed(),
+    })
 }
 
-impl std::error::Error for TinaWorkloadError {}
+impl std::error::Error for TinaWorkloadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Install(error) => Some(error),
+            Self::Register(error) => Some(error),
+            Self::Start(error) => Some(error),
+            Self::Counter(error) => Some(error),
+            Self::Observer(_) | Self::SettlementTimeout(_) => None,
+        }
+    }
+}
 
 pub fn run() -> Result<Report, TinaRunError> {
     let dir = tempfile::tempdir().map_err(TinaRunError::TempDir)?;
@@ -344,9 +358,12 @@ fn run_application(
         .wait(Duration::from_secs(10))
         .map_err(TinaWorkloadError::Observer)?;
 
-    bridge.closer.close();
-
-    let snap = bridge.metrics.snapshot();
+    let snap = match bridge.close_and_wait(Duration::from_secs(5)) {
+        SqliteCloseOutcome::Drained(metrics) => metrics,
+        SqliteCloseOutcome::TimedOut(metrics) => {
+            return Err(TinaWorkloadError::SettlementTimeout(metrics));
+        }
+    };
     eprintln!(
         "specimen_sqlite_counter (tina) bridge metrics: \
          admitted={} executed={} rows={} timeouts={} late={} full={} closed={} \
@@ -371,24 +388,11 @@ pub fn query_counter_value(
     app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
     db: SqliteAddress,
 ) -> Result<u64, QueryCounterError> {
-    use tina_sqlite_bridge::{SqliteMsg, SqliteRequest, SqliteResponse};
-
-    let outcome = app
-        .call_blocking(
-            db.address(),
-            SqliteMsg::Request(SqliteRequest::query_rows(QUERY_SQL, 1)),
-            SQL_TIMEOUT,
-        )
+    let outcome = query_blocking(app, db, QUERY_SQL, vec![], 1, SQL_TIMEOUT)
         .map_err(QueryCounterError::Host)?;
     match outcome {
-        CallOutcome::Replied(Ok(SqliteResponse::Rows { columns, rows })) => {
-            let rows = tina_sqlite_bridge::SqliteRows { columns, rows };
+        CallOutcome::Replied(Ok(rows)) => {
             decode_final_value(&rows).map_err(QueryCounterError::Protocol)
-        }
-        CallOutcome::Replied(Ok(SqliteResponse::Executed { .. })) => {
-            Err(QueryCounterError::Sqlite(SqliteError::Protocol(
-                tina_sqlite_bridge::SqliteProtocolError::QueryReturnedExecuted,
-            )))
         }
         CallOutcome::Replied(Err(error)) => Err(QueryCounterError::Sqlite(error)),
         CallOutcome::Full => Err(QueryCounterError::Delivery(BridgeDeliveryFailure::Full)),
@@ -415,7 +419,15 @@ impl std::fmt::Display for QueryCounterError {
     }
 }
 
-impl std::error::Error for QueryCounterError {}
+impl std::error::Error for QueryCounterError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Host(error) => Some(error),
+            Self::Sqlite(error) => Some(error),
+            Self::Delivery(_) | Self::Protocol(_) => None,
+        }
+    }
+}
 
 fn call_failure<T>(outcome: CallOutcome<Result<T, SqliteError>>) -> CounterFailure {
     match outcome {
@@ -471,4 +483,53 @@ fn seed_database(path: &std::path::Path) -> rusqlite::Result<()> {
         params![],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rows(cells: Vec<Vec<SqliteValue>>) -> tina_sqlite_bridge::SqliteRows {
+        let columns = cells
+            .first()
+            .map(|row| (0..row.len()).map(|index| format!("c{index}")).collect())
+            .unwrap_or_default();
+        tina_sqlite_bridge::SqliteRows {
+            columns,
+            rows: cells,
+        }
+    }
+
+    #[test]
+    fn final_value_protocol_is_exhaustive_and_never_coerces() {
+        assert_eq!(
+            decode_final_value(&rows(vec![])),
+            Err(CounterProtocolFailure::UnexpectedRowCount { actual: 0 })
+        );
+        assert_eq!(
+            decode_final_value(&rows(vec![vec![], vec![]])),
+            Err(CounterProtocolFailure::UnexpectedRowCount { actual: 2 })
+        );
+        assert_eq!(
+            decode_final_value(&rows(vec![vec![
+                SqliteValue::Integer(1),
+                SqliteValue::Integer(2),
+            ]])),
+            Err(CounterProtocolFailure::UnexpectedColumnCount { actual: 2 })
+        );
+        assert_eq!(
+            decode_final_value(&rows(vec![vec![SqliteValue::Integer(-1)]])),
+            Err(CounterProtocolFailure::NegativeFinalValue { actual: -1 })
+        );
+        assert_eq!(
+            decode_final_value(&rows(vec![vec![SqliteValue::Real(1.0)]])),
+            Err(CounterProtocolFailure::UnexpectedValueKind {
+                actual: SqliteValueKind::Real,
+            })
+        );
+        assert_eq!(
+            decode_final_value(&rows(vec![vec![SqliteValue::Integer(7)]])),
+            Ok(7)
+        );
+    }
 }

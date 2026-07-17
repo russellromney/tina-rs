@@ -46,8 +46,8 @@ fn public_smoke() {
     assert_eq!(tokio_impl::run().expect("tokio public runner"), expected_report());
     assert_eq!(tina_impl::run().expect("tina public runner"), expected_report());
 
-    // Point-in-time path: host call_blocking of SqliteRequest::query_rows
-    // through the helper documented for mid-run inspection.
+    // Point-in-time path: host query_blocking through the helper documented
+    // for mid-run inspection.
     tina_demo::demo_point_in_time_query().expect("point-in-time typed query");
 
     // Report fields are Copy and publicly comparable.
