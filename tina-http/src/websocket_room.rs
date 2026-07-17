@@ -50,9 +50,11 @@ pub struct WebSocketMemberTableReport {
     pub admit_rejected_duplicate: u64,
     pub left_peer: u64,
     pub left_slow: u64,
+    pub left_full: u64,
     pub left_protocol: u64,
     pub left_timeout: u64,
     pub left_foreign: u64,
+    pub left_stale: u64,
     pub broadcast_ok: u64,
     pub broadcast_full: u64,
     pub broadcast_closed: u64,
@@ -88,6 +90,9 @@ pub enum SendOutcomeAction {
     /// `OutboundQueueFull` / `OutboundBytesFull` from the connection owner.
     /// The member was removed; slow-peer eviction applies.
     RemovedSlow,
+    /// The connection owner's mailbox was full. The member was removed, but
+    /// this is not attributed to the peer's outbound frame/byte pressure.
+    RemovedFull,
     /// `Closed` / `Closing` from the connection owner. The member was
     /// removed; ordinary peer-side close.
     RemovedClosed,
@@ -99,9 +104,11 @@ pub enum SendOutcomeAction {
     /// The handle belongs to another runtime incarnation. The member was
     /// removed because this room can never deliver through that handle.
     RemovedForeign,
-    /// `Stale` from the connection owner *or* the outcome named a session id
-    /// that the table no longer holds (e.g., concurrent peer-side close
-    /// during a fanout). No membership change.
+    /// The connection owner rejected the table's current handle as stale. The
+    /// dead member was removed so it cannot retain bounded table capacity.
+    RemovedStale,
+    /// The outcome named a session id that the table no longer holds (e.g., a
+    /// concurrent peer-side close during fanout). No membership change.
     Stale,
 }
 
@@ -332,6 +339,12 @@ impl WebSocketMemberTable {
                 self.members.remove(&id);
                 SendOutcomeAction::RemovedSlow
             }
+            Err(WebSocketSendError::Full) => {
+                self.report.broadcast_full += 1;
+                self.report.left_full += 1;
+                self.members.remove(&id);
+                SendOutcomeAction::RemovedFull
+            }
             Err(WebSocketSendError::Closed) | Err(WebSocketSendError::Closing) => {
                 self.report.broadcast_closed += 1;
                 self.report.left_peer += 1;
@@ -358,7 +371,9 @@ impl WebSocketMemberTable {
             }
             Err(WebSocketSendError::Stale) => {
                 self.report.broadcast_stale += 1;
-                SendOutcomeAction::Stale
+                self.report.left_stale += 1;
+                self.members.remove(&id);
+                SendOutcomeAction::RemovedStale
             }
         }
     }
@@ -442,7 +457,26 @@ mod tests {
     }
 
     #[test]
-    fn record_send_outcome_stale_does_not_remove() {
+    fn owner_mailbox_full_is_not_counted_as_slow_peer_pressure() {
+        let mut table = WebSocketMemberTable::new(1);
+        let member = dummy_handle(1);
+        table.admit(member);
+
+        assert_eq!(
+            table.record_send_outcome(&WebSocketSendOutcome {
+                session: member.session_id(),
+                result: Err(WebSocketSendError::Full),
+            }),
+            SendOutcomeAction::RemovedFull
+        );
+        assert!(table.is_empty());
+        assert_eq!(table.report().broadcast_full, 1);
+        assert_eq!(table.report().left_full, 1);
+        assert_eq!(table.report().left_slow, 0);
+    }
+
+    #[test]
+    fn outcome_for_absent_member_is_stale_without_removal() {
         let mut table = WebSocketMemberTable::new(2);
         let h = dummy_handle(1);
         table.admit(h);
@@ -456,6 +490,54 @@ mod tests {
         );
         assert_eq!(table.len(), 1);
         assert_eq!(table.report().broadcast_stale, 1);
+        assert_eq!(table.report().left_stale, 0);
+    }
+
+    #[test]
+    fn owner_stale_outcome_removes_member_and_releases_capacity_once() {
+        let mut table = WebSocketMemberTable::new(1);
+        let member = dummy_handle(1);
+        let outcome = WebSocketSendOutcome {
+            session: member.session_id(),
+            result: Err(WebSocketSendError::Stale),
+        };
+        assert_eq!(table.admit(member), AdmitOutcome::Admitted);
+
+        assert_eq!(
+            table.record_send_outcome(&outcome),
+            SendOutcomeAction::RemovedStale
+        );
+        assert!(table.is_empty());
+        assert_eq!(table.report().left_stale, 1);
+        assert_eq!(table.report().broadcast_stale, 1);
+        assert_eq!(
+            table.record_send_outcome(&outcome),
+            SendOutcomeAction::Stale
+        );
+        assert_eq!(table.report().left_stale, 1);
+        assert_eq!(table.admit(dummy_handle(2)), AdmitOutcome::Admitted);
+    }
+
+    #[test]
+    fn duplicate_failed_outcome_never_double_counts_removal() {
+        let mut table = WebSocketMemberTable::new(1);
+        let member = dummy_handle(1);
+        let outcome = WebSocketSendOutcome {
+            session: member.session_id(),
+            result: Err(WebSocketSendError::Timeout),
+        };
+        table.admit(member);
+
+        assert_eq!(
+            table.record_send_outcome(&outcome),
+            SendOutcomeAction::RemovedTimeout
+        );
+        assert_eq!(
+            table.record_send_outcome(&outcome),
+            SendOutcomeAction::Stale
+        );
+        assert_eq!(table.report().left_timeout, 1);
+        assert_eq!(table.report().broadcast_timeout, 1);
     }
 
     #[test]

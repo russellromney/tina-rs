@@ -283,6 +283,7 @@ mod tests {
             Err(WebSocketSendError::Closed),
             Err(WebSocketSendError::Stale),
             Err(WebSocketSendError::Timeout),
+            Err(WebSocketSendError::Full),
             Err(WebSocketSendError::OutboundQueueFull),
             Err(WebSocketSendError::ForeignSystem {
                 expected: tina::SystemIncarnation::new(1),

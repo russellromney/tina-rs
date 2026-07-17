@@ -664,6 +664,8 @@ pub enum WebSocketSendError {
     Stale,
     Closing,
     Closed,
+    /// The connection owner's mailbox could not admit the call.
+    Full,
     OutboundQueueFull,
     OutboundBytesFull,
     Protocol,
@@ -696,7 +698,7 @@ impl WebSocketSendOutcome {
         let result = match outcome {
             CallOutcome::Replied(RequestChunkReply::WebSocketSend(outcome)) => outcome.result,
             CallOutcome::Replied(_) => Err(WebSocketSendError::Protocol),
-            CallOutcome::Full => Err(WebSocketSendError::OutboundQueueFull),
+            CallOutcome::Full => Err(WebSocketSendError::Full),
             CallOutcome::Closed => Err(WebSocketSendError::Closed),
             CallOutcome::Rejected(tina::CallRejectedReason::ForeignSystem { expected, actual }) => {
                 Err(WebSocketSendError::ForeignSystem { expected, actual })
@@ -716,7 +718,7 @@ impl WebSocketSessionReportOutcome {
         let result = match outcome {
             CallOutcome::Replied(RequestChunkReply::WebSocketReport(outcome)) => outcome.result,
             CallOutcome::Replied(_) => Err(WebSocketSendError::Protocol),
-            CallOutcome::Full => Err(WebSocketSendError::OutboundQueueFull),
+            CallOutcome::Full => Err(WebSocketSendError::Full),
             CallOutcome::Closed => Err(WebSocketSendError::Closed),
             CallOutcome::Rejected(tina::CallRejectedReason::ForeignSystem { expected, actual }) => {
                 Err(WebSocketSendError::ForeignSystem { expected, actual })
@@ -1255,7 +1257,7 @@ mod tests {
         let expected = tina::SystemIncarnation::new(10);
         let actual = tina::SystemIncarnation::new(11);
         let cases = [
-            (CallOutcome::Full, WebSocketSendError::OutboundQueueFull),
+            (CallOutcome::Full, WebSocketSendError::Full),
             (CallOutcome::Closed, WebSocketSendError::Closed),
             (CallOutcome::Timeout, WebSocketSendError::Timeout),
             (
@@ -1271,6 +1273,33 @@ mod tests {
         for (call, error) in cases {
             assert_eq!(
                 WebSocketSendOutcome::from_connection_call(session, call).result,
+                Err(error)
+            );
+        }
+    }
+
+    #[test]
+    fn report_call_terminals_preserve_the_same_exact_error_classes() {
+        let session = WebSocketSessionId::new(7);
+        let expected = tina::SystemIncarnation::new(10);
+        let actual = tina::SystemIncarnation::new(11);
+        let cases = [
+            (CallOutcome::Full, WebSocketSendError::Full),
+            (CallOutcome::Closed, WebSocketSendError::Closed),
+            (CallOutcome::Timeout, WebSocketSendError::Timeout),
+            (
+                CallOutcome::Rejected(tina::CallRejectedReason::ForeignSystem { expected, actual }),
+                WebSocketSendError::ForeignSystem { expected, actual },
+            ),
+            (
+                CallOutcome::Rejected(tina::CallRejectedReason::UnsupportedMessage),
+                WebSocketSendError::Protocol,
+            ),
+        ];
+
+        for (call, error) in cases {
+            assert_eq!(
+                WebSocketSessionReportOutcome::from_connection_call(session, call).result,
                 Err(error)
             );
         }

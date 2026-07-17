@@ -23,6 +23,10 @@ This file records completed work.
   foreign-system, stale-session, or accepted outcome returns as a typed
   `SendOutcome` event; destination admission can no longer disappear behind a
   fire-and-forget send.
+- Owner-reported stale handles now release member-table capacity exactly once;
+  outcomes for members already removed remain typed stale no-ops.
+- Connection-mailbox `Full` remains distinct from session outbound-frame or
+  byte pressure, so owner admission cannot be misreported as a slow peer.
 - Session handles expose `*_effect_service_event` helpers so room fanout
   continuations land as domain events on split services.
 - Direct proof: `typed_websocket_delivery` (request-only echo, split two-client

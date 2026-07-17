@@ -95,9 +95,11 @@ pub struct RoomStats {
     pub left_peer: u64,
     pub left_idle: u64,
     pub left_slow: u64,
+    pub left_full: u64,
     pub left_protocol: u64,
     pub left_timeout: u64,
     pub left_foreign: u64,
+    pub left_stale: u64,
     pub left_shutdown: u64,
     pub presence_ticks: u64,
     pub presence_broadcasts_ok: u64,
@@ -439,6 +441,10 @@ impl Room {
                     self.stats.presence_broadcasts_full += 1;
                     self.stats.left_slow += 1;
                 }
+                SendOutcomeAction::RemovedFull => {
+                    self.stats.presence_broadcasts_full += 1;
+                    self.stats.left_full += 1;
+                }
                 SendOutcomeAction::RemovedClosed => {
                     self.stats.presence_broadcasts_closed += 1;
                     self.stats.left_peer += 1;
@@ -454,6 +460,10 @@ impl Room {
                 SendOutcomeAction::RemovedForeign => {
                     self.stats.presence_broadcasts_foreign += 1;
                     self.stats.left_foreign += 1;
+                }
+                SendOutcomeAction::RemovedStale => {
+                    self.stats.presence_broadcasts_stale += 1;
+                    self.stats.left_stale += 1;
                 }
             }
         }
@@ -507,6 +517,11 @@ mod outcome_accounting_tests {
 
         let full = apply(SendOutcomeAction::RemovedSlow);
         assert_eq!((full.presence_broadcasts_full, full.left_slow), (1, 1));
+        let owner_full = apply(SendOutcomeAction::RemovedFull);
+        assert_eq!(
+            (owner_full.presence_broadcasts_full, owner_full.left_full),
+            (1, 1)
+        );
         let closed = apply(SendOutcomeAction::RemovedClosed);
         assert_eq!(
             (closed.presence_broadcasts_closed, closed.left_peer),
@@ -528,6 +543,14 @@ mod outcome_accounting_tests {
         let foreign = apply(SendOutcomeAction::RemovedForeign);
         assert_eq!(
             (foreign.presence_broadcasts_foreign, foreign.left_foreign),
+            (1, 1)
+        );
+        let owner_stale = apply(SendOutcomeAction::RemovedStale);
+        assert_eq!(
+            (
+                owner_stale.presence_broadcasts_stale,
+                owner_stale.left_stale
+            ),
             (1, 1)
         );
 
@@ -599,7 +622,7 @@ impl Gateway {
 
 fn serialize_stats(stats: &RoomStats) -> String {
     format!(
-        "{{\"member_capacity\":{},\"live_members\":{},\"member_high_water\":{},\"joined\":{},\"left_peer\":{},\"left_idle\":{},\"left_slow\":{},\"left_protocol\":{},\"left_timeout\":{},\"left_foreign\":{},\"left_shutdown\":{},\"presence_ticks\":{},\"presence_broadcasts_ok\":{},\"presence_broadcasts_full\":{},\"presence_broadcasts_stale\":{},\"presence_broadcasts_closed\":{},\"presence_broadcasts_protocol\":{},\"presence_broadcasts_timeout\":{},\"presence_broadcasts_foreign\":{},\"rejected_full\":{},\"rejected_shutdown\":{},\"messages_in\":{},\"messages_out_ok\":{},\"bootstrap_seen\":{},\"shutdown_started\":{},\"shutdown_close_requested\":{},\"shutdown_close_ok\":{},\"shutdown_close_failed\":{}}}",
+        "{{\"member_capacity\":{},\"live_members\":{},\"member_high_water\":{},\"joined\":{},\"left_peer\":{},\"left_idle\":{},\"left_slow\":{},\"left_full\":{},\"left_protocol\":{},\"left_timeout\":{},\"left_foreign\":{},\"left_stale\":{},\"left_shutdown\":{},\"presence_ticks\":{},\"presence_broadcasts_ok\":{},\"presence_broadcasts_full\":{},\"presence_broadcasts_stale\":{},\"presence_broadcasts_closed\":{},\"presence_broadcasts_protocol\":{},\"presence_broadcasts_timeout\":{},\"presence_broadcasts_foreign\":{},\"rejected_full\":{},\"rejected_shutdown\":{},\"messages_in\":{},\"messages_out_ok\":{},\"bootstrap_seen\":{},\"shutdown_started\":{},\"shutdown_close_requested\":{},\"shutdown_close_ok\":{},\"shutdown_close_failed\":{}}}",
         stats.member_capacity,
         stats.live_members,
         stats.member_high_water,
@@ -607,9 +630,11 @@ fn serialize_stats(stats: &RoomStats) -> String {
         stats.left_peer,
         stats.left_idle,
         stats.left_slow,
+        stats.left_full,
         stats.left_protocol,
         stats.left_timeout,
         stats.left_foreign,
+        stats.left_stale,
         stats.left_shutdown,
         stats.presence_ticks,
         stats.presence_broadcasts_ok,
@@ -652,9 +677,11 @@ fn parse_stats_json(json: &str) -> Option<RoomStats> {
         left_peer: num(json, "left_peer")?,
         left_idle: num(json, "left_idle")?,
         left_slow: num(json, "left_slow")?,
+        left_full: num(json, "left_full")?,
         left_protocol: num(json, "left_protocol")?,
         left_timeout: num(json, "left_timeout")?,
         left_foreign: num(json, "left_foreign")?,
+        left_stale: num(json, "left_stale")?,
         left_shutdown: num(json, "left_shutdown")?,
         presence_ticks: num(json, "presence_ticks")?,
         presence_broadcasts_ok: num(json, "presence_broadcasts_ok")?,

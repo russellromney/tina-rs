@@ -935,6 +935,15 @@ impl Room {
                             self.report.slow_peer_closed += 1;
                         }
                     }
+                    Err(WebSocketSendError::Full) => {
+                        if self.shutting_down {
+                            self.report.shutdown_close_failed += 1;
+                        } else if stale_probe {
+                            self.report.stale_handle_rejected = true;
+                        } else {
+                            self.report.broadcast_full += 1;
+                        }
+                    }
                     Err(WebSocketSendError::Closed | WebSocketSendError::Stale) => {
                         if self.shutting_down {
                             self.report.shutdown_close_failed += 1;
@@ -984,10 +993,11 @@ impl Room {
                     }
                 }
                 let mut removed_member = false;
-                if outcome.result.is_err() && !stale_probe {
-                    if let Some(handle) = self.members.remove(&outcome.session)
-                        && self.stale_probe.is_none()
-                    {
+                if outcome.result.is_err()
+                    && !stale_probe
+                    && let Some(handle) = self.members.remove(&outcome.session)
+                {
+                    if self.stale_probe.is_none() {
                         self.stale_probe = Some(handle);
                     }
                     self.first_closed = Some(outcome.session);
