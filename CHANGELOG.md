@@ -15,6 +15,10 @@ This file records completed work.
 - Live runtime and simulator settle terminal results exactly once:
   deliver on type match, or dispose with a typed trace reason on plain stop,
   type mismatch, stale/duplicate settlement, parent stop, or shutdown.
+- Runtime/simulator drop and `settle_terminal_reservations_on_shutdown` dispose
+  unsettled reservations with `Shutdown`. Observed-spawn continuations use the
+  priority overflow lane when the ordinary mailbox is full so admission errors
+  and initial lifecycle events are not silenced under reservation pressure.
 
 ### Envelope-free split-service bootstrap
 
