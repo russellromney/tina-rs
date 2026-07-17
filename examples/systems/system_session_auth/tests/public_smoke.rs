@@ -7,11 +7,11 @@ use std::time::Duration;
 
 use system_session_auth::{
     AuthShard, RunConfig, RunConfigError, RunError, SessionAuthEvent, SessionAuthReply,
-    SessionAuthRequest, SessionBucket, SessionToken, WorkloadError, expect_reply, run,
+    SessionAuthRequest, SessionBucket, SessionToken, UserId, WorkloadError, expect_reply, run,
     run_idle_expiry, run_login_touch_logout, run_overflow,
 };
 use tina::prelude::*;
-use tina_runtime::{CallError, CallOutcome, call_request};
+use tina_runtime::{CallError, CallOutcome, DefaultMailboxFactory, Runtime, call_request};
 use tina_sim::{MultiShardSimulator, MultiShardSimulatorConfig, SimulatorConfig};
 
 fn default_config() -> RunConfig {
@@ -37,6 +37,7 @@ fn assert_login_touch_logout(report: &system_session_auth::LoginTouchLogoutRepor
     assert_eq!(report.stats.active, 0);
     assert_eq!(report.stats.idle_expired, 0);
     assert_eq!(report.stats.full_rejects, 0);
+    assert_eq!(report.stats.duplicate_rejects, 0);
     assert_eq!(report.stats.timer_errors, 0);
 }
 
@@ -56,6 +57,7 @@ fn assert_overflow(report: &system_session_auth::OverflowReport) {
     assert_eq!(report.admitted, 4);
     assert_eq!(report.full, 5);
     assert_eq!(report.stats.full_rejects, 5);
+    assert_eq!(report.stats.duplicate_rejects, 0);
     assert_eq!(report.stats.per_shard_high_water, vec![4]);
     assert_eq!(report.stats.per_shard_active, vec![4]);
 }
@@ -252,7 +254,10 @@ impl Probe {
         match message {
             ProbeMessage::Login { user_id, token } => call_request(
                 self.bucket,
-                SessionAuthRequest::Login { user_id, token },
+                SessionAuthRequest::Login {
+                    user_id: UserId::try_new(user_id).expect("bounded probe user"),
+                    token,
+                },
                 Duration::from_secs(1),
             )
             .then(|outcome| ProbeMessage::Returned {
@@ -319,6 +324,110 @@ fn drive_until_phase(
     );
 }
 
+fn duplicate_sequence_messages(token: &SessionToken) -> [ProbeMessage; 4] {
+    [
+        ProbeMessage::Login {
+            user_id: "alice".to_owned(),
+            token: token.clone(),
+        },
+        ProbeMessage::Login {
+            user_id: "mallory".to_owned(),
+            token: token.clone(),
+        },
+        ProbeMessage::Login {
+            user_id: "bob".to_owned(),
+            token: SessionToken::try_new("new-token").expect("bounded token"),
+        },
+        ProbeMessage::Stats,
+    ]
+}
+
+fn live_duplicate_sequence() -> Vec<(&'static str, SessionAuthReply)> {
+    let config = RunConfig {
+        shards: 1,
+        max_sessions_per_shard: 1,
+        session_mailbox: 16,
+        ..default_config()
+    };
+    let replies = Rc::new(RefCell::new(Vec::new()));
+    let mut runtime = Runtime::new(AuthShard(0), DefaultMailboxFactory);
+    let bucket = runtime
+        .register_split_service::<SessionBucket, SessionAuthEvent, SessionAuthRequest, Infallible>(
+            SessionBucket::new(config),
+            config.session_mailbox,
+        );
+    let probe = runtime.register_with_capacity::<Probe, Infallible>(
+        Probe {
+            bucket: bucket.requests,
+            replies: Rc::clone(&replies),
+        },
+        16,
+    );
+    let token = SessionToken::try_new("same-token").expect("bounded token");
+    for message in duplicate_sequence_messages(&token) {
+        runtime.try_send(probe, message).expect("live ingress");
+        while runtime.step() > 0 {}
+    }
+    replies.borrow().clone()
+}
+
+fn sim_duplicate_sequence() -> Vec<(&'static str, SessionAuthReply)> {
+    let config = RunConfig {
+        shards: 1,
+        max_sessions_per_shard: 1,
+        session_mailbox: 16,
+        ..default_config()
+    };
+    let replies = Rc::new(RefCell::new(Vec::new()));
+    let mut sim = MultiShardSimulator::with_config(
+        [AuthShard(0)],
+        SimulatorConfig::default(),
+        MultiShardSimulatorConfig::default(),
+    );
+    let bucket = sim.register_split_service_on::<
+        SessionBucket,
+        SessionAuthEvent,
+        SessionAuthRequest,
+        Infallible,
+    >(
+        ShardId::new(0),
+        SessionBucket::new(config),
+        config.session_mailbox,
+    );
+    let probe = sim.register_with_capacity_on::<Probe, ProbeMessage, Infallible>(
+        ShardId::new(0),
+        Probe {
+            bucket: bucket.requests,
+            replies: Rc::clone(&replies),
+        },
+        16,
+    );
+    let token = SessionToken::try_new("same-token").expect("bounded token");
+    for message in duplicate_sequence_messages(&token) {
+        sim.try_send(probe, message).expect("sim ingress");
+        drive_ready(&mut sim, 64);
+    }
+    replies.borrow().clone()
+}
+
+#[test]
+fn live_and_simulator_duplicate_capacity_order_and_accounting_match() {
+    let live = live_duplicate_sequence();
+    let simulated = sim_duplicate_sequence();
+    assert_eq!(live, simulated);
+    assert!(matches!(live[0].1, SessionAuthReply::Admitted { .. }));
+    assert_eq!(live[1].1, SessionAuthReply::AlreadyExists);
+    assert_eq!(live[2].1, SessionAuthReply::Full);
+    let SessionAuthReply::Stats(stats) = live[3].1 else {
+        panic!("expected stats, got {:?}", live[3].1);
+    };
+    assert_eq!(stats.active, 1);
+    assert_eq!(stats.admitted, 1);
+    assert_eq!(stats.duplicate_rejects, 1);
+    assert_eq!(stats.full_rejects, 1);
+    assert_eq!(stats.high_water, 1);
+}
+
 fn sim_idle_expiry_script(seed: u64) -> (SessionAuthReply, system_session_auth::BucketStats) {
     let replies = Rc::new(RefCell::new(Vec::new()));
     let mut sim = MultiShardSimulator::with_config(
@@ -358,11 +467,11 @@ fn sim_idle_expiry_script(seed: u64) -> (SessionAuthReply, system_session_auth::
         16,
     );
 
-    let token = SessionToken("sim-1".into());
+    let token = SessionToken::try_new("sim-1").expect("bounded token");
     sim.try_send(
         probe,
         ProbeMessage::Login {
-            user_id: "sim-user".into(),
+            user_id: "sim-user".to_owned(),
             token: token.clone(),
         },
     )
