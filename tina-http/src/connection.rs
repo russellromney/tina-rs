@@ -74,6 +74,9 @@ use crate::websocket::{
     decode_close_payload, encode_server_frame_from, encode_server_message, outcome_messages,
     parse_client_frame,
 };
+use crate::websocket_delivery::{
+    WebSocketAppDelivery, WebSocketSessionLane, websocket_session_lane,
+};
 
 /// Bytes the connection isolate asks for per `tcp_read`. Bounded so a
 /// single read does not pull more than this into the runtime, regardless
@@ -99,7 +102,7 @@ fn tls_write_reply_to_tcp(reply: TlsWriteOwnedReply) -> TcpWriteOwnedReply {
 struct WebSocketState {
     session_id: WebSocketSessionId,
     selected_subprotocol: Option<String>,
-    app: Address<WebSocketSessionMsg, WebSocketSessionOutcome>,
+    delivery: WebSocketAppDelivery,
     limits: crate::websocket::WebSocketLimits,
     read_buf: Vec<u8>,
     fragmented_message: Option<WebSocketFragment>,
@@ -128,7 +131,7 @@ impl WebSocketState {
         Self {
             session_id: WebSocketSessionId::new(generation.get()),
             selected_subprotocol: accept.selected_subprotocol().map(ToOwned::to_owned),
-            app: accept.app(),
+            delivery: accept.delivery(),
             limits,
             read_buf: Vec::new(),
             fragmented_message: None,
@@ -184,8 +187,10 @@ pub enum HttpConnectionMsg {
     WroteClose(Result<TcpWriteOwnedCloseReply, CallError>),
     /// `tcp_close_stream` reply.
     Closed(Result<(), CallError>),
-    /// App reply to one WebSocket session event.
+    /// App reply to one WebSocket session request-lane event.
     WebSocketAppReturned(CallOutcome<WebSocketSessionOutcome>),
+    /// Observed admission of one WebSocket session event-lane notification.
+    WebSocketAppEventDelivered(SendOutcome),
     /// Public bounded send request routed through the connection/session owner.
     WebSocketSend(WebSocketSend),
     /// Public bounded report request routed through the connection/session owner.
@@ -571,6 +576,9 @@ impl<S: Shard + 'static, M: Send + 'static> Isolate for HttpConnection<S, M> {
             HttpConnectionMsg::Closed(_) => stop(),
             HttpConnectionMsg::WebSocketAppReturned(outcome) => {
                 self.handle_websocket_app_outcome(outcome)
+            }
+            HttpConnectionMsg::WebSocketAppEventDelivered(outcome) => {
+                self.handle_websocket_app_event_delivered(outcome)
             }
             HttpConnectionMsg::WebSocketSend(send) => self.handle_websocket_send(send),
             HttpConnectionMsg::WebSocketReport(report) => self.handle_websocket_report_msg(report),
@@ -1972,7 +1980,35 @@ impl<S: Shard + 'static, M: Send + 'static> HttpConnection<S, M> {
         let Some(ws) = self.websocket.as_ref() else {
             return self.begin_close();
         };
-        call(ws.app, msg, self.service_call_timeout).then(HttpConnectionMsg::WebSocketAppReturned)
+        let lane = websocket_session_lane(&msg);
+        let timeout = self.service_call_timeout;
+        match (ws.delivery, lane) {
+            (WebSocketAppDelivery::Call { address }, WebSocketSessionLane::Request) => {
+                call(address, msg, timeout).then(HttpConnectionMsg::WebSocketAppReturned)
+            }
+            (WebSocketAppDelivery::Call { address }, WebSocketSessionLane::Event) => {
+                // Notifications never wait on a request reply.
+                send_observed(address, msg).then(HttpConnectionMsg::WebSocketAppEventDelivered)
+            }
+            (WebSocketAppDelivery::Split { address }, WebSocketSessionLane::Request) => call(
+                address,
+                tina::ServiceMessage::Request(msg),
+                timeout,
+            )
+            .then(HttpConnectionMsg::WebSocketAppReturned),
+            (WebSocketAppDelivery::Split { address }, WebSocketSessionLane::Event) => {
+                send_observed(address, tina::ServiceMessage::Event(msg))
+                    .then(HttpConnectionMsg::WebSocketAppEventDelivered)
+            }
+            // Request-only services expose only a request lane. Every message
+            // is a call; room fanout / SendOutcome needs a split-service app.
+            (WebSocketAppDelivery::RequestOnly { address }, _) => call(
+                address,
+                tina::ServiceMessage::Request(msg),
+                timeout,
+            )
+            .then(HttpConnectionMsg::WebSocketAppReturned),
+        }
     }
 
     fn call_websocket_app_many(&mut self, mut msgs: Vec<WebSocketSessionMsg>) -> Effect<Self> {
@@ -1988,6 +2024,24 @@ impl<S: Shard + 'static, M: Send + 'static> HttpConnection<S, M> {
             ws.pending_app_msgs.extend(msgs);
         }
         self.call_websocket_app(first)
+    }
+
+    fn handle_websocket_app_event_delivered(&mut self, outcome: SendOutcome) -> Effect<Self> {
+        match outcome {
+            SendOutcome::Accepted => {
+                if let Some(msg) = self
+                    .websocket
+                    .as_mut()
+                    .and_then(|ws| ws.pending_app_msgs.pop_front())
+                {
+                    self.call_websocket_app(msg)
+                } else {
+                    self.websocket_continue_read()
+                }
+            }
+            SendOutcome::Full => self.websocket_pressure_then_close(WebSocketError::AppMailboxFull),
+            SendOutcome::Closed | SendOutcome::ForeignSystem { .. } => self.begin_close(),
+        }
     }
 
     fn websocket_handle(&self) -> Option<WebSocketSessionHandle> {

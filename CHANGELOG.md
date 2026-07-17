@@ -4,6 +4,26 @@ This file records completed work.
 
 ## Unreleased
 
+### Typed WebSocket delivery and lane correctness
+
+- WebSocket upgrade accept now takes capability-typed handles:
+  `accept_split_service`, `accept_split_service_subprotocol`, and
+  `accept_request_service`. The private `ServiceMessage` envelope stays inside
+  `tina-http`; install sites do not extract a raw app address.
+- Connection delivery classifies session messages by lane. Reply-needed work
+  (`SessionOpen`, `SessionText`, …) uses `call` into the request capability.
+  Notifications (`SendOutcome`, `SessionClosed`, …) use observed send into the
+  event capability. Write/send-admission completions never enter the
+  application's request lane.
+- `WebSocketMemberTable` snapshots recipients, excludes the sender, and offers
+  each remaining member exactly once in snapshot order. Fanout bounds no longer
+  force the room's message type to be `WebSocketSessionMsg`.
+- Session handles expose `*_effect_service_event` helpers so room fanout
+  continuations land as domain events on split services.
+- Direct proof: `typed_websocket_delivery` (request-only echo, split two-client
+  broadcast exactness, peer close lanes, malformed upgrade, shutdown) plus
+  member-table snapshot/exclude unit tests and compile-fail accept constructors.
+
 ### Typed child terminal observation
 
 - `spawn_observed(...).then_result(...)` / `.then_service_result(...)` map a
