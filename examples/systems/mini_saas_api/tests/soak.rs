@@ -5,7 +5,7 @@
 //! Asserts:
 //!
 //! - no transport timeouts and the harness's leak check holds,
-//! - the only error kind seen is `http_503` (any 4xx or other 5xx is
+//! - the only error kinds seen are typed pressure `http_503` / `http_429` (other 4xx/5xx is
 //!   a regression),
 //! - every 5xx maps to one of the typed pressure surfaces
 //!   (`db.full` + `outbound.full`) — pressure cannot escape the typed
@@ -48,13 +48,12 @@ fn small_steady_load_drains_cleanly_with_only_typed_pressure() {
         "load harness should have driven at least one op: {load:?}"
     );
 
-    // The only error kind allowed under steady load is `http_503` from
-    // the controller's typed `db_full` / `outbound_full` reply paths.
-    // Anything else (4xx for body/method, 5xx without typed pressure)
-    // is a real regression.
+    // Typed pressure under steady load: application `db_full` / `outbound_full`
+    // reply as 503; service-mailbox Full is 429 at the HTTP boundary. Other
+    // 4xx/5xx is a real regression.
     for (kind, _count) in &load.err_kinds {
         assert!(
-            kind == "http_503",
+            kind == "http_503" || kind == "http_429",
             "steady load saw an unexpected error kind `{kind}`: {load:?}",
         );
     }
