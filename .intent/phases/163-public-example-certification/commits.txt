@@ -212,3 +212,22 @@ blast-radius proof, and post-merge workflow result here.
 ### Next
 - M6 residual hosts
 - C1 final certification + FINDINGS.md + guards
+
+## Post-merge adversarial remediation train
+
+The independent review of merged #364-#376 found contract and proof gaps that
+were corrected in focused replacement PRs. Each row records the final reviewed
+head and its fully green replacement workflow.
+
+| PR | Correction | Reviewed head | Merge commit | Workflow |
+| --- | --- | --- | --- | --- |
+| #377 | Keepalive install, rollback, deadline, and retained authority settlement | a38d300526e3b2a407a06e51ebc9666503c2a5f0 | 17802b021a52a1e5ecd4d943c54a69051e11045b | 29569201714 SUCCESS |
+| #378 | Initial and replacement supervised factory-panic public proof | 81d76b71b127b05d52d310c30c0d65ed58af2063 | fb7c0b6c6e3fbf94e0515bbfcf6bf6a691a38236 | 29569201965 SUCCESS |
+| #379 | Exact WebSocket Full/stale/removal outcomes and counters | 62f0e5cd1e5f86ab089422d63f7d11bb3f029631 | 76c8677ceb60879a8367b321bf8022f89cd8b890 | 29569202965 SUCCESS |
+| #380 | Bounded gRPC actor-route caller-gone maintenance without TimerFull hot-loop | 10ea3783c402e627fc14099accaafc070ce21004 | 25d91209318a8ae3beb2ebfbb52efafe7047297d | 29569204150 SUCCESS |
+| #381 | Closed AwaitReady/AwaitQuiescent waiter reclamation | 62635eee514e03ad26570061be70ecea61935af8 | 109f877ef3fe75b127d70d568847b358d259bc58 | 29569409669 SUCCESS |
+| #382 | Physical terminal mailbox reservation and mapper-panic settlement | 6e6a4293c440ab1561766c5a3cb912934ae5384a | eeaa7f9ffe543954ab8ed226c0eb8afff7600326 | 29569423301 SUCCESS |
+
+Remaining remediation at this checkpoint: bounded session identities, SQLite
+failure fidelity, mini-SaaS retained keepalive authority, residual LocalSystem
+hosts, and typed HTTP caller-settlement proof. M6 and C1 remain incomplete.
