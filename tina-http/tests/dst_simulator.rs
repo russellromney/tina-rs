@@ -425,16 +425,10 @@ fn saved_seed_interleaving_fingerprint_is_stable() {
     const SAVED_SEED: u64 = 0xBEEF_C0DE;
     /// Pinned trace fingerprint for `SAVED_SEED` + the config below.
     /// Bump only after reviewing why the trace shape changed.
-    /// Last update: the terminal close-after-write completion now uses the
-    /// `StopRequester` action, so each `Connection: close` path records a
-    /// `CallCompletionAction` + ordinary `IsolateStopped` instead of
-    /// delivering a close-completion message the connection isolate then
-    /// processes in a separate handler turn. Both peers close, so len drops
-    /// by the two removed close-handling turns and gains two
-    /// `CallCompletionAction` facts (85 -> 81). Completion, terminal-action,
-    /// and stop facts are all still recorded; the terminal-action semantics
-    /// are proven directly by `runtime_terminal_completion_action` and
-    /// `timer_semantics`.
+    /// Last update: terminal requests bypass peer monitoring because their
+    /// response write owns transport close. Both saved-seed peers use
+    /// `Connection: close`, restoring the pre-monitor 81-event trace. The
+    /// keepalive monitor lifecycle is covered separately by typed delivery.
     const EXPECTED_HASH: u64 = 3_203_362_481_028_129_978;
     /// Pinned trace event count for `SAVED_SEED` + the config below.
     const EXPECTED_LEN: usize = 81;
@@ -462,7 +456,6 @@ fn saved_seed_interleaving_fingerprint_is_stable() {
     };
 
     let (hash, len) = run_pass(bind, make_cfg(), 16);
-
     // Pin against the saved fingerprint — this is what catches drift.
     assert_eq!(
         hash, EXPECTED_HASH,

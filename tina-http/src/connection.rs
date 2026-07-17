@@ -22,10 +22,9 @@
 //! connection serves one request per accept and closes — the legacy
 //! first-form behaviour.
 //!
-//! Pipelining is not supported: any bytes that arrive after a
-//! request's body but before its response is written are reset between
-//! iterations and effectively dropped. A well-behaved HTTP/1.1 client
-//! waits for each response before sending the next request.
+//! Requests are processed sequentially. Bytes for a subsequent request that
+//! arrive before the current response completes are retained and parsed only
+//! after that response is written.
 //!
 //! Backpressure mapping at the service boundary:
 //!
@@ -96,6 +95,62 @@ fn tls_write_reply_to_tcp(reply: TlsWriteOwnedReply) -> TcpWriteOwnedReply {
     TcpWriteOwnedReply {
         bytes: reply.bytes,
         written: reply.written,
+    }
+}
+
+/// Internal command for the bounded service-call peer monitor.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub enum HttpPeerMonitorMsg {
+    Begin,
+    Read(Result<TcpReadBufReply, CallError>),
+}
+
+/// Exact terminal emitted by one peer monitor.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub enum HttpPeerMonitorOutcome {
+    Disconnected,
+    ReadAhead(Vec<u8>),
+}
+
+/// One-read child used to observe peer EOF while a fully buffered request is
+/// waiting on its service. It performs one read and terminates, so the
+/// additional transport and mailbox pressure is bounded to one child and one
+/// byte carried in the terminal result.
+#[doc(hidden)]
+pub struct HttpPeerMonitor<S: Shard> {
+    stream: tina_runtime::StreamId,
+    _shard: std::marker::PhantomData<S>,
+}
+
+impl<S: Shard + 'static> Isolate for HttpPeerMonitor<S> {
+    tina::isolate_types! {
+        message: HttpPeerMonitorMsg,
+        reply: (),
+        send: tina::Outbound<std::convert::Infallible>,
+        spawn: std::convert::Infallible,
+        io: tina_runtime::RuntimeCall<HttpPeerMonitorMsg>,
+        shard: S,
+    }
+
+    fn handle(
+        &mut self,
+        msg: HttpPeerMonitorMsg,
+        _ctx: &mut Context<'_, S, Self::Reply>,
+    ) -> Effect<Self> {
+        match msg {
+            HttpPeerMonitorMsg::Begin => tcp_read_buf(self.stream, Vec::new(), 1)
+                .then(|result| HttpPeerMonitorMsg::Read(result.map_err(|error| error.error))),
+            HttpPeerMonitorMsg::Read(Ok(reply)) if reply.len == 0 => {
+                stop_with(HttpPeerMonitorOutcome::Disconnected)
+            }
+            HttpPeerMonitorMsg::Read(Ok(mut reply)) => {
+                reply.buffer.truncate(reply.len);
+                stop_with(HttpPeerMonitorOutcome::ReadAhead(reply.buffer))
+            }
+            HttpPeerMonitorMsg::Read(Err(_)) => stop_with(HttpPeerMonitorOutcome::Disconnected),
+        }
     }
 }
 
@@ -181,6 +236,11 @@ pub enum HttpConnectionMsg {
     },
     /// Service `call` reply.
     ServiceReturned(CallOutcome<HttpResponse>),
+    /// The per-request peer monitor was created; service dispatch starts only
+    /// after this continuation publishes its typed address.
+    ServiceMonitorSpawned(tina::SpawnObservedResult<HttpPeerMonitorMsg>),
+    /// Reserved terminal delivery from the per-request peer monitor.
+    ServicePeerMonitorEnded(HttpPeerMonitorOutcome),
     /// `tcp_write_owned` reply.
     Wrote(Result<TcpWriteOwnedReply, CallError>),
     /// `tcp_write_owned_close` reply.
@@ -360,6 +420,16 @@ pub struct HttpConnection<S: Shard, M: Send + 'static = HttpRequest> {
     // while the connection waits on socket I/O before answering.
     pending_request_body_reply: Option<RequestContext<RequestChunkReply>>,
 
+    // One disconnect monitor for a service call whose inbound request is
+    // already fully buffered. Streaming request bodies stay pull-driven and
+    // intentionally do not arm this rail.
+    service_monitor: Option<Address<HttpPeerMonitorMsg, ()>>,
+    pending_service_message: Option<M>,
+    service_read_ahead: Vec<u8>,
+    waiting_for_monitor_after_response: bool,
+    service_monitor_terminal_seen: bool,
+    service_peer_monitor_enabled: bool,
+
     _shard: std::marker::PhantomData<S>,
 }
 
@@ -473,8 +543,19 @@ impl<S: Shard, M: Send + 'static> HttpConnection<S, M> {
             head_deadline_armed: true,
             body_eof_replied: false,
             pending_request_body_reply: None,
+            service_monitor: None,
+            pending_service_message: None,
+            service_read_ahead: Vec::new(),
+            waiting_for_monitor_after_response: false,
+            service_monitor_terminal_seen: false,
+            service_peer_monitor_enabled: false,
             _shard: std::marker::PhantomData,
         }
+    }
+
+    pub(crate) fn with_service_peer_monitor(mut self, enabled: bool) -> Self {
+        self.service_peer_monitor_enabled = enabled;
+        self
     }
 }
 
@@ -486,7 +567,12 @@ impl<S: Shard + 'static, M: Send + 'static> Isolate for HttpConnection<S, M> {
         message: HttpConnectionMsg,
         reply: RequestChunkReply,
         send: tina::Outbound<std::convert::Infallible>,
-        spawn: std::convert::Infallible,
+        spawn: tina::ChildDefinition<HttpPeerMonitor<S>>,
+        spawn_observed: tina::SpawnObserved<
+            tina::ChildDefinition<HttpPeerMonitor<S>>,
+            HttpConnectionMsg,
+            HttpPeerMonitorMsg
+        >,
         io: tina_runtime::RuntimeCall<HttpConnectionMsg>,
         fact: tina_runtime::ProtocolFact,
         shard: S,
@@ -532,6 +618,12 @@ impl<S: Shard + 'static, M: Send + 'static> Isolate for HttpConnection<S, M> {
             }
 
             HttpConnectionMsg::ServiceReturned(outcome) => self.handle_service_outcome(outcome),
+            HttpConnectionMsg::ServiceMonitorSpawned(result) => {
+                self.handle_service_monitor_spawned(result)
+            }
+            HttpConnectionMsg::ServicePeerMonitorEnded(outcome) => {
+                self.handle_service_peer_monitor_ended(outcome)
+            }
             HttpConnectionMsg::EventAdmitted(outcome) => self.handle_event_admitted(outcome),
 
             HttpConnectionMsg::Wrote(Ok(reply)) => self.handle_wrote(reply),
@@ -666,9 +758,9 @@ impl<S: Shard + 'static, M: Send + 'static> HttpConnection<S, M> {
         batch(vec![read_effect, deadline_effect])
     }
 
-    /// Resets per-request state between keepalive iterations. Drops
-    /// any read-ahead bytes (no pipelining), clears the parsed head,
-    /// and resets streaming-body bookkeeping. Does not touch
+    /// Resets per-request state between keepalive iterations, clears the
+    /// parsed head, and resets streaming-body bookkeeping. Monitor read-ahead
+    /// lives separately and is reintroduced by [`Self::finish_response`]. Does not touch
     /// `request_generation` or `head_deadline_armed` — those are
     /// updated by [`Self::begin_request_iteration`].
     fn reset_for_next_request(&mut self) {
@@ -696,6 +788,9 @@ impl<S: Shard + 'static, M: Send + 'static> HttpConnection<S, M> {
         self.inbound_chunked = false;
         self.body_eof_replied = false;
         self.pending_request_body_reply = None;
+        self.pending_service_message = None;
+        self.waiting_for_monitor_after_response = false;
+        self.service_monitor_terminal_seen = false;
         self.will_close = false;
     }
 
@@ -871,6 +966,8 @@ impl<S: Shard + 'static, M: Send + 'static> HttpConnection<S, M> {
         self.release_request_all();
 
         // Decide buffered vs streaming dispatch based on the limits.
+        let request_streams_body = self.limits.inbound_stream_chunk_size.is_some()
+            && (head.content_length > 0 || head.chunked);
         let request = match self.limits.inbound_stream_chunk_size {
             Some(chunk_size) if head.content_length > 0 || head.chunked => {
                 let mut buf = std::mem::take(&mut self.read_buf);
@@ -952,6 +1049,9 @@ impl<S: Shard + 'static, M: Send + 'static> HttpConnection<S, M> {
                 // `read_buf + body`.
                 let body_end = self.head_len + head.content_length;
                 let mut buf = std::mem::take(&mut self.read_buf);
+                if buf.len() > body_end {
+                    self.service_read_ahead.extend(buf.split_off(body_end));
+                }
                 buf.truncate(body_end);
                 buf.drain(..self.head_len);
                 head.into_request(buf)
@@ -960,8 +1060,30 @@ impl<S: Shard + 'static, M: Send + 'static> HttpConnection<S, M> {
         let message = self.delivery.to_message(request);
         match self.delivery {
             ServiceDelivery::Call { address, .. } => {
-                call(address, message, self.service_call_timeout)
-                    .then(HttpConnectionMsg::ServiceReturned)
+                if !self.service_peer_monitor_enabled
+                    || self.will_close
+                    || request_streams_body
+                    || !self.service_read_ahead.is_empty()
+                    || matches!(self.transport, HttpTransport::Tls(_))
+                {
+                    return call(address, message, self.service_call_timeout)
+                        .then(HttpConnectionMsg::ServiceReturned);
+                }
+                self.pending_service_message = Some(message);
+                self.service_monitor_terminal_seen = false;
+                let HttpTransport::Tcp(stream) = self.transport else {
+                    unreachable!("TLS service calls bypass peer monitoring")
+                };
+                let monitor = HttpPeerMonitor {
+                    stream,
+                    _shard: std::marker::PhantomData,
+                };
+                spawn_observed(
+                    tina::ChildDefinition::new(monitor, 4)
+                        .with_initial_message(HttpPeerMonitorMsg::Begin),
+                )
+                .then_result(HttpConnectionMsg::ServicePeerMonitorEnded)
+                .then(HttpConnectionMsg::ServiceMonitorSpawned)
             }
             ServiceDelivery::Admit { address, .. } => {
                 send_observed(address, message).then(HttpConnectionMsg::EventAdmitted)
@@ -1202,6 +1324,57 @@ impl<S: Shard + 'static, M: Send + 'static> HttpConnection<S, M> {
             }
         };
         self.start_writing(response)
+    }
+
+    fn handle_service_monitor_spawned(
+        &mut self,
+        result: tina::SpawnObservedResult<HttpPeerMonitorMsg>,
+    ) -> Effect<Self> {
+        let Some(message) = self.pending_service_message.take() else {
+            return stop();
+        };
+        let Ok(monitor) = result else {
+            self.will_close = true;
+            return self.handle_service_outcome(CallOutcome::Closed);
+        };
+        if !self.service_monitor_terminal_seen {
+            self.service_monitor = Some(monitor.address);
+        }
+        let ServiceDelivery::Call { address, .. } = self.delivery else {
+            return stop();
+        };
+        call(address, message, self.service_call_timeout).then(HttpConnectionMsg::ServiceReturned)
+    }
+
+    fn handle_service_peer_monitor_ended(
+        &mut self,
+        outcome: HttpPeerMonitorOutcome,
+    ) -> Effect<Self> {
+        self.service_monitor = None;
+        self.service_monitor_terminal_seen = true;
+        match outcome {
+            HttpPeerMonitorOutcome::Disconnected => {
+                if self.websocket.is_some() {
+                    self.handle_websocket_bytes_read(&[])
+                } else if self.has_pending_body() {
+                    self.record_body_io_error();
+                    self.begin_close()
+                } else {
+                    stop()
+                }
+            }
+            HttpPeerMonitorOutcome::ReadAhead(bytes) => {
+                self.service_read_ahead.extend(bytes);
+                if self.waiting_for_monitor_after_response {
+                    self.waiting_for_monitor_after_response = false;
+                    let read_ahead = std::mem::take(&mut self.service_read_ahead);
+                    let len = read_ahead.len();
+                    self.handle_bytes_read(read_ahead, len)
+                } else {
+                    noop()
+                }
+            }
+        }
     }
 
     fn handle_event_admitted(&mut self, outcome: SendOutcome) -> Effect<Self> {
@@ -1468,8 +1641,27 @@ impl<S: Shard + 'static, M: Send + 'static> HttpConnection<S, M> {
             .limits
             .keepalive_idle_timeout
             .expect("keepalive iteration only happens when timeout is configured");
+        let read_ahead = std::mem::take(&mut self.service_read_ahead);
         self.reset_for_next_request();
-        self.begin_request_iteration(idle)
+        if read_ahead.is_empty() && self.service_monitor.is_none() {
+            return self.begin_request_iteration(idle);
+        }
+
+        self.request_generation = self
+            .request_generation
+            .checked_add(1)
+            .expect("HttpConnection request_generation overflowed u64");
+        self.head_deadline_armed = true;
+        let generation = self.request_generation;
+        let deadline_effect: Effect<Self> = sleep(idle)
+            .then(move |result| HttpConnectionMsg::HeaderDeadline { generation, result });
+        if read_ahead.is_empty() {
+            self.waiting_for_monitor_after_response = true;
+            return deadline_effect;
+        }
+        let len = read_ahead.len();
+        let parse_effect = self.handle_bytes_read(read_ahead, len);
+        batch(vec![parse_effect, deadline_effect])
     }
 
     /// True when this connection still owes the wire body bytes —
@@ -2256,6 +2448,14 @@ impl<S: Shard + 'static, M: Send + 'static> HttpConnection<S, M> {
     }
 
     fn websocket_continue_read(&mut self) -> Effect<Self> {
+        if !self.service_read_ahead.is_empty() {
+            let bytes = std::mem::take(&mut self.service_read_ahead);
+            return self.handle_websocket_bytes_read(&bytes);
+        }
+        if self.service_monitor.is_some() {
+            self.waiting_for_monitor_after_response = true;
+            return noop();
+        }
         let has_buffered = self
             .websocket
             .as_ref()

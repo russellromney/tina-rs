@@ -7,7 +7,11 @@
 //! - request-only and split request lanes → typed reply
 //! - Full → 429 (unit projection + zero-capacity wire for call and event
 //!   lanes), Closed → 503 (wire), timeout → 504, malformed → 400
-//! - peer close and listener shutdown remain clean
+//! - service timeout and an observed peer disconnect close captured caller
+//!   authority with distinct exact trace reasons
+//! - streaming request bodies remain pull-driven: disconnect is observed only
+//!   when the service pulls body bytes, preserving documented backpressure
+//! - listener and runtime shutdown remain clean
 //! - compile_fail doctests on the constructors prove lane confusion is
 //!   rejected at compile time
 
@@ -16,6 +20,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::Duration;
 
 use tina::prelude::*;
@@ -25,7 +30,8 @@ use tina_http::{
     response_for_call_outcome, response_for_send_outcome,
 };
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, SendOutcome, ThreadedRuntime, ThreadedRuntimeConfig,
+    CallOutcome, DefaultThreadedMailboxFactory, DeferredReplyRejectedReason, RuntimeEventKind,
+    SendOutcome, ThreadedRuntime, ThreadedRuntimeConfig,
 };
 
 const SHARD: u32 = 173;
@@ -99,6 +105,33 @@ fn scripted(addr: SocketAddr, request: &[u8]) -> String {
 
 fn status_line(response: &str) -> &str {
     response.lines().next().unwrap_or("")
+}
+
+fn read_one_response(stream: &mut TcpStream) -> String {
+    let mut bytes = Vec::new();
+    loop {
+        if let Some(head_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            let body_start = head_end + 4;
+            let head = String::from_utf8_lossy(&bytes[..body_start]);
+            let content_length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            if bytes.len() >= body_start + content_length {
+                bytes.truncate(body_start + content_length);
+                return String::from_utf8_lossy(&bytes).into_owned();
+            }
+        }
+        let mut chunk = [0_u8; 512];
+        let read = stream.read(&mut chunk).expect("read response");
+        assert!(read > 0, "peer closed before one complete response");
+        bytes.extend_from_slice(&chunk[..read]);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -446,7 +479,10 @@ impl From<HttpRequest> for TimeoutHttp {
     }
 }
 
-struct TimeoutSplit;
+struct TimeoutSplit {
+    admitted: Option<SyncSender<()>>,
+    late_context: SyncSender<(u64, bool)>,
+}
 
 #[tina_runtime::isolate(
     event = TimeoutEvent,
@@ -461,7 +497,12 @@ impl TimeoutSplit {
         _ctx: &mut Context<'_, TestShard, Self::Reply>,
     ) -> Effect<Self> {
         match event {
-            TimeoutEvent::Late(req) => reply_to(req, HttpResponse::text("late")),
+            TimeoutEvent::Late(req) => {
+                self.late_context
+                    .send((req.slot_id(), req.is_open()))
+                    .expect("late-context observer remains open");
+                reply_to(req, HttpResponse::text("late"))
+            }
         }
     }
 
@@ -470,23 +511,31 @@ impl TimeoutSplit {
         _request: TimeoutHttp,
         call: tina::RequestCall<'_, Self>,
     ) -> tina::RequestEffect<Self> {
-        // Sleep longer than service_call_timeout so the connection sees Timeout.
-        call.defer(tina_runtime::sleep(Duration::from_secs(2)))
-            .reply(|req, _| tina::ServiceMessage::Event(TimeoutEvent::Late(req)))
+        if let Some(admitted) = self.admitted.take() {
+            admitted.send(()).expect("admission observer remains open");
+        }
+        // Sleep longer than service_call_timeout so the connection closes its
+        // caller authority before the continuation reaches the service again.
+        call.defer(tina_runtime::sleep(Duration::from_millis(100)))
+            .reply_service_event(|req, _| TimeoutEvent::Late(req))
     }
 }
 
 #[test]
 fn request_timeout_returns_504() {
     let runtime = make_runtime();
+    let (late_tx, late_rx) = sync_channel(1);
     let handle = runtime
         .register_split_service::<TimeoutSplit, TimeoutEvent, TimeoutHttp, Infallible>(
-            TimeoutSplit,
+            TimeoutSplit {
+                admitted: None,
+                late_context: late_tx,
+            },
             8,
         )
         .expect("register timeout service");
     let mut cfg = config();
-    cfg.service_call_timeout = Duration::from_millis(50);
+    cfg.service_call_timeout = Duration::from_millis(10);
     let listener = HttpListener::<TestShard, _>::for_split_service(
         "127.0.0.1:0".parse().unwrap(),
         handle,
@@ -499,9 +548,347 @@ fn request_timeout_returns_504() {
         status_line(&response).starts_with("HTTP/1.1 504"),
         "slow service must answer 504, got {response}"
     );
+    let (slot_id, context_open) = late_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("late continuation settles");
+    assert!(
+        !context_open,
+        "service timeout must close the captured caller context"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let rejected = runtime.trace().events().iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::DeferredReplyRejected {
+                    slot_id: event_slot,
+                    reason: DeferredReplyRejectedReason::CallerTimedOut,
+                    ..
+                } if event_slot.get() == slot_id
+            )
+        });
+        if rejected {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed-out slot {slot_id} never recorded CallerTimedOut rejection"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
 
-    let _ = runtime.try_send(listener_addr, HttpListenerMsg::Stop);
-    let _ = runtime.shutdown();
+    runtime
+        .try_send(listener_addr, HttpListenerMsg::Stop)
+        .expect("stop listener");
+    runtime.shutdown().expect("clean runtime shutdown");
+}
+
+#[test]
+fn peer_disconnect_closes_pending_service_caller() {
+    let runtime = make_runtime();
+    let (admitted_tx, admitted_rx) = sync_channel(1);
+    let (late_tx, late_rx) = sync_channel(1);
+    let handle = runtime
+        .register_split_service::<TimeoutSplit, TimeoutEvent, TimeoutHttp, Infallible>(
+            TimeoutSplit {
+                admitted: Some(admitted_tx),
+                late_context: late_tx,
+            },
+            8,
+        )
+        .expect("register timeout service");
+    let mut cfg = config();
+    cfg.service_call_timeout = Duration::from_secs(5);
+    cfg.limits.keepalive_idle_timeout = Some(Duration::from_secs(2));
+    let listener = HttpListener::<TestShard, _>::for_split_service(
+        "127.0.0.1:0".parse().unwrap(),
+        handle,
+        cfg,
+    );
+    let (addr, listener_addr) = start_listener(&runtime, listener, 8);
+
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+    stream
+        .write_all(b"GET /abandon HTTP/1.1\r\nHost: x\r\n\r\n")
+        .expect("write request");
+    admitted_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("service admitted request");
+    drop(stream);
+
+    let (slot_id, context_open) = late_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("late continuation settles");
+    assert!(
+        !context_open,
+        "the peer monitor must close caller authority before the late continuation"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let rejected = runtime.trace().events().iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::DeferredReplyRejected {
+                    slot_id: event_slot,
+                    reason: DeferredReplyRejectedReason::OwnerStopped,
+                    ..
+                } if event_slot.get() == slot_id
+            )
+        });
+        if rejected {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "disconnected slot {slot_id} never recorded OwnerStopped rejection"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    runtime
+        .try_send(listener_addr, HttpListenerMsg::Stop)
+        .expect("stop listener");
+    runtime.shutdown().expect("clean runtime shutdown");
+}
+
+#[test]
+fn connection_close_request_does_not_arm_peer_monitor() {
+    let runtime = make_runtime();
+    let (late_tx, late_rx) = sync_channel(1);
+    let handle = runtime
+        .register_split_service::<TimeoutSplit, TimeoutEvent, TimeoutHttp, Infallible>(
+            TimeoutSplit {
+                admitted: None,
+                late_context: late_tx,
+            },
+            8,
+        )
+        .expect("register delayed service");
+    let mut cfg = config();
+    cfg.service_call_timeout = Duration::from_secs(5);
+    cfg.limits.keepalive_idle_timeout = Some(Duration::from_secs(2));
+    let listener = HttpListener::<TestShard, _>::for_split_service(
+        "127.0.0.1:0".parse().unwrap(),
+        handle,
+        cfg,
+    );
+    let (addr, listener_addr) = start_listener(&runtime, listener, 8);
+    let spawned_before = runtime
+        .trace()
+        .events()
+        .iter()
+        .filter(|event| matches!(event.kind(), RuntimeEventKind::Spawned { .. }))
+        .count();
+
+    let response = scripted(
+        addr,
+        b"GET /close HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    );
+    assert!(
+        status_line(&response).starts_with("HTTP/1.1 200"),
+        "{response}"
+    );
+    assert!(late_rx.recv_timeout(Duration::from_secs(2)).unwrap().1);
+    let spawned_after = runtime
+        .trace()
+        .events()
+        .iter()
+        .filter(|event| matches!(event.kind(), RuntimeEventKind::Spawned { .. }))
+        .count();
+    assert_eq!(
+        spawned_after - spawned_before,
+        1,
+        "a terminal request spawns its connection child but no peer monitor"
+    );
+
+    runtime
+        .try_send(listener_addr, HttpListenerMsg::Stop)
+        .expect("stop listener");
+    runtime.shutdown().expect("clean runtime shutdown");
+}
+
+#[test]
+fn unpulled_streaming_body_does_not_overclaim_disconnect_detection() {
+    let runtime = make_runtime();
+    let (admitted_tx, admitted_rx) = sync_channel(1);
+    let (late_tx, late_rx) = sync_channel(1);
+    let handle = runtime
+        .register_split_service::<TimeoutSplit, TimeoutEvent, TimeoutHttp, Infallible>(
+            TimeoutSplit {
+                admitted: Some(admitted_tx),
+                late_context: late_tx,
+            },
+            8,
+        )
+        .expect("register delayed service");
+    let mut cfg = config();
+    cfg.service_call_timeout = Duration::from_secs(5);
+    cfg.limits.inbound_stream_chunk_size = Some(1);
+    let listener = HttpListener::<TestShard, _>::for_split_service(
+        "127.0.0.1:0".parse().unwrap(),
+        handle,
+        cfg,
+    );
+    let (addr, listener_addr) = start_listener(&runtime, listener, 8);
+
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+    stream
+        .write_all(b"POST /stream HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n")
+        .expect("streaming request head");
+    admitted_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("service admitted streaming request");
+    drop(stream);
+
+    let (slot_id, context_open) = late_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("late continuation settles");
+    assert!(
+        context_open,
+        "without a body pull, monitoring would violate streaming backpressure"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let sent = runtime.trace().events().iter().any(|event| {
+            matches!(
+                event.kind(),
+                RuntimeEventKind::DeferredReplySent { slot_id: event_slot, .. }
+                    if event_slot.get() == slot_id
+            )
+        });
+        if sent {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "streaming slot {slot_id} was not consumed by the service reply"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    runtime
+        .try_send(listener_addr, HttpListenerMsg::Stop)
+        .expect("stop listener");
+    runtime.shutdown().expect("clean runtime shutdown");
+}
+
+#[test]
+fn peer_monitor_preserves_early_next_request_byte() {
+    let runtime = make_runtime();
+    let (late_tx, late_rx) = sync_channel(2);
+    let handle = runtime
+        .register_split_service::<TimeoutSplit, TimeoutEvent, TimeoutHttp, Infallible>(
+            TimeoutSplit {
+                admitted: None,
+                late_context: late_tx,
+            },
+            8,
+        )
+        .expect("register delayed service");
+    let mut cfg = config();
+    cfg.service_call_timeout = Duration::from_secs(5);
+    cfg.limits.keepalive_idle_timeout = Some(Duration::from_secs(2));
+    let listener = HttpListener::<TestShard, _>::for_split_service(
+        "127.0.0.1:0".parse().unwrap(),
+        handle,
+        cfg,
+    );
+    let (addr, listener_addr) = start_listener(&runtime, listener, 8);
+
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    stream
+        .write_all(b"GET /first HTTP/1.1\r\nHost: x\r\n\r\nG")
+        .expect("first request plus one read-ahead byte");
+    let first = read_one_response(&mut stream);
+    assert!(status_line(&first).starts_with("HTTP/1.1 200"), "{first}");
+    assert!(late_rx.recv_timeout(Duration::from_secs(2)).unwrap().1);
+
+    stream
+        .write_all(b"ET /second HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .expect("finish second request");
+    let second = read_one_response(&mut stream);
+    assert!(status_line(&second).starts_with("HTTP/1.1 200"), "{second}");
+    assert!(late_rx.recv_timeout(Duration::from_secs(2)).unwrap().1);
+
+    runtime
+        .try_send(listener_addr, HttpListenerMsg::Stop)
+        .expect("stop listener");
+    runtime.shutdown().expect("clean runtime shutdown");
+}
+
+#[test]
+fn single_slot_connection_preserves_service_completion_without_monitor() {
+    let runtime = make_runtime();
+    let (late_tx, late_rx) = sync_channel(1);
+    let handle = runtime
+        .register_split_service::<TimeoutSplit, TimeoutEvent, TimeoutHttp, Infallible>(
+            TimeoutSplit {
+                admitted: None,
+                late_context: late_tx,
+            },
+            8,
+        )
+        .expect("register delayed service");
+    let mut cfg = config();
+    cfg.service_call_timeout = Duration::from_secs(5);
+    cfg.connection_mailbox_capacity = 1;
+    let listener = HttpListener::<TestShard, _>::for_split_service(
+        "127.0.0.1:0".parse().unwrap(),
+        handle,
+        cfg,
+    );
+    let (addr, listener_addr) = start_listener(&runtime, listener, 8);
+
+    let response = scripted(addr, b"GET /one-slot HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(
+        status_line(&response).starts_with("HTTP/1.1 200"),
+        "single ordinary slot must remain available for service completion: {response}"
+    );
+    assert!(late_rx.recv_timeout(Duration::from_secs(2)).unwrap().1);
+
+    runtime
+        .try_send(listener_addr, HttpListenerMsg::Stop)
+        .expect("stop listener");
+    runtime.shutdown().expect("clean runtime shutdown");
+}
+
+#[test]
+fn two_slot_connection_preserves_service_completion_without_monitor() {
+    let runtime = make_runtime();
+    let (late_tx, late_rx) = sync_channel(1);
+    let handle = runtime
+        .register_split_service::<TimeoutSplit, TimeoutEvent, TimeoutHttp, Infallible>(
+            TimeoutSplit {
+                admitted: None,
+                late_context: late_tx,
+            },
+            8,
+        )
+        .expect("register delayed service");
+    let mut cfg = config();
+    cfg.service_call_timeout = Duration::from_secs(5);
+    cfg.connection_mailbox_capacity = 2;
+    let listener = HttpListener::<TestShard, _>::for_split_service(
+        "127.0.0.1:0".parse().unwrap(),
+        handle,
+        cfg,
+    );
+    let (addr, listener_addr) = start_listener(&runtime, listener, 8);
+
+    let response = scripted(addr, b"GET /two-slot HTTP/1.1\r\nHost: x\r\n\r\n");
+    assert!(
+        status_line(&response).starts_with("HTTP/1.1 200"),
+        "two ordinary slots must remain available for racing completions: {response}"
+    );
+    assert!(late_rx.recv_timeout(Duration::from_secs(2)).unwrap().1);
+
+    runtime
+        .try_send(listener_addr, HttpListenerMsg::Stop)
+        .expect("stop listener");
+    runtime.shutdown().expect("clean runtime shutdown");
 }
 
 #[test]

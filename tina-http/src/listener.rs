@@ -347,7 +347,8 @@ impl<S: Shard + 'static, M: Send + 'static> HttpListener<S, M> {
                 self.service_call_timeout,
                 Duration::ZERO,
                 self.metrics.clone(),
-            ),
+            )
+            .with_service_peer_monitor(self.connection_mailbox_capacity >= 3),
             self.connection_mailbox_capacity,
         )
         .with_initial_message(HttpConnectionMsg::Begin)
