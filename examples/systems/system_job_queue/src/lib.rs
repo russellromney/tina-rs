@@ -606,22 +606,16 @@ impl Queue {
     }
 
     fn discard_closed_ready_waiter(&mut self) {
-        if self
-            .ready_waiter
-            .as_ref()
-            .is_some_and(|waiter| !waiter.is_open())
-        {
-            self.ready_waiter = None;
-        }
+        Self::discard_closed_waiter(&mut self.ready_waiter);
     }
 
     fn discard_closed_quiescent_waiter(&mut self) {
-        if self
-            .quiescent_waiter
-            .as_ref()
-            .is_some_and(|waiter| !waiter.is_open())
-        {
-            self.quiescent_waiter = None;
+        Self::discard_closed_waiter(&mut self.quiescent_waiter);
+    }
+
+    fn discard_closed_waiter(waiter: &mut Option<tina::RequestContext<QueueReply>>) {
+        if waiter.as_ref().is_some_and(|waiter| !waiter.is_open()) {
+            *waiter = None;
         }
     }
 
@@ -1059,6 +1053,61 @@ fn classify_worker_cancel_outcome(
 mod tests {
     use super::*;
 
+    fn request_context(open: bool, slot_id: u64) -> tina::RequestContext<QueueReply> {
+        use std::any::TypeId;
+        use std::sync::Arc;
+
+        let shared = Arc::new(tina::DeferredSlotShared::new(
+            slot_id,
+            TypeId::of::<QueueReply>(),
+        ));
+        if !open {
+            shared.set_state(tina::DeferredSlotState::Closed);
+        }
+        let deferred = tina::runtime_internal::deferred_from_handle(
+            tina::runtime_internal::handle_from_shared(shared),
+        );
+        tina::runtime_internal::request_context_from_deferred(deferred)
+    }
+
+    #[test]
+    fn ready_and_quiescent_waiter_slots_reclaim_only_closed_callers() {
+        let mut queue = cancel_queue(JobId(1));
+        queue.ready_waiter = Some(request_context(false, 1));
+        queue.quiescent_waiter = Some(request_context(false, 2));
+        queue.discard_closed_ready_waiter();
+        queue.discard_closed_quiescent_waiter();
+        assert!(queue.ready_waiter.is_none());
+        assert!(queue.quiescent_waiter.is_none());
+
+        queue.ready_waiter = Some(request_context(true, 3));
+        queue.quiescent_waiter = Some(request_context(true, 4));
+        queue.discard_closed_ready_waiter();
+        queue.discard_closed_quiescent_waiter();
+        assert!(queue.ready_waiter.as_ref().is_some_and(|waiter| waiter.is_open()));
+        assert!(
+            queue
+                .quiescent_waiter
+                .as_ref()
+                .is_some_and(|waiter| waiter.is_open())
+        );
+    }
+
+    #[test]
+    fn terminal_settlement_never_replies_through_abandoned_waiter_slots() {
+        let mut queue = cancel_queue(JobId(1));
+        queue.ready_waiter = Some(request_context(false, 1));
+        queue.startup_error = Some(SpawnObservedError::ParentMailboxClosed);
+        assert!(matches!(queue.settle_ready_waiter(), Effect::Noop));
+        assert!(queue.ready_waiter.is_none());
+
+        queue.quiescent_waiter = Some(request_context(false, 2));
+        queue.worker_busy[0] = None;
+        queue.stats.in_flight = 0;
+        assert!(matches!(queue.settle_quiescent_waiter(), Effect::Noop));
+        assert!(queue.quiescent_waiter.is_none());
+    }
+
     #[test]
     fn worker_cancel_classification_is_exhaustive_and_id_sensitive() {
         let id = JobId(7);
@@ -1469,6 +1518,9 @@ pub fn run_quiescent_waiter_replacement(
 ) -> anyhow::Result<WaiterReplacementReport> {
     let mut config = config.validate()?;
     config.job_sleep_ms = config.job_sleep_ms.max(150);
+    config.call_timeout_ms = config
+        .call_timeout_ms
+        .max(config.job_sleep_ms.saturating_add(1_000));
     let config = config.validate()?;
     let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
     app.run_to_shutdown_reported(SHUTDOWN_TIMEOUT, |app| {
