@@ -1990,24 +1990,20 @@ impl<S: Shard + 'static, M: Send + 'static> HttpConnection<S, M> {
                 // Notifications never wait on a request reply.
                 send_observed(address, msg).then(HttpConnectionMsg::WebSocketAppEventDelivered)
             }
-            (WebSocketAppDelivery::Split { address }, WebSocketSessionLane::Request) => call(
-                address,
-                tina::ServiceMessage::Request(msg),
-                timeout,
-            )
-            .then(HttpConnectionMsg::WebSocketAppReturned),
+            (WebSocketAppDelivery::Split { address }, WebSocketSessionLane::Request) => {
+                call(address, tina::ServiceMessage::Request(msg), timeout)
+                    .then(HttpConnectionMsg::WebSocketAppReturned)
+            }
             (WebSocketAppDelivery::Split { address }, WebSocketSessionLane::Event) => {
                 send_observed(address, tina::ServiceMessage::Event(msg))
                     .then(HttpConnectionMsg::WebSocketAppEventDelivered)
             }
             // Request-only services expose only a request lane. Every message
             // is a call; room fanout / SendOutcome needs a split-service app.
-            (WebSocketAppDelivery::RequestOnly { address }, _) => call(
-                address,
-                tina::ServiceMessage::Request(msg),
-                timeout,
-            )
-            .then(HttpConnectionMsg::WebSocketAppReturned),
+            (WebSocketAppDelivery::RequestOnly { address }, _) => {
+                call(address, tina::ServiceMessage::Request(msg), timeout)
+                    .then(HttpConnectionMsg::WebSocketAppReturned)
+            }
         }
     }
 

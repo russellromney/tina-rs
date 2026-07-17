@@ -25,8 +25,8 @@
 
 use std::convert::Infallible;
 
-use tina::prelude::*;
 use tina::ServiceMessage;
+use tina::prelude::*;
 
 use crate::websocket::{
     WebSocketAccept, WebSocketError, WebSocketLimits, WebSocketSessionMsg, WebSocketSessionOutcome,
@@ -239,7 +239,9 @@ impl WebSocketUpgradeRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::websocket::{WebSocketCloseCode, WebSocketSendError, WebSocketSendOutcome, WebSocketSessionId};
+    use crate::websocket::{
+        WebSocketCloseCode, WebSocketSendError, WebSocketSendOutcome, WebSocketSessionId,
+    };
 
     #[test]
     fn send_outcome_is_event_lane() {

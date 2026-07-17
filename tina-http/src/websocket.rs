@@ -209,9 +209,9 @@ impl WebSocketSessionHandle {
     /// it never re-enters the caller's request lane.
     pub fn send_effect_service_event<
         I: Isolate<
-            Message = tina::ServiceMessage<Event, Request>,
-            Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
-        >,
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
         Event,
         Request,
         F,
@@ -245,9 +245,9 @@ impl WebSocketSessionHandle {
     /// Split-service form of [`Self::text_effect`].
     pub fn text_effect_service_event<
         I: Isolate<
-            Message = tina::ServiceMessage<Event, Request>,
-            Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
-        >,
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
         Event,
         Request,
         F,
@@ -289,9 +289,9 @@ impl WebSocketSessionHandle {
     /// Split-service form of [`Self::close_effect`].
     pub fn close_effect_service_event<
         I: Isolate<
-            Message = tina::ServiceMessage<Event, Request>,
-            Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
-        >,
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
         Event,
         Request,
         F,
@@ -337,9 +337,9 @@ impl WebSocketSessionHandle {
     /// Split-service form of [`Self::report_effect`].
     pub fn report_effect_service_event<
         I: Isolate<
-            Message = tina::ServiceMessage<Event, Request>,
-            Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
-        >,
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
         Event,
         Request,
         F,

@@ -292,12 +292,12 @@ pub use websocket::{
     WebSocketSessionMsg, WebSocketSessionOutcome, WebSocketSessionReport,
     WebSocketSessionReportOutcome, WebSocketUpgradeRequest, websocket_upgrade,
 };
-pub use websocket_delivery::{WebSocketSessionLane, websocket_session_lane};
 pub use websocket_client::{
     WebSocketClientConnected, WebSocketClientConnection, WebSocketClientError,
     WebSocketClientEvent, WebSocketClientMsg, WebSocketClientReply, WebSocketClientReport,
     WebSocketClientState, WebSocketTarget,
 };
+pub use websocket_delivery::{WebSocketSessionLane, websocket_session_lane};
 pub use websocket_room::{
     AdmitOutcome, SendOutcomeAction, WebSocketMemberTable, WebSocketMemberTableReport,
 };

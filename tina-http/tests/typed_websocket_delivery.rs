@@ -699,5 +699,3 @@ fn listener_shutdown_during_session_is_clean() {
     let mut buf = [0u8; 64];
     let _ = stream.read(&mut buf);
 }
-
-
