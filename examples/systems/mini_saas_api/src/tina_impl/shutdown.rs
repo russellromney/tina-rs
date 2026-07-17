@@ -410,7 +410,7 @@ mod conversion_tests {
             .expect("owner shutdown");
         let proof = prove_owner_terminal(&terminal).expect("terminal proof");
         let settlement = settle_after_owner_shutdown(authority, proof);
-        let _ = app.shutdown().join();
+        app.shutdown().join().expect("owner join remains clean");
         settlement
     }
 
