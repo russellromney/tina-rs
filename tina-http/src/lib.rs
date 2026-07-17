@@ -188,6 +188,7 @@ pub mod transport;
 pub mod types;
 pub mod websocket;
 pub mod websocket_client;
+pub mod websocket_delivery;
 pub mod websocket_room;
 
 pub use body_metrics::{BodyCapacityFull, BodyMetrics, BodyPressureReport};
@@ -296,6 +297,7 @@ pub use websocket_client::{
     WebSocketClientEvent, WebSocketClientMsg, WebSocketClientReply, WebSocketClientReport,
     WebSocketClientState, WebSocketTarget,
 };
+pub use websocket_delivery::{WebSocketSessionLane, websocket_session_lane};
 pub use websocket_room::{
     AdmitOutcome, SendOutcomeAction, WebSocketMemberTable, WebSocketMemberTableReport,
 };

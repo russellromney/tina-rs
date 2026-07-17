@@ -185,6 +185,9 @@ impl WebSocketSessionHandle {
     /// The call routes through the connection isolate that owns the upgraded
     /// stream and translates runtime `Full` / `Closed` / `Timeout` plus
     /// session-owner admission into [`WebSocketSessionMsg::SendOutcome`].
+    ///
+    /// The continuation is an ordinary later message — not a request-lane
+    /// reply — so write admission never re-enters the caller's request authority.
     pub fn send_effect<
         I: Isolate<Message = WebSocketSessionMsg, Io = RuntimeCall<WebSocketSessionMsg>>,
     >(
@@ -200,6 +203,35 @@ impl WebSocketSessionHandle {
         })
     }
 
+    /// Split-service form of [`Self::send_effect`].
+    ///
+    /// The connection call's admission outcome continues as a domain event so
+    /// it never re-enters the caller's request lane.
+    pub fn send_effect_service_event<
+        I: Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        Event,
+        Request,
+        F,
+    >(
+        self,
+        message: WebSocketMessage,
+        timeout: Duration,
+        map_outcome: F,
+    ) -> Effect<I>
+    where
+        Event: 'static,
+        Request: 'static,
+        F: FnOnce(WebSocketSendOutcome) -> Event + 'static,
+    {
+        let session = self.session_id;
+        call(self.target, self.send(message), timeout).then_service_event(move |outcome| {
+            map_outcome(WebSocketSendOutcome::from_connection_call(session, outcome))
+        })
+    }
+
     pub fn text_effect<
         I: Isolate<Message = WebSocketSessionMsg, Io = RuntimeCall<WebSocketSessionMsg>>,
     >(
@@ -208,6 +240,29 @@ impl WebSocketSessionHandle {
         timeout: Duration,
     ) -> Effect<I> {
         self.send_effect(WebSocketMessage::Text(text.into()), timeout)
+    }
+
+    /// Split-service form of [`Self::text_effect`].
+    pub fn text_effect_service_event<
+        I: Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        Event,
+        Request,
+        F,
+    >(
+        self,
+        text: impl Into<String>,
+        timeout: Duration,
+        map_outcome: F,
+    ) -> Effect<I>
+    where
+        Event: 'static,
+        Request: 'static,
+        F: FnOnce(WebSocketSendOutcome) -> Event + 'static,
+    {
+        self.send_effect_service_event(WebSocketMessage::Text(text.into()), timeout, map_outcome)
     }
 
     pub fn binary_effect<
@@ -231,6 +286,34 @@ impl WebSocketSessionHandle {
         self.send_effect(WebSocketMessage::Close(code, reason.into()), timeout)
     }
 
+    /// Split-service form of [`Self::close_effect`].
+    pub fn close_effect_service_event<
+        I: Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        Event,
+        Request,
+        F,
+    >(
+        self,
+        code: Option<WebSocketCloseCode>,
+        reason: impl Into<Vec<u8>>,
+        timeout: Duration,
+        map_outcome: F,
+    ) -> Effect<I>
+    where
+        Event: 'static,
+        Request: 'static,
+        F: FnOnce(WebSocketSendOutcome) -> Event + 'static,
+    {
+        self.send_effect_service_event(
+            WebSocketMessage::Close(code, reason.into()),
+            timeout,
+            map_outcome,
+        )
+    }
+
     /// Route a bounded session snapshot request through the connection owner.
     ///
     /// Use this for diagnostics and room policy decisions that need
@@ -246,6 +329,33 @@ impl WebSocketSessionHandle {
         let session = self.session_id;
         call(self.target, self.report(), timeout).then(move |outcome| {
             WebSocketSessionMsg::SessionReport(WebSocketSessionReportOutcome::from_connection_call(
+                session, outcome,
+            ))
+        })
+    }
+
+    /// Split-service form of [`Self::report_effect`].
+    pub fn report_effect_service_event<
+        I: Isolate<
+                Message = tina::ServiceMessage<Event, Request>,
+                Io = RuntimeCall<tina::ServiceMessage<Event, Request>>,
+            >,
+        Event,
+        Request,
+        F,
+    >(
+        self,
+        timeout: Duration,
+        map_outcome: F,
+    ) -> Effect<I>
+    where
+        Event: 'static,
+        Request: 'static,
+        F: FnOnce(WebSocketSessionReportOutcome) -> Event + 'static,
+    {
+        let session = self.session_id;
+        call(self.target, self.report(), timeout).then_service_event(move |outcome| {
+            map_outcome(WebSocketSessionReportOutcome::from_connection_call(
                 session, outcome,
             ))
         })
@@ -267,23 +377,30 @@ impl Eq for WebSocketSessionHandle {}
 /// the app session address and limits are known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebSocketUpgradeRequest {
-    accept_key: String,
+    pub(crate) accept_key: String,
     offered_subprotocols: Vec<String>,
     extension_offers: Vec<String>,
 }
 
 impl WebSocketUpgradeRequest {
+    /// Accept with a raw session app address.
+    ///
+    /// Prefer [`Self::accept_split_service`] or
+    /// [`Self::accept_request_service`] for capability-typed install sites.
+    /// On this raw Call path, event-lane notifications use observed send so
+    /// write completions do not enter the application's request lane (unlike
+    /// RequestOnly, which has no event capability).
     pub fn accept(
         self,
         app: Address<WebSocketSessionMsg, WebSocketSessionOutcome>,
         limits: WebSocketLimits,
     ) -> WebSocketAccept {
-        WebSocketAccept {
-            accept_key: self.accept_key,
-            selected_subprotocol: None,
-            app,
+        WebSocketAccept::from_parts(
+            self.accept_key,
+            None,
+            crate::websocket_delivery::WebSocketAppDelivery::call(app),
             limits,
-        }
+        )
     }
 
     pub fn accept_subprotocol(
@@ -293,22 +410,13 @@ impl WebSocketUpgradeRequest {
         subprotocol: impl Into<String>,
     ) -> Result<WebSocketAccept, WebSocketError> {
         let subprotocol = subprotocol.into();
-        if !is_subprotocol_token(&subprotocol) {
-            return Err(WebSocketError::InvalidSubprotocol);
-        }
-        if !self
-            .offered_subprotocols
-            .iter()
-            .any(|offered| offered == &subprotocol)
-        {
-            return Err(WebSocketError::UnsupportedSubprotocol);
-        }
-        Ok(WebSocketAccept {
-            accept_key: self.accept_key.clone(),
-            selected_subprotocol: Some(subprotocol),
-            app,
+        self.ensure_subprotocol(&subprotocol)?;
+        Ok(WebSocketAccept::from_parts(
+            self.accept_key.clone(),
+            Some(subprotocol),
+            crate::websocket_delivery::WebSocketAppDelivery::call(app),
             limits,
-        })
+        ))
     }
 
     pub fn accept_key(&self) -> &str {
@@ -322,6 +430,20 @@ impl WebSocketUpgradeRequest {
     pub fn extension_offers(&self) -> &[String] {
         &self.extension_offers
     }
+
+    pub(crate) fn ensure_subprotocol(&self, subprotocol: &str) -> Result<(), WebSocketError> {
+        if !is_subprotocol_token(subprotocol) {
+            return Err(WebSocketError::InvalidSubprotocol);
+        }
+        if !self
+            .offered_subprotocols
+            .iter()
+            .any(|offered| offered == subprotocol)
+        {
+            return Err(WebSocketError::UnsupportedSubprotocol);
+        }
+        Ok(())
+    }
 }
 
 /// Accepted WebSocket handoff payload carried by
@@ -330,11 +452,25 @@ impl WebSocketUpgradeRequest {
 pub struct WebSocketAccept {
     accept_key: String,
     selected_subprotocol: Option<String>,
-    pub(crate) app: Address<WebSocketSessionMsg, WebSocketSessionOutcome>,
+    pub(crate) delivery: crate::websocket_delivery::WebSocketAppDelivery,
     pub(crate) limits: WebSocketLimits,
 }
 
 impl WebSocketAccept {
+    pub(crate) fn from_parts(
+        accept_key: String,
+        selected_subprotocol: Option<String>,
+        delivery: crate::websocket_delivery::WebSocketAppDelivery,
+        limits: WebSocketLimits,
+    ) -> Self {
+        Self {
+            accept_key,
+            selected_subprotocol,
+            delivery,
+            limits,
+        }
+    }
+
     pub fn accept_key(&self) -> &str {
         &self.accept_key
     }
@@ -343,8 +479,17 @@ impl WebSocketAccept {
         self.selected_subprotocol.as_deref()
     }
 
-    pub fn app(&self) -> Address<WebSocketSessionMsg, WebSocketSessionOutcome> {
-        self.app
+    /// Raw session app address when the accept used the legacy call form.
+    ///
+    /// Returns `None` when the accept was installed from a typed split or
+    /// request-only service handle — hold that handle instead of asking for a
+    /// raw address.
+    pub fn app(&self) -> Option<Address<WebSocketSessionMsg, WebSocketSessionOutcome>> {
+        self.delivery.legacy_app_address()
+    }
+
+    pub(crate) fn delivery(&self) -> crate::websocket_delivery::WebSocketAppDelivery {
+        self.delivery
     }
 
     pub fn limits(&self) -> WebSocketLimits {

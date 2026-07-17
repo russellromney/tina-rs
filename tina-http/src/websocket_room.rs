@@ -10,18 +10,31 @@
 //! table — the table only handles the bookkeeping that two specimens already
 //! had verbatim.
 //!
+//! # Broadcast contract
+//!
+//! When the room processes one inbound text event, this table:
+//!
+//! 1. takes a membership snapshot
+//! 2. excludes the sender
+//! 3. offers the payload exactly once to every remaining member, in snapshot
+//!    order, as event-authority sends into each connection owner
+//!
+//! There is no global ordering promise before concurrent inputs reach the
+//! room mailbox. Closed/stale recipients surface as typed
+//! [`WebSocketSendOutcome`] values and are removed through
+//! [`WebSocketMemberTable::record_send_outcome`].
+//!
 //! Not a chat framework. Not a hidden queue. Not a room registry. No `Arc`
 //! sharing. The table lives as one field on a room isolate.
 
 use std::collections::BTreeMap;
 
 use tina::{Effect, Isolate, Outbound};
-use tina_runtime::RuntimeCall;
 
 use crate::connection::HttpConnectionMsg;
 use crate::websocket::{
     WebSocketCloseCode, WebSocketSendError, WebSocketSendOutcome, WebSocketSessionHandle,
-    WebSocketSessionId, WebSocketSessionMsg,
+    WebSocketSessionId,
 };
 
 /// Bounded report counters captured by the table itself. Rooms can mirror
@@ -177,10 +190,32 @@ impl WebSocketMemberTable {
         self.members.remove(&id)
     }
 
+    /// Snapshot of current members excluding `exclude`, in table order.
+    ///
+    /// The room mailbox is the ordering boundary: one room event builds one
+    /// snapshot, then offers exactly once to each remaining recipient.
+    pub fn recipient_snapshot(
+        &self,
+        exclude: Option<WebSocketSessionId>,
+    ) -> Vec<(WebSocketSessionId, WebSocketSessionHandle)> {
+        self.members
+            .iter()
+            .filter(|(id, _)| exclude != Some(**id))
+            .map(|(id, handle)| (*id, *handle))
+            .collect()
+    }
+
     /// Build `tina::send` effects for `message_for` applied to every member
-    /// except `exclude`. The followup `WebSocketSessionMsg::SendOutcome`
-    /// routes to the room's `handle` entry point through each connection
-    /// owner; pair with [`Self::record_send_outcome`] for slow-peer
+    /// except `exclude`.
+    ///
+    /// Contract:
+    /// - recipients come from a membership snapshot at this call
+    /// - the sender (`exclude`) is never offered the message
+    /// - each remaining member is offered exactly once, in snapshot order
+    ///
+    /// Each offer is an event-authority send into the connection owner. The
+    /// followup `WebSocketSessionMsg::SendOutcome` is delivered on the app's
+    /// event lane; pair with [`Self::record_send_outcome`] for slow-peer
     /// eviction.
     pub fn fanout<I, F>(
         &self,
@@ -188,19 +223,13 @@ impl WebSocketMemberTable {
         message_for: F,
     ) -> Vec<Effect<I>>
     where
-        I: Isolate<
-                Message = WebSocketSessionMsg,
-                Send = Outbound<HttpConnectionMsg>,
-                Io = RuntimeCall<WebSocketSessionMsg>,
-            >,
+        I: Isolate<Send = Outbound<HttpConnectionMsg>>,
         F: Fn(WebSocketSessionHandle) -> HttpConnectionMsg,
     {
-        let mut effects = Vec::with_capacity(self.members.len());
-        for (id, handle) in &self.members {
-            if exclude == Some(*id) {
-                continue;
-            }
-            effects.push(tina::send(handle.target(), message_for(*handle)));
+        let recipients = self.recipient_snapshot(exclude);
+        let mut effects = Vec::with_capacity(recipients.len());
+        for (_id, handle) in recipients {
+            effects.push(tina::send(handle.target(), message_for(handle)));
         }
         effects
     }
@@ -212,11 +241,7 @@ impl WebSocketMemberTable {
         text: impl Into<String>,
     ) -> Vec<Effect<I>>
     where
-        I: Isolate<
-                Message = WebSocketSessionMsg,
-                Send = Outbound<HttpConnectionMsg>,
-                Io = RuntimeCall<WebSocketSessionMsg>,
-            >,
+        I: Isolate<Send = Outbound<HttpConnectionMsg>>,
     {
         let text = text.into();
         self.fanout(exclude, move |handle| handle.text(text.clone()))
@@ -229,11 +254,7 @@ impl WebSocketMemberTable {
         bytes: impl Into<Vec<u8>>,
     ) -> Vec<Effect<I>>
     where
-        I: Isolate<
-                Message = WebSocketSessionMsg,
-                Send = Outbound<HttpConnectionMsg>,
-                Io = RuntimeCall<WebSocketSessionMsg>,
-            >,
+        I: Isolate<Send = Outbound<HttpConnectionMsg>>,
     {
         let bytes = bytes.into();
         self.fanout(exclude, move |handle| handle.binary(bytes.clone()))
@@ -249,11 +270,7 @@ impl WebSocketMemberTable {
         reason: impl Into<Vec<u8>>,
     ) -> Vec<Effect<I>>
     where
-        I: Isolate<
-                Message = WebSocketSessionMsg,
-                Send = Outbound<HttpConnectionMsg>,
-                Io = RuntimeCall<WebSocketSessionMsg>,
-            >,
+        I: Isolate<Send = Outbound<HttpConnectionMsg>>,
     {
         let reason = reason.into();
         let effects = self.fanout(None, move |handle| handle.close(code, reason.clone()));
@@ -309,7 +326,9 @@ impl WebSocketMemberTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::websocket::WebSocketSessionMsg;
     use tina::{Address, AddressGeneration, IsolateId, ShardId};
+    use tina_runtime::RuntimeCall;
 
     fn dummy_handle(isolate: u64) -> WebSocketSessionHandle {
         let target: Address<HttpConnectionMsg, crate::streaming::RequestChunkReply> =
@@ -548,6 +567,46 @@ mod tests {
         table.admit(dummy_handle(3));
         let effects: Vec<Effect<DummyRoomIsolate>> = table.broadcast_text(None, "ping");
         assert_eq!(effects.len(), 3);
+    }
+
+    #[test]
+    fn recipient_snapshot_excludes_sender_exactly_once_in_order() {
+        let mut table = WebSocketMemberTable::new(4);
+        let a = dummy_handle(1);
+        let b = dummy_handle(2);
+        let c = dummy_handle(3);
+        table.admit(a);
+        table.admit(b);
+        table.admit(c);
+        let snapshot = table.recipient_snapshot(Some(b.session_id()));
+        let ids: Vec<WebSocketSessionId> = snapshot.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&a.session_id()));
+        assert!(ids.contains(&c.session_id()));
+        assert!(!ids.contains(&b.session_id()));
+        // Exactly one offer per remaining member.
+        assert_eq!(ids.iter().filter(|id| **id == a.session_id()).count(), 1);
+        assert_eq!(ids.iter().filter(|id| **id == c.session_id()).count(), 1);
+        // Snapshot order matches membership order (BTreeMap by session id).
+        let full: Vec<WebSocketSessionId> = table.members().map(|(id, _)| id).collect();
+        let expected: Vec<WebSocketSessionId> = full
+            .into_iter()
+            .filter(|id| *id != b.session_id())
+            .collect();
+        assert_eq!(ids, expected);
+    }
+
+    #[test]
+    fn fanout_offer_count_matches_snapshot() {
+        let mut table = WebSocketMemberTable::new(4);
+        let a = dummy_handle(1);
+        let b = dummy_handle(2);
+        table.admit(a);
+        table.admit(b);
+        let effects: Vec<Effect<DummyRoomIsolate>> =
+            table.broadcast_text(Some(a.session_id()), "only-b");
+        assert_eq!(effects.len(), 1);
+        assert_eq!(table.recipient_snapshot(Some(a.session_id())).len(), 1);
     }
 
     #[test]
