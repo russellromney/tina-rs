@@ -623,6 +623,14 @@ pub enum SpawnObservedError {
     /// panics remain restart lifecycle facts reported as
     /// `RestartSkippedReason::FactoryPanicked` by runtime owners.
     FactoryPanicked,
+
+    /// The parent's mailbox could not reserve a slot for eventual terminal
+    /// result delivery. No child was created and no reservation remains.
+    ParentMailboxFull,
+
+    /// The parent's mailbox is closed, so a terminal-delivery reservation
+    /// cannot be taken. No child was created.
+    ParentMailboxClosed,
 }
 
 /// Type-level child address information carried by supported spawn requests.
@@ -655,11 +663,19 @@ pub type SpawnObservedContinuation<P, M, R = ()> = Box<dyn FnOnce(SpawnObservedR
 /// Repeatable continuation invoked for each successful replacement child.
 pub type SpawnRestartedContinuation<P, M, R = ()> = Rc<dyn Fn(ChildRef<M, R>) -> P>;
 
+/// Maps a child's type-erased [`crate::StopResult`] into a parent message.
+///
+/// Returns `None` when the payload type does not match the mapper's expected
+/// type. The runtime disposes that result exactly once and does not deliver a
+/// wrong-typed parent event.
+pub type SpawnTerminalContinuation<P> = Rc<dyn Fn(crate::StopResult) -> Option<P>>;
+
 /// Parts consumed by runtime adapters that understand observed spawn.
 pub type SpawnObservedParts<S, P, M, R = ()> = (
     S,
     SpawnObservedContinuation<P, M, R>,
     Option<SpawnRestartedContinuation<P, M, R>>,
+    Option<SpawnTerminalContinuation<P>>,
 );
 
 type SpawnObservedMarker<M, R> = PhantomData<fn() -> (M, R)>;
@@ -680,6 +696,47 @@ impl<S, M, R> SpawnObservedBuilder<S, M, R> {
         }
     }
 
+    /// Observes a typed child [`crate::stop_with`] result as a parent message.
+    ///
+    /// Chain with [`SpawnObservedTerminalBuilder::then`] or
+    /// [`SpawnObservedTerminalBuilder::then_with_restarts`] so the parent
+    /// receives initial (and optional replacement) lifecycle events plus the
+    /// exact terminal payload. Admission reserves one parent mailbox slot for
+    /// that generation's terminal delivery; if the parent mailbox is full or
+    /// closed, spawn is not admitted.
+    pub fn then_result<T, F>(self, map: F) -> SpawnObservedTerminalBuilder<S, M, R, T, F>
+    where
+        T: Send + 'static,
+        F: 'static,
+    {
+        SpawnObservedTerminalBuilder {
+            spawn: self.spawn,
+            map,
+            marker: PhantomData,
+        }
+    }
+
+    /// Observes a typed child [`crate::stop_with`] result as a split-service
+    /// event without exposing the service envelope.
+    ///
+    /// Chain with [`SpawnObservedServiceTerminalBuilder::then_service_event`]
+    /// or
+    /// [`SpawnObservedServiceTerminalBuilder::then_service_event_with_restarts`].
+    pub fn then_service_result<T, F>(
+        self,
+        map: F,
+    ) -> SpawnObservedServiceTerminalBuilder<S, M, R, T, F>
+    where
+        T: Send + 'static,
+        F: 'static,
+    {
+        SpawnObservedServiceTerminalBuilder {
+            spawn: self.spawn,
+            map,
+            marker: PhantomData,
+        }
+    }
+
     /// Maps the runtime's later child-start result into an ordinary parent
     /// continuation message.
     pub fn then<I, P, F>(self, continuation: F) -> Effect<I>
@@ -691,6 +748,7 @@ impl<S, M, R> SpawnObservedBuilder<S, M, R> {
             spawn: self.spawn,
             continuation: Box::new(continuation),
             restart_continuation: None,
+            terminal_continuation: None,
             marker: PhantomData,
         })
     }
@@ -714,6 +772,7 @@ impl<S, M, R> SpawnObservedBuilder<S, M, R> {
             spawn: self.spawn,
             continuation: Box::new(initial),
             restart_continuation: Some(Rc::new(restarted)),
+            terminal_continuation: None,
             marker: PhantomData,
         })
     }
@@ -761,12 +820,163 @@ impl<S, M, R> SpawnObservedBuilder<S, M, R> {
     }
 }
 
+/// Intermediate builder after [`SpawnObservedBuilder::then_result`].
+///
+/// Finish with [`Self::then`] or [`Self::then_with_restarts`] so the parent
+/// receives initial (and optional replacement) events plus the terminal result.
+#[must_use = "a spawn_observed terminal mapper has no effect until finished with then*"]
+#[derive(Debug)]
+pub struct SpawnObservedTerminalBuilder<S, M, R, T, F> {
+    spawn: S,
+    map: F,
+    marker: PhantomData<(M, R, T)>,
+}
+
+impl<S, M, R, T, F> SpawnObservedTerminalBuilder<S, M, R, T, F>
+where
+    T: Send + 'static,
+    F: 'static,
+{
+    /// Maps the runtime's later child-start result into an ordinary parent
+    /// message. The terminal mapper from [`SpawnObservedBuilder::then_result`]
+    /// remains attached.
+    pub fn then<I, P, C>(self, continuation: C) -> Effect<I>
+    where
+        I: Isolate<Message = P, SpawnObserved = SpawnObserved<S, P, M, R>>,
+        F: Fn(T) -> P + 'static,
+        C: FnOnce(SpawnObservedResult<M, R>) -> P + 'static,
+        P: 'static,
+    {
+        let map = self.map;
+        Effect::SpawnObserved(SpawnObserved {
+            spawn: self.spawn,
+            continuation: Box::new(continuation),
+            restart_continuation: None,
+            terminal_continuation: Some(Rc::new(move |result: crate::StopResult| {
+                match result.into_any().downcast::<T>() {
+                    Ok(value) => Some(map(*value)),
+                    Err(_authority) => None,
+                }
+            })),
+            marker: PhantomData,
+        })
+    }
+
+    /// Maps the initial spawn result and every successful replacement child,
+    /// and keeps the terminal mapper from
+    /// [`SpawnObservedBuilder::then_result`].
+    pub fn then_with_restarts<I, P, C, G>(self, initial: C, restarted: G) -> Effect<I>
+    where
+        I: Isolate<Message = P, SpawnObserved = SpawnObserved<S, P, M, R>>,
+        F: Fn(T) -> P + 'static,
+        C: FnOnce(SpawnObservedResult<M, R>) -> P + 'static,
+        G: Fn(ChildRef<M, R>) -> P + 'static,
+        P: 'static,
+    {
+        let map = self.map;
+        Effect::SpawnObserved(SpawnObserved {
+            spawn: self.spawn,
+            continuation: Box::new(initial),
+            restart_continuation: Some(Rc::new(restarted)),
+            terminal_continuation: Some(Rc::new(move |result: crate::StopResult| {
+                match result.into_any().downcast::<T>() {
+                    Ok(value) => Some(map(*value)),
+                    Err(_authority) => None,
+                }
+            })),
+            marker: PhantomData,
+        })
+    }
+}
+
+/// Intermediate builder after [`SpawnObservedBuilder::then_service_result`].
+///
+/// Finish with [`Self::then_service_event`] or
+/// [`Self::then_service_event_with_restarts`].
+#[must_use = "a spawn_observed terminal mapper has no effect until finished with then_service*"]
+#[derive(Debug)]
+pub struct SpawnObservedServiceTerminalBuilder<S, M, R, T, F> {
+    spawn: S,
+    map: F,
+    marker: PhantomData<(M, R, T)>,
+}
+
+impl<S, M, R, T, F> SpawnObservedServiceTerminalBuilder<S, M, R, T, F>
+where
+    T: Send + 'static,
+    F: 'static,
+{
+    /// Maps the observed child-start result into a split-service event and
+    /// keeps the terminal mapper as a service event.
+    pub fn then_service_event<I, Event, Request, C>(self, continuation: C) -> Effect<I>
+    where
+        I: Isolate<
+                Message = ServiceMessage<Event, Request>,
+                SpawnObserved = SpawnObserved<S, ServiceMessage<Event, Request>, M, R>,
+            >,
+        F: Fn(T) -> Event + 'static,
+        C: FnOnce(SpawnObservedResult<M, R>) -> Event + 'static,
+        Event: 'static,
+        Request: 'static,
+    {
+        let map = self.map;
+        Effect::SpawnObserved(SpawnObserved {
+            spawn: self.spawn,
+            continuation: Box::new(move |result| ServiceMessage::Event(continuation(result))),
+            restart_continuation: None,
+            terminal_continuation: Some(Rc::new(move |result: crate::StopResult| {
+                match result.into_any().downcast::<T>() {
+                    Ok(value) => Some(ServiceMessage::Event(map(*value))),
+                    Err(_authority) => None,
+                }
+            })),
+            marker: PhantomData,
+        })
+    }
+
+    /// Maps initial and replacement lifecycle into split-service events and
+    /// keeps the terminal mapper as a service event.
+    pub fn then_service_event_with_restarts<I, Event, Request, C, G>(
+        self,
+        initial: C,
+        restarted: G,
+    ) -> Effect<I>
+    where
+        I: Isolate<
+                Message = ServiceMessage<Event, Request>,
+                SpawnObserved = SpawnObserved<S, ServiceMessage<Event, Request>, M, R>,
+            >,
+        F: Fn(T) -> Event + 'static,
+        C: FnOnce(SpawnObservedResult<M, R>) -> Event + 'static,
+        G: Fn(ChildRef<M, R>) -> Event + 'static,
+        Event: 'static,
+        Request: 'static,
+    {
+        let map = self.map;
+        Effect::SpawnObserved(SpawnObserved {
+            spawn: self.spawn,
+            continuation: Box::new(move |result| ServiceMessage::Event(initial(result))),
+            restart_continuation: Some(Rc::new(move |child| {
+                ServiceMessage::Event(restarted(child))
+            })),
+            terminal_continuation: Some(Rc::new(move |result: crate::StopResult| {
+                match result.into_any().downcast::<T>() {
+                    Ok(value) => Some(ServiceMessage::Event(map(*value))),
+                    Err(_authority) => None,
+                }
+            })),
+            marker: PhantomData,
+        })
+    }
+}
+
 /// Spawn request plus continuation for delivering a typed child reference.
 #[must_use = "a spawn_observed request has no effect until returned as an Effect"]
 pub struct SpawnObserved<S, P, M, R = ()> {
     spawn: S,
     continuation: SpawnObservedContinuation<P, M, R>,
     restart_continuation: Option<SpawnRestartedContinuation<P, M, R>>,
+    terminal_continuation: Option<SpawnTerminalContinuation<P>>,
     marker: SpawnObservedMarker<M, R>,
 }
 
@@ -778,14 +988,23 @@ where
         formatter
             .debug_struct("SpawnObserved")
             .field("spawn", &self.spawn)
+            .field(
+                "has_terminal_continuation",
+                &self.terminal_continuation.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
 
 impl<S, P, M, R> SpawnObserved<S, P, M, R> {
-    /// Consumes this request into its spawn payload and continuation.
+    /// Consumes this request into its spawn payload and continuations.
     pub fn into_parts(self) -> SpawnObservedParts<S, P, M, R> {
-        (self.spawn, self.continuation, self.restart_continuation)
+        (
+            self.spawn,
+            self.continuation,
+            self.restart_continuation,
+            self.terminal_continuation,
+        )
     }
 }
 
@@ -843,7 +1062,8 @@ mod spawn_observed_service_event_tests {
 
     #[test]
     fn service_restart_continuations_preserve_initial_and_replacement_types() {
-        let (_, initial, restarted) = service_restart_parts();
+        let (_, initial, restarted, terminal) = service_restart_parts();
+        assert!(terminal.is_none());
         assert!(matches!(
             initial(Err(SpawnObservedError::ZeroMailboxCapacity)),
             ServiceMessage::Event(ParentEvent::Started(Err(
@@ -851,7 +1071,7 @@ mod spawn_observed_service_event_tests {
             )))
         ));
 
-        let (_, initial, restarted_again) = service_restart_parts();
+        let (_, initial, restarted_again, _) = service_restart_parts();
         let first = ChildRef::new(Address::new(ShardId::new(3), IsolateId::new(7)));
         assert!(matches!(
             initial(Ok(first)),
