@@ -1643,6 +1643,9 @@ where
                     mailbox_capacity,
                     restart_recipe: None,
                     restart_continuation: None,
+                    terminal_continuation: None,
+                    terminal_slot_reserved: false,
+                    terminal_settled_generation: None,
                 });
                 parent
             }
@@ -1689,6 +1692,8 @@ where
             mailbox_capacity,
             restart_recipe: None,
             restart_continuation: None,
+            terminal_continuation: None,
+            terminal_slot_reserved: false,
             bootstrap_message: bootstrap_message.map(|message| Box::new(message) as Box<dyn Any>),
         }
     }
@@ -1707,6 +1712,9 @@ where
             mailbox_capacity: outcome.mailbox_capacity,
             restart_recipe: outcome.restart_recipe,
             restart_continuation: outcome.restart_continuation,
+            terminal_continuation: outcome.terminal_continuation,
+            terminal_slot_reserved: outcome.terminal_slot_reserved,
+            terminal_settled_generation: None,
         });
     }
 
@@ -1840,6 +1848,294 @@ where
                     },
                 );
             }
+        }
+    }
+
+    pub(crate) fn try_reserve_terminal_slot(
+        &self,
+        parent: IsolateId,
+    ) -> Result<(), tina_runtime::SendRejectedReason> {
+        let Some(entry) = self.entry_by_isolate(parent) else {
+            return Err(tina_runtime::SendRejectedReason::Closed);
+        };
+        if entry.stopped.get() {
+            return Err(tina_runtime::SendRejectedReason::Closed);
+        }
+        entry.inbox.try_reserve_slot()
+    }
+
+    pub(crate) fn release_terminal_slot(&self, parent: IsolateId) {
+        let Some(entry) = self.entry_by_isolate(parent) else {
+            return;
+        };
+        entry.inbox.release_reserved_slot();
+    }
+
+    pub(crate) fn settle_child_terminal_observation(
+        &mut self,
+        child: RegisteredAddress,
+        result: Option<tina::StopResult>,
+        cause: tina_runtime::CauseId,
+    ) -> Option<tina::StopResult> {
+        use tina_runtime::ChildTerminalDisposedReason;
+
+        let Some(record_index) = self.child_record_index_by_child(child) else {
+            return result;
+        };
+        let record = &self.child_records[record_index];
+        if record.terminal_continuation.is_none() && !record.terminal_slot_reserved {
+            return result;
+        }
+        if record.terminal_settled_generation == Some(child.generation) {
+            self.push_event(
+                record.parent,
+                Some(cause),
+                RuntimeEventKind::ChildTerminalDisposed {
+                    child_ordinal: record.child_ordinal,
+                    child_isolate: child.isolate,
+                    child_generation: child.generation,
+                    reason: ChildTerminalDisposedReason::Duplicate,
+                },
+            );
+            drop(result);
+            return None;
+        }
+        if record.child.generation != child.generation {
+            self.push_event(
+                record.parent,
+                Some(cause),
+                RuntimeEventKind::ChildTerminalDisposed {
+                    child_ordinal: record.child_ordinal,
+                    child_isolate: child.isolate,
+                    child_generation: child.generation,
+                    reason: ChildTerminalDisposedReason::StaleGeneration,
+                },
+            );
+            drop(result);
+            return None;
+        }
+
+        let parent = record.parent;
+        let child_ordinal = record.child_ordinal;
+        let had_reservation = record.terminal_slot_reserved;
+        let mapper = record.terminal_continuation.clone();
+        self.child_records[record_index].terminal_settled_generation = Some(child.generation);
+        self.child_records[record_index].terminal_slot_reserved = false;
+
+        let Some(mapper) = mapper else {
+            if had_reservation {
+                self.release_terminal_slot(parent);
+            }
+            drop(result);
+            return None;
+        };
+        let Some(result) = result else {
+            if had_reservation {
+                self.release_terminal_slot(parent);
+            }
+            self.push_event(
+                parent,
+                Some(cause),
+                RuntimeEventKind::ChildTerminalDisposed {
+                    child_ordinal,
+                    child_isolate: child.isolate,
+                    child_generation: child.generation,
+                    reason: ChildTerminalDisposedReason::StoppedWithoutResult,
+                },
+            );
+            return None;
+        };
+        let Some(message) = mapper(result) else {
+            if had_reservation {
+                self.release_terminal_slot(parent);
+            }
+            self.push_event(
+                parent,
+                Some(cause),
+                RuntimeEventKind::ChildTerminalDisposed {
+                    child_ordinal,
+                    child_isolate: child.isolate,
+                    child_generation: child.generation,
+                    reason: ChildTerminalDisposedReason::TypeMismatch,
+                },
+            );
+            return None;
+        };
+
+        let Some(parent_index) = self.entries.iter().position(|entry| entry.id == parent) else {
+            drop(message);
+            self.push_event(
+                parent,
+                Some(cause),
+                RuntimeEventKind::ChildTerminalDisposed {
+                    child_ordinal,
+                    child_isolate: child.isolate,
+                    child_generation: child.generation,
+                    reason: ChildTerminalDisposedReason::ParentStopped,
+                },
+            );
+            return None;
+        };
+        if self.entries[parent_index].stopped.get() {
+            if had_reservation {
+                self.entries[parent_index].inbox.release_reserved_slot();
+            }
+            drop(message);
+            self.push_event(
+                parent,
+                Some(cause),
+                RuntimeEventKind::ChildTerminalDisposed {
+                    child_ordinal,
+                    child_isolate: child.isolate,
+                    child_generation: child.generation,
+                    reason: ChildTerminalDisposedReason::ParentStopped,
+                },
+            );
+            return None;
+        }
+
+        let parent_generation = self.entries[parent_index].generation;
+        let attempted = self.push_event(
+            parent,
+            Some(cause),
+            RuntimeEventKind::SendDispatchAttempted {
+                target_shard: self.shard.id(),
+                target_isolate: parent,
+                target_generation: parent_generation,
+            },
+        );
+        let delivery = if had_reservation {
+            self.entries[parent_index]
+                .inbox
+                .push_reserved(message, self.step_ordinal, None)
+                .map_err(|err| match err {
+                    TrySendError::Full(_) => tina_runtime::SendRejectedReason::Full,
+                    TrySendError::Closed(_) => tina_runtime::SendRejectedReason::Closed,
+                })
+        } else {
+            self.dispatch_local_send(ErasedSend {
+                target_system: self.system_incarnation,
+                target_shard: self.shard.id(),
+                target_isolate: parent,
+                target_generation: parent_generation,
+                message,
+            })
+        };
+        match delivery {
+            Ok(()) => {
+                self.push_event(
+                    parent,
+                    Some(attempted.into()),
+                    RuntimeEventKind::SendAccepted {
+                        target_shard: self.shard.id(),
+                        target_isolate: parent,
+                        target_generation: parent_generation,
+                    },
+                );
+                self.push_event(
+                    parent,
+                    Some(attempted.into()),
+                    RuntimeEventKind::ChildTerminalDelivered {
+                        child_ordinal,
+                        child_isolate: child.isolate,
+                        child_generation: child.generation,
+                    },
+                );
+            }
+            Err(reason) => {
+                self.push_event(
+                    parent,
+                    Some(attempted.into()),
+                    RuntimeEventKind::SendRejected {
+                        target_shard: self.shard.id(),
+                        target_isolate: parent,
+                        target_generation: parent_generation,
+                        reason,
+                    },
+                );
+                let dispose_reason = match reason {
+                    tina_runtime::SendRejectedReason::Full => {
+                        ChildTerminalDisposedReason::ParentMailboxFull
+                    }
+                    tina_runtime::SendRejectedReason::Closed => {
+                        ChildTerminalDisposedReason::ParentMailboxClosed
+                    }
+                    tina_runtime::SendRejectedReason::ForeignSystem { .. } => {
+                        ChildTerminalDisposedReason::ParentStopped
+                    }
+                };
+                self.push_event(
+                    parent,
+                    Some(attempted.into()),
+                    RuntimeEventKind::ChildTerminalDisposed {
+                        child_ordinal,
+                        child_isolate: child.isolate,
+                        child_generation: child.generation,
+                        reason: dispose_reason,
+                    },
+                );
+            }
+        }
+        None
+    }
+
+    pub(crate) fn dispose_child_terminal_reservation(
+        &mut self,
+        record_index: usize,
+        reason: tina_runtime::ChildTerminalDisposedReason,
+        cause: tina_runtime::CauseId,
+    ) {
+        let record = &self.child_records[record_index];
+        if !record.terminal_slot_reserved && record.terminal_continuation.is_none() {
+            return;
+        }
+        if record.terminal_settled_generation == Some(record.child.generation) {
+            return;
+        }
+        let parent = record.parent;
+        let child_ordinal = record.child_ordinal;
+        let child_isolate = record.child.isolate;
+        let child_generation = record.child.generation;
+        let had_reservation = record.terminal_slot_reserved;
+        self.child_records[record_index].terminal_slot_reserved = false;
+        self.child_records[record_index].terminal_settled_generation = Some(child_generation);
+        if had_reservation {
+            self.release_terminal_slot(parent);
+        }
+        self.push_event(
+            parent,
+            Some(cause),
+            RuntimeEventKind::ChildTerminalDisposed {
+                child_ordinal,
+                child_isolate,
+                child_generation,
+                reason,
+            },
+        );
+    }
+
+    fn dispose_parent_terminal_reservations(
+        &mut self,
+        parent: IsolateId,
+        cause: tina_runtime::CauseId,
+    ) {
+        let indexes: Vec<usize> = self
+            .child_records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                record.parent == parent
+                    && (record.terminal_slot_reserved || record.terminal_continuation.is_some())
+                    && record.terminal_settled_generation != Some(record.child.generation)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for index in indexes {
+            self.dispose_child_terminal_reservation(
+                index,
+                tina_runtime::ChildTerminalDisposedReason::ParentStopped,
+                cause,
+            );
         }
     }
 
@@ -1984,9 +2280,45 @@ where
             }
         }
 
+        let needs_terminal_reservation = self.child_records[child_record_index]
+            .terminal_continuation
+            .is_some();
+        let mut terminal_slot_reserved = false;
+        if needs_terminal_reservation {
+            match self.try_reserve_terminal_slot(parent) {
+                Ok(()) => terminal_slot_reserved = true,
+                Err(reason) => {
+                    self.child_records[child_record_index].restart_recipe = Some(recipe);
+                    let skipped = match reason {
+                        tina_runtime::SendRejectedReason::Full => {
+                            RestartSkippedReason::ParentMailboxFull
+                        }
+                        tina_runtime::SendRejectedReason::Closed
+                        | tina_runtime::SendRejectedReason::ForeignSystem { .. } => {
+                            RestartSkippedReason::ParentMailboxClosed
+                        }
+                    };
+                    self.push_event(
+                        parent,
+                        Some(attempted.into()),
+                        RuntimeEventKind::RestartChildSkipped {
+                            child_ordinal,
+                            old_isolate: old_child.isolate,
+                            old_generation: old_child.generation,
+                            reason: skipped,
+                        },
+                    );
+                    return;
+                }
+            }
+        }
+
         let outcome = match catch_unwind(AssertUnwindSafe(|| recipe.create(self, parent))) {
             Ok(outcome) => outcome,
             Err(_) => {
+                if terminal_slot_reserved {
+                    self.release_terminal_slot(parent);
+                }
                 self.child_records[child_record_index].restart_recipe = Some(recipe);
                 self.push_event(
                     parent,
@@ -2006,6 +2338,8 @@ where
         self.child_records[child_record_index].child = new_child;
         self.child_records[child_record_index].mailbox_capacity = outcome.mailbox_capacity;
         self.child_records[child_record_index].restart_recipe = Some(recipe);
+        self.child_records[child_record_index].terminal_slot_reserved = terminal_slot_reserved;
+        self.child_records[child_record_index].terminal_settled_generation = None;
 
         let restarted = self.push_event(
             parent,
@@ -6812,7 +7146,14 @@ where
                     RuntimeEventKind::MessageAbandoned,
                 );
             }
-            drop(result);
+            let generation = self.entries[index].generation;
+            let address = RegisteredAddress {
+                system: self.system_incarnation,
+                shard: self.shard.id(),
+                isolate: isolate_id,
+                generation,
+            };
+            let _ = self.settle_child_terminal_observation(address, result, stopped.into());
             return stopped;
         }
 
@@ -6856,6 +7197,14 @@ where
             );
         }
         let generation = self.entries[index].generation;
+        let address = RegisteredAddress {
+            system: self.system_incarnation,
+            shard: self.shard.id(),
+            isolate: isolate_id,
+            generation,
+        };
+        let result = self.settle_child_terminal_observation(address, result, stopped.into());
+        self.dispose_parent_terminal_reservations(isolate_id, stopped.into());
         match result {
             Some(result) => {
                 self.result_observations
@@ -7159,7 +7508,39 @@ where
         sim: &mut Simulator<S>,
         parent: IsolateId,
     ) -> SpawnObservedOutcome<S> {
-        let (spawn, continuation, restart_continuation) = self.inner.into_parts();
+        let (spawn, continuation, restart_continuation, terminal_continuation) =
+            self.inner.into_parts();
+
+        let terminal_erased = terminal_continuation.map(|mapper| {
+            Rc::new(move |result: tina::StopResult| {
+                mapper(result).map(|message| Box::new(message) as Box<dyn Any>)
+            }) as ErasedTerminalContinuation
+        });
+
+        let mut terminal_slot_reserved = false;
+        if terminal_erased.is_some() {
+            match sim.try_reserve_terminal_slot(parent) {
+                Ok(()) => terminal_slot_reserved = true,
+                Err(tina_runtime::SendRejectedReason::Full) => {
+                    let message = continuation(Err(SpawnObservedError::ParentMailboxFull));
+                    return SpawnObservedOutcome {
+                        spawn: None,
+                        continuation: Some(Box::new(message)),
+                    };
+                }
+                Err(tina_runtime::SendRejectedReason::Closed) => {
+                    let message = continuation(Err(SpawnObservedError::ParentMailboxClosed));
+                    return SpawnObservedOutcome {
+                        spawn: None,
+                        continuation: Some(Box::new(message)),
+                    };
+                }
+                Err(tina_runtime::SendRejectedReason::ForeignSystem { .. }) => {
+                    panic!("terminal reservation against local parent cannot be foreign")
+                }
+            }
+        }
+
         match spawn.into_erased_spawn().try_spawn_observed(sim, parent) {
             Ok(mut outcome) => {
                 let child_address = Address::<ChildMessage, ChildReply>::new_with_generation_in(
@@ -7180,12 +7561,17 @@ where
                         Box::new(continuation(ChildRef::new(address))) as Box<dyn Any>
                     }) as Rc<dyn Fn(RegisteredAddress) -> Box<dyn Any>>
                 });
+                outcome.terminal_continuation = terminal_erased;
+                outcome.terminal_slot_reserved = terminal_slot_reserved;
                 SpawnObservedOutcome {
                     spawn: Some(outcome),
                     continuation: Some(Box::new(message)),
                 }
             }
             Err(error) => {
+                if terminal_slot_reserved {
+                    sim.release_terminal_slot(parent);
+                }
                 let message = continuation(Err(error));
                 SpawnObservedOutcome {
                     spawn: None,

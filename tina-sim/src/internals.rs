@@ -513,6 +513,8 @@ pub(crate) struct LocalInbox {
     pub(crate) capacity: usize,
     pub(crate) queue: RefCell<VecDeque<QueuedMessage>>,
     pub(crate) closed: Cell<bool>,
+    /// Slots held for eventual terminal-result delivery to this isolate.
+    pub(crate) reserved: Cell<usize>,
 }
 
 impl std::fmt::Debug for LocalInbox {
@@ -522,6 +524,7 @@ impl std::fmt::Debug for LocalInbox {
             .field("capacity", &self.capacity)
             .field("closed", &self.closed.get())
             .field("len", &self.queue.borrow().len())
+            .field("reserved", &self.reserved.get())
             .finish()
     }
 }
@@ -532,7 +535,12 @@ impl LocalInbox {
             capacity,
             queue: RefCell::new(VecDeque::new()),
             closed: Cell::new(false),
+            reserved: Cell::new(0),
         }
+    }
+
+    fn has_free_slot(&self, queue_len: usize) -> bool {
+        queue_len.saturating_add(self.reserved.get()) < self.capacity
     }
 
     pub(crate) fn push(
@@ -545,8 +553,58 @@ impl LocalInbox {
             return Err(TrySendError::Closed(message));
         }
         let mut queue = self.queue.borrow_mut();
-        if queue.len() >= self.capacity {
+        if !self.has_free_slot(queue.len()) {
             return Err(TrySendError::Full(message));
+        }
+        queue.push_back(QueuedMessage {
+            message,
+            visible_at_step,
+            call_context,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn try_reserve_slot(&self) -> Result<(), tina_runtime::SendRejectedReason> {
+        if self.closed.get() {
+            return Err(tina_runtime::SendRejectedReason::Closed);
+        }
+        let queue_len = self.queue.borrow().len();
+        if !self.has_free_slot(queue_len) {
+            return Err(tina_runtime::SendRejectedReason::Full);
+        }
+        self.reserved.set(self.reserved.get() + 1);
+        Ok(())
+    }
+
+    pub(crate) fn release_reserved_slot(&self) {
+        let reserved = self.reserved.get();
+        if reserved == 0 {
+            panic!("release_reserved_slot without a reservation");
+        }
+        self.reserved.set(reserved - 1);
+    }
+
+    pub(crate) fn push_reserved(
+        &self,
+        message: Box<dyn Any>,
+        visible_at_step: u64,
+        call_context: Option<MessageCallContext>,
+    ) -> Result<(), TrySendError<Box<dyn Any>>> {
+        let reserved = self.reserved.get();
+        if reserved == 0 {
+            panic!("push_reserved without a reservation");
+        }
+        self.reserved.set(reserved - 1);
+        if self.closed.get() {
+            return Err(TrySendError::Closed(message));
+        }
+        let mut queue = self.queue.borrow_mut();
+        if queue.len() >= self.capacity {
+            panic!(
+                "reserved terminal delivery found inbox full (len={}, capacity={})",
+                queue.len(),
+                self.capacity
+            );
         }
         queue.push_back(QueuedMessage {
             message,
@@ -1163,6 +1221,8 @@ where
     pub(crate) mailbox_capacity: usize,
     pub(crate) restart_recipe: Option<Rc<dyn ErasedRestartRecipe<S>>>,
     pub(crate) restart_continuation: Option<ErasedRestartContinuation>,
+    pub(crate) terminal_continuation: Option<ErasedTerminalContinuation>,
+    pub(crate) terminal_slot_reserved: bool,
     pub(crate) bootstrap_message: Option<Box<dyn Any>>,
 }
 
@@ -1184,9 +1244,16 @@ where
     pub(crate) mailbox_capacity: usize,
     pub(crate) restart_recipe: Option<Rc<dyn ErasedRestartRecipe<S>>>,
     pub(crate) restart_continuation: Option<ErasedRestartContinuation>,
+    pub(crate) terminal_continuation: Option<ErasedTerminalContinuation>,
+    pub(crate) terminal_slot_reserved: bool,
+    pub(crate) terminal_settled_generation: Option<AddressGeneration>,
 }
 
 pub(crate) type ErasedRestartContinuation = Rc<dyn Fn(RegisteredAddress) -> Box<dyn Any>>;
+
+/// Maps a type-erased child stop result into a parent message, or `None` on
+/// type mismatch.
+pub(crate) type ErasedTerminalContinuation = Rc<dyn Fn(tina::StopResult) -> Option<Box<dyn Any>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SupervisorRecord {

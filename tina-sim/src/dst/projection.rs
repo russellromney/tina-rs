@@ -87,6 +87,10 @@ pub enum RuntimeEventKindName {
     RestartChildCompleted,
     /// [`RuntimeEventKind::ChildStopped`].
     ChildStopped,
+    /// [`RuntimeEventKind::ChildTerminalDelivered`].
+    ChildTerminalDelivered,
+    /// [`RuntimeEventKind::ChildTerminalDisposed`].
+    ChildTerminalDisposed,
     /// [`RuntimeEventKind::ChildStarted`].
     ChildStarted,
     /// [`RuntimeEventKind::RemoteChildStopRequested`].
@@ -177,6 +181,12 @@ fn runtime_event_kind_name(kind: RuntimeEventKind) -> Option<RuntimeEventKindNam
             RuntimeEventKindName::RestartChildCompleted
         }
         RuntimeEventKind::ChildStopped { .. } => RuntimeEventKindName::ChildStopped,
+        RuntimeEventKind::ChildTerminalDelivered { .. } => {
+            RuntimeEventKindName::ChildTerminalDelivered
+        }
+        RuntimeEventKind::ChildTerminalDisposed { .. } => {
+            RuntimeEventKindName::ChildTerminalDisposed
+        }
         RuntimeEventKind::ChildStarted { .. } => RuntimeEventKindName::ChildStarted,
         RuntimeEventKind::RemoteChildStopRequested { .. } => {
             RuntimeEventKindName::RemoteChildStopRequested
@@ -353,6 +363,8 @@ fn every_kind_except(keep: &[RuntimeEventKindName]) -> Vec<RuntimeEventKindName>
         N::RestartChildSkipped,
         N::RestartChildCompleted,
         N::ChildStopped,
+        N::ChildTerminalDelivered,
+        N::ChildTerminalDisposed,
         N::ChildStarted,
         N::RemoteChildStopRequested,
         N::RemoteChildStopped,
