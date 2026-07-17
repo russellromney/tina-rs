@@ -772,9 +772,12 @@ impl<S, M, R> SpawnObservedBuilder<S, M, R> {
     /// The initial continuation can receive `Err` when child construction is
     /// rejected or a restartable child's initial factory panics. The restart
     /// continuation only runs after a replacement exists, so it receives a
-    /// `ChildRef` directly. Each message uses the parent's bounded mailbox and
-    /// normal traced send path; a full or stopped parent does not gain a hidden
-    /// lifecycle queue.
+    /// `ChildRef` directly. Both lifecycle facts use the parent's bounded
+    /// mailbox; when that mailbox is full (including under terminal-reservation
+    /// pressure), same-shard delivery parks the one fact in a **priority
+    /// overflow** lane and drains it on a later step ahead of ordinary ingress.
+    /// That is not a hidden admission queue. A closed or stopped parent still
+    /// rejects.
     pub fn then_with_restarts<I, P, F, G>(self, initial: F, restarted: G) -> Effect<I>
     where
         I: Isolate<Message = P, SpawnObserved = SpawnObserved<S, P, M, R>>,
@@ -810,7 +813,8 @@ impl<S, M, R> SpawnObservedBuilder<S, M, R> {
     ///
     /// This has the same bounded-delivery semantics as
     /// [`Self::then_with_restarts`]: both events use the parent's ordinary
-    /// mailbox and traced send path, with no hidden lifecycle queue.
+    /// mailbox, with priority overflow under Full for same-shard lifecycle
+    /// facts, and no hidden admission queue. A closed parent still rejects.
     pub fn then_service_event_with_restarts<I, Event, Request, F, G>(
         self,
         initial: F,
