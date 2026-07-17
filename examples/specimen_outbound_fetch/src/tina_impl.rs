@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    DefaultThreadedMailboxFactory, LoopStep, StreamId, TcpConnectReply, TcpReadReply, TcpReadToEof,
-    TcpStreamCloseReply, TcpWriteAll, ThreadedRuntime, WriteOwnedError, WriteOwnedReply,
+    DefaultThreadedMailboxFactory, LocalSystem, LoopStep, StreamId, TcpConnectReply, TcpReadReply,
+    TcpReadToEof, TcpStreamCloseReply, TcpWriteAll, WriteOwnedError, WriteOwnedReply,
     tcp_close_stream, tcp_connect,
 };
 
@@ -170,9 +170,28 @@ pub fn run() -> anyhow::Result<Report> {
     let server = TestServer::start(FETCH_COUNT)?;
     let addr = server.addr;
 
-    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
-    let fetcher = runtime
-        .register_with_capacity::<_, Infallible>(
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    let runtime_result = app.run_to_shutdown_reported(Duration::from_secs(5), move |app| {
+        run_application(app, addr)
+    });
+    let server_shutdown = server.stop();
+    let outcome = runtime_result?;
+    server_shutdown?;
+
+    Ok(Report {
+        successful_fetches: outcome.successful,
+        failed_fetches: outcome.failed,
+        bytes_received: outcome.bytes,
+        exit_clean: true,
+    })
+}
+
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    addr: SocketAddr,
+) -> anyhow::Result<FetchOutcome> {
+    let fetcher = app
+        .register_root::<_, Infallible>(
             Fetcher {
                 target: addr,
                 remaining: FETCH_COUNT,
@@ -183,25 +202,12 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register fetcher: {e:?}"))?;
 
-    let result = runtime
+    let result = app
         .observe_result::<FetchOutcome, _, _>(fetcher)
         .map_err(|e| anyhow::anyhow!("register result waiter: {e:?}"))?;
-    runtime
-        .try_send(fetcher, FetchMsg::Begin)
+    app.try_send(fetcher, FetchMsg::Begin)
         .map_err(|e| anyhow::anyhow!("kick fetcher: {e:?}"))?;
-    let outcome = result
+    result
         .wait(Duration::from_secs(5))
-        .map_err(|e| anyhow::anyhow!("fetcher finishes with result: {e:?}"))?;
-
-    let runtime_shutdown = runtime.shutdown_report().ensure_clean();
-    let server_shutdown = server.stop();
-    runtime_shutdown?;
-    server_shutdown?;
-
-    Ok(Report {
-        successful_fetches: outcome.successful,
-        failed_fetches: outcome.failed,
-        bytes_received: outcome.bytes,
-        exit_clean: true,
-    })
+        .map_err(|e| anyhow::anyhow!("fetcher finishes with result: {e:?}"))
 }

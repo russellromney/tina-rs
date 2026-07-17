@@ -26,10 +26,6 @@ fn print_side(side: &str, report: Report) {
     println!(
         "comparison=specimen_retrying_outbound_http side={} attempts_made={} \
          transient_failures={} final_ok={} exit_clean={}",
-        side,
-        report.attempts_made,
-        report.transient_failures,
-        report.final_ok,
-        report.exit_clean,
+        side, report.attempts_made, report.transient_failures, report.final_ok, report.exit_clean,
     );
 }

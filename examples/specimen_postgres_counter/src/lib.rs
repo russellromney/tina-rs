@@ -10,8 +10,8 @@
 //!   pool experiences (acquire timeouts, query failures) bubbles up
 //!   as `sqlx::Error` and the surrounding code decides what to do.
 //! - **Tina**: drive `tina-sqlx-bridge`. The bridge owns the
-//!   `PgPool`. The host script calls in with
-//!   `ThreadedRuntime::call_blocking`; admission, in-flight, and
+//!   `PgPool` installed on the `LocalSystem`. The host script calls in
+//!   with capability-typed blocking calls; admission, in-flight, and
 //!   per-attempt timeout are named caps with typed failure modes.
 //!   Shard thread does no SQLx work.
 //!

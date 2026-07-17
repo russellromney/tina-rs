@@ -16,7 +16,7 @@ use tina_http::{
     HttpResponse, HttpResponseBody, HttpTarget, HttpsListener, HttpsListenerMsg, HttpsServerConfig,
     StatefulRouter, TlsServerIdentity, TlsTrustRoots,
 };
-use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime};
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, LocalSystem};
 
 use crate::{Report, tls_identity};
 
@@ -75,19 +75,24 @@ fn body_text(response: &HttpResponse) -> String {
 }
 
 pub fn run() -> anyhow::Result<Report> {
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), run_application)?)
+}
+
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+) -> anyhow::Result<Report> {
     let identity_bundle = tls_identity::generate();
     let identity = TlsServerIdentity::from_der(
         identity_bundle.cert_chain_der.clone(),
         identity_bundle.private_key_der.clone(),
     );
 
-    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
-
-    let counter = runtime
-        .register_with_capacity::<_, Infallible>(Counter::default(), 16)
+    let counter = app
+        .register_root::<_, Infallible>(Counter::default(), 16)
         .map_err(|e| anyhow::anyhow!("register counter: {e:?}"))?;
-    let listener = runtime
-        .register_with_capacity::<_, _>(
+    let listener = app
+        .register_root::<_, _>(
             HttpsListener::<SingleShard>::new(
                 "127.0.0.1:0".parse()?,
                 counter,
@@ -98,14 +103,14 @@ pub fn run() -> anyhow::Result<Report> {
         .map_err(|e| anyhow::anyhow!("register listener: {e:?}"))?;
     // The HTTPS client shares the runtime — and the shard, and the TLS lane —
     // with the server it talks to.
-    let client = runtime
-        .register_with_capacity::<HttpClient<SingleShard>, Infallible>(
+    let client = app
+        .register_root::<HttpClient<SingleShard>, Infallible>(
             HttpClient::<SingleShard>::new(HttpClientConfig::dev()),
             16,
         )
         .map_err(|e| anyhow::anyhow!("register client: {e:?}"))?;
 
-    let ready = match runtime
+    let ready = match app
         .call_blocking(listener, HttpsListenerMsg::Start, Duration::from_secs(5))
         .map_err(|e| anyhow::anyhow!("https startup call failed: {e:?}"))?
     {
@@ -133,7 +138,7 @@ pub fn run() -> anyhow::Result<Report> {
     // The same scripted flow the stdlib client runs against the tokio side, now
     // driven by Tina's own HTTPS client against Tina's own HTTPS server.
     let fetch = |req: HttpRequest| -> anyhow::Result<HttpResponse> {
-        match runtime
+        match app
             .call_blocking(
                 client,
                 HttpClientMsg::call(target(), req),
@@ -174,10 +179,8 @@ pub fn run() -> anyhow::Result<Report> {
         report.got_404_for_missing = true;
     }
 
-    runtime
-        .try_send(listener, HttpsListenerMsg::Stop)
+    app.try_send(listener, HttpsListenerMsg::Stop)
         .map_err(|e| anyhow::anyhow!("send Stop: {e:?}"))?;
-    runtime.shutdown_report().ensure_clean()?;
 
     Ok(report)
 }

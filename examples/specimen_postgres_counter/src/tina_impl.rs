@@ -4,11 +4,10 @@
 //! same Postgres pool underneath, but the Tina side names every
 //! pressure cap and surfaces typed failures.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime};
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, ThreadedRuntime};
 use tina_sqlx_bridge::{PgConfig, PgMsg, PgPoolConfig, PgRequest, PgResponse, PgWorker};
 
 use crate::{INCREMENTS, Report, unique_table};
@@ -16,12 +15,17 @@ use crate::{INCREMENTS, Report, unique_table};
 const SQL_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn run(url: &str) -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
-    let shutdown = runtime.shutdown_handle();
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), move |app| run_application(app, url))?)
+}
 
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    url: &str,
+) -> anyhow::Result<Report> {
+    // The bridge helpers keep the capability-typed host call form through
+    // the lower host-control handle.
+    let host = app.host_control();
     let cfg = PgConfig::new()
         .with_pool(
             PgPoolConfig::new(url)
@@ -31,12 +35,12 @@ pub fn run(url: &str) -> anyhow::Result<Report> {
         .with_default_timeout(Duration::from_secs(5))
         .with_poll_interval(Duration::from_millis(1))
         .with_max_in_flight(2);
-    let bridge = PgWorker::<SingleShard>::install(&runtime, cfg)
+    let bridge = PgWorker::<SingleShard>::install_local(app, cfg)
         .map_err(|e| anyhow::anyhow!("install pg bridge: {e}"))?;
 
     let table = unique_table("tina_counter");
     let mut report = Report::default();
-    let run_result = run_counter_script(&runtime, bridge.address, &table);
+    let run_result = run_counter_script(&host, bridge.address, &table);
     match run_result {
         Ok(final_value) => {
             report.final_value = final_value;
@@ -46,7 +50,7 @@ pub fn run(url: &str) -> anyhow::Result<Report> {
             eprintln!("specimen_postgres_counter (tina): {error:#}");
         }
     }
-    let _ = execute(&runtime, bridge.address, drop_sql(&table));
+    let _ = execute(&host, bridge.address, drop_sql(&table));
     bridge.closer.close();
 
     let snap = bridge.metrics.snapshot();
@@ -65,9 +69,6 @@ pub fn run(url: &str) -> anyhow::Result<Report> {
         snap.in_flight_high_water,
     );
 
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
     Ok(report)
 }
 

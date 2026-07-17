@@ -9,7 +9,7 @@ use tina::prelude::*;
 use tina_http::{
     HttpListener, HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig, StatefulRouter,
 };
-use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime};
+use tina_runtime::{DefaultThreadedMailboxFactory, LocalSystem};
 
 use crate::{Report, scripted_client};
 
@@ -51,15 +51,20 @@ impl Counter {
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), run_application)?)
+}
 
-    let counter = runtime
-        .register_with_capacity::<_, Infallible>(Counter::default(), 16)
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+) -> anyhow::Result<Report> {
+    let counter = app
+        .register_root::<_, Infallible>(Counter::default(), 16)
         .map_err(|e| anyhow::anyhow!("register counter: {e:?}"))?;
 
     let server_config = HttpServerConfig::dev();
-    let listener = runtime
-        .register_with_capacity::<_, _>(
+    let listener = app
+        .register_root::<_, _>(
             HttpListener::<SingleShard>::with_config(
                 "127.0.0.1:0".parse()?,
                 counter,
@@ -69,9 +74,8 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register listener: {e:?}"))?;
 
-    let bound = runtime.observe_next_bound()?;
-    runtime
-        .try_send(listener, HttpListenerMsg::Start)
+    let bound = app.observe_next_bound()?;
+    app.try_send(listener, HttpListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("send Start: {e:?}"))?;
     let server_addr = bound
         .wait(Duration::from_secs(2))
@@ -79,10 +83,8 @@ pub fn run() -> anyhow::Result<Report> {
 
     let report = scripted_client(server_addr);
 
-    runtime
-        .try_send(listener, HttpListenerMsg::Stop)
+    app.try_send(listener, HttpListenerMsg::Stop)
         .map_err(|e| anyhow::anyhow!("send Stop: {e:?}"))?;
-    runtime.shutdown_report().ensure_clean()?;
 
     Ok(report)
 }

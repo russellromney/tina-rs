@@ -1,5 +1,6 @@
-//! Tina: native `tina_http::HttpListener` server + native
-//! `tina_http::build_keepalive_pool` outbound client. The host runs the
+//! Tina: native `tina_http::HttpListener` server + an owned
+//! `tina_http::InstallKeepalivePool` outbound client installed on the
+//! `LocalSystem`. The host runs the
 //! same scripted sequence as the Tokio side, but every request still
 //! travels through Tina's bounded pool and keepalive connection isolates.
 
@@ -7,21 +8,21 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use http::StatusCode;
-use tina::pool::{AcquireOutcome, CloseMode, PoolConfig, ReleaseDisposition, ReleaseOutcome};
+use tina::pool::{AcquireOutcome, PoolConfig, ReleaseDisposition, ReleaseOutcome};
 use tina::prelude::*;
 use tina_http::{
     HttpClientConfig, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig,
-    HttpTarget, KeepaliveConnAddr, KeepaliveConnectionMsg, KeepaliveOutcome,
-    KeepalivePoolDrainOutcome, StatefulRouter, build_keepalive_pool, shutdown_keepalive_pool,
+    HttpTarget, InstallKeepalivePool, KeepaliveCloseAndDrain, KeepaliveConnAddr,
+    KeepaliveConnectionMsg, KeepaliveOutcome, KeepalivePoolInstallConfig, StatefulRouter,
 };
 use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
-    CallKind, CallOutcome, DefaultThreadedMailboxFactory, RuntimeEventKind, ThreadedRuntime,
+    CallKind, CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, RuntimeEventKind,
 };
 
 use crate::Report;
 
-type Runtime = ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>;
+type App = LocalSystem<SingleShard, DefaultThreadedMailboxFactory>;
 type PoolAddr = Address<WorkerPoolMsg<KeepaliveConnAddr>, WorkerPoolReply<KeepaliveConnAddr>>;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -72,17 +73,20 @@ impl Counter {
 // -------------------------------------------------------------------
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), run_application)?)
+}
 
+fn run_application(app: &App) -> anyhow::Result<Report> {
     // Server: counter service + keepalive-enabled listener.
-    let counter = runtime
-        .register_with_capacity::<_, Infallible>(Counter::default(), 16)
+    let counter = app
+        .register_root::<_, Infallible>(Counter::default(), 16)
         .map_err(|e| anyhow::anyhow!("register counter: {e:?}"))?;
 
     let mut server_config = HttpServerConfig::dev();
     server_config.limits.keepalive_idle_timeout = Some(Duration::from_secs(30));
-    let listener_addr = runtime
-        .register_with_capacity::<_, _>(
+    let listener_addr = app
+        .register_root::<_, _>(
             HttpListener::<SingleShard>::with_config(
                 "127.0.0.1:0".parse()?,
                 counter,
@@ -91,73 +95,67 @@ pub fn run() -> anyhow::Result<Report> {
             server_config.listener_mailbox_capacity,
         )
         .map_err(|e| anyhow::anyhow!("register listener: {e:?}"))?;
-    let bound = runtime.observe_next_bound()?;
-    runtime
-        .try_send(listener_addr, HttpListenerMsg::Start)
+    let bound = app.observe_next_bound()?;
+    app.try_send(listener_addr, HttpListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("send Start: {e:?}"))?;
     let server_addr = bound
         .wait(Duration::from_secs(2))
         .map_err(|e| anyhow::anyhow!("listener bind: {e:?}"))?;
 
-    // Client: a one-slot keepalive pool. The pool owns the lease
-    // vocabulary; the connection isolate owns the TCP transport and
-    // reuses it for every request below.
-    let handles = build_keepalive_pool(
-        &runtime,
-        HttpTarget::http_with_host(server_addr, "x"),
-        HttpClientConfig::dev(),
-        PoolConfig::new(1, 4),
-        16,
-        16,
-    )
-    .map_err(|e| anyhow::anyhow!("build keepalive pool: {e:?}"))?;
+    // Client: a one-slot keepalive pool installed as an owned resource.
+    // The pool owns the lease vocabulary; the connection isolate owns the
+    // TCP transport and reuses it for every request below.
+    let pool = app
+        .install_keepalive_pool(KeepalivePoolInstallConfig::new(
+            HttpTarget::http_with_host(server_addr, "x"),
+            HttpClientConfig::dev(),
+            PoolConfig::new(1, 4),
+            16,
+            16,
+        ))
+        .map_err(|e| anyhow::anyhow!("install keepalive pool: {e:?}"))?;
 
-    let lease = acquire_connection(&runtime, handles.pool)?;
+    let lease = acquire_connection(app, pool.pool())?;
     let conn = *lease.handle();
     let mut report = Report {
         exit_clean: true,
         ..Report::default()
     };
 
-    let response = send_request(&runtime, conn, HttpRequest::get("/counter").build())?;
+    let response = send_request(app, conn, HttpRequest::get("/counter").build())?;
     record_get(&mut report, &response, Some("0"))?;
 
     for _ in 0..3 {
-        let response = send_request(&runtime, conn, HttpRequest::post("/counter").build())?;
+        let response = send_request(app, conn, HttpRequest::post("/counter").build())?;
         if response.status == StatusCode::OK {
             report.successful_post += 1;
         }
     }
 
-    let response = send_request(&runtime, conn, HttpRequest::get("/counter").build())?;
+    let response = send_request(app, conn, HttpRequest::get("/counter").build())?;
     record_get(&mut report, &response, None)?;
     report.final_counter_value = body_text(&response).trim().parse().unwrap_or(0);
 
-    let response = send_request(&runtime, conn, HttpRequest::get("/missing").build())?;
+    let response = send_request(app, conn, HttpRequest::get("/missing").build())?;
     if response.status == StatusCode::NOT_FOUND {
         report.got_404_for_missing = true;
     }
 
-    release_connection(&runtime, handles.pool, lease)?;
-    let shutdown = shutdown_keepalive_pool(&runtime, &handles, CloseMode::Drain, REQUEST_TIMEOUT)
-        .map_err(|e| anyhow::anyhow!("shutdown keepalive pool: {e:?}"))?;
+    release_connection(app, pool.pool(), lease)?;
+    let settled = match pool.close_and_drain(REQUEST_TIMEOUT) {
+        KeepaliveCloseAndDrain::Drained(settled) => settled,
+        other => anyhow::bail!("keepalive close_and_drain was not clean: {other:?}"),
+    };
     anyhow::ensure!(
-        matches!(shutdown.drain, KeepalivePoolDrainOutcome::Drained)
-            && shutdown.requested == shutdown.stopped
-            && shutdown.timed_out == 0
-            && shutdown.rejected == 0
-            && shutdown.already_closed == 0
-            && shutdown.connection_failures.is_empty(),
-        "keepalive shutdown was not clean: {shutdown:?}"
+        settled.requested == settled.stopped && settled.already_closed == 0,
+        "keepalive shutdown was not clean: {settled:?}"
     );
 
-    runtime
-        .try_send(listener_addr, HttpListenerMsg::Stop)
+    app.try_send(listener_addr, HttpListenerMsg::Stop)
         .map_err(|e| anyhow::anyhow!("send Stop: {e:?}"))?;
-    let terminal = runtime.shutdown_report();
-    terminal.ensure_clean()?;
-    let accepts = terminal
+    let accepts = app
         .trace()
+        .events()
         .iter()
         .filter(|event| {
             matches!(
@@ -178,10 +176,10 @@ pub fn run() -> anyhow::Result<Report> {
 }
 
 fn acquire_connection(
-    runtime: &Runtime,
+    app: &App,
     pool: PoolAddr,
 ) -> anyhow::Result<tina::pool::PoolLease<KeepaliveConnAddr>> {
-    match runtime.call_blocking(pool, WorkerPoolMsg::Acquire, REQUEST_TIMEOUT)? {
+    match app.call_blocking(pool, WorkerPoolMsg::Acquire, REQUEST_TIMEOUT)? {
         CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Acquired(lease))) => {
             Ok(lease)
         }
@@ -190,11 +188,11 @@ fn acquire_connection(
 }
 
 fn send_request(
-    runtime: &Runtime,
+    app: &App,
     conn: KeepaliveConnAddr,
     request: HttpRequest,
 ) -> anyhow::Result<HttpResponse> {
-    match runtime.call_blocking(
+    match app.call_blocking(
         conn,
         KeepaliveConnectionMsg::request(request, REQUEST_TIMEOUT),
         REQUEST_TIMEOUT + Duration::from_secs(1),
@@ -208,11 +206,11 @@ fn send_request(
 }
 
 fn release_connection(
-    runtime: &Runtime,
+    app: &App,
     pool: PoolAddr,
     lease: tina::pool::PoolLease<KeepaliveConnAddr>,
 ) -> anyhow::Result<()> {
-    match runtime.call_blocking(
+    match app.call_blocking(
         pool,
         WorkerPoolMsg::Release {
             lease,

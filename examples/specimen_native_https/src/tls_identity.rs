@@ -11,8 +11,8 @@ pub struct GeneratedIdentity {
 
 pub fn generate() -> GeneratedIdentity {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-        .expect("rcgen self-sign");
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen self-sign");
     let cert_der = certified.cert.der().to_vec();
     let private_key_der = certified.key_pair.serialize_der();
     GeneratedIdentity {

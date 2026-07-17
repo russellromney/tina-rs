@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    BoundedItems, CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, bounded_batch, call,
+    BoundedItems, CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, bounded_batch, call,
     call_request,
 };
 
@@ -366,18 +366,23 @@ fn record_driver_outcome(outcome: &mut DriverOutcome, returned: CallOutcome<Pipe
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), run_application)?)
+}
 
-    let parse = runtime
-        .register_with_capacity::<_, Infallible>(ParseStage, 32)
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+) -> anyhow::Result<Report> {
+    let parse = app
+        .register_root::<_, Infallible>(ParseStage, 32)
         .map_err(|e| anyhow::anyhow!("register parse: {e:?}"))?;
-    let validate = runtime
-        .register_with_capacity::<_, Infallible>(ValidateStage, 32)
+    let validate = app
+        .register_root::<_, Infallible>(ValidateStage, 32)
         .map_err(|e| anyhow::anyhow!("register validate: {e:?}"))?;
-    let execute = runtime
-        .register_with_capacity::<_, Infallible>(ExecuteStage, 32)
+    let execute = app
+        .register_root::<_, Infallible>(ExecuteStage, 32)
         .map_err(|e| anyhow::anyhow!("register execute: {e:?}"))?;
-    let pipeline = runtime
+    let pipeline = app
         .register_split_service::<Pipeline, PipelineEvent, PipelineRequest, Infallible>(
             Pipeline {
                 parse,
@@ -388,8 +393,8 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register pipeline: {e:?}"))?
         .requests;
-    let driver = runtime
-        .register_with_capacity::<_, Infallible>(
+    let driver = app
+        .register_root::<_, Infallible>(
             Driver {
                 pipeline,
                 remaining: REQUESTS,
@@ -399,17 +404,14 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register driver: {e:?}"))?;
 
-    let result = runtime
+    let result = app
         .observe_result::<DriverOutcome, _, _>(driver)
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
-    runtime
-        .try_send(driver, DriverMsg::Begin)
+    app.try_send(driver, DriverMsg::Begin)
         .map_err(|e| anyhow::anyhow!("kick driver: {e:?}"))?;
     let outcome = result
         .wait(Duration::from_secs(10))
         .map_err(|e| anyhow::anyhow!("driver finishes: {e:?}"))?;
-
-    runtime.shutdown_report().ensure_clean()?;
 
     Ok(Report {
         requests: REQUESTS,

@@ -24,9 +24,7 @@ use tina_reqwest_bridge::{
     ReqwestAddress, ReqwestCallOutcome, ReqwestConfig, ReqwestOutcomeClass, ReqwestOutcomeExt,
     ReqwestRequest, ReqwestWorker, send_request,
 };
-use tina_runtime::{
-    DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, ThreadedRuntimeConfig, sleep,
-};
+use tina_runtime::{DefaultThreadedMailboxFactory, LocalSystem, SleepReply, sleep};
 use tokio::net::TcpListener;
 use tokio::runtime::Builder;
 use tokio::sync::oneshot;
@@ -189,35 +187,45 @@ impl Caller {
 pub fn run() -> anyhow::Result<Report> {
     let upstream = spawn_flaky_upstream()?;
 
-    let runtime = Arc::new(ThreadedRuntime::try_with_config(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 8,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    )?);
-    let shutdown = runtime.shutdown_handle();
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+        .ingress_capacity(8)
+        .idle_wait(Duration::from_millis(1))
+        .try_build()?;
+    let runtime_result = app.run_to_shutdown_reported(Duration::from_secs(5), move |app| {
+        run_application(app, upstream.addr)
+    });
+    let upstream_shutdown = upstream.stop();
+    match (runtime_result, upstream_shutdown) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(runtime), Ok(())) => Err(runtime.into()),
+        (Ok(_), Err(upstream)) => Err(upstream),
+        (Err(runtime), Err(upstream)) => Err(anyhow::anyhow!(
+            "Tina runtime shutdown failed: {runtime:#}; upstream shutdown also failed: {upstream:#}"
+        )),
+    }
+}
 
-    let bridge = ReqwestWorker::<SingleShard>::install(&runtime, ReqwestConfig::default())
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    upstream_addr: SocketAddr,
+) -> anyhow::Result<Report> {
+    let bridge = ReqwestWorker::<SingleShard>::install_local(app, ReqwestConfig::default())
         .map_err(|e| anyhow::anyhow!("install reqwest bridge: {e}"))?;
 
     let caller = Caller {
         http: bridge.address,
-        url: format!("http://{}/flaky", upstream.addr),
+        url: format!("http://{upstream_addr}/flaky"),
         report: Report::default(),
     };
-    let caller_addr = runtime
-        .register_with_capacity::<_, std::convert::Infallible>(caller, 8)
+    let caller_addr = app
+        .register_root::<_, std::convert::Infallible>(caller, 8)
         .map_err(|e| anyhow::anyhow!("register caller: {e:?}"))?;
 
-    let waiter = runtime
+    let waiter = app
         .observe_result::<Report, _, _>(caller_addr)
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
 
-    runtime
-        .try_send(caller_addr, CallerMsg::Begin)
+    app.try_send(caller_addr, CallerMsg::Begin)
         .map_err(|e| anyhow::anyhow!("send Begin: {e:?}"))?;
 
     let report = waiter
@@ -225,19 +233,5 @@ pub fn run() -> anyhow::Result<Report> {
         .map_err(|e| anyhow::anyhow!("caller did not finish: {e:?}"))?;
 
     bridge.closer.close();
-    let runtime_shutdown: anyhow::Result<()> = (|| {
-        let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-        terminal.ensure_clean()?;
-        Ok(())
-    })();
-    drop(runtime);
-    let upstream_shutdown = upstream.stop();
-    match (runtime_shutdown, upstream_shutdown) {
-        (Ok(()), Ok(())) => Ok(report),
-        (Err(runtime), Ok(())) => Err(runtime),
-        (Ok(()), Err(upstream)) => Err(upstream),
-        (Err(runtime), Err(upstream)) => Err(anyhow::anyhow!(
-            "Tina runtime shutdown failed: {runtime:#}; upstream shutdown also failed: {upstream:#}"
-        )),
-    }
+    Ok(report)
 }

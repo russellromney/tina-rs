@@ -22,7 +22,7 @@ use tina_http::{
     BodyMetrics, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse, HttpServerConfig,
     IterBodySource, ResponseChunkMsg, ResponseChunkReply,
 };
-use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, format_discovery_line};
+use tina_runtime::{DefaultThreadedMailboxFactory, LocalSystem, format_discovery_line};
 
 use crate::{CHUNK_BYTES, RESPONSE_BODY_BYTES, Report, decode_chunked, slow_reader_client};
 
@@ -81,19 +81,59 @@ fn body_chunks() -> impl Iterator<Item = Vec<u8>> + Send + 'static {
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime: ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory> =
-        ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
     let metrics = BodyMetrics::with_body_capacity("http.bodies", CHUNK_BYTES, RESPONSE_BODY_BYTES);
+    let partial = app.run_to_shutdown_reported(Duration::from_secs(5), {
+        let metrics = metrics.clone();
+        move |app| run_application(app, metrics)
+    })?;
+    // Snapshot after the bounded shutdown: the join edge makes the
+    // shard-side body release visible to `drained()`/`high_water`.
+    let snap = metrics.snapshot();
+    let capacity_discovery_line = snap
+        .response_capacity_report(
+            "specimen_http_body_streaming.response_body",
+            tina::capacity::CapacityMode::Fixed,
+        )
+        .map(|report| format_discovery_line(&report));
+    Ok(Report {
+        bytes_received: partial.bytes_received,
+        status_ok: partial.status_ok,
+        wall_clock_ms: partial.wall_clock_ms,
+        exit_clean: snap.drained(),
+        tokio_response_alloc_floor: None,
+        tina_response_high_water: Some(snap.response_body_high_water),
+        tina_chunked_wire_bytes: Some(partial.chunked_wire_bytes),
+        tina_chunked_decoded_bytes: Some(partial.chunked_decoded_len),
+        tina_capacity_discovery_line: capacity_discovery_line,
+    })
+}
+
+/// Workload results known before the post-shutdown metrics snapshot.
+struct PartialRun {
+    bytes_received: usize,
+    status_ok: bool,
+    wall_clock_ms: u128,
+    chunked_wire_bytes: usize,
+    chunked_decoded_len: usize,
+}
+
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    metrics: BodyMetrics,
+) -> anyhow::Result<PartialRun> {
+    // `IterBodySource::register` still takes the lower host-control handle.
+    let host = app.host_control();
 
     // `IterBodySource::register` wraps the iterator and registers
     // the source isolate in one step — no turbofish, no
     // `Infallible` placeholder.
-    let known_source = IterBodySource::<SingleShard>::register(&runtime, body_chunks(), 16)
+    let known_source = IterBodySource::<SingleShard>::register(&host, body_chunks(), 16)
         .map_err(|e| anyhow::anyhow!("register known source: {e:?}"))?;
-    let chunked_source = IterBodySource::<SingleShard>::register(&runtime, body_chunks(), 16)
+    let chunked_source = IterBodySource::<SingleShard>::register(&host, body_chunks(), 16)
         .map_err(|e| anyhow::anyhow!("register chunked source: {e:?}"))?;
-    let service = runtime
-        .register_with_capacity::<_, Infallible>(
+    let service = app
+        .register_root::<_, Infallible>(
             StreamingService {
                 known_source,
                 chunked_source,
@@ -106,13 +146,12 @@ pub fn run() -> anyhow::Result<Report> {
     let listener_isolate =
         HttpListener::<SingleShard>::with_config("127.0.0.1:0".parse()?, service, server_config)
             .with_metrics(metrics.clone());
-    let listener = runtime
-        .register_with_capacity::<_, _>(listener_isolate, server_config.listener_mailbox_capacity)
+    let listener = app
+        .register_root::<_, _>(listener_isolate, server_config.listener_mailbox_capacity)
         .map_err(|e| anyhow::anyhow!("register listener: {e:?}"))?;
 
-    let bound = runtime.observe_next_bound()?;
-    runtime
-        .try_send(listener, HttpListenerMsg::Start)
+    let bound = app.observe_next_bound()?;
+    app.try_send(listener, HttpListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("send Start: {e:?}"))?;
     let server_addr = bound
         .wait(Duration::from_secs(2))
@@ -128,28 +167,15 @@ pub fn run() -> anyhow::Result<Report> {
     let (chunked_wire_bytes, chunked_decoded_len, chunked_ok) =
         chunked_request_decoded(server_addr)?;
 
-    runtime
-        .try_send(listener, HttpListenerMsg::Stop)
+    app.try_send(listener, HttpListenerMsg::Stop)
         .map_err(|e| anyhow::anyhow!("send Stop: {e:?}"))?;
-    runtime.shutdown_report().ensure_clean()?;
 
-    let snap = metrics.snapshot();
-    let capacity_discovery_line = snap
-        .response_capacity_report(
-            "specimen_http_body_streaming.response_body",
-            tina::capacity::CapacityMode::Fixed,
-        )
-        .map(|report| format_discovery_line(&report));
-    Ok(Report {
+    Ok(PartialRun {
         bytes_received: known_bytes,
         status_ok: known_ok && chunked_ok,
         wall_clock_ms: wall_ms_known,
-        exit_clean: snap.drained(),
-        tokio_response_alloc_floor: None,
-        tina_response_high_water: Some(snap.response_body_high_water),
-        tina_chunked_wire_bytes: Some(chunked_wire_bytes),
-        tina_chunked_decoded_bytes: Some(chunked_decoded_len),
-        tina_capacity_discovery_line: capacity_discovery_line,
+        chunked_wire_bytes,
+        chunked_decoded_len,
     })
 }
 

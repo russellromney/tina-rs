@@ -447,6 +447,61 @@ jobs:
         if: always()
         run: sccache --show-stats || true
 
+  # specimen_postgres_counter is the sole external-service public example
+  # row: its public_smoke / public_characterization only count as proof when
+  # they run against a real PostgreSQL — a green skip with DATABASE_URL
+  # unset is not evidence. This job starts PostgreSQL 16, points
+  # DATABASE_URL at it, and runs the exact public proof commands plus the
+  # tokio control path (`-- both`). The specimen creates per-process unique
+  # tables and drops them on exit, and the service container is fresh per
+  # job, so no schema cleanup step is needed.
+  postgres-example:
+    name: postgres example (specimen_postgres_counter vs PostgreSQL 16)
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up mold linker
+        uses: rui314/setup-mold@v1
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo + target (per example workspace)
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: "true"
+          workspaces: |
+            examples/specimen_postgres_counter -> target
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: specimen_postgres_counter public proof (tina + control)
+        run: |
+          cargo test --manifest-path examples/specimen_postgres_counter/Cargo.toml --test public_smoke public_smoke -- --exact
+          cargo test --manifest-path examples/specimen_postgres_counter/Cargo.toml --test public_smoke public_characterization -- --exact
+          cargo run --manifest-path examples/specimen_postgres_counter/Cargo.toml -- both
+          cargo clippy --manifest-path examples/specimen_postgres_counter/Cargo.toml --all-targets -- -D warnings
+
   # Packaging-readiness smoke check (crates.io 0.1.0 prep): guards against
   # regressing back to an unpublishable crate graph. Two layers (see the
   # Makefile `verify-packaging` target):

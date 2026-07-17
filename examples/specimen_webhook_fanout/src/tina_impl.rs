@@ -1,5 +1,4 @@
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tina::prelude::*;
@@ -7,7 +6,7 @@ use tina_reqwest_bridge::{
     ReqwestAddress, ReqwestCallOutcome, ReqwestConfig, ReqwestOutcomeClass, ReqwestOutcomeExt,
     ReqwestRequest, ReqwestTransientReason, ReqwestWorker, send_request,
 };
-use tina_runtime::{BoundedItems, DefaultThreadedMailboxFactory, ThreadedRuntime, bounded_batch};
+use tina_runtime::{BoundedItems, DefaultThreadedMailboxFactory, LocalSystem, bounded_batch};
 
 use crate::upstream::{self, Upstream};
 use crate::{MAX_ENDPOINTS, Report, WebhookTerminal};
@@ -104,13 +103,15 @@ pub fn run() -> anyhow::Result<Report> {
 }
 
 fn run_inner(upstream: &Upstream) -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
-    let shutdown = runtime.shutdown_handle();
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), |app| run_application(app, upstream))?)
+}
 
-    let bridge = ReqwestWorker::<SingleShard>::install(&runtime, ReqwestConfig::default())
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    upstream: &Upstream,
+) -> anyhow::Result<Report> {
+    let bridge = ReqwestWorker::<SingleShard>::install_local(app, ReqwestConfig::default())
         .map_err(|e| anyhow::anyhow!("install reqwest bridge: {e}"))?;
 
     let addrs = BoundedItems::try_from_iter(MAX_ENDPOINTS, upstream.addrs.iter().copied())
@@ -125,8 +126,8 @@ fn run_inner(upstream: &Upstream) -> anyhow::Result<Report> {
     .map_err(|error| anyhow::anyhow!("bound webhook URLs: {error}"))?;
     let pending = urls.len() as u32;
 
-    let dispatcher = runtime
-        .register_with_capacity::<_, Infallible>(
+    let dispatcher = app
+        .register_root::<_, Infallible>(
             Dispatcher {
                 http: bridge.address,
                 urls,
@@ -137,11 +138,10 @@ fn run_inner(upstream: &Upstream) -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register dispatcher: {e:?}"))?;
 
-    let result = runtime
+    let result = app
         .observe_result::<Counts, _, _>(dispatcher)
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
-    runtime
-        .try_send(dispatcher, DispatcherMsg::Begin)
+    app.try_send(dispatcher, DispatcherMsg::Begin)
         .map_err(|e| anyhow::anyhow!("send Begin: {e:?}"))?;
 
     let counts = result
@@ -149,9 +149,6 @@ fn run_inner(upstream: &Upstream) -> anyhow::Result<Report> {
         .map_err(|e| anyhow::anyhow!("dispatcher did not finish: {e:?}"))?;
 
     bridge.closer.close();
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
     Ok(Report {
         delivered: counts.delivered,
         server_unavailable: counts.server_unavailable,

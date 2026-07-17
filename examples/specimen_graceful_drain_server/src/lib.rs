@@ -73,5 +73,8 @@ pub fn assert_report_invariants(side: &str, report: &Report) {
         report.shutdown_observed,
         "{side}: worker should have observed shutdown, got {report:?}",
     );
-    assert!(report.exit_clean, "{side}: expected exit_clean, got {report:?}");
+    assert!(
+        report.exit_clean,
+        "{side}: expected exit_clean, got {report:?}"
+    );
 }

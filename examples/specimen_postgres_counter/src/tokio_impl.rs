@@ -28,9 +28,11 @@ pub fn run(url: &str) -> anyhow::Result<Report> {
             .await?;
 
         for _ in 0..INCREMENTS {
-            sqlx::query(&format!("UPDATE {table} SET value = value + 1 WHERE id = 0"))
-                .execute(&pool)
-                .await?;
+            sqlx::query(&format!(
+                "UPDATE {table} SET value = value + 1 WHERE id = 0"
+            ))
+            .execute(&pool)
+            .await?;
         }
 
         let row: (i64,) = sqlx::query_as(&format!("SELECT value FROM {table} WHERE id = 0"))
