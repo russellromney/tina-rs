@@ -235,3 +235,36 @@ head and its fully green replacement workflow.
 Remaining remediation at this checkpoint: bounded session identities, SQLite
 failure fidelity, mini-SaaS retained keepalive authority, residual LocalSystem
 hosts, and typed HTTP caller-settlement proof. M6 and C1 remain incomplete.
+
+## M6 #387 MERGED — residual host migrations complete
+
+- Work code: M6 residual hosts
+- Branch: agent/phase-163-m6-residual
+- Reviewed head: 81cde8391de024caa782c14b4d608f5ef9af8448
+- Independent adversarial review round 1 (pre-commit 55-file diff): CHANGES REQUIRED
+  - FIX REQUIRED: specimen_postgres_counter public proof self-certified via skip; no CI job set DATABASE_URL
+    → fixed by new `postgres-example` CI job (PostgreSQL 16 service, DATABASE_URL, exact public_smoke/public_characterization commands, `-- both` control path, clippy)
+  - RESIDUAL RISK: specimen_http_body_streaming metrics snapshot lost its shutdown happens-before edge
+    → fixed by taking `metrics.snapshot()` after the `run_to_shutdown_reported` join edge (workload returns PartialRun)
+  - NOTEs: dormant shard_pair_capacity under single-shard ingress override; TcpAccept live-trace read equivalent in fixture; webhook_publisher error preference inverted runtime-first (dual-failure still names both)
+- Independent adversarial review round 2 (committed head 81cde839): APPROVE (no FIX REQUIRED)
+- Merge commit: 127510d3e2e9c8122ecad7d8779fdaa64fd37fc0
+- Merged at: 2026-07-17T10:18:31Z
+- PR CI (pre-merge): run 29572630925 full matrix SUCCESS (incl. new postgres-example job vs PostgreSQL 16)
+- Post-merge main workflow: https://github.com/russellromney/tina-rs/actions/runs/29573028010 SUCCESS on 127510d3e2e9c8122ecad7d8779fdaa64fd37fc0
+- Owns (all 21 manifest rows complete): specimen_graceful_drain_server, specimen_graceful_pool_shutdown, specimen_http_body_streaming, specimen_idempotent_retry, specimen_mini_keyspace, specimen_mux_client, specimen_native_http, specimen_native_https, specimen_outbound_fetch, specimen_outbound_http, specimen_periodic_batcher, specimen_pool_cancel_reclaim, specimen_postgres_counter, specimen_request_scope_fanout, specimen_retrying_outbound_http, specimen_scatter_gather, specimen_sharded_fanout_read, specimen_sharded_keyspace, specimen_two_stage_pipeline, specimen_webhook_fanout, specimen_webhook_publisher; docs/tcp-loops.md audited (loop-helper guidance only, no stale host vocabulary, no change needed)
+- Raw-runtime allowlist unchanged (cpu_run, mem_run, cross_shard_child_ownership, tracing_demo, owned_state_leak, perf_native raw rows)
+
+### Direct proof (M6)
+- 13 checkpoint-sweep migrations verified by hand against execute.md §9; 8 remaining rows migrated in this session (mini_keyspace, mux_client, outbound_fetch, outbound_http, postgres_counter, retrying_outbound_http, sharded_fanout_read, sharded_keyspace)
+- every row: LocalSystem/LocalMultiShardSystem + run_to_shutdown_reported; keepalive via install_keepalive_pool + consuming close_and_drain; no raw ThreadedRuntime/MultiShard host remains in any M6 row (reviewer sweep, zero hits)
+- every row gained tests/public_smoke.rs with exact `public_smoke` + `public_characterization` functions pinning report facts through the documented runner; exact commands per row:
+  - `cargo test --manifest-path examples/<crate>/Cargo.toml --test public_smoke public_smoke -- --exact`
+  - `cargo test --manifest-path examples/<crate>/Cargo.toml --test public_smoke public_characterization -- --exact`
+- `public_correction`: N/A for all M6 rows (no named correction; the two correction-ledger rows belong to I0A/F4)
+- behavior preservation: all pre-existing tests/smoke.rs suites pass unchanged on both tina and tokio sides; no framework crate touched (diff limited to examples/** + .github/workflows/verify.yml)
+- full local gates green: focused tests + `--all-targets`, clippy `-D warnings`, rustdoc `-D warnings`, per-crate fmt, `git diff --check`
+
+### Next
+- remediation PR #388 (typed HTTP caller settlement, Codex-owned) must merge green before C1 certification
+- C1 final certification + FINDINGS.md + guards from fresh worktree off 127510d3
