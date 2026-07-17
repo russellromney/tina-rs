@@ -228,6 +228,7 @@ head and its fully green replacement workflow.
 | #381 | Closed AwaitReady/AwaitQuiescent waiter reclamation | 62635eee514e03ad26570061be70ecea61935af8 | 109f877ef3fe75b127d70d568847b358d259bc58 | 29569409669 SUCCESS |
 | #382 | Physical terminal mailbox reservation and mapper-panic settlement | 6e6a4293c440ab1561766c5a3cb912934ae5384a | eeaa7f9ffe543954ab8ed226c0eb8afff7600326 | 29569423301 SUCCESS |
 | #383 | Pre-allocation bounded session identities and duplicate accounting | 0b341c159150897523afb6c19a4e98c19cb9de50 | 77be6c1f1215904ff40bb294d22509ef0c0795b5 | 29569751683 SUCCESS |
+| #384 | LocalSystem hosts, transactional persistence, graceful dependency failure, replay parity, and bounded metrics waiters | 7e72bfc5050f3c3693ab01f91de97048c70146ea | da0c9050f79e1ca752e1f93393b89d5eed6f2625 | 29570501459 SUCCESS |
 
 Remaining remediation at this checkpoint: bounded session identities, SQLite
 failure fidelity, mini-SaaS retained keepalive authority, residual LocalSystem
