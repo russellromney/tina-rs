@@ -95,7 +95,7 @@ mod conversion_tests {
         // choreography then records as `StepOutcome::Timeout`.
         let pool = KeepalivePoolShutdownReport {
             pool_close: KeepalivePoolCloseOutcome::Closed,
-            drain: KeepalivePoolDrainOutcome::TimedOut { leased: 1 },
+            drain: KeepalivePoolDrainOutcome::TimedOut { leased: Some(1) },
             requested: 0,
             stopped: 0,
             timed_out: 0,

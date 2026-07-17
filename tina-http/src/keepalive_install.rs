@@ -201,11 +201,17 @@ impl std::error::Error for KeepalivePoolInstallError {
     }
 }
 
-/// Exact pending work observed when a drain times out or an owner fails.
+/// Pending work observed when a drain times out or an owner fails.
+///
+/// `leased` is exact only when a pressure sample was observed. It is never
+/// capacity-seeded: unobserved paths leave `leased` as [`None`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeepalivePendingCounts {
-    /// Outstanding pool leases still held by admitted callers.
-    pub leased: usize,
+    /// Outstanding pool leases from a pressure observation.
+    ///
+    /// `Some(n)` is the exact leased count at observation time. `None` means no
+    /// pressure sample was available — never a capacity guess.
+    pub leased: Option<usize>,
     /// Connection isolates that have not yet been stopped by this handle.
     pub connections_live: usize,
     /// Whether pool admission has already been closed.
@@ -250,12 +256,12 @@ where
     Drained(KeepalivePoolSettledReport),
     /// Drain deadline fired. The owned handle is returned so the caller can retry.
     ///
-    /// Admitted work was not aborted. `pending` names the exact lease and
-    /// connection counts still live.
+    /// Admitted work was not aborted. `pending.leased` is the exact observed
+    /// lease count when a pressure sample landed; it is never capacity-seeded.
     TimedOut {
         /// Handle retained for a later drain attempt.
         pool: InstalledKeepalivePool<S, F>,
-        /// Exact pending counts at the deadline.
+        /// Pending counts at the deadline (`leased` only when observed).
         pending: KeepalivePendingCounts,
     },
     /// The live owner failed while closing or draining. Handle retained.
@@ -338,11 +344,15 @@ where
     /// retry. There is no force-close path on this facade.
     pub fn close_and_drain(mut self, timeout: Duration) -> KeepaliveCloseAndDrain<S, F> {
         let connections_live = self.handles.connections.len();
-        let pending = |leased: usize, admission_closed: bool| KeepalivePendingCounts {
+        // `leased` is only `Some` after a real pressure sample. Never seed it
+        // from connection capacity — that lies when capacity > outstanding leases.
+        let pending = |leased: Option<usize>, admission_closed: bool| KeepalivePendingCounts {
             leased,
             connections_live,
             admission_closed,
         };
+        // Close-phase failures have not observed pressure yet.
+        let unobserved = |admission_closed: bool| pending(None, admission_closed);
 
         if !self.admission_closed {
             let close = match self.host.call_blocking(
@@ -352,11 +362,7 @@ where
             ) {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    return map_owner_or_shutdown_error(
-                        self,
-                        error,
-                        pending(connections_live, false),
-                    );
+                    return map_owner_or_shutdown_error(self, error, unobserved(false));
                 }
             };
 
@@ -368,28 +374,32 @@ where
                     let settlement = KeepaliveShutdownSettlement {
                         pool_close: KeepalivePoolCloseOutcome::AlreadyClosed,
                         drain: KeepalivePoolDrainOutcome::PoolAlreadyClosed,
-                        pending: pending(connections_live, true),
+                        pending: unobserved(true),
                     };
                     // Drop releases the install claim; shutdown owns settlement.
                     drop(self);
                     return KeepaliveCloseAndDrain::Shutdown(settlement);
                 }
                 CallOutcome::Timeout => {
+                    // Prefer a real pressure sample for exact TimedOut claims.
+                    // If observation fails, refuse exact leased (None) — never
+                    // substitute pool capacity.
+                    let leased = observe_pool_leased(&self.host, &self.handles, timeout);
                     return KeepaliveCloseAndDrain::TimedOut {
-                        pending: pending(connections_live, false),
+                        pending: pending(leased, false),
                         pool: self,
                     };
                 }
                 CallOutcome::Full => {
                     return KeepaliveCloseAndDrain::OwnerFailed {
-                        pending: pending(connections_live, false),
+                        pending: unobserved(false),
                         error: ThreadedRuntimeError::CommandFull,
                         pool: self,
                     };
                 }
                 CallOutcome::Rejected(_) | CallOutcome::Replied(_) => {
                     return KeepaliveCloseAndDrain::OwnerFailed {
-                        pending: pending(connections_live, false),
+                        pending: unobserved(false),
                         error: ThreadedRuntimeError::WorkerUnresponsive,
                         pool: self,
                     };
@@ -400,11 +410,7 @@ where
         let drain = match wait_pool_drain(&self.host, &self.handles, timeout) {
             Ok(outcome) => outcome,
             Err(error) => {
-                return map_owner_or_shutdown_error(
-                    self,
-                    error,
-                    pending(connections_live, true),
-                );
+                return map_owner_or_shutdown_error(self, error, unobserved(true));
             }
         };
 
@@ -420,10 +426,12 @@ where
             | KeepalivePoolDrainOutcome::PressureUnavailable
             | KeepalivePoolDrainOutcome::SkippedAdmissionNotClosed
             | KeepalivePoolDrainOutcome::NotRequested => {
+                // Prefer a late observation when drain could not prove truth.
+                let leased = observe_pool_leased(&self.host, &self.handles, timeout);
                 let settlement = KeepaliveShutdownSettlement {
                     pool_close: KeepalivePoolCloseOutcome::Closed,
                     drain,
-                    pending: pending(connections_live, true),
+                    pending: pending(leased, true),
                 };
                 drop(self);
                 return KeepaliveCloseAndDrain::Shutdown(settlement);
@@ -444,27 +452,28 @@ where
                 }
                 Ok(CallOutcome::Closed) => KeepaliveConnectionStopOutcome::AlreadyClosed,
                 Ok(CallOutcome::Timeout) => {
+                    // Drain already proved leased == 0 before stop phase.
                     return KeepaliveCloseAndDrain::TimedOut {
-                        pending: pending(0, true),
+                        pending: pending(Some(0), true),
                         pool: self,
                     };
                 }
                 Ok(CallOutcome::Full) => {
                     return KeepaliveCloseAndDrain::OwnerFailed {
-                        pending: pending(0, true),
+                        pending: pending(Some(0), true),
                         error: ThreadedRuntimeError::CommandFull,
                         pool: self,
                     };
                 }
                 Ok(CallOutcome::Rejected(_)) | Ok(CallOutcome::Replied(_)) => {
                     return KeepaliveCloseAndDrain::OwnerFailed {
-                        pending: pending(0, true),
+                        pending: pending(Some(0), true),
                         error: ThreadedRuntimeError::WorkerUnresponsive,
                         pool: self,
                     };
                 }
                 Err(error) => {
-                    return map_owner_or_shutdown_error(self, error, pending(0, true));
+                    return map_owner_or_shutdown_error(self, error, pending(Some(0), true));
                 }
             };
 
@@ -476,7 +485,7 @@ where
                     // by mapping into owner-failed without inventing a force path.
                     let _ = (index, other);
                     return KeepaliveCloseAndDrain::OwnerFailed {
-                        pending: pending(0, true),
+                        pending: pending(Some(0), true),
                         error: ThreadedRuntimeError::WorkerUnresponsive,
                         pool: self,
                     };
@@ -756,6 +765,38 @@ where
     report
 }
 
+/// Best-effort pressure sample for exact lease counts.
+///
+/// Returns `Some(leased)` only on a real pressure reply. Never invents a
+/// capacity-based guess.
+fn observe_pool_leased<S, F>(
+    host: &ThreadedRuntime<S, F>,
+    handles: &KeepalivePoolHandles,
+    timeout: Duration,
+) -> Option<usize>
+where
+    S: Shard + Send + 'static,
+    F: MailboxFactory + Send + 'static,
+{
+    if timeout.is_zero() {
+        return None;
+    }
+    match host.call_blocking(handles.pool, WorkerPoolMsg::PressureReport, timeout) {
+        Ok(CallOutcome::Replied(WorkerPoolReply::Pressure(report))) => Some(report.leased),
+        _ => None,
+    }
+}
+
+/// Map the last observed lease count into a drain timeout outcome.
+///
+/// `None` means no pressure sample landed — refuse to claim an exact leased
+/// count (do not substitute pool capacity).
+fn drain_timeout_outcome(last_leased: Option<usize>) -> KeepalivePoolDrainOutcome {
+    KeepalivePoolDrainOutcome::TimedOut {
+        leased: last_leased,
+    }
+}
+
 fn wait_pool_drain<S, F>(
     host: &ThreadedRuntime<S, F>,
     handles: &KeepalivePoolHandles,
@@ -766,34 +807,29 @@ where
     F: MailboxFactory + Send + 'static,
 {
     let deadline = tina::Deadline::from_instant(Instant::now(), timeout).instant();
-    let mut last_leased = handles.connections.len();
+    // Prefer real pressure observation. Never seed from connections.len()/capacity.
+    let mut last_leased: Option<usize> = None;
 
     loop {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Ok(KeepalivePoolDrainOutcome::TimedOut {
-                leased: last_leased,
-            });
+            return Ok(drain_timeout_outcome(last_leased));
         };
         if remaining.is_zero() {
-            return Ok(KeepalivePoolDrainOutcome::TimedOut {
-                leased: last_leased,
-            });
+            return Ok(drain_timeout_outcome(last_leased));
         }
 
         let pressure = match host.call_blocking(handles.pool, WorkerPoolMsg::PressureReport, remaining)
         {
             Ok(outcome) => outcome,
             Err(ThreadedRuntimeError::HostWaitTimeout) => {
-                return Ok(KeepalivePoolDrainOutcome::TimedOut {
-                    leased: last_leased,
-                });
+                return Ok(drain_timeout_outcome(last_leased));
             }
             Err(error) => return Err(error),
         };
 
         match pressure {
             CallOutcome::Replied(WorkerPoolReply::Pressure(report)) => {
-                last_leased = report.leased;
+                last_leased = Some(report.leased);
                 if report.leased == 0 {
                     return Ok(KeepalivePoolDrainOutcome::Drained);
                 }
@@ -802,9 +838,9 @@ where
                 return Ok(KeepalivePoolDrainOutcome::PressureUnavailable);
             }
             CallOutcome::Timeout => {
-                return Ok(KeepalivePoolDrainOutcome::TimedOut {
-                    leased: last_leased,
-                });
+                // Pressure call timed out before a sample body. Report only if
+                // an earlier sample was observed — never capacity.
+                return Ok(drain_timeout_outcome(last_leased));
             }
             CallOutcome::Closed => {
                 return Ok(KeepalivePoolDrainOutcome::PoolAlreadyClosed);
@@ -942,5 +978,35 @@ where
                 rollback,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drain_timeout_before_pressure_sample_does_not_report_capacity() {
+        // capacity >= 2, one lease held. Timeout before any pressure sample
+        // (or with pressure CallOutcome::Timeout and no prior sample) must not
+        // invent capacity as leased. Re-seed last_leased from capacity to see
+        // this fail.
+        let capacity = 2usize;
+        assert_ne!(
+            drain_timeout_outcome(None),
+            KeepalivePoolDrainOutcome::TimedOut {
+                leased: Some(capacity)
+            },
+            "unobserved timeout must not report capacity as leased"
+        );
+        assert_eq!(
+            drain_timeout_outcome(None),
+            KeepalivePoolDrainOutcome::TimedOut { leased: None }
+        );
+        // Observed exact lease count under capacity 2.
+        assert_eq!(
+            drain_timeout_outcome(Some(1)),
+            KeepalivePoolDrainOutcome::TimedOut { leased: Some(1) }
+        );
     }
 }

@@ -1160,7 +1160,11 @@ pub enum KeepalivePoolDrainOutcome {
     /// available.
     PressureUnavailable,
     /// Drain deadline fired while leases remained.
-    TimedOut { leased: usize },
+    ///
+    /// `leased` is the exact outstanding lease count from a pressure sample.
+    /// `None` means the deadline fired before any pressure sample landed — the
+    /// helper refuses to invent a capacity-based guess.
+    TimedOut { leased: Option<usize> },
 }
 
 /// Per-connection result when a shutdown helper asks a slot to stop.
@@ -1386,6 +1390,15 @@ where
     Ok(report)
 }
 
+/// Map the last observed lease count into a drain timeout outcome.
+///
+/// `leased` is `None` when no pressure sample landed — never capacity-seeded.
+fn drain_timeout_outcome(last_leased: Option<usize>) -> KeepalivePoolDrainOutcome {
+    KeepalivePoolDrainOutcome::TimedOut {
+        leased: last_leased,
+    }
+}
+
 fn wait_keepalive_pool_drain<S>(
     runtime: &ThreadedRuntime<S, tina_runtime::DefaultThreadedMailboxFactory>,
     handles: &KeepalivePoolHandles,
@@ -1395,18 +1408,15 @@ where
     S: Shard + Send + 'static,
 {
     let deadline = tina::Deadline::from_instant(Instant::now(), timeout).instant();
-    let mut last_leased = handles.connections.len();
+    // Prefer real pressure observation. Never seed from connections.len()/capacity.
+    let mut last_leased: Option<usize> = None;
 
     loop {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Ok(KeepalivePoolDrainOutcome::TimedOut {
-                leased: last_leased,
-            });
+            return Ok(drain_timeout_outcome(last_leased));
         };
         if remaining.is_zero() {
-            return Ok(KeepalivePoolDrainOutcome::TimedOut {
-                leased: last_leased,
-            });
+            return Ok(drain_timeout_outcome(last_leased));
         }
 
         let pressure =
@@ -1417,16 +1427,16 @@ where
 
         match pressure {
             CallOutcome::Replied(WorkerPoolReply::Pressure(report)) => {
-                last_leased = report.leased;
+                last_leased = Some(report.leased);
                 if report.leased == 0 {
                     return Ok(KeepalivePoolDrainOutcome::Drained);
                 }
             }
             CallOutcome::Replied(_) => return Ok(KeepalivePoolDrainOutcome::PressureUnavailable),
             CallOutcome::Timeout => {
-                return Ok(KeepalivePoolDrainOutcome::TimedOut {
-                    leased: last_leased,
-                });
+                // Pressure call timed out before a sample body. Report only if
+                // an earlier sample was observed — never capacity.
+                return Ok(drain_timeout_outcome(last_leased));
             }
             CallOutcome::Full | CallOutcome::Closed | CallOutcome::Rejected(_) => {
                 return Ok(KeepalivePoolDrainOutcome::PressureUnavailable);
@@ -1442,15 +1452,14 @@ where
 
 fn classify_drain_host_error(
     error: ThreadedRuntimeError,
-    last_leased: usize,
+    last_leased: Option<usize>,
 ) -> Result<KeepalivePoolDrainOutcome, ThreadedRuntimeError> {
     match error {
         // The pressure call's target deadline is the helper's remaining drain
         // budget. `call_blocking` adds delivery grace to the host wait, so a
         // HostWaitTimeout arrives only after that drain budget has elapsed.
-        ThreadedRuntimeError::HostWaitTimeout => Ok(KeepalivePoolDrainOutcome::TimedOut {
-            leased: last_leased,
-        }),
+        // Exact leased requires a prior pressure sample — never capacity.
+        ThreadedRuntimeError::HostWaitTimeout => Ok(drain_timeout_outcome(last_leased)),
         error => Err(error),
     }
 }
@@ -1465,16 +1474,44 @@ mod tests {
     #[test]
     fn drain_host_timeout_maps_without_collapsing_control_errors() {
         assert_eq!(
-            classify_drain_host_error(ThreadedRuntimeError::HostWaitTimeout, 3),
-            Ok(KeepalivePoolDrainOutcome::TimedOut { leased: 3 })
+            classify_drain_host_error(ThreadedRuntimeError::HostWaitTimeout, Some(3)),
+            Ok(KeepalivePoolDrainOutcome::TimedOut { leased: Some(3) })
         );
         assert_eq!(
-            classify_drain_host_error(ThreadedRuntimeError::WorkerStopped, 3),
+            classify_drain_host_error(ThreadedRuntimeError::HostWaitTimeout, None),
+            Ok(KeepalivePoolDrainOutcome::TimedOut { leased: None })
+        );
+        assert_eq!(
+            classify_drain_host_error(ThreadedRuntimeError::WorkerStopped, Some(3)),
             Err(ThreadedRuntimeError::WorkerStopped)
         );
         assert_eq!(
-            classify_drain_host_error(ThreadedRuntimeError::CommandFull, 3),
+            classify_drain_host_error(ThreadedRuntimeError::CommandFull, Some(3)),
             Err(ThreadedRuntimeError::CommandFull)
+        );
+    }
+
+    #[test]
+    fn drain_timeout_before_pressure_sample_does_not_report_capacity() {
+        // Capacity 2 world: if drain times out with no pressure sample, leased
+        // must be None — never invent capacity (2). Re-seeding last_leased from
+        // capacity / connections.len() makes this fail.
+        let capacity = 2usize;
+        assert_ne!(
+            drain_timeout_outcome(None),
+            KeepalivePoolDrainOutcome::TimedOut {
+                leased: Some(capacity)
+            },
+            "unobserved timeout must not report capacity as leased"
+        );
+        assert_eq!(
+            drain_timeout_outcome(None),
+            KeepalivePoolDrainOutcome::TimedOut { leased: None }
+        );
+        // Observed exact 1 (one lease held in a capacity-2 pool).
+        assert_eq!(
+            drain_timeout_outcome(Some(1)),
+            KeepalivePoolDrainOutcome::TimedOut { leased: Some(1) }
         );
     }
 

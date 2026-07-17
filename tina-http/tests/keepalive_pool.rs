@@ -2414,7 +2414,7 @@ fn drain_shutdown_helper_does_not_stop_leased_connection_on_timeout() {
     assert_eq!(report.pool_close, KeepalivePoolCloseOutcome::Closed);
     assert_eq!(
         report.drain,
-        KeepalivePoolDrainOutcome::TimedOut { leased: 1 }
+        KeepalivePoolDrainOutcome::TimedOut { leased: Some(1) }
     );
     assert_eq!(report.requested, 0);
     assert_eq!(report.stopped, 0);

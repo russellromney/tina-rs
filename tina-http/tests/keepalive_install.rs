@@ -379,7 +379,7 @@ fn drain_timeout_retains_owned_handle_and_exact_pending_counts() {
 
     let retained = match pool.close_and_drain(Duration::from_millis(200)) {
         KeepaliveCloseAndDrain::TimedOut { pool, pending } => {
-            assert_eq!(pending.leased, 1);
+            assert_eq!(pending.leased, Some(1));
             assert_eq!(pending.connections_live, 1);
             assert!(pending.admission_closed);
             pool
@@ -423,6 +423,84 @@ fn drain_timeout_retains_owned_handle_and_exact_pending_counts() {
             assert_eq!(report.stopped, 1);
         }
         other => panic!("expected drained after retry, got {other:?}"),
+    }
+
+    let _ = app.shutdown().join();
+    server.stop();
+}
+
+#[test]
+fn drain_timeout_reports_observed_leased_not_pool_capacity() {
+    // Regression: capacity-seeded last_leased lied when capacity > outstanding
+    // leases. Capacity 2 with one held lease must report pending.leased == 1,
+    // never 2. A re-seed from connections.len()/capacity makes this fail when
+    // the timeout path runs off the seed (before/without a later sample body).
+    let server = ScriptedServer::start();
+    let app = system();
+    let pool = app
+        .install_keepalive_pool(config(HttpTarget::http(server.addr), 2))
+        .expect("install capacity 2");
+
+    let lease = match app
+        .call_blocking(pool.pool(), WorkerPoolMsg::Acquire, Duration::from_secs(2))
+        .expect("acquire one of two")
+    {
+        CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Acquired(lease))) => lease,
+        other => panic!("expected acquired, got {other:?}"),
+    };
+
+    // Sanity: pressure sees exact leased=1 under capacity=2 before drain.
+    match app
+        .call_blocking(
+            pool.pool(),
+            WorkerPoolMsg::PressureReport,
+            Duration::from_secs(2),
+        )
+        .expect("pressure")
+    {
+        CallOutcome::Replied(WorkerPoolReply::Pressure(report)) => {
+            assert_eq!(report.capacity, 2);
+            assert_eq!(report.leased, 1);
+        }
+        other => panic!("expected pressure, got {other:?}"),
+    }
+
+    let retained = match pool.close_and_drain(Duration::from_millis(200)) {
+        KeepaliveCloseAndDrain::TimedOut { pool, pending } => {
+            assert_eq!(
+                pending.leased,
+                Some(1),
+                "pending.leased must be observed exact count, not capacity 2"
+            );
+            assert_ne!(pending.leased, Some(2), "capacity seed must not appear");
+            assert_eq!(pending.connections_live, 2);
+            assert!(pending.admission_closed);
+            pool
+        }
+        other => panic!("expected timed out retention, got {other:?}"),
+    };
+
+    match app
+        .call_blocking(
+            retained.pool(),
+            WorkerPoolMsg::Release {
+                lease,
+                disposition: ReleaseDisposition::Reuse,
+            },
+            Duration::from_secs(2),
+        )
+        .expect("release")
+    {
+        CallOutcome::Replied(WorkerPoolReply::Release(ReleaseOutcome::Released)) => {}
+        other => panic!("expected released, got {other:?}"),
+    }
+
+    match retained.close_and_drain(Duration::from_secs(2)) {
+        KeepaliveCloseAndDrain::Drained(report) => {
+            assert_eq!(report.drain, KeepalivePoolDrainOutcome::Drained);
+            assert_eq!(report.stopped, 2);
+        }
+        other => panic!("expected drained after release, got {other:?}"),
     }
 
     let _ = app.shutdown().join();
