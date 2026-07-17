@@ -4,8 +4,8 @@
 //! shared by `examples/specimen_websocket_room` and
 //! `examples/systems/system_realtime_rooms`. Holds
 //! `BTreeMap<WebSocketSessionId, WebSocketSessionHandle>` under a fixed
-//! capacity and emits ordinary `tina::send` effects through each session's
-//! connection owner. Slow-peer eviction, idle eviction, shutdown sequencing,
+//! capacity and emits bounded owner calls through each session's connection
+//! isolate. Slow-peer eviction, idle eviction, shutdown sequencing,
 //! and the room's own report shape stay in the room isolate that owns this
 //! table — the table only handles the bookkeeping that two specimens already
 //! had verbatim.
@@ -28,13 +28,14 @@
 //! sharing. The table lives as one field on a room isolate.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
-use tina::{Effect, Isolate, Outbound};
+use tina::{Effect, Isolate, ServiceMessage};
+use tina_runtime::RuntimeCall;
 
-use crate::connection::HttpConnectionMsg;
 use crate::websocket::{
-    WebSocketCloseCode, WebSocketSendError, WebSocketSendOutcome, WebSocketSessionHandle,
-    WebSocketSessionId,
+    WebSocketCloseCode, WebSocketMessage, WebSocketSendError, WebSocketSendOutcome,
+    WebSocketSessionHandle, WebSocketSessionId, WebSocketSessionMsg,
 };
 
 /// Bounded report counters captured by the table itself. Rooms can mirror
@@ -49,14 +50,18 @@ pub struct WebSocketMemberTableReport {
     pub admit_rejected_duplicate: u64,
     pub left_peer: u64,
     pub left_slow: u64,
+    pub left_full: u64,
     pub left_protocol: u64,
     pub left_timeout: u64,
+    pub left_foreign: u64,
+    pub left_stale: u64,
     pub broadcast_ok: u64,
     pub broadcast_full: u64,
     pub broadcast_closed: u64,
     pub broadcast_protocol: u64,
     pub broadcast_stale: u64,
     pub broadcast_timeout: u64,
+    pub broadcast_foreign: u64,
     pub shutdown_close_requested: u64,
     pub member_high_water: u64,
 }
@@ -85,6 +90,9 @@ pub enum SendOutcomeAction {
     /// `OutboundQueueFull` / `OutboundBytesFull` from the connection owner.
     /// The member was removed; slow-peer eviction applies.
     RemovedSlow,
+    /// The connection owner's mailbox was full. The member was removed, but
+    /// this is not attributed to the peer's outbound frame/byte pressure.
+    RemovedFull,
     /// `Closed` / `Closing` from the connection owner. The member was
     /// removed; ordinary peer-side close.
     RemovedClosed,
@@ -93,9 +101,14 @@ pub enum SendOutcomeAction {
     RemovedProtocol,
     /// `Timeout` from the connection owner. The member was removed.
     RemovedTimeout,
-    /// `Stale` from the connection owner *or* the outcome named a session id
-    /// that the table no longer holds (e.g., concurrent peer-side close
-    /// during a fanout). No membership change.
+    /// The handle belongs to another runtime incarnation. The member was
+    /// removed because this room can never deliver through that handle.
+    RemovedForeign,
+    /// The connection owner rejected the table's current handle as stale. The
+    /// dead member was removed so it cannot retain bounded table capacity.
+    RemovedStale,
+    /// The outcome named a session id that the table no longer holds (e.g., a
+    /// concurrent peer-side close during fanout). No membership change.
     Stale,
 }
 
@@ -205,7 +218,7 @@ impl WebSocketMemberTable {
             .collect()
     }
 
-    /// Build `tina::send` effects for `message_for` applied to every member
+    /// Build bounded owner calls for `message_for` applied to every member
     /// except `exclude`.
     ///
     /// Contract:
@@ -213,23 +226,34 @@ impl WebSocketMemberTable {
     /// - the sender (`exclude`) is never offered the message
     /// - each remaining member is offered exactly once, in snapshot order
     ///
-    /// Each offer is an event-authority send into the connection owner. The
-    /// followup `WebSocketSessionMsg::SendOutcome` is delivered on the app's
-    /// event lane; pair with [`Self::record_send_outcome`] for slow-peer
-    /// eviction.
+    /// Each offer calls the connection owner and maps its exact admission and
+    /// session result into `WebSocketSessionMsg::SendOutcome` on the room's
+    /// event lane. Destination `Full`, `Closed`, `Timeout`, foreign-system,
+    /// and stale-session outcomes therefore cannot disappear between the room
+    /// snapshot and [`Self::record_send_outcome`].
     pub fn fanout<I, F>(
         &self,
         exclude: Option<WebSocketSessionId>,
+        timeout: Duration,
         message_for: F,
     ) -> Vec<Effect<I>>
     where
-        I: Isolate<Send = Outbound<HttpConnectionMsg>>,
-        F: Fn(WebSocketSessionHandle) -> HttpConnectionMsg,
+        I: Isolate<
+                Message = ServiceMessage<WebSocketSessionMsg, WebSocketSessionMsg>,
+                Io = RuntimeCall<ServiceMessage<WebSocketSessionMsg, WebSocketSessionMsg>>,
+            >,
+        F: Fn(WebSocketSessionHandle) -> WebSocketMessage,
     {
         let recipients = self.recipient_snapshot(exclude);
         let mut effects = Vec::with_capacity(recipients.len());
         for (_id, handle) in recipients {
-            effects.push(tina::send(handle.target(), message_for(handle)));
+            effects.push(
+                handle.send_effect_service_event::<I, WebSocketSessionMsg, WebSocketSessionMsg, _>(
+                    message_for(handle),
+                    timeout,
+                    WebSocketSessionMsg::SendOutcome,
+                ),
+            );
         }
         effects
     }
@@ -239,12 +263,18 @@ impl WebSocketMemberTable {
         &self,
         exclude: Option<WebSocketSessionId>,
         text: impl Into<String>,
+        timeout: Duration,
     ) -> Vec<Effect<I>>
     where
-        I: Isolate<Send = Outbound<HttpConnectionMsg>>,
+        I: Isolate<
+                Message = ServiceMessage<WebSocketSessionMsg, WebSocketSessionMsg>,
+                Io = RuntimeCall<ServiceMessage<WebSocketSessionMsg, WebSocketSessionMsg>>,
+            >,
     {
         let text = text.into();
-        self.fanout(exclude, move |handle| handle.text(text.clone()))
+        self.fanout(exclude, timeout, move |_| {
+            WebSocketMessage::Text(text.clone())
+        })
     }
 
     /// Broadcast a binary frame to every member except `exclude`.
@@ -252,12 +282,18 @@ impl WebSocketMemberTable {
         &self,
         exclude: Option<WebSocketSessionId>,
         bytes: impl Into<Vec<u8>>,
+        timeout: Duration,
     ) -> Vec<Effect<I>>
     where
-        I: Isolate<Send = Outbound<HttpConnectionMsg>>,
+        I: Isolate<
+                Message = ServiceMessage<WebSocketSessionMsg, WebSocketSessionMsg>,
+                Io = RuntimeCall<ServiceMessage<WebSocketSessionMsg, WebSocketSessionMsg>>,
+            >,
     {
         let bytes = bytes.into();
-        self.fanout(exclude, move |handle| handle.binary(bytes.clone()))
+        self.fanout(exclude, timeout, move |_| {
+            WebSocketMessage::Binary(bytes.clone())
+        })
     }
 
     /// Emit close frames toward every member. The table is left populated so
@@ -268,12 +304,18 @@ impl WebSocketMemberTable {
         &mut self,
         code: Option<WebSocketCloseCode>,
         reason: impl Into<Vec<u8>>,
+        timeout: Duration,
     ) -> Vec<Effect<I>>
     where
-        I: Isolate<Send = Outbound<HttpConnectionMsg>>,
+        I: Isolate<
+                Message = ServiceMessage<WebSocketSessionMsg, WebSocketSessionMsg>,
+                Io = RuntimeCall<ServiceMessage<WebSocketSessionMsg, WebSocketSessionMsg>>,
+            >,
     {
         let reason = reason.into();
-        let effects = self.fanout(None, move |handle| handle.close(code, reason.clone()));
+        let effects = self.fanout(None, timeout, move |_| {
+            WebSocketMessage::Close(code, reason.clone())
+        });
         self.report.shutdown_close_requested += effects.len() as u64;
         effects
     }
@@ -297,6 +339,12 @@ impl WebSocketMemberTable {
                 self.members.remove(&id);
                 SendOutcomeAction::RemovedSlow
             }
+            Err(WebSocketSendError::Full) => {
+                self.report.broadcast_full += 1;
+                self.report.left_full += 1;
+                self.members.remove(&id);
+                SendOutcomeAction::RemovedFull
+            }
             Err(WebSocketSendError::Closed) | Err(WebSocketSendError::Closing) => {
                 self.report.broadcast_closed += 1;
                 self.report.left_peer += 1;
@@ -315,9 +363,17 @@ impl WebSocketMemberTable {
                 self.members.remove(&id);
                 SendOutcomeAction::RemovedTimeout
             }
+            Err(WebSocketSendError::ForeignSystem { .. }) => {
+                self.report.broadcast_foreign += 1;
+                self.report.left_foreign += 1;
+                self.members.remove(&id);
+                SendOutcomeAction::RemovedForeign
+            }
             Err(WebSocketSendError::Stale) => {
                 self.report.broadcast_stale += 1;
-                SendOutcomeAction::Stale
+                self.report.left_stale += 1;
+                self.members.remove(&id);
+                SendOutcomeAction::RemovedStale
             }
         }
     }
@@ -326,6 +382,7 @@ impl WebSocketMemberTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::HttpConnectionMsg;
     use crate::websocket::WebSocketSessionMsg;
     use tina::{Address, AddressGeneration, IsolateId, ShardId};
     use tina_runtime::RuntimeCall;
@@ -383,7 +440,43 @@ mod tests {
     }
 
     #[test]
-    fn record_send_outcome_stale_does_not_remove() {
+    fn full_outcome_releases_capacity_for_deterministic_refill() {
+        let mut table = WebSocketMemberTable::new(1);
+        let first = dummy_handle(1);
+        table.admit(first);
+        assert_eq!(
+            table.record_send_outcome(&WebSocketSendOutcome {
+                session: first.session_id(),
+                result: Err(WebSocketSendError::OutboundQueueFull),
+            }),
+            SendOutcomeAction::RemovedSlow
+        );
+        assert!(table.is_empty());
+        assert_eq!(table.admit(dummy_handle(2)), AdmitOutcome::Admitted);
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn owner_mailbox_full_is_not_counted_as_slow_peer_pressure() {
+        let mut table = WebSocketMemberTable::new(1);
+        let member = dummy_handle(1);
+        table.admit(member);
+
+        assert_eq!(
+            table.record_send_outcome(&WebSocketSendOutcome {
+                session: member.session_id(),
+                result: Err(WebSocketSendError::Full),
+            }),
+            SendOutcomeAction::RemovedFull
+        );
+        assert!(table.is_empty());
+        assert_eq!(table.report().broadcast_full, 1);
+        assert_eq!(table.report().left_full, 1);
+        assert_eq!(table.report().left_slow, 0);
+    }
+
+    #[test]
+    fn outcome_for_absent_member_is_stale_without_removal() {
         let mut table = WebSocketMemberTable::new(2);
         let h = dummy_handle(1);
         table.admit(h);
@@ -397,6 +490,54 @@ mod tests {
         );
         assert_eq!(table.len(), 1);
         assert_eq!(table.report().broadcast_stale, 1);
+        assert_eq!(table.report().left_stale, 0);
+    }
+
+    #[test]
+    fn owner_stale_outcome_removes_member_and_releases_capacity_once() {
+        let mut table = WebSocketMemberTable::new(1);
+        let member = dummy_handle(1);
+        let outcome = WebSocketSendOutcome {
+            session: member.session_id(),
+            result: Err(WebSocketSendError::Stale),
+        };
+        assert_eq!(table.admit(member), AdmitOutcome::Admitted);
+
+        assert_eq!(
+            table.record_send_outcome(&outcome),
+            SendOutcomeAction::RemovedStale
+        );
+        assert!(table.is_empty());
+        assert_eq!(table.report().left_stale, 1);
+        assert_eq!(table.report().broadcast_stale, 1);
+        assert_eq!(
+            table.record_send_outcome(&outcome),
+            SendOutcomeAction::Stale
+        );
+        assert_eq!(table.report().left_stale, 1);
+        assert_eq!(table.admit(dummy_handle(2)), AdmitOutcome::Admitted);
+    }
+
+    #[test]
+    fn duplicate_failed_outcome_never_double_counts_removal() {
+        let mut table = WebSocketMemberTable::new(1);
+        let member = dummy_handle(1);
+        let outcome = WebSocketSendOutcome {
+            session: member.session_id(),
+            result: Err(WebSocketSendError::Timeout),
+        };
+        table.admit(member);
+
+        assert_eq!(
+            table.record_send_outcome(&outcome),
+            SendOutcomeAction::RemovedTimeout
+        );
+        assert_eq!(
+            table.record_send_outcome(&outcome),
+            SendOutcomeAction::Stale
+        );
+        assert_eq!(table.report().left_timeout, 1);
+        assert_eq!(table.report().broadcast_timeout, 1);
     }
 
     #[test]
@@ -455,8 +596,11 @@ mod tests {
         // happens by checking the counter delta — fanout returns one effect
         // per member; we ignore the effects themselves.
         let count_before = table.report().shutdown_close_requested;
-        let _effects: Vec<Effect<DummyRoomIsolate>> =
-            table.shutdown_close(Some(WebSocketCloseCode(1001)), b"bye".to_vec());
+        let _effects: Vec<Effect<DummyRoomIsolate>> = table.shutdown_close(
+            Some(WebSocketCloseCode(1001)),
+            b"bye".to_vec(),
+            Duration::from_secs(1),
+        );
         let count_after = table.report().shutdown_close_requested;
         assert_eq!(count_after - count_before, 2);
         // Members are deliberately left populated so subsequent SessionClose /
@@ -551,7 +695,7 @@ mod tests {
         table.admit(charlie);
 
         let effects: Vec<Effect<DummyRoomIsolate>> =
-            table.broadcast_text(Some(bravo.session_id()), "ping");
+            table.broadcast_text(Some(bravo.session_id()), "ping", Duration::from_secs(1));
         assert_eq!(
             effects.len(),
             2,
@@ -565,7 +709,8 @@ mod tests {
         table.admit(dummy_handle(1));
         table.admit(dummy_handle(2));
         table.admit(dummy_handle(3));
-        let effects: Vec<Effect<DummyRoomIsolate>> = table.broadcast_text(None, "ping");
+        let effects: Vec<Effect<DummyRoomIsolate>> =
+            table.broadcast_text(None, "ping", Duration::from_secs(1));
         assert_eq!(effects.len(), 3);
     }
 
@@ -604,9 +749,47 @@ mod tests {
         table.admit(a);
         table.admit(b);
         let effects: Vec<Effect<DummyRoomIsolate>> =
-            table.broadcast_text(Some(a.session_id()), "only-b");
+            table.broadcast_text(Some(a.session_id()), "only-b", Duration::from_secs(1));
         assert_eq!(effects.len(), 1);
         assert_eq!(table.recipient_snapshot(Some(a.session_id())).len(), 1);
+    }
+
+    #[test]
+    fn two_recipient_fanout_uses_observed_owner_calls_not_fire_and_forget_sends() {
+        let mut table = WebSocketMemberTable::new(3);
+        let sender = dummy_handle(1);
+        table.admit(sender);
+        table.admit(dummy_handle(2));
+        table.admit(dummy_handle(3));
+
+        let effects: Vec<Effect<DummyRoomIsolate>> =
+            table.broadcast_text(Some(sender.session_id()), "bounded", Duration::from_secs(1));
+
+        assert_eq!(effects.len(), 2);
+        assert!(effects.iter().all(|effect| matches!(effect, Effect::Io(_))));
+    }
+
+    #[test]
+    fn foreign_system_outcome_is_distinct_and_removes_member_once() {
+        let mut table = WebSocketMemberTable::new(1);
+        let member = dummy_handle(1);
+        let id = member.session_id();
+        table.admit(member);
+        let outcome = WebSocketSendOutcome {
+            session: id,
+            result: Err(WebSocketSendError::ForeignSystem {
+                expected: tina::SystemIncarnation::new(1),
+                actual: tina::SystemIncarnation::new(2),
+            }),
+        };
+
+        assert_eq!(
+            table.record_send_outcome(&outcome),
+            SendOutcomeAction::RemovedForeign
+        );
+        assert!(table.is_empty());
+        assert_eq!(table.report().broadcast_foreign, 1);
+        assert_eq!(table.report().left_foreign, 1);
     }
 
     #[test]
@@ -614,7 +797,7 @@ mod tests {
         let mut table = WebSocketMemberTable::new(2);
         table.admit(dummy_handle(1));
         let effects: Vec<Effect<DummyRoomIsolate>> =
-            table.broadcast_binary(None, b"bytes".to_vec());
+            table.broadcast_binary(None, b"bytes".to_vec(), Duration::from_secs(1));
         assert_eq!(effects.len(), 1);
     }
 
@@ -694,17 +877,17 @@ mod tests {
 
     impl Isolate for DummyRoomIsolate {
         tina::isolate_types! {
-            message: WebSocketSessionMsg,
+            message: ServiceMessage<WebSocketSessionMsg, WebSocketSessionMsg>,
             reply: crate::websocket::WebSocketSessionOutcome,
-            send: tina::Outbound<HttpConnectionMsg>,
+            send: std::convert::Infallible,
             spawn: std::convert::Infallible,
-            io: RuntimeCall<WebSocketSessionMsg>,
+            io: RuntimeCall<ServiceMessage<WebSocketSessionMsg, WebSocketSessionMsg>>,
             shard: DummyShard,
         }
 
         fn handle(
             &mut self,
-            _msg: WebSocketSessionMsg,
+            _msg: ServiceMessage<WebSocketSessionMsg, WebSocketSessionMsg>,
             _ctx: &mut tina::Context<'_, DummyShard, Self::Reply>,
         ) -> Effect<Self> {
             tina::reply(crate::websocket::WebSocketSessionOutcome::None)

@@ -16,14 +16,12 @@ slow-peer handling, explicit shutdown, and member-table pressure.
 - A recurring liveness tick — one `sleep_then` self-reschedules the room
   every `presence_tick`, broadcasts a heartbeat to every live member, and
   evicts members whose last activity was older than `idle_evict`.
-- An explicit app-control bootstrap — the host sends
-  `WebSocketSessionMsg::AppControl(Start)` after `register_with_capacity` so
-  the recurring tick starts. Forgetting that one `try_send` produces a quiet
-  service whose startup effect never runs.
-- A bounded fan-out path that emits sends via `tina::send` (try_send) so
-  that send admission is reported back to the room through the connection
-  isolate's `call_websocket_app(SendOutcome)` path. See the **rough**
-  finding below for why this matters.
+- An explicit app-control bootstrap installed atomically through
+  `register_split_service_with_bootstrap`, so the recurring tick cannot be
+  omitted after registration.
+- A bounded fan-out path that calls each connection owner with a fixed timeout.
+  Every `Full`, `Closed`, `Timeout`, foreign-system, stale-session, or accepted
+  outcome returns as a typed `SendOutcome` on the room's event lane.
 - Graceful shutdown via the public `WebSocketSessionMsg::Shutdown` variant.
   The room iterates its bounded member table and emits a `Close` frame per
   handle through the ordinary owner — no second writer, no hidden queue.
@@ -106,9 +104,8 @@ What felt good:
 - The native WebSocket server surface (`WebSocketSessionHandle`,
   `WebSocketSessionId`, `WebSocketSessionMsg`) is enough to build a
   bounded, fan-out room without touching `HttpConnection` internals.
-- `register_with_capacity` plus one `try_send(addr, Bootstrap)` from the
-  host is a small, explicit pattern that maps cleanly to the "startup
-  bootstrap message" idea capacity-aware registration formalizes.
+- `register_split_service_with_bootstrap` keeps bounded registration and the
+  one startup event in a single host operation.
 - The `sleep_then(d, msg)` self-reschedule pattern reads like ordinary
   state-machine code; no hidden cancellation or callbacks were needed.
 
@@ -119,45 +116,25 @@ What felt rough:
   this with `WebSocketSessionMsg::AppControl(WebSocketSessionControl::...)`.
   Control remains an ordinary bounded app message, but it is no longer peer
   text.
-- **`handle.text_effect::<Self>` (`call(...).then(SendOutcome)`) interacts
-  badly with the connection isolate when emitted from the room's
-  `handle_call` return value.** Concrete observed behaviour: the FIRST
-  `tcp_write` triggered by the call delivers its `Wrote(Ok)` completion
-  back to the connection via `handle_call` with a
-  `HttpConnectionMsg::Wrote(_)` variant, which the connection rejects as
-  `UnsupportedMessage`. The connection then never drains its outbound
-  queue; subsequent admits succeed (the room sees nine consecutive `Ok`
-  SendOutcomes), the queue fills up, and the room (correctly) evicts the
-  member with `OutboundQueueFull`. The workaround used here is to use
-  plain `tina::send(handle.target(), handle.text(...))` (try_send
-  semantics) instead — the connection then takes the
-  `handle_websocket_send` path and the call-back to the room is from the
-  connection's mailbox rather than from a `.then` chain. This deserves a
-  dedicated finding; see `examples/FINDINGS.md`.
-- **The cross-client SessionText broadcast still races against the
-  bounded outbound queue.** When client A sends "hello-from-a" and the
-  room fans it out to B, B's connection sometimes gets a TCP RST during
-  the next `Read` even though the broadcast write succeeded. The smoke
-  here therefore proves the recurring tick story specifically and leaves
-  cross-client text echo to `specimen_websocket_room`, which exercises
-  that path with its own scaffolding.
+- Fanout must choose an explicit owner-call timeout. The table takes that
+  timeout at the broadcast call site so the bound remains visible; it does not
+  hide a retry queue or silently turn timeout into success.
+- The room mailbox orders recipient snapshots, but connections settle their
+  sends independently. Counters therefore describe exact per-recipient
+  outcomes rather than implying a global wire-completion order.
 
 Tina capability pulled:
 
 - `tina-http` WebSocket (`WebSocketSessionHandle`, `WebSocketSessionMsg`,
   `websocket_upgrade`, `HttpResponse::websocket`).
 - `tina_runtime::sleep_then` for the recurring liveness tick.
-- `tina::send` (`Effect::Send`) for bounded fan-out without a `.then`
-  chain.
-- `ThreadedRuntime::register_with_capacity` + host `try_send` of a
-  Bootstrap message.
+- `WebSocketMemberTable::broadcast_text` for bounded, outcome-observed owner
+  calls whose continuations enter the event lane.
+- `LocalSystem::register_split_service_with_bootstrap` for atomic bounded
+  registration and startup.
 
 Suggested follow-up:
 
-- Add the call/try_send asymmetry to `examples/FINDINGS.md` — this is the
-  third specimen run that has paid the "be careful which entry point a
-  `.then` chain originates from" tax (`system_cache_with_fill`,
-  `system_job_queue`, now `system_realtime_rooms`).
 - Promote the bootstrap-on-register pattern (already on the capacity-aware registration
   list as `register_and_bootstrap`).
 - Consider an app-injectable typed variant on `WebSocketSessionMsg` so
@@ -173,5 +150,5 @@ Suggested follow-up:
 
 Verdict:
 
-- keep. The room ships, the recurring tick is bounded, the slow-peer
-  policy is explicit, and the rough bits are now written down.
+- keep. The room ships, the recurring tick is bounded, and every fanout offer
+  has an exact actor-owned terminal disposition.

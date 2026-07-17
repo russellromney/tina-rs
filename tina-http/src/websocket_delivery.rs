@@ -283,7 +283,12 @@ mod tests {
             Err(WebSocketSendError::Closed),
             Err(WebSocketSendError::Stale),
             Err(WebSocketSendError::Timeout),
+            Err(WebSocketSendError::Full),
             Err(WebSocketSendError::OutboundQueueFull),
+            Err(WebSocketSendError::ForeignSystem {
+                expected: tina::SystemIncarnation::new(1),
+                actual: tina::SystemIncarnation::new(2),
+            }),
         ] {
             let msg = WebSocketSessionMsg::SendOutcome(WebSocketSendOutcome {
                 session: WebSocketSessionId::new(1),

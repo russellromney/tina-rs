@@ -38,6 +38,7 @@ pub struct RoomReport {
     pub broadcast_full: usize,
     pub broadcast_closed: usize,
     pub broadcast_timeout: usize,
+    pub broadcast_foreign: usize,
     pub slow_peer_closed: usize,
     pub live_members: usize,
     pub shutdown_started: bool,
@@ -64,7 +65,7 @@ pub struct RoomReport {
 impl RoomReport {
     fn to_json(&self) -> String {
         format!(
-            "{{\"active_rooms\":{},\"room_capacity\":{},\"member_capacity\":{},\"joined\":{},\"left\":{},\"rejected_origin\":{},\"rejected_auth\":{},\"rejected_subprotocol\":{},\"rejected_full\":{},\"rejected_shutdown\":{},\"broadcast_ok\":{},\"broadcast_full\":{},\"broadcast_closed\":{},\"broadcast_timeout\":{},\"slow_peer_closed\":{},\"live_members\":{},\"shutdown_started\":{},\"shutdown_close_requested\":{},\"shutdown_close_ok\":{},\"shutdown_close_failed\":{},\"stale_handle_rejected\":{},\"refill_after_close\":{},\"selected_subprotocol_seen\":{},\"session_report_ok\":{},\"session_report_stale\":{},\"session_high_water\":{},\"room_high_water\":{},\"queued_frame_high_water\":{},\"queued_byte_high_water\":{},\"app_close_seen\":{},\"peer_close_seen\":{},\"protocol_close_seen\":{},\"timeout_close_seen\":{},\"client_a_received\":{},\"client_b_received\":{}}}",
+            "{{\"active_rooms\":{},\"room_capacity\":{},\"member_capacity\":{},\"joined\":{},\"left\":{},\"rejected_origin\":{},\"rejected_auth\":{},\"rejected_subprotocol\":{},\"rejected_full\":{},\"rejected_shutdown\":{},\"broadcast_ok\":{},\"broadcast_full\":{},\"broadcast_closed\":{},\"broadcast_timeout\":{},\"broadcast_foreign\":{},\"slow_peer_closed\":{},\"live_members\":{},\"shutdown_started\":{},\"shutdown_close_requested\":{},\"shutdown_close_ok\":{},\"shutdown_close_failed\":{},\"stale_handle_rejected\":{},\"refill_after_close\":{},\"selected_subprotocol_seen\":{},\"session_report_ok\":{},\"session_report_stale\":{},\"session_high_water\":{},\"room_high_water\":{},\"queued_frame_high_water\":{},\"queued_byte_high_water\":{},\"app_close_seen\":{},\"peer_close_seen\":{},\"protocol_close_seen\":{},\"timeout_close_seen\":{},\"client_a_received\":{},\"client_b_received\":{}}}",
             self.active_rooms,
             self.room_capacity,
             self.member_capacity,
@@ -79,6 +80,7 @@ impl RoomReport {
             self.broadcast_full,
             self.broadcast_closed,
             self.broadcast_timeout,
+            self.broadcast_foreign,
             self.slow_peer_closed,
             self.live_members,
             self.shutdown_started,
@@ -132,6 +134,7 @@ fn parse_report_json(json: &str) -> Option<RoomReport> {
         broadcast_full: num(json, "broadcast_full")?,
         broadcast_closed: num(json, "broadcast_closed")?,
         broadcast_timeout: num(json, "broadcast_timeout")?,
+        broadcast_foreign: num(json, "broadcast_foreign")?,
         slow_peer_closed: num(json, "slow_peer_closed")?,
         live_members: num(json, "live_members")?,
         shutdown_started: flag(json, "shutdown_started"),
@@ -932,6 +935,15 @@ impl Room {
                             self.report.slow_peer_closed += 1;
                         }
                     }
+                    Err(WebSocketSendError::Full) => {
+                        if self.shutting_down {
+                            self.report.shutdown_close_failed += 1;
+                        } else if stale_probe {
+                            self.report.stale_handle_rejected = true;
+                        } else {
+                            self.report.broadcast_full += 1;
+                        }
+                    }
                     Err(WebSocketSendError::Closed | WebSocketSendError::Stale) => {
                         if self.shutting_down {
                             self.report.shutdown_close_failed += 1;
@@ -970,12 +982,22 @@ impl Room {
                             self.report.broadcast_timeout += 1;
                         }
                     }
+                    Err(WebSocketSendError::ForeignSystem { .. }) => {
+                        if self.shutting_down {
+                            self.report.shutdown_close_failed += 1;
+                        } else if stale_probe {
+                            self.report.stale_handle_rejected = true;
+                        } else {
+                            self.report.broadcast_foreign += 1;
+                        }
+                    }
                 }
                 let mut removed_member = false;
-                if outcome.result.is_err() && !stale_probe {
-                    if let Some(handle) = self.members.remove(&outcome.session)
-                        && self.stale_probe.is_none()
-                    {
+                if outcome.result.is_err()
+                    && !stale_probe
+                    && let Some(handle) = self.members.remove(&outcome.session)
+                {
+                    if self.stale_probe.is_none() {
                         self.stale_probe = Some(handle);
                     }
                     self.first_closed = Some(outcome.session);
@@ -1188,11 +1210,13 @@ impl RoomServer {
             })
             .try_build()?;
 
-        let mut report = RoomReport::default();
-        report.active_rooms = 1;
-        report.room_capacity = config.room_capacity;
-        report.member_capacity = config.member_capacity;
-        report.room_high_water = 1;
+        let report = RoomReport {
+            active_rooms: 1,
+            room_capacity: config.room_capacity,
+            member_capacity: config.member_capacity,
+            room_high_water: 1,
+            ..RoomReport::default()
+        };
 
         let room = app
             .register_split_service::<
@@ -1372,11 +1396,13 @@ impl TlsRoomServer {
             })
             .try_build()?;
 
-        let mut report = RoomReport::default();
-        report.active_rooms = 1;
-        report.room_capacity = config.room_capacity;
-        report.member_capacity = config.member_capacity;
-        report.room_high_water = 1;
+        let report = RoomReport {
+            active_rooms: 1,
+            room_capacity: config.room_capacity,
+            member_capacity: config.member_capacity,
+            room_high_water: 1,
+            ..RoomReport::default()
+        };
 
         let room = app
             .register_split_service::<

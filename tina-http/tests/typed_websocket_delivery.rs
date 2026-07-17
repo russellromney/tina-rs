@@ -400,7 +400,11 @@ impl SplitRoom {
             WebSocketSessionMsg::SessionText { session_id, text } => {
                 self.lanes.session_texts.fetch_add(1, Ordering::SeqCst);
                 let body = format!("room:{text}");
-                let effects = self.members.broadcast_text::<Self>(Some(session_id), body);
+                let effects = self.members.broadcast_text::<Self>(
+                    Some(session_id),
+                    body,
+                    Duration::from_secs(1),
+                );
                 call.reply_and(WebSocketSessionOutcome::None, effects)
             }
             WebSocketSessionMsg::SessionClose { code, reason, .. } => {
