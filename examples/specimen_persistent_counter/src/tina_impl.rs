@@ -9,15 +9,14 @@
 
 use std::convert::Infallible;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tempfile::TempDir;
 use tina::prelude::*;
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, JournalAppendReply, JournalReplayReply,
-    SnapshotCommitReply, SnapshotLoadReply, ThreadedRuntime, journal_append, journal_replay,
-    snapshot_commit, snapshot_load,
+    CallError, LocalSystem, SnapshotCommitReply, SnapshotLoadReply, journal_append,
+    journal_replay, snapshot_commit, snapshot_load,
 };
 
 use crate::{PHASE_A_INCREMENTS, PHASE_B_INCREMENTS, Report};
@@ -39,7 +38,17 @@ enum CounterReply {
         value: u64,
         journal_records: u64,
     },
-    Failed,
+    Failed(CounterFailure),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CounterFailure {
+    SnapshotLoad(CallError),
+    SnapshotDecode { actual_bytes: usize },
+    JournalReplay(CallError),
+    JournalDecode { index: u64, actual_bytes: usize },
+    JournalAppend(CallError),
+    SnapshotCommit(CallError),
 }
 
 #[derive(Debug)]
@@ -50,6 +59,8 @@ enum CounterEvent {
     },
     JournalLoaded {
         req: RequestContext<CounterReply>,
+        recovered_value: u64,
+        snapshot_index: u64,
         result: JournalReplayReply,
     },
     AppendDurable {
@@ -91,27 +102,60 @@ impl Counter {
                 req,
                 result: Ok(Some(snapshot)),
             } => {
-                self.state.value = decode_u64(&snapshot.bytes);
-                self.state.last_journal_index = snapshot.last_journal_index;
+                let Ok(recovered_value) = decode_u64(&snapshot.bytes) else {
+                    return reply_to(
+                        req,
+                        CounterReply::Failed(CounterFailure::SnapshotDecode {
+                            actual_bytes: snapshot.bytes.len(),
+                        }),
+                    );
+                };
+                let snapshot_index = snapshot.last_journal_index;
                 journal_replay(self.journal_path.clone()).then_service_event(move |result| {
-                    CounterEvent::JournalLoaded { req, result }
+                    CounterEvent::JournalLoaded {
+                        req,
+                        recovered_value,
+                        snapshot_index,
+                        result,
+                    }
                 })
             }
             CounterEvent::SnapshotLoaded {
                 req,
                 result: Ok(None),
-            } => journal_replay(self.journal_path.clone())
-                .then_service_event(move |result| CounterEvent::JournalLoaded { req, result }),
+            } => journal_replay(self.journal_path.clone()).then_service_event(move |result| {
+                CounterEvent::JournalLoaded {
+                    req,
+                    recovered_value: 0,
+                    snapshot_index: 0,
+                    result,
+                }
+            }),
             CounterEvent::JournalLoaded {
                 req,
+                recovered_value,
+                snapshot_index,
                 result: Ok(replay),
             } => {
+                let mut value = recovered_value;
+                let mut last_journal_index = snapshot_index;
                 for record in replay.records {
-                    if record.index > self.state.last_journal_index {
-                        self.state.value = decode_u64(&record.bytes);
-                        self.state.last_journal_index = record.index;
+                    if record.index > last_journal_index {
+                        let Ok(decoded) = decode_u64(&record.bytes) else {
+                            return reply_to(
+                                req,
+                                CounterReply::Failed(CounterFailure::JournalDecode {
+                                    index: record.index,
+                                    actual_bytes: record.bytes.len(),
+                                }),
+                            );
+                        };
+                        value = decoded;
+                        last_journal_index = record.index;
                     }
                 }
+                self.state.value = value;
+                self.state.last_journal_index = last_journal_index;
                 reply_to(req, self.ok_reply())
             }
             CounterEvent::AppendDurable {
@@ -129,14 +173,36 @@ impl Counter {
                 req,
                 result: Ok(()),
             } => reply_to(req, self.ok_reply()),
-            CounterEvent::SnapshotLoaded { req, result: Err(_) }
-            | CounterEvent::JournalLoaded { req, result: Err(_) }
-            | CounterEvent::AppendDurable {
-                req, result: Err(_), ..
-            }
-            | CounterEvent::SnapshotCommitted { req, result: Err(_) } => {
-                reply_to(req, CounterReply::Failed)
-            }
+            CounterEvent::SnapshotLoaded {
+                req,
+                result: Err(error),
+            } => reply_to(
+                req,
+                CounterReply::Failed(CounterFailure::SnapshotLoad(error)),
+            ),
+            CounterEvent::JournalLoaded {
+                req,
+                result: Err(error),
+                ..
+            } => reply_to(
+                req,
+                CounterReply::Failed(CounterFailure::JournalReplay(error)),
+            ),
+            CounterEvent::AppendDurable {
+                req,
+                result: Err(error),
+                ..
+            } => reply_to(
+                req,
+                CounterReply::Failed(CounterFailure::JournalAppend(error)),
+            ),
+            CounterEvent::SnapshotCommitted {
+                req,
+                result: Err(error),
+            } => reply_to(
+                req,
+                CounterReply::Failed(CounterFailure::SnapshotCommit(error)),
+            ),
         }
     }
 
@@ -193,21 +259,19 @@ fn encode_u64(value: u64) -> Vec<u8> {
     value.to_le_bytes().to_vec()
 }
 
-fn decode_u64(bytes: &[u8]) -> u64 {
-    let arr: [u8; 8] = bytes
-        .try_into()
-        .expect("counter snapshot/journal payload is 8 bytes");
-    u64::from_le_bytes(arr)
+fn decode_u64(bytes: &[u8]) -> Result<u64, usize> {
+    let arr: [u8; 8] = bytes.try_into().map_err(|_| bytes.len())?;
+    Ok(u64::from_le_bytes(arr))
 }
 
 type CounterHandle = tina::ServiceRequestAddress<CounterEvent, CounterRequest, CounterReply>;
 
 fn call_counter(
-    runtime: &ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>,
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
     counter: CounterHandle,
     request: CounterRequest,
 ) -> anyhow::Result<CounterReply> {
-    match runtime.call_blocking_request(counter, request, OP_TIMEOUT)? {
+    match app.call_blocking_request(counter, request, OP_TIMEOUT)? {
         CallOutcome::Replied(reply) => Ok(reply),
         other => anyhow::bail!("counter call {request:?} failed: {other:?}"),
     }
@@ -253,33 +317,29 @@ fn run_phase(
     increments: u64,
     take_snapshot: bool,
 ) -> anyhow::Result<PhaseReport> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
-    let shutdown = runtime.shutdown_handle();
-
-    let counter = runtime
-        .register_split_service::<Counter, CounterEvent, CounterRequest, Infallible>(
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    app.run_to_shutdown_reported(Duration::from_secs(5), |app| {
+        let counter = app
+            .register_split_service::<Counter, CounterEvent, CounterRequest, Infallible>(
             Counter {
                 snapshot_path,
                 journal_path,
                 state: CounterState::default(),
             },
             16,
-        )
-        .map_err(|e| anyhow::anyhow!("register counter: {e:?}"))?
-        .requests;
+            )
+            .map_err(|e| anyhow::anyhow!("register counter: {e:?}"))?
+            .requests;
 
-    let recovered = match call_counter(&runtime, counter, CounterRequest::Recover)? {
+        let recovered = match call_counter(app, counter, CounterRequest::Recover)? {
         CounterReply::Ok { value, .. } => value,
-        CounterReply::Failed => anyhow::bail!("recover failed"),
+            CounterReply::Failed(error) => anyhow::bail!("recover failed: {error:?}"),
     };
 
     let mut final_value = recovered;
     let mut journal_records_written = 0u64;
     for _ in 0..increments {
-        match call_counter(&runtime, counter, CounterRequest::Increment)? {
+        match call_counter(app, counter, CounterRequest::Increment)? {
             CounterReply::Ok {
                 value,
                 journal_records,
@@ -287,26 +347,39 @@ fn run_phase(
                 final_value = value;
                 journal_records_written = journal_records;
             }
-            CounterReply::Failed => anyhow::bail!("increment failed"),
+                CounterReply::Failed(error) => anyhow::bail!("increment failed: {error:?}"),
         }
     }
 
     let mut snapshot_committed = false;
     if take_snapshot {
-        match call_counter(&runtime, counter, CounterRequest::CommitSnapshot)? {
+            match call_counter(app, counter, CounterRequest::CommitSnapshot)? {
             CounterReply::Ok { .. } => snapshot_committed = true,
-            CounterReply::Failed => anyhow::bail!("commit snapshot failed"),
+                CounterReply::Failed(error) => {
+                    anyhow::bail!("commit snapshot failed: {error:?}")
+                }
         }
     }
 
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
-
-    Ok(PhaseReport {
-        recovered_value: recovered,
-        final_value,
-        snapshot_committed,
-        journal_records_written,
+        Ok(PhaseReport {
+            recovered_value: recovered,
+            final_value,
+            snapshot_committed,
+            journal_records_written,
+        })
     })
+    .map_err(anyhow::Error::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persisted_values_require_exactly_eight_bytes() {
+        assert_eq!(decode_u64(&7_u64.to_le_bytes()), Ok(7));
+        assert_eq!(decode_u64(&[]), Err(0));
+        assert_eq!(decode_u64(&[0; 7]), Err(7));
+        assert_eq!(decode_u64(&[0; 9]), Err(9));
+    }
 }
