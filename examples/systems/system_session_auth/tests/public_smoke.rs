@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use system_session_auth::{
     AuthShard, RunConfig, RunConfigError, RunError, SessionAuthEvent, SessionAuthReply,
-    SessionAuthRequest, SessionBucket, SessionToken, WorkloadError, expect_reply, run,
+    SessionAuthRequest, SessionBucket, SessionToken, UserId, WorkloadError, expect_reply, run,
     run_idle_expiry, run_login_touch_logout, run_overflow,
 };
 use tina::prelude::*;
@@ -252,7 +252,10 @@ impl Probe {
         match message {
             ProbeMessage::Login { user_id, token } => call_request(
                 self.bucket,
-                SessionAuthRequest::Login { user_id, token },
+                SessionAuthRequest::Login {
+                    user_id: UserId::try_new(user_id).expect("bounded probe user"),
+                    token,
+                },
                 Duration::from_secs(1),
             )
             .then(|outcome| ProbeMessage::Returned {
@@ -358,11 +361,11 @@ fn sim_idle_expiry_script(seed: u64) -> (SessionAuthReply, system_session_auth::
         16,
     );
 
-    let token = SessionToken("sim-1".into());
+    let token = SessionToken::try_new("sim-1").expect("bounded token");
     sim.try_send(
         probe,
         ProbeMessage::Login {
-            user_id: "sim-user".into(),
+            user_id: "sim-user".to_owned(),
             token: token.clone(),
         },
     )

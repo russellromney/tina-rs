@@ -40,6 +40,10 @@ pub const MAX_IDLE_TIMEOUT_MS: u64 = 60_000;
 pub const MAX_SWEEP_INTERVAL_MS: u64 = 60_000;
 /// Host call timeout ceiling in milliseconds.
 pub const MAX_CALL_TIMEOUT_MS: u64 = 60_000;
+/// Maximum UTF-8 bytes in a user id before mailbox admission.
+pub const MAX_USER_ID_BYTES: usize = 256;
+/// Maximum UTF-8 bytes in a session token before mailbox admission.
+pub const MAX_SESSION_TOKEN_BYTES: usize = 128;
 /// Consuming shutdown observation budget for public runners.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -252,9 +256,69 @@ pub struct SessionStats {
     pub per_shard_high_water: Vec<u64>,
 }
 
-/// Opaque session handle. Encodes nothing the host couldn't compute.
+/// Why a session input was rejected before mailbox admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionInputError {
+    /// Empty identities and tokens are not meaningful.
+    Empty { field: &'static str },
+    /// UTF-8 byte length exceeded the public bound.
+    TooLong {
+        field: &'static str,
+        actual: usize,
+        max: usize,
+    },
+}
+
+impl fmt::Display for SessionInputError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty { field } => write!(f, "{field} must not be empty"),
+            Self::TooLong { field, actual, max } => {
+                write!(f, "{field} length {actual} exceeds maximum {max}")
+            }
+        }
+    }
+}
+
+impl Error for SessionInputError {}
+
+fn validate_input(
+    field: &'static str,
+    value: String,
+    max: usize,
+) -> Result<String, SessionInputError> {
+    if value.is_empty() {
+        Err(SessionInputError::Empty { field })
+    } else if value.len() > max {
+        Err(SessionInputError::TooLong {
+            field,
+            actual: value.len(),
+            max,
+        })
+    } else {
+        Ok(value)
+    }
+}
+
+/// Bounded application user identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserId(String);
+
+impl UserId {
+    pub fn try_new(value: impl Into<String>) -> Result<Self, SessionInputError> {
+        validate_input("user_id", value.into(), MAX_USER_ID_BYTES).map(Self)
+    }
+}
+
+/// Opaque, bounded session handle. Encodes nothing the host couldn't compute.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct SessionToken(pub String);
+pub struct SessionToken(String);
+
+impl SessionToken {
+    pub fn try_new(value: impl Into<String>) -> Result<Self, SessionInputError> {
+        validate_input("session_token", value.into(), MAX_SESSION_TOKEN_BYTES).map(Self)
+    }
+}
 
 /// Typed reply vocabulary for session operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,6 +336,8 @@ pub enum SessionAuthReply {
     NotFound,
     /// The owning shard bucket was at capacity.
     Full,
+    /// The token already names a live session; no row or counter changed.
+    AlreadyExists,
     /// One shard's operational snapshot.
     Stats(BucketStats),
 }
@@ -319,7 +385,7 @@ pub enum SessionAuthRequest {
     /// Host-supplied token; the bucket records it and replies with admission.
     Login {
         /// Application user identity.
-        user_id: String,
+        user_id: UserId,
         /// Host-minted token already routed to this shard.
         token: SessionToken,
     },
@@ -340,7 +406,7 @@ pub enum SessionAuthRequest {
 #[derive(Debug)]
 struct SessionRow {
     #[allow(dead_code)]
-    user_id: String,
+    user_id: UserId,
     last_touched_at: Instant,
 }
 
@@ -412,11 +478,14 @@ impl SessionBucket {
 
     fn login(
         &mut self,
-        user_id: String,
+        user_id: UserId,
         token: SessionToken,
         now: Instant,
         call: RequestCall<'_, Self>,
     ) -> RequestEffect<Self> {
+        if self.rows.contains_key(&token) {
+            return call.reply(SessionAuthReply::AlreadyExists);
+        }
         if self.rows.len() >= self.config.max_sessions_per_shard {
             self.stats.full_rejects += 1;
             return call.reply(SessionAuthReply::Full);
@@ -505,10 +574,13 @@ impl SessionBucket {
     #[cfg(test)]
     fn login_at_for_test(
         &mut self,
-        user_id: String,
+        user_id: UserId,
         token: SessionToken,
         now: Instant,
     ) -> SessionAuthReply {
+        if self.rows.contains_key(&token) {
+            return SessionAuthReply::AlreadyExists;
+        }
         if self.rows.len() >= self.config.max_sessions_per_shard {
             self.stats.full_rejects += 1;
             return SessionAuthReply::Full;
@@ -580,6 +652,8 @@ struct AuthWorld<'a> {
 /// Workload failure retaining exact host/runtime terminals.
 #[derive(Debug)]
 pub enum WorkloadError {
+    /// A user id or token exceeded its public request bound.
+    InvalidInput(SessionInputError),
     /// Shard placement construction failed.
     Placement(ShardPlacementError),
     /// A per-shard bucket registration/bootstrap failed.
@@ -615,6 +689,7 @@ pub enum WorkloadError {
 impl fmt::Display for WorkloadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidInput(error) => write!(f, "invalid session input: {error}"),
             Self::Placement(error) => write!(f, "placement failed: {error}"),
             Self::Registration { shard, source } => {
                 write!(f, "register bucket on shard {shard} failed: {source}")
@@ -633,6 +708,7 @@ impl fmt::Display for WorkloadError {
 impl Error for WorkloadError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::InvalidInput(error) => Some(error),
             Self::Placement(error) => Some(error),
             Self::Registration { source, .. } => Some(source),
             Self::HostCall { source, .. } => Some(source),
@@ -732,7 +808,7 @@ impl<'a> AuthWorld<'a> {
 
     fn mint_token(&self) -> SessionToken {
         let n = self.next_id.fetch_add(1, Ordering::Relaxed);
-        SessionToken(format!("s-{n}"))
+        SessionToken::try_new(format!("s-{n}")).expect("minted token is bounded")
     }
 
     fn addr_for(&self, token: &SessionToken) -> AuthRequestAddr {
@@ -741,6 +817,7 @@ impl<'a> AuthWorld<'a> {
     }
 
     fn login(&self, user_id: String) -> Result<SessionAuthReply, WorkloadError> {
+        let user_id = UserId::try_new(user_id).map_err(WorkloadError::InvalidInput)?;
         let token = self.mint_token();
         let addr = self.addr_for(&token);
         expect_reply(
@@ -1043,9 +1120,9 @@ mod tests {
             session_mailbox: 8,
             call_timeout_ms: 1_000,
         });
-        let token = SessionToken("t-1".into());
+        let token = SessionToken::try_new("t-1").unwrap();
         assert!(matches!(
-            bucket.login_at_for_test("alice".into(), token.clone(), now),
+            bucket.login_at_for_test(UserId::try_new("alice").unwrap(), token.clone(), now),
             SessionAuthReply::Admitted { .. }
         ));
         // Still inside idle window.
@@ -1080,9 +1157,9 @@ mod tests {
             session_mailbox: 8,
             call_timeout_ms: 1_000,
         });
-        let token = SessionToken("t-dep".into());
+        let token = SessionToken::try_new("t-dep").unwrap();
         assert!(matches!(
-            bucket.login_at_for_test("bob".into(), token.clone(), now),
+            bucket.login_at_for_test(UserId::try_new("bob").unwrap(), token.clone(), now),
             SessionAuthReply::Admitted { .. }
         ));
         bucket.sweep_at_for_test(Err(CallError::TimerFull), now + Duration::from_secs(1));
@@ -1145,14 +1222,75 @@ mod tests {
             call_timeout_ms: 1_000,
         });
         assert!(matches!(
-            bucket.login_at_for_test("a".into(), SessionToken("1".into()), now),
+            bucket.login_at_for_test(
+                UserId::try_new("a").unwrap(),
+                SessionToken::try_new("1").unwrap(),
+                now,
+            ),
             SessionAuthReply::Admitted { .. }
         ));
         assert_eq!(
-            bucket.login_at_for_test("b".into(), SessionToken("2".into()), now),
+            bucket.login_at_for_test(
+                UserId::try_new("b").unwrap(),
+                SessionToken::try_new("2").unwrap(),
+                now,
+            ),
             SessionAuthReply::Full
         );
         assert_eq!(bucket.stats_for_test().full_rejects, 1);
         assert_eq!(bucket.stats_for_test().active, 1);
+    }
+
+    #[test]
+    fn request_identities_are_bounded_before_mailbox_construction() {
+        assert!(matches!(
+            UserId::try_new(""),
+            Err(SessionInputError::Empty { field: "user_id" })
+        ));
+        assert!(UserId::try_new("u".repeat(MAX_USER_ID_BYTES)).is_ok());
+        assert!(matches!(
+            UserId::try_new("u".repeat(MAX_USER_ID_BYTES + 1)),
+            Err(SessionInputError::TooLong {
+                field: "user_id",
+                actual,
+                max: MAX_USER_ID_BYTES,
+            }) if actual == MAX_USER_ID_BYTES + 1
+        ));
+        assert!(SessionToken::try_new("t".repeat(MAX_SESSION_TOKEN_BYTES)).is_ok());
+        assert!(matches!(
+            SessionToken::try_new("t".repeat(MAX_SESSION_TOKEN_BYTES + 1)),
+            Err(SessionInputError::TooLong {
+                field: "session_token",
+                actual,
+                max: MAX_SESSION_TOKEN_BYTES,
+            }) if actual == MAX_SESSION_TOKEN_BYTES + 1
+        ));
+    }
+
+    #[test]
+    fn duplicate_token_never_overwrites_or_increments_admission() {
+        let now = Instant::now();
+        let mut bucket = SessionBucket::new(RunConfig {
+            shards: 1,
+            max_sessions_per_shard: 1,
+            ..RunConfig::default()
+        });
+        let token = SessionToken::try_new("same").unwrap();
+        assert!(matches!(
+            bucket.login_at_for_test(UserId::try_new("alice").unwrap(), token.clone(), now),
+            SessionAuthReply::Admitted { .. }
+        ));
+        assert_eq!(
+            bucket.login_at_for_test(
+                UserId::try_new("mallory").unwrap(),
+                token,
+                now + Duration::from_secs(1),
+            ),
+            SessionAuthReply::AlreadyExists
+        );
+        let stats = bucket.stats_for_test();
+        assert_eq!(stats.active, 1);
+        assert_eq!(stats.admitted, 1);
+        assert_eq!(stats.full_rejects, 0);
     }
 }
