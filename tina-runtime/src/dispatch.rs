@@ -3070,11 +3070,10 @@ where
         };
 
         let record = &self.child_records[record_index];
-        if record.terminal_continuation.is_none()
-            && !record.terminal_slot_reserved
-            && record.previous_child.is_none()
-            && record.terminal_settled_generation.is_none()
-        {
+        // Parent terminal observation only. Supervised/restartable children
+        // always have a child record; without a parent terminal mapper or
+        // reservation, host `observe_result` still owns the stop_with value.
+        if record.terminal_continuation.is_none() && !record.terminal_slot_reserved {
             return result;
         }
 
@@ -3153,11 +3152,12 @@ where
         self.child_records[record_index].terminal_slot_reserved = false;
 
         let Some(mapper) = mapper else {
+            // Reservation without mapper is unexpected; free the slot and leave
+            // the value for host observe_result rather than swallowing it.
             if had_reservation {
                 self.release_terminal_slot(parent);
             }
-            drop(result);
-            return None;
+            return result;
         };
 
         let Some(result) = result else {
