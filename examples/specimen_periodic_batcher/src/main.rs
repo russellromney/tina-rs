@@ -26,10 +26,6 @@ fn print_side(side: &str, report: Report) {
     println!(
         "comparison=specimen_periodic_batcher side={} items_seen={} \
          size_flushes={} timer_flushes={} exit_clean={}",
-        side,
-        report.items_seen,
-        report.size_flushes,
-        report.timer_flushes,
-        report.exit_clean,
+        side, report.items_seen, report.size_flushes, report.timer_flushes, report.exit_clean,
     );
 }

@@ -3,9 +3,9 @@
 //!
 //! - Tokio: `axum` server + `reqwest` client.
 //! - Tina: `tina_http::HttpListener` server +
-//!   `tina_http::build_keepalive_pool` client. The host drives the
-//!   script with `ThreadedRuntime::call_blocking`, while the pool and
-//!   connection isolates keep admission, reuse, and close decisions
+//!   an owned keepalive pool installed on the `LocalSystem`. The host
+//!   drives the script with `LocalSystem::call_blocking`, while the pool
+//!   and connection isolates keep admission, reuse, and close decisions
 //!   typed.
 //!
 //! Read [`tokio_impl`] and [`tina_impl`] top-to-bottom; the README

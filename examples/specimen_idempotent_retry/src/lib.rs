@@ -24,13 +24,12 @@
 
 use std::collections::HashSet;
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tina::prelude::*;
 use tina::time::Backoff;
 use tina_runtime::{
-    DefaultThreadedMailboxFactory, FullDecision, FullHandling, SleepReply, ThreadedRuntime, sleep,
+    DefaultThreadedMailboxFactory, FullDecision, FullHandling, LocalSystem, SleepReply, sleep,
 };
 
 /// How the delivery ended.
@@ -199,12 +198,18 @@ impl Default for RunConfig {
 
 /// Drive one delivery to completion.
 pub fn run(config: RunConfig) -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
-    let shutdown = runtime.shutdown_handle();
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    Ok(
+        app.run_to_shutdown_reported(Duration::from_secs(5), move |app| {
+            run_application(app, config)
+        })?,
+    )
+}
 
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    config: RunConfig,
+) -> anyhow::Result<Report> {
     let backoff = Backoff::constant(Duration::from_millis(config.backoff_ms), config.max_retries)
         .map_err(|e| anyhow::anyhow!("backoff config: {e:?}"))?;
     let relay = Relay {
@@ -215,28 +220,22 @@ pub fn run(config: RunConfig) -> anyhow::Result<Report> {
         retries: 0,
     };
 
-    let addr = runtime
-        .register_with_capacity::<_, Infallible>(relay, 8)
+    let addr = app
+        .register_root::<_, Infallible>(relay, 8)
         .map_err(|e| anyhow::anyhow!("register relay: {e:?}"))?;
-    let waiter = runtime
+    let waiter = app
         .observe_result::<Report, _, _>(addr)
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
 
-    runtime
-        .try_send(
-            addr,
-            RelayMsg::Deliver {
-                idempotency_key: config.idempotency_key,
-            },
-        )
-        .map_err(|e| anyhow::anyhow!("send Deliver: {e:?}"))?;
+    app.try_send(
+        addr,
+        RelayMsg::Deliver {
+            idempotency_key: config.idempotency_key,
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("send Deliver: {e:?}"))?;
 
-    let report = waiter
+    waiter
         .wait(Duration::from_secs(5))
-        .map_err(|e| anyhow::anyhow!("relay did not finish: {e:?}"))?;
-
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
-    Ok(report)
+        .map_err(|e| anyhow::anyhow!("relay did not finish: {e:?}"))
 }

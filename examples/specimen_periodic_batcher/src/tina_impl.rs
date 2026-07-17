@@ -12,12 +12,11 @@
 //! and ignores stale ticks.
 
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina_runtime::{DefaultThreadedMailboxFactory, SleepReply, ThreadedRuntime, sleep};
+use tina_runtime::{DefaultThreadedMailboxFactory, LocalSystem, SleepReply, sleep};
 
 use crate::{
     BATCH_INTERVAL_MS, BATCH_SIZE, PRODUCER_GAP_MS, Report, TOTAL_ITEMS, TRAILING_PAUSE_MS,
@@ -111,12 +110,13 @@ impl Batcher {
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
-    let shutdown = runtime.shutdown_handle();
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), run_application)?)
+}
 
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+) -> anyhow::Result<Report> {
     let batcher = Batcher {
         interval: RecurringTick::every(Duration::from_millis(BATCH_INTERVAL_MS))
             .map_err(|e| anyhow::anyhow!("configure interval: {e:?}"))?,
@@ -124,11 +124,11 @@ pub fn run() -> anyhow::Result<Report> {
         pending_tick: None,
         report: Report::default(),
     };
-    let addr = runtime
-        .register_with_capacity::<_, Infallible>(batcher, 64)
+    let addr = app
+        .register_root::<_, Infallible>(batcher, 64)
         .map_err(|e| anyhow::anyhow!("register batcher: {e:?}"))?;
 
-    let waiter = runtime
+    let waiter = app
         .observe_result::<Report, _, _>(addr)
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
 
@@ -137,30 +137,22 @@ pub fn run() -> anyhow::Result<Report> {
     // fire on the third batch, then the last 2 items, then a final
     // pause to let the timer fire again, then BurstClosed.
     for n in 0..(TOTAL_ITEMS - 2) {
-        runtime
-            .try_send(addr, BatcherMsg::Submit(n))
+        app.try_send(addr, BatcherMsg::Submit(n))
             .map_err(|e| anyhow::anyhow!("try_send {n}: {e:?}"))?;
         thread::sleep(Duration::from_millis(PRODUCER_GAP_MS));
     }
     thread::sleep(Duration::from_millis(TRAILING_PAUSE_MS));
     for n in (TOTAL_ITEMS - 2)..TOTAL_ITEMS {
-        runtime
-            .try_send(addr, BatcherMsg::Submit(n))
+        app.try_send(addr, BatcherMsg::Submit(n))
             .map_err(|e| anyhow::anyhow!("try_send {n}: {e:?}"))?;
         thread::sleep(Duration::from_millis(PRODUCER_GAP_MS));
     }
     thread::sleep(Duration::from_millis(BATCH_INTERVAL_MS * 3));
 
-    runtime
-        .try_send(addr, BatcherMsg::BurstClosed)
+    app.try_send(addr, BatcherMsg::BurstClosed)
         .map_err(|e| anyhow::anyhow!("send BurstClosed: {e:?}"))?;
 
-    let report = waiter
+    waiter
         .wait(Duration::from_secs(5))
-        .map_err(|e| anyhow::anyhow!("batcher did not finish: {e:?}"))?;
-
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
-    Ok(report)
+        .map_err(|e| anyhow::anyhow!("batcher did not finish: {e:?}"))
 }

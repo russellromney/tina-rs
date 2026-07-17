@@ -9,7 +9,6 @@
 //! normally.
 
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tina::pool::{
@@ -21,13 +20,14 @@ use tina_runtime::pool::{
     release_result_effect,
 };
 use tina_runtime::{
-    BoundedItems, CallError, CallOutcome, DefaultThreadedMailboxFactory, SleepReply,
-    ThreadedRuntime, bounded_batch, call_request, sleep,
+    BoundedItems, CallError, CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, SleepReply,
+    bounded_batch, call_request, sleep,
 };
 
 use crate::{CALLERS, Report, SHUTDOWN_AFTER_MS, TinaTerminalCounts, WORK_MS, WORKERS};
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 // --- Worker --------------------------------------------------------------
 
@@ -315,35 +315,35 @@ fn close_was_observed(outcome: &CallOutcome<WorkerPoolReply<WorkerHandle>>) -> b
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
-    let shutdown = runtime.shutdown_handle();
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    Ok(app.run_to_shutdown_reported(SHUTDOWN_TIMEOUT, run_application)?)
+}
 
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+) -> anyhow::Result<Report> {
     let mut workers = Vec::with_capacity(WORKERS);
     for _ in 0..WORKERS {
         workers.push(
-            runtime
-                .register_split_service::<Worker, WorkerEvent, WorkerRequest, Infallible>(
-                    Worker {
-                        work: Duration::from_millis(WORK_MS),
-                    },
-                    16,
-                )
-                .map_err(|e| anyhow::anyhow!("register worker: {e:?}"))?
-                .requests,
+            app.register_split_service::<Worker, WorkerEvent, WorkerRequest, Infallible>(
+                Worker {
+                    work: Duration::from_millis(WORK_MS),
+                },
+                16,
+            )
+            .map_err(|e| anyhow::anyhow!("register worker: {e:?}"))?
+            .requests,
         );
     }
 
     let pool: WorkerPool<WorkerHandle, SingleShard> =
         WorkerPool::new(PoolConfig::new(WORKERS, CALLERS), workers);
-    let pool_addr = runtime
-        .register_with_capacity::<_, Infallible>(pool, 64)
+    let pool_addr = app
+        .register_root::<_, Infallible>(pool, 64)
         .map_err(|e| anyhow::anyhow!("register pool: {e:?}"))?;
 
-    let driver = runtime
-        .register_with_capacity::<_, Infallible>(
+    let driver = app
+        .register_root::<_, Infallible>(
             Driver {
                 pool: pool_addr,
                 outcome: DriverOutcome::default(),
@@ -356,21 +356,16 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register driver: {e:?}"))?;
 
-    let result = runtime
+    let result = app
         .observe_result::<DriverOutcome, _, _>(driver)
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
 
-    runtime
-        .try_send(driver, DriverMsg::Begin)
+    app.try_send(driver, DriverMsg::Begin)
         .map_err(|e| anyhow::anyhow!("send Begin: {e:?}"))?;
 
     let outcome = result
         .wait(Duration::from_secs(10))
         .map_err(|e| anyhow::anyhow!("driver finishes: {e:?}"))?;
-
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
 
     Ok(Report {
         callers: CALLERS,

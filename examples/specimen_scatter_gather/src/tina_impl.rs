@@ -14,9 +14,9 @@ use std::time::Duration;
 use tina::prelude::*;
 use tina_runtime::sharded::{ScatterGatherConfig, ScatterGatherReport, ScatterGatherTargetOutcome};
 use tina_runtime::{
-    BoundedItems, CallOutcome, DefaultThreadedMailboxFactory, ScatterGatherEvent,
-    ScatterGatherOperations, ScatterGatherOperationsStart, ScatterGatherStartError,
-    ThreadedRuntime, bounded_batch, call_cancelable, call_request,
+    BoundedItems, CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, ScatterGatherEvent,
+    ScatterGatherOperations, ScatterGatherOperationsStart, ScatterGatherStartError, bounded_batch,
+    call_cancelable, call_request,
 };
 
 use crate::{
@@ -378,17 +378,28 @@ fn run_with_max_in_flight(
     max_in_flight: usize,
     prove_refill: bool,
 ) -> anyhow::Result<(Report, DriverOutcome)> {
-    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    Ok(
+        app.run_to_shutdown_reported(Duration::from_secs(5), move |app| {
+            run_with_max_in_flight_on(app, max_in_flight, prove_refill)
+        })?,
+    )
+}
 
+fn run_with_max_in_flight_on(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    max_in_flight: usize,
+    prove_refill: bool,
+) -> anyhow::Result<(Report, DriverOutcome)> {
     let mut workers = Vec::with_capacity(WORKERS);
     for w in 0..WORKERS as u64 {
-        let addr = runtime
-            .register_with_capacity::<_, Infallible>(Worker { id: w }, 16)
+        let addr = app
+            .register_root::<_, Infallible>(Worker { id: w }, 16)
             .map_err(|e| anyhow::anyhow!("register worker {w}: {e:?}"))?;
         workers.push(addr);
     }
 
-    let coord = runtime
+    let coord = app
         .register_split_service::<Coordinator, CoordEvent, CoordRequest, Infallible>(
             Coordinator {
                 workers,
@@ -406,8 +417,8 @@ fn run_with_max_in_flight(
             .enumerate(),
     )
     .expect("CLIENTS is the driver-owned request bound");
-    let driver = runtime
-        .register_with_capacity::<_, Infallible>(
+    let driver = app
+        .register_root::<_, Infallible>(
             Driver {
                 coord,
                 payloads,
@@ -419,17 +430,14 @@ fn run_with_max_in_flight(
         )
         .map_err(|e| anyhow::anyhow!("register driver: {e:?}"))?;
 
-    let result = runtime
+    let result = app
         .observe_result::<DriverOutcome, _, _>(driver)
         .map_err(|e| anyhow::anyhow!("register result waiter: {e:?}"))?;
-    runtime
-        .try_send(driver, DriverMsg::Begin)
+    app.try_send(driver, DriverMsg::Begin)
         .map_err(|e| anyhow::anyhow!("kick driver: {e:?}"))?;
     let outcome = result
         .wait(Duration::from_secs(10))
         .map_err(|e| anyhow::anyhow!("driver finishes: {e:?}"))?;
-
-    runtime.shutdown_report().ensure_clean()?;
 
     Ok((
         Report {

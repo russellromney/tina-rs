@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    DefaultThreadedMailboxFactory, StreamId, TcpConnectReply, TcpReadReply, TcpStreamCloseReply,
-    TcpWriteReply, ThreadedRuntime, tcp_close_stream, tcp_connect, tcp_read, tcp_write,
+    DefaultThreadedMailboxFactory, LocalSystem, StreamId, TcpConnectReply, TcpReadReply,
+    TcpStreamCloseReply, TcpWriteReply, tcp_close_stream, tcp_connect, tcp_read, tcp_write,
 };
 
 use crate::{REQUEST_IDS, Report, spawn_responder};
@@ -112,9 +112,29 @@ pub fn run() -> anyhow::Result<Report> {
     });
     let target = server_addr_rx.recv()?;
 
-    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
-    let address = runtime
-        .register_with_capacity::<_, Infallible>(
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    let runtime_result = app.run_to_shutdown_reported(Duration::from_secs(5), move |app| {
+        run_application(app, target)
+    });
+    let server_stop = server_done_tx
+        .send(())
+        .map_err(|_| anyhow::anyhow!("mux server stop receiver dropped"));
+    let server_join = server_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("mux server thread panicked"));
+    let arrival_order = runtime_result?;
+    server_stop?;
+    server_join?;
+
+    Ok(Report { arrival_order })
+}
+
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    target: SocketAddr,
+) -> anyhow::Result<Vec<u32>> {
+    let address = app
+        .register_root::<_, Infallible>(
             MuxClient {
                 target,
                 expected: REQUEST_IDS.len(),
@@ -124,26 +144,12 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register mux client: {e:?}"))?;
 
-    let result = runtime
+    let result = app
         .observe_result::<Vec<u32>, _, _>(address)
         .map_err(|e| anyhow::anyhow!("register result waiter: {e:?}"))?;
-    runtime
-        .try_send(address, MuxMsg::Begin)
+    app.try_send(address, MuxMsg::Begin)
         .map_err(|e| anyhow::anyhow!("kick mux client: {e:?}"))?;
-    let arrival_order = result
+    result
         .wait(Duration::from_secs(3))
-        .map_err(|e| anyhow::anyhow!("mux client finishes with arrivals: {e:?}"))?;
-
-    let runtime_shutdown = runtime.shutdown_report().ensure_clean();
-    let server_stop = server_done_tx
-        .send(())
-        .map_err(|_| anyhow::anyhow!("mux server stop receiver dropped"));
-    let server_join = server_thread
-        .join()
-        .map_err(|_| anyhow::anyhow!("mux server thread panicked"));
-    runtime_shutdown?;
-    server_stop?;
-    server_join?;
-
-    Ok(Report { arrival_order })
+        .map_err(|e| anyhow::anyhow!("mux client finishes with arrivals: {e:?}"))
 }

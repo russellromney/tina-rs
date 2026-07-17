@@ -91,8 +91,7 @@ fn one_request(addr: SocketAddr, root_cert_der: Vec<u8>, request: &[u8]) -> Vec<
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let server_name =
-        rustls::pki_types::ServerName::try_from("localhost").expect("server name");
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").expect("server name");
     let connection =
         rustls::ClientConnection::new(Arc::new(config), server_name).expect("client conn");
     let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("tcp connect");

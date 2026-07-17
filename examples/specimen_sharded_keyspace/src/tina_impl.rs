@@ -30,7 +30,9 @@ use std::time::Duration;
 use anyhow::Context;
 use tina::prelude::*;
 use tina_runtime::sharded::{ShardPlacement, ShardServiceTable, WrongShard};
-use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedMultiShardRuntime, call};
+use tina_runtime::{
+    CallOutcome, DefaultThreadedMailboxFactory, LocalMultiShardSystem, LocalSystem, call,
+};
 
 use crate::{Command, Report, SCRIPT, SHARD_RAW_IDS, parse_commands};
 
@@ -233,10 +235,17 @@ impl Driver {
 // ---------- Run ----------
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = ThreadedMultiShardRuntime::try_new(
-        SHARD_RAW_IDS.iter().copied().map(AppShard),
-        DefaultThreadedMailboxFactory,
-    )?;
+    let mut builder = LocalSystem::multi_shard(DefaultThreadedMailboxFactory);
+    for raw in SHARD_RAW_IDS {
+        builder = builder.shard(AppShard(raw));
+    }
+    let app = builder.try_build()?;
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), run_application)?)
+}
+
+fn run_application(
+    app: &LocalMultiShardSystem<AppShard, DefaultThreadedMailboxFactory>,
+) -> anyhow::Result<Report> {
     let placement = ShardPlacement::new(
         "specimen-sharded-keyspace",
         SHARD_RAW_IDS.iter().copied().map(ShardId::new).collect(),
@@ -250,7 +259,7 @@ pub fn run() -> anyhow::Result<Report> {
     // settlement and composes with `.context(...)`.
     let placement_for_register = placement.clone();
     let table = ShardServiceTable::try_from_placement(placement.clone(), |shard| {
-        runtime.register_with_capacity_on::<Store, Infallible>(
+        app.register_root_on::<Store, Infallible>(
             shard,
             Store {
                 placement: placement_for_register.clone(),
@@ -263,8 +272,8 @@ pub fn run() -> anyhow::Result<Report> {
 
     // Driver lives on the first shard; it walks the script one
     // command at a time via `call(...).then(...)`.
-    let driver = runtime
-        .register_with_capacity_on::<Driver, Infallible>(
+    let driver = app
+        .register_root_on::<Driver, Infallible>(
             ShardId::new(SHARD_RAW_IDS[0]),
             Driver {
                 table: table.clone(),
@@ -278,19 +287,16 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register driver: {e:?}"))?;
 
-    // Typed result waiter on the multi-shard runtime. No
+    // Typed result waiter on the multi-shard system. No
     // `Arc<Mutex<Option<Report>>>` polling.
-    let waiter = runtime
+    let waiter = app
         .observe_result::<Report, _, _>(driver)
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
 
-    runtime
-        .try_send(driver, DriverMsg::Begin)
+    app.try_send(driver, DriverMsg::Begin)
         .map_err(|e| anyhow::anyhow!("send Begin: {e:?}"))?;
 
-    let report = waiter
+    waiter
         .wait(Duration::from_secs(5))
-        .map_err(|e| anyhow::anyhow!("driver did not produce a report: {e:?}"))?;
-    runtime.shutdown_report().ensure_clean()?;
-    Ok(report)
+        .map_err(|e| anyhow::anyhow!("driver did not produce a report: {e:?}"))
 }

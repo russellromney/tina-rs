@@ -23,14 +23,13 @@
 //! cancel effect per rail).
 
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
     BoundedItems, CallOutcome, CallReplyRejectedReason, DefaultThreadedMailboxFactory,
-    DeferredReplyRejectedReason, RequestScope, RequestScopeId, RuntimeEventKind, ScopeCancelCause,
-    SleepReply, ThreadedRuntime, bounded_batch, call_cancelable_request, sleep,
+    DeferredReplyRejectedReason, LocalSystem, RequestScope, RequestScopeId, RuntimeEventKind,
+    ScopeCancelCause, SleepReply, bounded_batch, call_cancelable_request, sleep,
 };
 
 /// Number of child rails the driver dispatches per request.
@@ -310,32 +309,32 @@ impl Driver {
 
 // --- Run ------------------------------------------------------------------
 
-/// Runs the specimen end-to-end against a live threaded runtime.
+/// Runs the specimen end-to-end against a live local system.
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
-    let shutdown = runtime.shutdown_handle();
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), run_application)?)
+}
 
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+) -> anyhow::Result<Report> {
     let mut workers = Vec::with_capacity(FANOUT as usize);
     for _ in 0..FANOUT {
         workers.push(
-            runtime
-                .register_split_service::<Worker, WorkerEvent, WorkerRequest, Infallible>(
-                    Worker {
-                        work: Duration::from_millis(WORK_MS),
-                        held: None,
-                    },
-                    8,
-                )
-                .map_err(|e| anyhow::anyhow!("register worker: {e:?}"))?
-                .requests,
+            app.register_split_service::<Worker, WorkerEvent, WorkerRequest, Infallible>(
+                Worker {
+                    work: Duration::from_millis(WORK_MS),
+                    held: None,
+                },
+                8,
+            )
+            .map_err(|e| anyhow::anyhow!("register worker: {e:?}"))?
+            .requests,
         );
     }
 
-    let driver = runtime
-        .register_with_capacity::<_, Infallible>(
+    let driver = app
+        .register_root::<_, Infallible>(
             Driver {
                 workers,
                 scope: None,
@@ -359,12 +358,11 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register driver: {e:?}"))?;
 
-    let result = runtime
+    let result = app
         .observe_result::<Report, _, _>(driver)
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
 
-    runtime
-        .try_send(driver, DriverMsg::Begin)
+    app.try_send(driver, DriverMsg::Begin)
         .map_err(|e| anyhow::anyhow!("send Begin: {e:?}"))?;
 
     let mut report = result
@@ -389,11 +387,7 @@ pub fn run() -> anyhow::Result<Report> {
             })
             .count() as u32
     }
-    report.late_rejected_in_trace = count_rejected(&runtime.trace());
-
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
+    report.late_rejected_in_trace = count_rejected(&app.trace());
 
     Ok(report)
 }

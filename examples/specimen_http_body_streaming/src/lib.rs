@@ -89,9 +89,7 @@ pub fn slow_reader_client(addr: SocketAddr, path: &str) -> (usize, bool, u128) {
         .set_read_timeout(Some(Duration::from_secs(30)))
         .expect("read timeout");
     let request = format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
-    stream
-        .write_all(request.as_bytes())
-        .expect("write request");
+    stream.write_all(request.as_bytes()).expect("write request");
     stream.flush().expect("flush request");
 
     let start = Instant::now();

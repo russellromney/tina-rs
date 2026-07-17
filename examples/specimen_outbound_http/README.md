@@ -49,15 +49,16 @@ Three first-class HTTP pieces, driven from the host:
   `HttpServerConfig::dev()` plus
   `limits.keepalive_idle_timeout = Some(...)`; ties the counter
   address to the network. Address comes back via
-  `runtime.observe_next_bound()`.
-- **`build_keepalive_pool`** — registers one pool isolate plus one
-  `KeepaliveConnection` isolate. The script acquires a `PoolLease`,
-  sends every request through the leased connection, releases the
-  lease, then calls `shutdown_keepalive_pool(...)` so close, drain,
-  and per-connection stop outcomes are asserted together. The trace
-  asserts the server saw exactly one `TcpAccept` for the whole
-  sequence.
-- **Host script** — uses `ThreadedRuntime::call_blocking` for the
+  `app.observe_next_bound()`.
+- **`InstallKeepalivePool`** — `app.install_keepalive_pool(...)`
+  atomically installs one pool isolate plus one `KeepaliveConnection`
+  isolate and returns an owned handle. The script acquires a
+  `PoolLease`, sends every request through the leased connection,
+  releases the lease, then calls the consuming
+  `pool.close_and_drain(...)` so close, drain, and per-connection stop
+  outcomes are asserted together. The trace asserts the server saw
+  exactly one `TcpAccept` for the whole sequence.
+- **Host script** — uses `LocalSystem::call_blocking` for the
   test/specimen boundary. This removes the old one-off Driver isolate
   without changing the service truth: acquire, request, release, close
   are still ordinary typed Tina calls.
@@ -87,12 +88,12 @@ What feels better:
 What feels worse:
 
 - **Pool lifecycle is explicit.** The host must acquire and release,
-  then call `shutdown_keepalive_pool(...)` so pool close, drain, and
-  per-connection stop buckets are all named and testable. That is more
-  ceremony than `reqwest::Client`, but every resource transition is
-  visible.
-- **Configuring one runtime to host both server and client** means
+  then call the consuming `close_and_drain(...)` so pool close, drain,
+  and per-connection stop buckets are all named and testable. That is
+  more ceremony than `reqwest::Client`, but every resource transition
+  is visible and a double close is unrepresentable.
+- **Configuring one system to host both server and client** means
   the spawn order matters (server first, then pool), and shutdown is
-  `shutdown_keepalive_pool(...)` + listener stop + checked
-  `runtime.shutdown()`.
-  Tokio's `with_graceful_shutdown` is shorter.
+  `close_and_drain(...)` + listener stop inside
+  `run_to_shutdown_reported`, which bounds and observes the final
+  shutdown. Tokio's `with_graceful_shutdown` is shorter.

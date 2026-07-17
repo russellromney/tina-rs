@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use tina::prelude::*;
 use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ListenerId, StreamId, TcpAcceptReply, TcpBindReply,
-    TcpListenerCloseReply, TcpReadReply, TcpStreamCloseReply, TcpWriteReply, ThreadedRuntime, call,
+    CallOutcome, DefaultThreadedMailboxFactory, ListenerId, LocalSystem, StreamId, TcpAcceptReply,
+    TcpBindReply, TcpListenerCloseReply, TcpReadReply, TcpStreamCloseReply, TcpWriteReply, call,
     tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream, tcp_read, tcp_write,
 };
 
@@ -261,13 +261,18 @@ impl Listener {
 // -------------------------------------------------------------------
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)?;
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), run_application)?)
+}
 
-    let store = runtime
-        .register_with_capacity::<_, Infallible>(Store::default(), 16)
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+) -> anyhow::Result<Report> {
+    let store = app
+        .register_root::<_, Infallible>(Store::default(), 16)
         .map_err(|e| anyhow::anyhow!("register store: {e:?}"))?;
-    let listener = runtime
-        .register_with_capacity::<_, Infallible>(
+    let listener = app
+        .register_root::<_, Infallible>(
             Listener {
                 bind_addr: "127.0.0.1:0".parse()?,
                 store,
@@ -277,9 +282,8 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register listener: {e:?}"))?;
 
-    let bound = runtime.observe_next_bound()?;
-    runtime
-        .try_send(listener, ListenerMsg::Start)
+    let bound = app.observe_next_bound()?;
+    app.try_send(listener, ListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start listener: {e:?}"))?;
     let addr = bound
         .wait(Duration::from_secs(3))
@@ -289,7 +293,6 @@ pub fn run() -> anyhow::Result<Report> {
         .join()
         .map_err(|_| anyhow::anyhow!("client thread panicked"))??;
 
-    runtime.shutdown_report().ensure_clean()?;
     Ok(parse_response(&response))
 }
 

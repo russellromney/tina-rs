@@ -5,7 +5,10 @@ use specimen_retrying_outbound_http::{expected_report, tina_impl, tokio_impl};
 
 #[test]
 fn tokio_smoke() {
-    assert_eq!(tokio_impl::run().expect("tokio side ran"), expected_report());
+    assert_eq!(
+        tokio_impl::run().expect("tokio side ran"),
+        expected_report()
+    );
 }
 
 #[test]

@@ -17,16 +17,17 @@
 //!   `Arc<Mutex>`, no mpsc.
 
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tina::prelude::*;
 use tina_runtime::{
-    DefaultThreadedMailboxFactory, HostBurstOutcomes, SingleCallGate, SleepReply, ThreadedRuntime,
+    DefaultThreadedMailboxFactory, HostBurstOutcomes, LocalSystem, SingleCallGate, SleepReply,
     sleep,
 };
 
 use crate::{BURST_JOBS, JOB_WORK_MS, QUEUE_CAPACITY, Report};
+
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 enum WorkerMsg {
@@ -108,14 +109,15 @@ impl Worker {
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
-    let shutdown = runtime.shutdown_handle();
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    Ok(app.run_to_shutdown_reported(SHUTDOWN_TIMEOUT, run_application)?)
+}
 
-    let worker_addr = runtime
-        .register_with_capacity::<_, Infallible>(
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+) -> anyhow::Result<Report> {
+    let worker_addr = app
+        .register_root::<_, Infallible>(
             Worker {
                 work: Duration::from_millis(JOB_WORK_MS),
                 gate: SingleCallGate::new(),
@@ -128,7 +130,7 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|e| anyhow::anyhow!("register worker: {e:?}"))?;
 
-    let waiter = runtime
+    let waiter = app
         .observe_result::<Report, _, _>(worker_addr)
         .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
 
@@ -136,7 +138,7 @@ pub fn run() -> anyhow::Result<Report> {
     // `HostBurstOutcomes` (the host burst outcome helpers).
     let outcomes = HostBurstOutcomes::new();
     for n in 0..BURST_JOBS {
-        let _ = runtime.try_send_outcome(worker_addr, WorkerMsg::Submit(n), &outcomes);
+        let _ = app.try_send_outcome(worker_addr, WorkerMsg::Submit(n), &outcomes);
     }
     outcomes
         .wait_complete(Duration::from_secs(2))
@@ -146,29 +148,23 @@ pub fn run() -> anyhow::Result<Report> {
     // Drain rides the same bounded mailbox; `send_observed_until`
     // retries on `MailboxFull` / `IngressFull` up to the deadline.
     let close_deadline = Instant::now() + Duration::from_secs(2);
-    runtime
-        .send_observed_until(
-            worker_addr,
-            close_deadline,
-            Duration::from_millis(2),
-            || WorkerMsg::Drain,
-        )
-        .map_err(|e| anyhow::anyhow!("Drain send: {e:?}"))?;
+    app.send_observed_until(
+        worker_addr,
+        close_deadline,
+        Duration::from_millis(2),
+        || WorkerMsg::Drain,
+    )
+    .map_err(|e| anyhow::anyhow!("Drain send: {e:?}"))?;
 
     let report = waiter
         .wait(Duration::from_secs(5))
         .map_err(|e| anyhow::anyhow!("worker did not finish: {e:?}"))?;
 
-    let final_report = Report {
+    Ok(Report {
         items_admitted: snap.admitted,
         items_full: snap.mailbox_full + snap.ingress_full,
         items_processed: report.items_processed,
         shutdown_observed: report.shutdown_observed,
         exit_clean: report.exit_clean,
-    };
-
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
-    Ok(final_report)
+    })
 }

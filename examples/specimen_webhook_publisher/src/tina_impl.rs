@@ -17,7 +17,6 @@
 //! `["1", "2", "3"]` regardless of which shape produced them.
 
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tina::prelude::*;
@@ -25,7 +24,7 @@ use tina_reqwest_bridge::{
     ReqwestAddress, ReqwestCallError, ReqwestCallOutcome, ReqwestConfig, ReqwestMsg,
     ReqwestRequest, ReqwestResponse, ReqwestWorker, flatten_outcome, send_request,
 };
-use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, call};
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, call};
 
 use crate::{Report, WebhookServer};
 
@@ -163,17 +162,31 @@ fn check_flat(result: &Result<ReqwestResponse, ReqwestCallError>) {
 }
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = Arc::new(ThreadedRuntime::try_new(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-    )?);
-    let shutdown = runtime.shutdown_handle();
-
     let webhook = WebhookServer::spawn();
     let url = webhook.url();
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    let runtime_result =
+        app.run_to_shutdown_reported(Duration::from_secs(5), move |app| run_application(app, url));
+    // Let the webhook server's writer task land before snapshotting.
+    std::thread::sleep(Duration::from_millis(20));
+    let bodies = webhook.snapshot();
+    let webhook_shutdown = webhook.stop();
+    match (runtime_result, webhook_shutdown) {
+        (Ok(()), Ok(())) => Ok(Report { bodies }),
+        (Err(runtime), Ok(())) => Err(runtime.into()),
+        (Ok(()), Err(webhook)) => Err(webhook),
+        (Err(runtime), Err(webhook)) => Err(anyhow::anyhow!(
+            "Tina runtime shutdown failed: {runtime:#}; webhook shutdown also failed: {webhook:#}"
+        )),
+    }
+}
 
-    let bridge =
-        ReqwestWorker::<SingleShard>::install(&runtime, ReqwestConfig::default()).expect("install");
+fn run_application(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    url: String,
+) -> anyhow::Result<()> {
+    let bridge = ReqwestWorker::<SingleShard>::install_local(app, ReqwestConfig::default())
+        .map_err(|e| anyhow::anyhow!("install reqwest bridge: {e}"))?;
 
     let driver = Driver {
         http: bridge.address,
@@ -181,38 +194,25 @@ pub fn run() -> anyhow::Result<Report> {
         counter: 0,
         timeout: Duration::from_secs(2),
     };
-    let driver_addr = runtime
-        .register_with_capacity::<_, Infallible>(driver, 8)
-        .expect("register driver");
+    let driver_addr = app
+        .register_root::<_, Infallible>(driver, 8)
+        .map_err(|e| anyhow::anyhow!("register driver: {e:?}"))?;
 
-    let complete = runtime.observe_isolate_complete(driver_addr)?;
+    let complete = app
+        .observe_isolate_complete(driver_addr)
+        .map_err(|e| anyhow::anyhow!("observe isolate complete: {e:?}"))?;
 
-    runtime
-        .try_send(driver_addr, DriverMsg::Run(url))
-        .expect("kick driver");
+    app.try_send(driver_addr, DriverMsg::Run(url))
+        .map_err(|e| anyhow::anyhow!("kick driver: {e:?}"))?;
 
-    complete.wait(Duration::from_secs(10)).expect(
-        "tina driver did not stop before timeout — the bridge or \
+    complete.wait(Duration::from_secs(10)).map_err(|_| {
+        anyhow::anyhow!(
+            "tina driver did not stop before timeout — the bridge or \
              the webhook never finished. The webhook bodies assertion \
-             would otherwise blame the wrong layer.",
-    );
+             would otherwise blame the wrong layer."
+        )
+    })?;
 
-    // Let the webhook server's writer task land before snapshotting.
-    std::thread::sleep(Duration::from_millis(20));
-    let bodies = webhook.snapshot();
-    let webhook_shutdown = webhook.stop();
-    let runtime_shutdown: anyhow::Result<()> = (|| {
-        let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-        terminal.ensure_clean()?;
-        Ok(())
-    })();
-    drop(runtime);
-    match (webhook_shutdown, runtime_shutdown) {
-        (Ok(()), Ok(())) => Ok(Report { bodies }),
-        (Err(webhook), Ok(())) => Err(webhook),
-        (Ok(()), Err(runtime)) => Err(runtime),
-        (Err(webhook), Err(runtime)) => Err(anyhow::anyhow!(
-            "webhook shutdown failed: {webhook:#}; Tina runtime shutdown also failed: {runtime:#}"
-        )),
-    }
+    bridge.closer.close();
+    Ok(())
 }

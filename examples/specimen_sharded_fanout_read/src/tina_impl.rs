@@ -11,9 +11,9 @@ use tina_runtime::sharded::{
     ShardRequestServiceTable,
 };
 use tina_runtime::{
-    BoundedItems, CallOutcome, DefaultThreadedMailboxFactory, ScatterGatherEvent,
-    ScatterGatherOperations, ScatterGatherOperationsStart, ScatterGatherStartError,
-    ThreadedMultiShardRuntime, call_cancelable_request,
+    BoundedItems, CallOutcome, DefaultThreadedMailboxFactory, LocalMultiShardSystem, LocalSystem,
+    ScatterGatherEvent, ScatterGatherOperations, ScatterGatherOperationsStart,
+    ScatterGatherStartError, call_cancelable_request,
 };
 
 use crate::{Report, SEED_VALUES, SHARD_RAW_IDS};
@@ -173,11 +173,17 @@ impl ScatterCoord {
 // ---------- Run -----------------------------------------------------------
 
 pub fn run() -> anyhow::Result<Report> {
-    let runtime = ThreadedMultiShardRuntime::try_new(
-        SHARD_RAW_IDS.iter().copied().map(AppShard),
-        DefaultThreadedMailboxFactory,
-    )?;
+    let mut builder = LocalSystem::multi_shard(DefaultThreadedMailboxFactory);
+    for raw in SHARD_RAW_IDS {
+        builder = builder.shard(AppShard(raw));
+    }
+    let app = builder.try_build()?;
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), run_application)?)
+}
 
+fn run_application(
+    app: &LocalMultiShardSystem<AppShard, DefaultThreadedMailboxFactory>,
+) -> anyhow::Result<Report> {
     let placement = ShardPlacement::new(
         "specimen-sharded-fanout-read",
         SHARD_RAW_IDS.iter().copied().map(ShardId::new).collect(),
@@ -190,7 +196,7 @@ pub fn run() -> anyhow::Result<Report> {
             .iter()
             .position(|candidate| *candidate == shard)
             .expect("registration shard came from placement")];
-        runtime.register_request_service_on(shard, ShardCounter { shard, value }, 8)
+        app.register_request_service_on(shard, ShardCounter { shard, value }, 8)
     })
     .map_err(|error| anyhow::anyhow!("register shard counters: {error}"))?;
 
@@ -204,7 +210,7 @@ pub fn run() -> anyhow::Result<Report> {
         .validate()
         .map_err(|error| anyhow::anyhow!("scatter/gather config: {error}"))?;
 
-    let coord = runtime
+    let coord = app
         .register_split_service_on::<ScatterCoord, CoordEvent, CoordRequest, Infallible>(
             ShardId::new(SHARD_RAW_IDS[0]),
             ScatterCoord {
@@ -216,7 +222,7 @@ pub fn run() -> anyhow::Result<Report> {
         )
         .map_err(|error| anyhow::anyhow!("register coordinator: {error:?}"))?;
 
-    let outcome = runtime
+    let outcome = app
         .call_blocking_request(
             coord.requests,
             CoordRequest::ReadAll,
@@ -241,7 +247,6 @@ pub fn run() -> anyhow::Result<Report> {
     let total_sum = validated_total(&report)?;
     let shards_replied = report.replied_count() as u32;
 
-    runtime.shutdown_report().ensure_clean()?;
     Ok(Report {
         total_sum,
         shards_replied,
