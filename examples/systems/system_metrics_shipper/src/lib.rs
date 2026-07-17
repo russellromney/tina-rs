@@ -22,9 +22,10 @@ use tina_runtime::lifecycle::{
     ServiceTopology, ShutdownChoreography, ShutdownStep, StepOutcome, TopologyComponent,
 };
 use tina_runtime::{
-    AdmitDecision, CallOutcome, DefaultThreadedMailboxFactory, DrainStage, DrainState,
-    LocalPermitGate, LocalPermitName, Permit, ThreadedRuntime, ThreadedShutdownHandle,
-    call_request, sleep,
+    AdmitDecision, CallOutcome, ConcurrencyParkError, ConcurrencyParkTicket,
+    ConcurrencyPendingReplies, ConcurrencyReplyError, DefaultThreadedMailboxFactory, DrainStage,
+    DrainState, LocalPermitGate, LocalPermitName, LocalSystem, Permit, call_request,
+    request_effect_after_concurrency_park, sleep,
 };
 
 /// One submitted metric event. Payload is opaque; the specimen only cares
@@ -144,6 +145,9 @@ pub struct ShipperStats {
     pub ticks_fired_useful: u64,
     pub ticks_fired_stale: u64,
     pub ticks_fired_idle: u64,
+    pub await_waiters_high_water: usize,
+    pub await_caller_gone: u64,
+    pub await_full_rejects: u64,
 }
 
 /// Snapshot of every sink-side cap and pressure counter.
@@ -188,9 +192,6 @@ pub enum ShipperRequest {
     Stop,
 }
 
-/// Split-service envelope for the shipper isolate.
-pub type ShipperMsg = tina::ServiceMessage<ShipperEvent, ShipperRequest>;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShipperReply {
     Accepted,
@@ -199,6 +200,8 @@ pub enum ShipperReply {
     Stats(ShipperStats),
     /// [`ShipperRequest::AwaitRouted`] resolved; `routed` is delivered + lost.
     Routed { routed: u64 },
+    AwaitBusy,
+    RouteWaitStopped { routed: u64 },
     Stopped {
         flushed_on_drain: usize,
         drained_batches: usize,
@@ -229,7 +232,7 @@ pub enum SinkReply {
     Stats(SinkStats),
 }
 
-type ShipperAddr = Address<ShipperMsg, ShipperReply>;
+type ShipperAddr = tina::ServiceRequestAddress<ShipperEvent, ShipperRequest, ShipperReply>;
 type SinkAddr = tina::ServiceRequestAddress<SinkEvent, SinkRequest, SinkReply>;
 
 struct Shipper {
@@ -250,7 +253,8 @@ struct Shipper {
     drain: DrainState,
     pending_stop: Option<RequestContext<ShipperReply>>,
     /// Host wait for "burst has reached the sink (or been lost)".
-    pending_await: Option<(u64, RequestContext<ShipperReply>)>,
+    pending_await: ConcurrencyPendingReplies<u64, ShipperReply>,
+    pending_await_ticket: Option<(u64, ConcurrencyParkTicket<u64>)>,
     /// Events successfully delivered to the sink (Ack path).
     events_delivered: u64,
     drained_events: usize,
@@ -284,7 +288,10 @@ impl Shipper {
     ) -> RequestEffect<Self> {
         match request {
             ShipperRequest::Submit { event } => self.on_submit(event, call),
-            ShipperRequest::Stats => call.reply(ShipperReply::Stats(self.snapshot())),
+            ShipperRequest::Stats => {
+                self.sweep_await();
+                call.reply(ShipperReply::Stats(self.snapshot()))
+            }
             ShipperRequest::AwaitRouted { target } => self.on_await_routed(target, call),
             ShipperRequest::Stop => self.on_stop(call),
         }
@@ -305,7 +312,8 @@ impl Shipper {
                 .catch_up(RecurringCatchUp::Skip),
             drain: DrainState::new(),
             pending_stop: None,
-            pending_await: None,
+            pending_await: ConcurrencyPendingReplies::with_capacity("shipper.await_routed", 1),
+            pending_await_ticket: None,
             events_delivered: 0,
             drained_events: 0,
             drained_batches: 0,
@@ -317,7 +325,8 @@ impl Shipper {
     }
 
     fn routed_total(&self) -> u64 {
-        self.events_delivered + self.stats.events_lost_on_flush
+        self.events_delivered
+            .saturating_add(self.stats.events_lost_on_flush)
     }
 
     fn on_await_routed(
@@ -325,36 +334,76 @@ impl Shipper {
         target: u64,
         call: RequestCall<'_, Self>,
     ) -> RequestEffect<Self> {
+        self.sweep_await();
         if self.routed_total() >= target {
             return call.reply(ShipperReply::Routed {
                 routed: self.routed_total(),
             });
         }
-        if self.pending_await.is_some() {
-            // Specimen hosts issue one await at a time; a second waiter is a
-            // real policy reject rather than a silent overwrite.
-            return call.reject(tina::CallRejectedReason::UnsupportedMessage);
-        }
-        call.capture(|req| {
-            self.pending_await = Some((target, req));
-            noop()
-        })
+        let (ticket, permit) = match self.pending_await.park_request(target, call) {
+            Ok(parked) => parked,
+            Err(ConcurrencyParkError::Admission { call, .. })
+            | Err(ConcurrencyParkError::DuplicateKey { call, .. })
+            | Err(ConcurrencyParkError::PendingFull { call, .. }) => {
+                return call.reply(ShipperReply::AwaitBusy);
+            }
+        };
+        self.pending_await_ticket = Some((target, ticket));
+        request_effect_after_concurrency_park(permit, noop())
     }
 
     fn maybe_complete_await(&mut self) -> Effect<Self> {
-        let Some((target, req)) = self.pending_await.take() else {
+        self.sweep_await();
+        let Some((target, _)) = self.pending_await_ticket.as_ref() else {
             return noop();
         };
-        if self.routed_total() >= target {
-            return reply_to(
-                req,
-                ShipperReply::Routed {
-                    routed: self.routed_total(),
-                },
-            );
+        if self.routed_total() < *target {
+            return noop();
         }
-        self.pending_await = Some((target, req));
-        noop()
+        let (_, ticket) = self
+            .pending_await_ticket
+            .take()
+            .expect("checked pending await ticket");
+        self.reply_await_ticket(
+            ticket,
+            ShipperReply::Routed {
+                routed: self.routed_total(),
+            },
+        )
+    }
+
+    fn settle_await_on_stop(&mut self) -> Effect<Self> {
+        self.sweep_await();
+        let Some((_, ticket)) = self.pending_await_ticket.take() else {
+            return noop();
+        };
+        self.reply_await_ticket(
+            ticket,
+            ShipperReply::RouteWaitStopped {
+                routed: self.routed_total(),
+            },
+        )
+    }
+
+    fn reply_await_ticket(
+        &mut self,
+        ticket: ConcurrencyParkTicket<u64>,
+        reply: ShipperReply,
+    ) -> Effect<Self> {
+        match self.pending_await.reply_ticket(ticket, reply) {
+            Ok(effect) => effect,
+            Err(ConcurrencyReplyError::CallerGone { .. }) => noop(),
+            Err(ConcurrencyReplyError::Missing { .. })
+            | Err(ConcurrencyReplyError::StaleTicket { .. }) => {
+                panic!("shipper await ticket must remain owned until settlement")
+            }
+        }
+    }
+
+    fn sweep_await(&mut self) {
+        if self.pending_await.sweep() > 0 {
+            self.pending_await_ticket = None;
+        }
     }
 
     fn on_submit(&mut self, event: Event, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
@@ -408,10 +457,14 @@ impl Shipper {
 
         if self.buffer.is_empty() && self.flush_gate.is_idle() {
             self.drain.finish();
-            return call.reply(ShipperReply::Stopped {
-                flushed_on_drain: self.drained_events,
-                drained_batches: self.drained_batches,
-            });
+            let await_effect = self.settle_await_on_stop();
+            return call.reply_and(
+                ShipperReply::Stopped {
+                    flushed_on_drain: self.drained_events,
+                    drained_batches: self.drained_batches,
+                },
+                vec![await_effect],
+            );
         }
         call.capture(|req| {
             self.pending_stop = Some(req);
@@ -452,7 +505,7 @@ impl Shipper {
         let succeeded = matches!(outcome, CallOutcome::Replied(SinkReply::Ack));
         if succeeded {
             self.drain.record_complete();
-            self.events_delivered += count as u64;
+            self.events_delivered = self.events_delivered.saturating_add(count as u64);
             match kind {
                 FlushKind::Size => self.stats.batches_flushed_by_size += 1,
                 FlushKind::Time => self.stats.batches_flushed_by_time += 1,
@@ -465,7 +518,10 @@ impl Shipper {
         } else {
             self.drain.record_cancelled_or_retired();
             self.stats.flush_failures += 1;
-            self.stats.events_lost_on_flush += count as u64;
+            self.stats.events_lost_on_flush = self
+                .stats
+                .events_lost_on_flush
+                .saturating_add(count as u64);
         }
 
         let drain_done =
@@ -478,7 +534,7 @@ impl Shipper {
                     drained_batches: self.drained_batches,
                 };
                 // Also release any host await so it does not hang across stop.
-                let await_effect = self.maybe_complete_await();
+                let await_effect = self.settle_await_on_stop();
                 return batch(vec![reply_to(req, reply), await_effect]);
             }
             return self.maybe_complete_await();
@@ -517,13 +573,13 @@ impl Shipper {
             SinkRequest::Flush { batch },
             self.flush_timeout,
         )
-        .then(move |outcome| {
-            ShipperMsg::Event(ShipperEvent::FlushDone {
+        .then_service_event(move |outcome| {
+            ShipperEvent::FlushDone {
                 kind,
                 count,
                 permit,
                 outcome,
-            })
+            }
         })
     }
 
@@ -532,7 +588,7 @@ impl Shipper {
         self.stats.ticks_armed += 1;
         match decision {
             RecurringTickDecision::Sleep { delay, token, .. } => {
-                sleep(delay).then(move |_| ShipperMsg::Event(ShipperEvent::Tick { token }))
+                sleep(delay).then_service_event(move |_| ShipperEvent::Tick { token })
             }
             RecurringTickDecision::Skip(report) => {
                 // Skip means whole periods were missed since this isolate
@@ -549,7 +605,12 @@ impl Shipper {
     }
 
     fn snapshot(&self) -> ShipperStats {
-        self.stats
+        let mut stats = self.stats;
+        let await_report = self.pending_await.report();
+        stats.await_waiters_high_water = await_report.parked_high_water;
+        stats.await_caller_gone = await_report.caller_gone_count;
+        stats.await_full_rejects = await_report.admission.full_count;
+        stats
     }
 }
 
@@ -646,7 +707,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
         // Force buffer overflow: parallel callers + slow sink + small
         // buffer. Each in-flight flush blocks for sink_flush_delay_ms so
         // the buffer fills and the next Submit gets a typed Dropped.
-        events: config.events * 4,
+        events: config.events.saturating_mul(4),
         callers: 8,
         buffer_capacity: (config.buffer_capacity / 2).max(2),
         batch_size: (config.batch_size / 2).max(1),
@@ -670,7 +731,9 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
 
 pub fn run_steady(config: &RunConfig) -> anyhow::Result<SteadyReport> {
     let world = World::start(config)?;
-    let outcomes = world.submit_burst(config.events, config.callers, false)?;
+    // The steady probe isolates normal service behavior. Concurrency pressure
+    // belongs to `run_overload`, where Full and Dropped are asserted directly.
+    let outcomes = world.submit_burst(config.events, 1, true)?;
     let mut accepted = 0;
     let mut dropped_full = 0;
     let mut stopping_rejects = 0;
@@ -721,7 +784,10 @@ pub fn run_overload(config: &RunConfig) -> anyhow::Result<OverloadReport> {
     world.wait_for_flushed_events(accepted, Duration::from_secs(3))?;
     let stats = world.shipper_stats()?;
     let sink = world.sink_stats()?;
-    let _ = world.stop_and_shutdown()?;
+    anyhow::ensure!(
+        world.stop_and_shutdown()?,
+        "overload run service or owner shutdown not clean"
+    );
     Ok(OverloadReport {
         submitted: outcomes.len(),
         accepted,
@@ -757,9 +823,9 @@ pub fn run_shutdown(config: &RunConfig) -> anyhow::Result<ShutdownReport> {
     let mut choreo = ShutdownChoreography::new("system_metrics_shipper");
 
     let t_drain = std::time::Instant::now();
-    let stop_outcome = world.runtime.call_blocking(
+    let stop_outcome = world.app.call_blocking_request(
         world.shipper,
-        ShipperMsg::Request(ShipperRequest::Stop),
+        ShipperRequest::Stop,
         Duration::from_millis(config.stop_timeout_ms),
     )?;
     let (flushed_on_drain, drained_batches, drain_clean) = match stop_outcome {
@@ -804,14 +870,14 @@ pub fn run_shutdown(config: &RunConfig) -> anyhow::Result<ShutdownReport> {
     // StopIngress sits before DrainInFlight; the invariant check still
     // proves the shipper is in the right state, just outside the
     // ordered choreography.
-    let stopping = world.runtime.call_blocking(
+    let stopping = world.app.call_blocking_request(
         world.shipper,
-        ShipperMsg::Request(ShipperRequest::Submit {
+        ShipperRequest::Submit {
             event: Event {
                 key: "after-stop".into(),
                 value: 0,
             },
-        }),
+        },
         Duration::from_millis(config.call_timeout_ms),
     )?;
     anyhow::ensure!(
@@ -1004,8 +1070,7 @@ pub fn lifecycle_for_drain_stage(stage: DrainStage) -> Lifecycle {
 }
 
 struct World {
-    runtime: Arc<ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>>,
-    shutdown: ThreadedShutdownHandle,
+    app: LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
     shipper: ShipperAddr,
     sink: SinkAddr,
     call_timeout: Duration,
@@ -1014,11 +1079,8 @@ struct World {
 
 impl World {
     fn start(config: &RunConfig) -> anyhow::Result<Self> {
-        let runtime = Arc::new(ThreadedRuntime::try_new(
-            SingleShard,
-            DefaultThreadedMailboxFactory,
-        )?);
-        let sink = runtime
+        let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+        let sink = app
             .register_split_service::<Sink, SinkEvent, SinkRequest, Infallible>(
                 Sink::new(
                     config.sink_mailbox,
@@ -1029,22 +1091,15 @@ impl World {
             )
             .map_err(|e| anyhow::anyhow!("register sink: {e:?}"))?
             .requests;
-        let shipper = runtime
+        let shipper = app
             .register_split_service::<Shipper, ShipperEvent, ShipperRequest, Infallible>(
                 Shipper::new(sink, config),
                 config.shipper_mailbox,
             )
             .map_err(|e| anyhow::anyhow!("register shipper: {e:?}"))?
-            .requests
-            .address()
-            .address();
-        // Cloneable shutdown handle: lets the host drive runtime
-        // teardown without `Arc::try_unwrap(runtime)` once the burst
-        // threads have joined.
-        let shutdown = runtime.shutdown_handle();
+            .requests;
         Ok(Self {
-            runtime,
-            shutdown,
+            app,
             shipper,
             sink,
             call_timeout: Duration::from_millis(config.call_timeout_ms),
@@ -1061,14 +1116,14 @@ impl World {
         if sequential || callers <= 1 {
             let mut outcomes = Vec::with_capacity(events);
             for i in 0..events {
-                outcomes.push(self.runtime.call_blocking(
+                outcomes.push(self.app.call_blocking_request(
                     self.shipper,
-                    ShipperMsg::Request(ShipperRequest::Submit {
+                    ShipperRequest::Submit {
                         event: Event {
                             key: format!("k{i}"),
                             value: i as i64,
                         },
-                    }),
+                    },
                     self.call_timeout,
                 )?);
             }
@@ -1076,51 +1131,53 @@ impl World {
         }
         let barrier = Arc::new(Barrier::new(callers + 1));
         let per_caller = events.div_ceil(callers);
-        let mut threads = Vec::with_capacity(callers);
-        for caller in 0..callers {
-            let rt = Arc::clone(&self.runtime);
-            let gate = Arc::clone(&barrier);
-            let timeout = self.call_timeout;
-            let shipper = self.shipper;
-            let start = caller * per_caller;
-            let end = ((caller + 1) * per_caller).min(events);
-            threads.push(thread::spawn(
-                move || -> anyhow::Result<Vec<CallOutcome<ShipperReply>>> {
-                    gate.wait();
-                    let mut local = Vec::with_capacity(end.saturating_sub(start));
-                    for i in start..end {
-                        let event = Event {
-                            key: format!("k{i}"),
-                            value: i as i64,
-                        };
-                        let outcome = rt.call_blocking(
-                            shipper,
-                            ShipperMsg::Request(ShipperRequest::Submit { event }),
-                            timeout,
-                        )?;
-                        local.push(outcome);
-                    }
-                    Ok(local)
-                },
-            ));
-        }
-        barrier.wait();
-        let mut outcomes = Vec::with_capacity(events);
-        for handle in threads {
-            let local = handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("submit thread panicked"))??;
-            outcomes.extend(local);
-        }
+        let outcomes = thread::scope(|scope| -> anyhow::Result<Vec<_>> {
+            let mut threads = Vec::with_capacity(callers);
+            for caller in 0..callers {
+                let gate = Arc::clone(&barrier);
+                let timeout = self.call_timeout;
+                let shipper = self.shipper;
+                let start = caller * per_caller;
+                let end = ((caller + 1) * per_caller).min(events);
+                threads.push(scope.spawn(
+                    move || -> anyhow::Result<Vec<CallOutcome<ShipperReply>>> {
+                        gate.wait();
+                        let mut local = Vec::with_capacity(end.saturating_sub(start));
+                        for i in start..end {
+                            let event = Event {
+                                key: format!("k{i}"),
+                                value: i as i64,
+                            };
+                            let outcome = self.app.call_blocking_request(
+                                shipper,
+                                ShipperRequest::Submit { event },
+                                timeout,
+                            )?;
+                            local.push(outcome);
+                        }
+                        Ok(local)
+                    },
+                ));
+            }
+            barrier.wait();
+            let mut outcomes = Vec::with_capacity(events);
+            for handle in threads {
+                let local = handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("submit thread panicked"))??;
+                outcomes.extend(local);
+            }
+            Ok(outcomes)
+        })?;
         Ok(outcomes)
     }
 
     fn shipper_stats(&self) -> anyhow::Result<ShipperStats> {
         match self
-            .runtime
-            .call_blocking(
+            .app
+            .call_blocking_request(
                 self.shipper,
-                ShipperMsg::Request(ShipperRequest::Stats),
+                ShipperRequest::Stats,
                 self.call_timeout,
             )?
         {
@@ -1131,7 +1188,7 @@ impl World {
 
     fn sink_stats(&self) -> anyhow::Result<SinkStats> {
         match self
-            .runtime
+            .app
             .call_blocking_request(self.sink, SinkRequest::Stats, self.call_timeout)?
         {
             CallOutcome::Replied(SinkReply::Stats(stats)) => Ok(stats),
@@ -1144,11 +1201,11 @@ impl World {
         target_accepted: usize,
         timeout: Duration,
     ) -> anyhow::Result<()> {
-        match self.runtime.call_blocking(
+        match self.app.call_blocking_request(
             self.shipper,
-            ShipperMsg::Request(ShipperRequest::AwaitRouted {
+            ShipperRequest::AwaitRouted {
                 target: target_accepted as u64,
-            }),
+            },
             timeout,
         )? {
             CallOutcome::Replied(ShipperReply::Routed { .. }) => Ok(()),
@@ -1159,38 +1216,117 @@ impl World {
     }
 
     fn stop_and_shutdown(self) -> anyhow::Result<bool> {
-        let outcome =
-            self.runtime
-                .call_blocking(
-                    self.shipper,
-                    ShipperMsg::Request(ShipperRequest::Stop),
-                    self.stop_timeout,
-                )?;
+        let outcome = self.app.call_blocking_request(
+            self.shipper,
+            ShipperRequest::Stop,
+            self.stop_timeout,
+        )?;
         let clean = matches!(outcome, CallOutcome::Replied(ShipperReply::Stopped { .. }));
-        self.shutdown()?;
-        Ok(clean)
+        let owner_clean = self.shutdown()?;
+        Ok(clean && owner_clean)
     }
 
-    /// Tear down the runtime through the cloneable shutdown handle. No
-    /// `Arc::try_unwrap(runtime)` ceremony: the handle requests shutdown,
-    /// waits for the terminal report, and the runtime Arc can be dropped
-    /// independently.
-    ///
     /// Service-level drain (the shipper's own `Stop`/`DrainState`
     /// protocol) is the shipper's responsibility and is driven separately
     /// by [`Self::stop_and_shutdown`]; this helper controls the runtime
     /// only.
     fn shutdown(self) -> anyhow::Result<bool> {
-        self.shutdown
-            .request_shutdown()
-            .map_err(|e| anyhow::anyhow!("runtime shutdown request: {e:?}"))?;
-        let report = self
-            .shutdown
-            .wait_report(Duration::from_secs(5))
-            .map_err(|e| anyhow::anyhow!("runtime shutdown wait: {e:?}"))?;
-        // Drop the Arc; the runtime owner's `Drop` short-circuits via
-        // the cached terminal report so this does not re-join.
-        drop(self.runtime);
+        let report = self.app.shutdown().join_report();
         Ok(report.error().is_none())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wait_until_await_is_parked(world: &World) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let stats = world.shipper_stats().expect("await pressure");
+            if stats.await_waiters_high_water == 1 && stats.await_caller_gone == 0 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "await caller was not parked before the deadline: {stats:?}"
+            );
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn await_routed_is_bounded_and_reclaims_a_gone_caller() {
+        let config = RunConfig {
+            events: 1,
+            callers: 1,
+            batch_window_ms: 100,
+            ..RunConfig::default()
+        };
+        let world = World::start(&config).expect("world");
+        let first = thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                world.app.call_blocking_request(
+                    world.shipper,
+                    ShipperRequest::AwaitRouted { target: 1 },
+                    Duration::from_millis(250),
+                )
+            });
+            wait_until_await_is_parked(&world);
+            let second = world
+                .app
+                .call_blocking_request(
+                    world.shipper,
+                    ShipperRequest::AwaitRouted { target: 2 },
+                    Duration::from_millis(50),
+                )
+                .expect("second call");
+            assert!(matches!(
+                second,
+                CallOutcome::Replied(ShipperReply::AwaitBusy)
+            ));
+            waiting.join().expect("wait thread").expect("first call")
+        });
+        assert!(matches!(first, CallOutcome::Timeout));
+
+        let stats = world.shipper_stats().expect("stats sweep");
+        assert_eq!(stats.await_waiters_high_water, 1);
+        assert_eq!(stats.await_full_rejects, 1);
+        assert_eq!(stats.await_caller_gone, 1);
+        assert!(world.stop_and_shutdown().expect("shutdown"));
+    }
+
+    #[test]
+    fn stop_explicitly_settles_an_unreachable_route_waiter() {
+        let config = RunConfig::default();
+        let world = World::start(&config).expect("world");
+        thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                world.app.call_blocking_request(
+                    world.shipper,
+                    ShipperRequest::AwaitRouted { target: 1 },
+                    Duration::from_secs(1),
+                )
+            });
+            wait_until_await_is_parked(&world);
+            let stopped = world
+                .app
+                .call_blocking_request(
+                    world.shipper,
+                    ShipperRequest::Stop,
+                    Duration::from_secs(1),
+                )
+                .expect("stop call");
+            assert!(matches!(
+                stopped,
+                CallOutcome::Replied(ShipperReply::Stopped { .. })
+            ));
+            let waiter = waiting.join().expect("wait thread").expect("wait call");
+            assert!(matches!(
+                waiter,
+                CallOutcome::Replied(ShipperReply::RouteWaitStopped { routed: 0 })
+            ));
+        });
+        assert!(world.shutdown().expect("shutdown"));
     }
 }

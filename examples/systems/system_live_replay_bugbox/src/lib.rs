@@ -3,11 +3,8 @@
 //!
 //! What this specimen pulls on:
 //!
-//! - `tina_runtime::ThreadedRuntime::try_with_config_and_trace_observer` to
-//!   fallibly start the worker and wire a live trace observer before the first
-//!   event.
-//!   `LocalSystemBuilder::trace_observer(...).try_build()` already supports
-//!   this shape; migrating this example to that facade remains follow-up work.
+//! - `tina_runtime::LocalSystem` to fallibly start the worker and wire a live
+//!   trace observer before the first event.
 //! - [`tina_proof_harness::LiveTrace`] to capture the live trace shape
 //!   (event count + `stable_trace_hash`).
 //! - [`tina_sim::dst::capture_overload_run`] /
@@ -30,13 +27,12 @@
 
 use std::convert::Infallible;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tina::capacity::{CapacityMode, CapacitySurfaceReport};
 use tina::prelude::*;
 use tina_proof_harness::live_replay::LiveTrace;
-use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig};
+use tina_runtime::{DefaultThreadedMailboxFactory, LocalSystem};
 use tina_sim::dst::{
     CaptureSource, CaptureSummary, DiscoveredConstants, LiveReplayCapture, LiveReplayFact,
     LiveReplayReport, ReplayCase, ReplayConfig, ReplayReport, ShrinkCapturedReport, ShrinkConfig,
@@ -122,7 +118,7 @@ pub struct SavedCase {
 }
 
 // ---------------------------------------------------------------------------
-// Live side: same isolate logic running on `ThreadedRuntime`.
+// Live side: same isolate logic running behind `LocalSystem`.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
@@ -278,8 +274,8 @@ pub fn case() -> ReplayCase<Op> {
     let config = ReplayConfig::with_faults(faults())
         .with_mailbox(PRODUCER_ROLE, 8)
         .with_mailbox(SINK_ROLE, 8)
-        // Live capture uses `ThreadedRuntime`, which registers a host-call
-        // dispatcher pool at worker startup. Reserve the same id range in
+        // LocalSystem's live worker registers a host-call dispatcher pool at
+        // startup. Reserve the same id range in
         // the sim so user-isolate ids match and the captured trace replays
         // exactly.
         .with_reserved_system_isolates(tina_runtime::HOST_CALL_DISPATCHER_POOL_SIZE);
@@ -384,19 +380,13 @@ fn run_captured_case(
 /// case still reproduces, pin constants for a small seed sweep, and
 /// shrink the bug history to its minimum.
 pub fn run() -> anyhow::Result<BugboxReport> {
-    // 1) Live capture. ThreadedRuntime + LiveTrace observer.
+    // 1) Live capture. LocalSystem + LiveTrace observer.
     let live_trace = LiveTrace::new();
-    let runtime = Arc::new(ThreadedRuntime::try_with_config_and_trace_observer(
-        SingleShard,
-        DefaultThreadedMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 64,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-        live_trace.observer(),
-    )?);
-    let shutdown = runtime.shutdown_handle();
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+        .ingress_capacity(64)
+        .idle_wait(Duration::from_millis(1))
+        .trace_observer(live_trace.observer())
+        .try_build()?;
 
     let live_case = case();
     let poison_sent = live_case
@@ -405,45 +395,41 @@ pub fn run() -> anyhow::Result<BugboxReport> {
         .iter()
         .any(|op| matches!(op, Op::Send(v) if *v == POISON_VALUE));
 
-    let sink = runtime
-        .register_with_capacity::<_, Infallible>(
-            LiveSink {
-                received: Vec::new(),
-                poison_sent,
-            },
-            16,
-        )
-        .map_err(|e| anyhow::anyhow!("register live sink: {e:?}"))?;
-    // Claim the terminal receive report before any workload message can stop
-    // the sink.
-    let waiter = runtime
-        .observe_result::<Output, _, _>(sink)
-        .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
-    let producer = runtime
-        .register_with_capacity::<_, SinkMsg>(LiveProducer { sink }, 16)
-        .map_err(|e| anyhow::anyhow!("register live producer: {e:?}"))?;
+    let live_output = app.run_to_shutdown_reported(Duration::from_secs(5), |app| {
+        let sink = app
+            .register_root::<_, Infallible>(
+                LiveSink {
+                    received: Vec::new(),
+                    poison_sent,
+                },
+                16,
+            )
+            .map_err(|e| anyhow::anyhow!("register live sink: {e:?}"))?;
+        // Claim the terminal receive report before any workload message can stop
+        // the sink.
+        let waiter = app
+            .observe_result::<Output, _, _>(sink)
+            .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
+        let producer = app
+            .register_root::<_, SinkMsg>(LiveProducer { sink }, 16)
+            .map_err(|e| anyhow::anyhow!("register live producer: {e:?}"))?;
 
-    for op in live_case.history.operations() {
-        if let Op::Send(value) = *op {
-            runtime
-                .try_send(producer, ProducerMsg::Tick(value))
-                .map_err(|e| anyhow::anyhow!("live ingress failed: {e:?}"))?;
+        for op in live_case.history.operations() {
+            if let Op::Send(value) = *op {
+                app.try_send(producer, ProducerMsg::Tick(value))
+                    .map_err(|e| anyhow::anyhow!("live ingress failed: {e:?}"))?;
+            }
         }
-    }
-    // Finish is ordered after every Tick in the producer mailbox, so every
-    // Got reaches the sink before the sink settles its terminal report.
-    runtime
-        .try_send(producer, ProducerMsg::Finish)
-        .map_err(|e| anyhow::anyhow!("live finish failed: {e:?}"))?;
+        // Finish is ordered after every Tick in the producer mailbox, so every
+        // Got reaches the sink before the sink settles its terminal report.
+        app.try_send(producer, ProducerMsg::Finish)
+            .map_err(|e| anyhow::anyhow!("live finish failed: {e:?}"))?;
 
-    let live_output = waiter
-        .wait(Duration::from_secs(2))
-        .map_err(|e| anyhow::anyhow!("live sink did not settle: {e:?}"))?;
+        waiter
+            .wait(Duration::from_secs(2))
+            .map_err(|e| anyhow::anyhow!("live sink did not settle: {e:?}"))
+    })?;
     let live_received_count = live_output.messages_received;
-
-    let terminal = shutdown.request_and_wait_report(Duration::from_secs(5))?;
-    drop(runtime);
-    terminal.ensure_clean()?;
     let live_shape = live_trace.snapshot();
     let live_events = live_trace.events();
     let live_pressure = live_trace.pressure_summary();

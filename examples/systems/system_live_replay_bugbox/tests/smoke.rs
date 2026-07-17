@@ -25,6 +25,10 @@ fn live_capture_then_sim_replay_then_shrink() {
         report.live_trace_shape.trace_hash, 0,
         "live trace hash must be non-zero: {report:#?}",
     );
+    assert_eq!(
+        report.capture.expected, report.live_trace_shape,
+        "the capture must preserve the complete post-LocalSystem-shutdown live trace",
+    );
 
     // 2) Live sink count == non-poison sends from the canonical case.
     let original = &report.capture.history;
@@ -77,6 +81,10 @@ fn live_capture_then_sim_replay_then_shrink() {
     assert!(
         report.shrunk.capture().live_facts == report.capture.live_facts,
         "live-derived shrink must preserve proving facts by default: {report:#?}",
+    );
+    assert_eq!(
+        report.capture_replay.live_facts, report.capture.live_facts,
+        "capture replay must reproduce every typed live fact",
     );
 
     // 6) Live pressure surface clean: this workload has no bounded
