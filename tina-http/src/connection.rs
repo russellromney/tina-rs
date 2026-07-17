@@ -1353,7 +1353,9 @@ impl<S: Shard + 'static, M: Send + 'static> HttpConnection<S, M> {
         self.service_monitor_terminal_seen = true;
         match outcome {
             HttpPeerMonitorOutcome::Disconnected => {
-                if self.has_pending_body() {
+                if self.websocket.is_some() {
+                    self.handle_websocket_bytes_read(&[])
+                } else if self.has_pending_body() {
                     self.record_body_io_error();
                     self.begin_close()
                 } else {
@@ -2445,6 +2447,14 @@ impl<S: Shard + 'static, M: Send + 'static> HttpConnection<S, M> {
     }
 
     fn websocket_continue_read(&mut self) -> Effect<Self> {
+        if !self.service_read_ahead.is_empty() {
+            let bytes = std::mem::take(&mut self.service_read_ahead);
+            return self.handle_websocket_bytes_read(&bytes);
+        }
+        if self.service_monitor.is_some() {
+            self.waiting_for_monitor_after_response = true;
+            return noop();
+        }
         let has_buffered = self
             .websocket
             .as_ref()

@@ -318,6 +318,46 @@ fn request_only_accept_echoes_text_over_wire() {
     let _ = runtime.shutdown();
 }
 
+#[test]
+fn request_only_preserves_first_frame_sent_with_upgrade() {
+    let runtime = make_runtime();
+    let requests = runtime
+        .register_request_service::<EchoService, WebSocketSessionMsg, Infallible>(EchoService, 16)
+        .expect("register echo");
+    let gateway = runtime
+        .register_with_capacity::<EchoGateway, Infallible>(
+            EchoGateway {
+                requests,
+                limits: WebSocketLimits::default(),
+            },
+            8,
+        )
+        .expect("register gateway");
+    let listener = HttpListener::<TestShard>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        gateway,
+        HttpLimits::default(),
+        Duration::from_secs(2),
+        16,
+    );
+    let (addr, listener_addr) = start_listener(&runtime, listener);
+
+    let mut stream = TcpStream::connect_timeout(&addr, TEST_IO_TIMEOUT).expect("connect");
+    stream
+        .set_read_timeout(Some(TEST_IO_TIMEOUT))
+        .expect("read timeout");
+    write_upgrade(&mut stream);
+    stream
+        .write_all(&masked_frame(0x1, b"early-frame"))
+        .expect("write frame before upgrade response");
+    let head = read_upgrade_response(&mut stream);
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    assert_eq!(read_server_text(&mut stream), "early-frame");
+
+    let _ = runtime.try_send(listener_addr, HttpListenerMsg::Stop);
+    let _ = runtime.shutdown();
+}
+
 // ---------------------------------------------------------------------------
 // Split-service room: lane separation + two-client broadcast
 // ---------------------------------------------------------------------------
