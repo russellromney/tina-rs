@@ -65,10 +65,11 @@ A `Counter` isolate using runtime-owned primitives:
 - The `Counter` isolate just sequences these calls and tracks
   `(value, last_journal_index)` as state.
 
-The host correlates "did my op finish?" via a `u64` op id threaded
-through every continuation message and read back from a shared
-`Observation` slot. That's app-specific data the runtime can't know
-about — `FINDINGS.md` tracks this as typed isolate result waiter work.
+Each host op is a typed request (`Recover`, `Increment`,
+`CommitSnapshot`). The isolate privately sequences the IO
+continuations and replies with the current value when the op
+settles. The host uses `call_blocking_request` — no shared observation
+slot, no op-id correlator, no host spin loop.
 
 ## Discussion
 
@@ -91,12 +92,9 @@ What feels better:
 
 What feels worse:
 
-- **The `op` correlator + `Observation` slot is real boilerplate.**
-  Every operation has to thread a `u64` op id through its
-  continuations and write a final value back through atomics. That
-  pattern recurs across persistent-state isolates. A typed
-  observation handle that resolves to the isolate's outcome (with a
-  `Result<T, E>` payload) would retire it.
+- **The continuation enum still names every IO step.** Typed
+  request/reply retires the host side channel, but the isolate still
+  expands each op into explicit load/append/commit continuations.
 - **The continuation enum has 7 variants for 3 user-facing
   operations.** Each runtime call needs a reply variant; the
   Recover op alone touches three. A combinator that chained "do
@@ -111,10 +109,9 @@ What this suggests:
 - The runtime-as-source-of-durability-decisions is the right call.
   Centralizing fsync / temp-rename / record framing in
   `tina-runtime` is the kind of work that doesn't fit anywhere else.
-- The `op` correlator + atomic publish slot is the same shape as
-  the side channel from `specimen_mux_client`'s arrival log. A typed
-  "operation done" handle that carries a typed result would close
-  the loop on both.
+- Typed request replies closed the host-side observation slot. The
+  remaining cost is isolate-side continuation growth for multi-step
+  durable ops.
 - Continuation enum growth keeps showing up. A combinator that
   hides the per-step variant for "linear pipelines" would help
   here, in `specimen_mini_keyspace`, and in `specimen_mux_client`.
