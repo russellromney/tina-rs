@@ -21,7 +21,9 @@ use tina_http::{
     HttpClientConfig, HttpRequest, HttpTarget, InstallKeepalivePool, KeepaliveCloseAndDrain,
     KeepaliveConnectionMsg, KeepaliveInstallStep, KeepaliveOutcome, KeepalivePoolCloseOutcome,
     KeepalivePoolConfigError, KeepalivePoolDrainOutcome, KeepalivePoolInstallConfig,
-    KeepalivePoolInstallError, OriginKey, build_keepalive_pool, install_keepalive_pool_fail_after,
+    KeepalivePoolInstallError, KeepaliveRollbackResult, MAX_KEEPALIVE_MAILBOX_CAPACITY,
+    MAX_KEEPALIVE_POOL_CAPACITY, MAX_KEEPALIVE_POOL_WAITERS, OriginKey, build_keepalive_pool,
+    install_keepalive_pool_fail_after, install_keepalive_pool_fail_after_with_rollback_failure,
     shutdown_keepalive_pool,
 };
 use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
@@ -291,6 +293,54 @@ fn partial_install_fails_on_pool_registration_and_rolls_back_connections() {
 }
 
 #[test]
+fn every_registration_boundary_rolls_back_completely() {
+    for succeed_count in 0..=3 {
+        let app = system();
+        let target = HttpTarget::http(
+            format!("127.0.0.1:{}", 10_000 + succeed_count)
+                .parse()
+                .unwrap(),
+        );
+        let error =
+            install_keepalive_pool_fail_after(&app, config(target.clone(), 3), succeed_count)
+                .expect_err("injected registration failure");
+        match error {
+            KeepalivePoolInstallError::Register {
+                failed_at,
+                rollback,
+                recovery,
+                ..
+            } => {
+                let expected_step = if succeed_count < 3 {
+                    KeepaliveInstallStep::Connection {
+                        index: succeed_count,
+                    }
+                } else {
+                    KeepaliveInstallStep::Pool
+                };
+                assert_eq!(failed_at, expected_step);
+                assert_eq!(rollback.connections_registered, succeed_count);
+                assert_eq!(
+                    rollback.connections_stopped + rollback.connections_already_closed,
+                    succeed_count
+                );
+                assert!(rollback.connection_stop_failures.is_empty());
+                assert!(recovery.is_none());
+            }
+            other => panic!("unexpected boundary failure: {other:?}"),
+        }
+        let pool = app
+            .install_keepalive_pool(config(target, 1))
+            .expect("complete rollback releases boundary claim");
+        assert!(matches!(
+            pool.close_and_drain(Duration::from_secs(2)),
+            KeepaliveCloseAndDrain::Drained(_)
+        ));
+        let _ = app.shutdown().join();
+    }
+}
+
+#[test]
 fn duplicate_origin_install_returns_typed_conflict() {
     let server = ScriptedServer::start();
     let app = system();
@@ -338,6 +388,161 @@ fn invalid_config_is_refused_before_registration() {
     let _ = app.shutdown().join();
 }
 
+#[test]
+fn oversized_config_is_refused_before_install_claim_or_resources() {
+    let app = system();
+    let target = HttpTarget::http("127.0.0.1:9".parse().unwrap());
+    let cases = [
+        (
+            PoolConfig::new(MAX_KEEPALIVE_POOL_CAPACITY + 1, 1),
+            8,
+            16,
+            "pool_config.capacity",
+        ),
+        (
+            PoolConfig::new(1, MAX_KEEPALIVE_POOL_WAITERS + 1),
+            8,
+            16,
+            "pool_config.max_waiters",
+        ),
+        (
+            PoolConfig::new(1, 1),
+            MAX_KEEPALIVE_MAILBOX_CAPACITY + 1,
+            16,
+            "connection_mailbox_capacity",
+        ),
+        (
+            PoolConfig::new(1, 1),
+            8,
+            MAX_KEEPALIVE_MAILBOX_CAPACITY + 1,
+            "pool_mailbox_capacity",
+        ),
+    ];
+    for (pool_config, connection_mailbox, pool_mailbox, field) in cases {
+        let cfg = KeepalivePoolInstallConfig::new(
+            target.clone(),
+            HttpClientConfig::pressure(),
+            pool_config,
+            connection_mailbox,
+            pool_mailbox,
+        );
+        match app.install_keepalive_pool(cfg) {
+            Err(KeepalivePoolInstallError::InvalidConfig(KeepalivePoolConfigError::TooLarge {
+                field: actual,
+                ..
+            })) if actual == field => {}
+            other => panic!("expected TooLarge for {field}, got {other:?}"),
+        }
+    }
+
+    // No rejected attempt acquired the same-origin claim or installed a resource.
+    let pool = app
+        .install_keepalive_pool(config(target, 1))
+        .expect("valid install after every preflight rejection");
+    assert!(matches!(
+        pool.close_and_drain(Duration::from_secs(2)),
+        KeepaliveCloseAndDrain::Drained(_)
+    ));
+    let _ = app.shutdown().join();
+}
+
+#[test]
+fn dropping_installed_handle_keeps_origin_tombstoned() {
+    let app = system();
+    let target = HttpTarget::http("127.0.0.1:9".parse().unwrap());
+    let pool = app
+        .install_keepalive_pool(config(target.clone(), 1))
+        .expect("install");
+    drop(pool);
+
+    assert!(matches!(
+        app.install_keepalive_pool(config(target, 1)),
+        Err(KeepalivePoolInstallError::Conflict { .. })
+    ));
+    let _ = app.shutdown().join();
+}
+
+#[test]
+fn incomplete_rollback_retains_cleanup_and_conflict_authority() {
+    let app = system();
+    let target = HttpTarget::http("127.0.0.1:9".parse().unwrap());
+    let error = install_keepalive_pool_fail_after_with_rollback_failure(
+        &app,
+        config(target.clone(), 2),
+        2,
+        1,
+    )
+    .expect_err("pool registration failure");
+    let recovery = match error {
+        KeepalivePoolInstallError::Register {
+            rollback,
+            recovery: Some(recovery),
+            ..
+        } => {
+            assert_eq!(rollback.connections_stopped, 1);
+            assert_eq!(rollback.connection_stop_failures.len(), 1);
+            recovery
+        }
+        other => panic!("expected retained recovery, got {other:?}"),
+    };
+
+    assert!(matches!(
+        app.install_keepalive_pool(config(target.clone(), 1)),
+        Err(KeepalivePoolInstallError::Conflict { .. })
+    ));
+    match recovery.retry(Duration::from_secs(2)) {
+        KeepaliveRollbackResult::Recovered(report) => {
+            assert_eq!(
+                report.connections_stopped + report.connections_already_closed,
+                2
+            );
+            assert!(report.connection_stop_failures.is_empty());
+        }
+        other => panic!("expected complete recovery, got {other:?}"),
+    }
+
+    let pool = app
+        .install_keepalive_pool(config(target, 1))
+        .expect("claim released only after recovery");
+    assert!(matches!(
+        pool.close_and_drain(Duration::from_secs(2)),
+        KeepaliveCloseAndDrain::Drained(_)
+    ));
+    let _ = app.shutdown().join();
+}
+
+#[test]
+fn incomplete_rollback_owner_shutdown_is_typed_and_terminal() {
+    let app = system();
+    let target = HttpTarget::http("127.0.0.1:9".parse().unwrap());
+    let error =
+        install_keepalive_pool_fail_after_with_rollback_failure(&app, config(target, 2), 2, 1)
+            .expect_err("pool registration failure");
+    let recovery = match error {
+        KeepalivePoolInstallError::Register {
+            recovery: Some(recovery),
+            ..
+        } => recovery,
+        other => panic!("expected retained recovery, got {other:?}"),
+    };
+
+    app.shutdown_handle()
+        .request_and_wait_report(Duration::from_secs(2))
+        .expect("owner shutdown");
+    match recovery.retry(Duration::from_secs(2)) {
+        KeepaliveRollbackResult::Shutdown(report) => {
+            assert_eq!(report.connections_registered, 2);
+            assert_eq!(
+                report.connections_stopped + report.connections_already_closed,
+                2
+            );
+            assert!(report.connection_stop_failures.is_empty());
+        }
+        other => panic!("expected typed rollback shutdown, got {other:?}"),
+    }
+    let _ = app.shutdown().join();
+}
+
 // =====================================================================
 // Close / drain proofs
 // =====================================================================
@@ -362,6 +567,29 @@ fn close_and_drain_success_settles_every_connection() {
 
     let _ = app.shutdown().join();
     server.stop();
+}
+
+#[test]
+fn zero_total_deadline_returns_authority_without_starting_close() {
+    let app = system();
+    let pool = app
+        .install_keepalive_pool(config(HttpTarget::http("127.0.0.1:9".parse().unwrap()), 2))
+        .expect("install");
+
+    let retained = match pool.close_and_drain(Duration::ZERO) {
+        KeepaliveCloseAndDrain::TimedOut { pool, pending } => {
+            assert_eq!(pending.leased, None);
+            assert_eq!(pending.connections_live, 2);
+            assert!(!pending.admission_closed);
+            pool
+        }
+        other => panic!("zero total deadline must retain authority, got {other:?}"),
+    };
+    assert!(matches!(
+        retained.close_and_drain(Duration::from_secs(2)),
+        KeepaliveCloseAndDrain::Drained(_)
+    ));
+    let _ = app.shutdown().join();
 }
 
 #[test]
@@ -510,6 +738,32 @@ fn drain_timeout_reports_observed_leased_not_pool_capacity() {
     server.stop();
 }
 
+#[test]
+fn partial_connection_stop_timeout_reports_only_unsettled_slots() {
+    let app = system();
+    let pool = app
+        .install_keepalive_pool(config(HttpTarget::http("127.0.0.1:9".parse().unwrap()), 2))
+        .expect("install");
+
+    let retained = match pool.close_and_drain_with_stop_timeout_at(Duration::from_secs(2), 1) {
+        KeepaliveCloseAndDrain::TimedOut { pool, pending } => {
+            assert_eq!(pending.leased, Some(0));
+            assert_eq!(pending.connections_live, 1);
+            assert!(pending.admission_closed);
+            pool
+        }
+        other => panic!("expected injected stop timeout, got {other:?}"),
+    };
+    match retained.close_and_drain(Duration::from_secs(2)) {
+        KeepaliveCloseAndDrain::Drained(report) => {
+            assert_eq!(report.requested, 2);
+            assert_eq!(report.stopped + report.already_closed, 2);
+        }
+        other => panic!("expected retry to finish remaining slot, got {other:?}"),
+    }
+    let _ = app.shutdown().join();
+}
+
 #[derive(Debug)]
 enum SpinnerMsg {
     Tick,
@@ -636,40 +890,19 @@ fn system_shutdown_settles_without_claiming_a_full_drain() {
 
     // Request runtime shutdown while the install handle is still live.
     let handle = app.shutdown_handle();
-    handle
-        .request_shutdown()
-        .expect("request shutdown while pool handle is live");
-
-    // Give the worker a moment to process Shutdown.
-    thread::sleep(Duration::from_millis(50));
+    let terminal = handle
+        .request_and_wait_report(Duration::from_secs(2))
+        .expect("complete shutdown while pool handle is live");
+    assert_eq!(
+        terminal.topology().expect("terminal topology").shards()[0].state(),
+        tina_runtime::LiveShardState::Stopped
+    );
 
     match pool.close_and_drain(Duration::from_millis(500)) {
         KeepaliveCloseAndDrain::Shutdown(settlement) => {
-            // Must not claim Drained when shutdown cancelled the path.
             assert_ne!(settlement.drain, KeepalivePoolDrainOutcome::Drained);
         }
-        KeepaliveCloseAndDrain::OwnerFailed { error, .. } => {
-            // Acceptable alternate: owner already gone before close admitted.
-            assert!(
-                matches!(
-                    error,
-                    ThreadedRuntimeError::WorkerStopped
-                        | ThreadedRuntimeError::WorkerUnresponsive
-                        | ThreadedRuntimeError::CommandFull
-                        | ThreadedRuntimeError::HostWaitTimeout
-                ),
-                "unexpected owner error: {error:?}"
-            );
-        }
-        KeepaliveCloseAndDrain::Drained(report) => {
-            // If the worker was still responsive enough to finish a true
-            // drain before dying, that is still a correct explicit-close
-            // settlement — not a silent force-close.
-            assert_eq!(report.drain, KeepalivePoolDrainOutcome::Drained);
-        }
-        KeepaliveCloseAndDrain::TimedOut { .. } => {
-            // Timeout under shutdown is acceptable; caller still holds truth.
-        }
+        other => panic!("proven stopped owner must classify as Shutdown, got {other:?}"),
     }
 
     let _ = app.shutdown().join();
