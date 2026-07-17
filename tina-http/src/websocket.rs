@@ -668,6 +668,11 @@ pub enum WebSocketSendError {
     OutboundBytesFull,
     Protocol,
     Timeout,
+    /// The session handle belongs to a different runtime incarnation.
+    ForeignSystem {
+        expected: tina::SystemIncarnation,
+        actual: tina::SystemIncarnation,
+    },
 }
 
 impl From<WebSocketError> for WebSocketSendError {
@@ -692,7 +697,11 @@ impl WebSocketSendOutcome {
             CallOutcome::Replied(RequestChunkReply::WebSocketSend(outcome)) => outcome.result,
             CallOutcome::Replied(_) => Err(WebSocketSendError::Protocol),
             CallOutcome::Full => Err(WebSocketSendError::OutboundQueueFull),
-            CallOutcome::Closed | CallOutcome::Rejected(_) => Err(WebSocketSendError::Closed),
+            CallOutcome::Closed => Err(WebSocketSendError::Closed),
+            CallOutcome::Rejected(tina::CallRejectedReason::ForeignSystem { expected, actual }) => {
+                Err(WebSocketSendError::ForeignSystem { expected, actual })
+            }
+            CallOutcome::Rejected(_) => Err(WebSocketSendError::Protocol),
             CallOutcome::Timeout => Err(WebSocketSendError::Timeout),
         };
         Self { session, result }
@@ -708,7 +717,11 @@ impl WebSocketSessionReportOutcome {
             CallOutcome::Replied(RequestChunkReply::WebSocketReport(outcome)) => outcome.result,
             CallOutcome::Replied(_) => Err(WebSocketSendError::Protocol),
             CallOutcome::Full => Err(WebSocketSendError::OutboundQueueFull),
-            CallOutcome::Closed | CallOutcome::Rejected(_) => Err(WebSocketSendError::Closed),
+            CallOutcome::Closed => Err(WebSocketSendError::Closed),
+            CallOutcome::Rejected(tina::CallRejectedReason::ForeignSystem { expected, actual }) => {
+                Err(WebSocketSendError::ForeignSystem { expected, actual })
+            }
+            CallOutcome::Rejected(_) => Err(WebSocketSendError::Protocol),
             CallOutcome::Timeout => Err(WebSocketSendError::Timeout),
         };
         Self { session, result }
@@ -1231,6 +1244,36 @@ mod tests {
             generation: 0,
         };
         assert_ne!(stale, refill);
+    }
+
+    #[test]
+    fn connection_admission_terminals_remain_distinct_websocket_outcomes() {
+        let session = WebSocketSessionId {
+            id: 7,
+            generation: 1,
+        };
+        let expected = tina::SystemIncarnation::new(10);
+        let actual = tina::SystemIncarnation::new(11);
+        let cases = [
+            (CallOutcome::Full, WebSocketSendError::OutboundQueueFull),
+            (CallOutcome::Closed, WebSocketSendError::Closed),
+            (CallOutcome::Timeout, WebSocketSendError::Timeout),
+            (
+                CallOutcome::Rejected(tina::CallRejectedReason::ForeignSystem { expected, actual }),
+                WebSocketSendError::ForeignSystem { expected, actual },
+            ),
+            (
+                CallOutcome::Rejected(tina::CallRejectedReason::UnsupportedMessage),
+                WebSocketSendError::Protocol,
+            ),
+        ];
+
+        for (call, error) in cases {
+            assert_eq!(
+                WebSocketSendOutcome::from_connection_call(session, call).result,
+                Err(error)
+            );
+        }
     }
 
     #[test]

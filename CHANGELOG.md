@@ -18,13 +18,17 @@ This file records completed work.
   intentionally routes every session message (including notifications) as a
   request-lane `call` because that handle has no event capability.
 - `WebSocketMemberTable` snapshots recipients, excludes the sender, and offers
-  each remaining member exactly once in snapshot order. Fanout bounds no longer
-  force the room's message type to be `WebSocketSessionMsg`.
+  each remaining member exactly once in snapshot order. Each offer is now a
+  bounded connection-owner call whose `Full`, `Closed`, `Timeout`,
+  foreign-system, stale-session, or accepted outcome returns as a typed
+  `SendOutcome` event; destination admission can no longer disappear behind a
+  fire-and-forget send.
 - Session handles expose `*_effect_service_event` helpers so room fanout
   continuations land as domain events on split services.
 - Direct proof: `typed_websocket_delivery` (request-only echo, split two-client
   broadcast exactness, peer close lanes, malformed upgrade, shutdown) plus
-  member-table snapshot/exclude unit tests and compile-fail accept constructors.
+  member-table snapshot/exclude, terminal mapping, pressure/refill, and
+  application-counter tests plus compile-fail accept constructors.
 
 ### Typed child terminal observation
 

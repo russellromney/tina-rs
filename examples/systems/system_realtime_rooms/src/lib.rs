@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use http::Method;
 use tina::prelude::*;
 use tina_http::{
-    AdmitOutcome, HttpConnectionMsg, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest,
-    HttpResponse, HttpServerConfig, SendOutcomeAction, WebSocketCloseCode, WebSocketError,
+    AdmitOutcome, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse,
+    HttpServerConfig, SendOutcomeAction, WebSocketCloseCode, WebSocketError,
     WebSocketLimits, WebSocketMemberTable, WebSocketSessionControl, WebSocketSessionHandle,
     WebSocketSessionId, WebSocketSessionMsg, WebSocketSessionOutcome, websocket_upgrade,
 };
@@ -95,11 +95,18 @@ pub struct RoomStats {
     pub left_peer: u64,
     pub left_idle: u64,
     pub left_slow: u64,
+    pub left_protocol: u64,
+    pub left_timeout: u64,
+    pub left_foreign: u64,
     pub left_shutdown: u64,
     pub presence_ticks: u64,
     pub presence_broadcasts_ok: u64,
     pub presence_broadcasts_full: u64,
     pub presence_broadcasts_stale: u64,
+    pub presence_broadcasts_closed: u64,
+    pub presence_broadcasts_protocol: u64,
+    pub presence_broadcasts_timeout: u64,
+    pub presence_broadcasts_foreign: u64,
     pub rejected_full: u64,
     pub rejected_shutdown: u64,
     pub messages_in: u64,
@@ -135,6 +142,7 @@ impl std::error::Error for RoomShutdownTimeout {}
 
 /// Reserved tick generation used as a host snapshot request (never scheduled).
 const SNAPSHOT_TICK: u64 = u64::MAX;
+const SESSION_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Default, Clone, Copy)]
 struct RoomShard;
@@ -161,7 +169,6 @@ struct Room {
     event = WebSocketSessionMsg,
     request = WebSocketSessionMsg,
     reply = WebSocketSessionOutcome,
-    send = tina::Outbound<HttpConnectionMsg>,
     shard = RoomShard
 )]
 impl Room {
@@ -185,7 +192,11 @@ impl Room {
                 self.last_seen.insert(session_id, now);
                 self.stats.messages_in += 1;
                 let body = format!("room:{text}");
-                let effects = self.members.broadcast_text::<Self>(Some(session_id), body);
+                let effects = self.members.broadcast_text::<Self>(
+                    Some(session_id),
+                    body,
+                    SESSION_SEND_TIMEOUT,
+                );
                 call.reply_and(WebSocketSessionOutcome::None, effects)
             }
             WebSocketSessionMsg::SessionBinary { session_id, .. } => {
@@ -246,13 +257,16 @@ impl Room {
             }
             WebSocketSessionMsg::SessionPressure {
                 session_id,
-                error:
-                    WebSocketError::PeerClosed
-                    | WebSocketError::Closing
-                    | WebSocketError::OutboundQueueFull
-                    | WebSocketError::OutboundBytesFull,
+                error: WebSocketError::PeerClosed | WebSocketError::Closing,
             } => {
                 self.mark_gone(session_id, GoneReason::Peer);
+                reply(WebSocketSessionOutcome::None)
+            }
+            WebSocketSessionMsg::SessionPressure {
+                session_id,
+                error: WebSocketError::OutboundQueueFull | WebSocketError::OutboundBytesFull,
+            } => {
+                self.mark_gone(session_id, GoneReason::Slow);
                 reply(WebSocketSessionOutcome::None)
             }
             WebSocketSessionMsg::SessionPressure { .. } => reply(WebSocketSessionOutcome::None),
@@ -308,15 +322,26 @@ impl Room {
                 self.last_seen.remove(&id);
                 self.stats.left_idle += 1;
                 self.stats.live_members = self.members.len();
-                effects.push(tina::send(
-                    handle.target(),
-                    handle.close(Some(WebSocketCloseCode(1001)), b"idle".to_vec()),
+                effects.push(handle.close_effect_service_event::<
+                    Self,
+                    WebSocketSessionMsg,
+                    WebSocketSessionMsg,
+                    _,
+                >(
+                    Some(WebSocketCloseCode(1001)),
+                    b"idle".to_vec(),
+                    SESSION_SEND_TIMEOUT,
+                    WebSocketSessionMsg::SendOutcome,
                 ));
             }
         }
 
         let payload = format!("tick:{}:{}", generation, self.members.len());
-        effects.extend(self.members.broadcast_text::<Self>(None, payload));
+        effects.extend(self.members.broadcast_text::<Self>(
+            None,
+            payload,
+            SESSION_SEND_TIMEOUT,
+        ));
         effects.push(self.schedule_tick());
         batch(effects)
     }
@@ -378,31 +403,58 @@ impl Room {
     fn on_send_outcome(&mut self, outcome: tina_http::WebSocketSendOutcome) -> Effect<Self> {
         let session_id = outcome.session;
         let action = self.members.record_send_outcome(&outcome);
-        let shutting_down = self.shutting_down;
-        match (shutting_down, action) {
-            (true, SendOutcomeAction::Ok) => self.stats.shutdown_close_ok += 1,
-            (true, _) => self.stats.shutdown_close_failed += 1,
-            (false, SendOutcomeAction::Ok) => {
+        self.record_send_action(Some(session_id), action);
+        reply(WebSocketSessionOutcome::None)
+    }
+
+    fn record_send_action(
+        &mut self,
+        session_id: Option<WebSocketSessionId>,
+        action: SendOutcomeAction,
+    ) {
+        let removed = !matches!(action, SendOutcomeAction::Ok | SendOutcomeAction::Stale);
+        if removed {
+            if let Some(session_id) = session_id {
+                self.last_seen.remove(&session_id);
+            }
+            self.stats.live_members = self.members.len();
+        }
+
+        if self.shutting_down {
+            match action {
+                SendOutcomeAction::Ok => self.stats.shutdown_close_ok += 1,
+                _ => self.stats.shutdown_close_failed += 1,
+            }
+            if removed {
+                self.stats.left_shutdown += 1;
+            }
+        } else {
+            match action {
+                SendOutcomeAction::Ok => {
                 self.stats.presence_broadcasts_ok += 1;
                 self.stats.messages_out_ok += 1;
-            }
-            (false, SendOutcomeAction::Stale) => self.stats.presence_broadcasts_stale += 1,
-            (false, SendOutcomeAction::RemovedSlow) => self.stats.presence_broadcasts_full += 1,
-            (false, _) => {}
-        }
-        match action {
-            SendOutcomeAction::Ok | SendOutcomeAction::Stale => {
-                reply(WebSocketSessionOutcome::None)
-            }
-            SendOutcomeAction::RemovedSlow => {
-                self.mark_gone(session_id, GoneReason::Slow);
-                reply(WebSocketSessionOutcome::None)
-            }
-            SendOutcomeAction::RemovedClosed
-            | SendOutcomeAction::RemovedProtocol
-            | SendOutcomeAction::RemovedTimeout => {
-                self.mark_gone(session_id, GoneReason::Peer);
-                reply(WebSocketSessionOutcome::None)
+                }
+                SendOutcomeAction::Stale => self.stats.presence_broadcasts_stale += 1,
+                SendOutcomeAction::RemovedSlow => {
+                    self.stats.presence_broadcasts_full += 1;
+                    self.stats.left_slow += 1;
+                }
+                SendOutcomeAction::RemovedClosed => {
+                    self.stats.presence_broadcasts_closed += 1;
+                    self.stats.left_peer += 1;
+                }
+                SendOutcomeAction::RemovedProtocol => {
+                    self.stats.presence_broadcasts_protocol += 1;
+                    self.stats.left_protocol += 1;
+                }
+                SendOutcomeAction::RemovedTimeout => {
+                    self.stats.presence_broadcasts_timeout += 1;
+                    self.stats.left_timeout += 1;
+                }
+                SendOutcomeAction::RemovedForeign => {
+                    self.stats.presence_broadcasts_foreign += 1;
+                    self.stats.left_foreign += 1;
+                }
             }
         }
     }
@@ -410,13 +462,90 @@ impl Room {
     fn on_shutdown(&mut self, code: Option<WebSocketCloseCode>, reason: Vec<u8>) -> Effect<Self> {
         self.shutting_down = true;
         self.stats.shutdown_started = true;
-        let effects: Vec<Effect<Self>> = self.members.shutdown_close::<Self>(code, reason);
+        let effects: Vec<Effect<Self>> =
+            self.members
+                .shutdown_close::<Self>(code, reason, SESSION_SEND_TIMEOUT);
         self.stats.shutdown_close_requested += effects.len() as u64;
         if effects.is_empty() {
             reply(WebSocketSessionOutcome::None)
         } else {
             batch(effects)
         }
+    }
+}
+
+#[cfg(test)]
+mod outcome_accounting_tests {
+    use super::*;
+
+    fn room() -> Room {
+        Room {
+            members: WebSocketMemberTable::new(1),
+            last_seen: BTreeMap::new(),
+            presence_tick: Duration::from_secs(1),
+            idle_evict: Duration::from_secs(1),
+            stats: RoomStats {
+                member_capacity: 1,
+                live_members: 1,
+                ..RoomStats::default()
+            },
+            tick_generation: 0,
+            bootstrapped: true,
+            shutting_down: false,
+            _shard: PhantomData,
+        }
+    }
+
+    #[test]
+    fn pressure_closed_timeout_foreign_and_stale_update_exact_counters() {
+        let apply = |action| {
+            let mut room = room();
+            room.record_send_action(None, action);
+            assert_eq!(room.stats.live_members, 0);
+            room.stats
+        };
+
+        let full = apply(SendOutcomeAction::RemovedSlow);
+        assert_eq!((full.presence_broadcasts_full, full.left_slow), (1, 1));
+        let closed = apply(SendOutcomeAction::RemovedClosed);
+        assert_eq!(
+            (closed.presence_broadcasts_closed, closed.left_peer),
+            (1, 1)
+        );
+        let protocol = apply(SendOutcomeAction::RemovedProtocol);
+        assert_eq!(
+            (
+                protocol.presence_broadcasts_protocol,
+                protocol.left_protocol
+            ),
+            (1, 1)
+        );
+        let timeout = apply(SendOutcomeAction::RemovedTimeout);
+        assert_eq!(
+            (timeout.presence_broadcasts_timeout, timeout.left_timeout),
+            (1, 1)
+        );
+        let foreign = apply(SendOutcomeAction::RemovedForeign);
+        assert_eq!(
+            (foreign.presence_broadcasts_foreign, foreign.left_foreign),
+            (1, 1)
+        );
+
+        let mut stale = room();
+        stale.record_send_action(None, SendOutcomeAction::Stale);
+        assert_eq!(stale.stats.live_members, 1);
+        assert_eq!(stale.stats.presence_broadcasts_stale, 1);
+    }
+
+    #[test]
+    fn shutdown_removal_is_counted_once_by_the_room() {
+        let mut room = room();
+        room.shutting_down = true;
+        room.record_send_action(None, SendOutcomeAction::RemovedClosed);
+        assert_eq!(room.stats.live_members, 0);
+        assert_eq!(room.stats.left_shutdown, 1);
+        assert_eq!(room.stats.shutdown_close_failed, 1);
+        assert_eq!(room.stats.left_peer, 0);
     }
 }
 
@@ -470,7 +599,7 @@ impl Gateway {
 
 fn serialize_stats(stats: &RoomStats) -> String {
     format!(
-        "{{\"member_capacity\":{},\"live_members\":{},\"member_high_water\":{},\"joined\":{},\"left_peer\":{},\"left_idle\":{},\"left_slow\":{},\"left_shutdown\":{},\"presence_ticks\":{},\"presence_broadcasts_ok\":{},\"presence_broadcasts_full\":{},\"presence_broadcasts_stale\":{},\"rejected_full\":{},\"rejected_shutdown\":{},\"messages_in\":{},\"messages_out_ok\":{},\"bootstrap_seen\":{},\"shutdown_started\":{},\"shutdown_close_requested\":{},\"shutdown_close_ok\":{},\"shutdown_close_failed\":{}}}",
+        "{{\"member_capacity\":{},\"live_members\":{},\"member_high_water\":{},\"joined\":{},\"left_peer\":{},\"left_idle\":{},\"left_slow\":{},\"left_protocol\":{},\"left_timeout\":{},\"left_foreign\":{},\"left_shutdown\":{},\"presence_ticks\":{},\"presence_broadcasts_ok\":{},\"presence_broadcasts_full\":{},\"presence_broadcasts_stale\":{},\"presence_broadcasts_closed\":{},\"presence_broadcasts_protocol\":{},\"presence_broadcasts_timeout\":{},\"presence_broadcasts_foreign\":{},\"rejected_full\":{},\"rejected_shutdown\":{},\"messages_in\":{},\"messages_out_ok\":{},\"bootstrap_seen\":{},\"shutdown_started\":{},\"shutdown_close_requested\":{},\"shutdown_close_ok\":{},\"shutdown_close_failed\":{}}}",
         stats.member_capacity,
         stats.live_members,
         stats.member_high_water,
@@ -478,11 +607,18 @@ fn serialize_stats(stats: &RoomStats) -> String {
         stats.left_peer,
         stats.left_idle,
         stats.left_slow,
+        stats.left_protocol,
+        stats.left_timeout,
+        stats.left_foreign,
         stats.left_shutdown,
         stats.presence_ticks,
         stats.presence_broadcasts_ok,
         stats.presence_broadcasts_full,
         stats.presence_broadcasts_stale,
+        stats.presence_broadcasts_closed,
+        stats.presence_broadcasts_protocol,
+        stats.presence_broadcasts_timeout,
+        stats.presence_broadcasts_foreign,
         stats.rejected_full,
         stats.rejected_shutdown,
         stats.messages_in,
@@ -516,11 +652,18 @@ fn parse_stats_json(json: &str) -> Option<RoomStats> {
         left_peer: num(json, "left_peer")?,
         left_idle: num(json, "left_idle")?,
         left_slow: num(json, "left_slow")?,
+        left_protocol: num(json, "left_protocol")?,
+        left_timeout: num(json, "left_timeout")?,
+        left_foreign: num(json, "left_foreign")?,
         left_shutdown: num(json, "left_shutdown")?,
         presence_ticks: num(json, "presence_ticks")?,
         presence_broadcasts_ok: num(json, "presence_broadcasts_ok")?,
         presence_broadcasts_full: num(json, "presence_broadcasts_full")?,
         presence_broadcasts_stale: num(json, "presence_broadcasts_stale")?,
+        presence_broadcasts_closed: num(json, "presence_broadcasts_closed")?,
+        presence_broadcasts_protocol: num(json, "presence_broadcasts_protocol")?,
+        presence_broadcasts_timeout: num(json, "presence_broadcasts_timeout")?,
+        presence_broadcasts_foreign: num(json, "presence_broadcasts_foreign")?,
         rejected_full: num(json, "rejected_full")?,
         rejected_shutdown: num(json, "rejected_shutdown")?,
         messages_in: num(json, "messages_in")?,
@@ -580,7 +723,7 @@ impl RoomServer {
                 Room,
                 WebSocketSessionMsg,
                 WebSocketSessionMsg,
-                HttpConnectionMsg,
+                Infallible,
             >(
                 Room {
                     members: WebSocketMemberTable::new(config.member_capacity),
