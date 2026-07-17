@@ -16,11 +16,16 @@ rejection reason, worker error, or unexpected response.
 `RunReport::work_failures` retains those values instead of reducing them to a
 failure count.
 
+`RunConfig::validate` rejects zero callers/in-flight capacity and oversized
+mailbox/duration values before runtime or barrier construction. Zero mailbox
+remains available for intentional host-`Full` proof (`run_put_terminals`).
+
 ## Run
 
 ```bash
 cargo run --manifest-path examples/systems/system_bounded_object_lane/Cargo.toml
 cargo test --manifest-path examples/systems/system_bounded_object_lane/Cargo.toml
+cargo test --manifest-path examples/systems/system_bounded_object_lane/Cargo.toml --test public_smoke public_smoke -- --exact
 ```
 
 ## Findings

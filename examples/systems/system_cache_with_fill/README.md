@@ -15,11 +15,17 @@ Both parked callers and cache entries have explicit capacities. Their overload
 replies remain distinct (`PendingFull` and `EntryFull`), so policy does not have
 to infer why admission failed.
 
+`RunConfig::validate` rejects zero and oversized caller, pending, entry,
+mailbox, and duration values before runtime or barrier construction. Host
+mailbox `Full` remains distinct from application `Rejected(PendingFull)` and
+`Rejected(EntryFull)` (`run_mailbox_full`).
+
 ## Run
 
 ```bash
 cargo run --manifest-path examples/systems/system_cache_with_fill/Cargo.toml
 cargo test --manifest-path examples/systems/system_cache_with_fill/Cargo.toml
+cargo test --manifest-path examples/systems/system_cache_with_fill/Cargo.toml --test public_smoke public_smoke -- --exact
 ```
 
 ## What this specimen says about Tina

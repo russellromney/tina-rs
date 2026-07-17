@@ -18,6 +18,8 @@
 //! the same grep + parser works.
 
 use std::convert::Infallible;
+use std::error::Error;
+use std::fmt;
 use std::sync::{Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,6 +32,17 @@ use tina_runtime::{
     SharedCapacityScope, SharedLease, SharedScopeFull, SleepReply, SplitServiceHandle,
     ThreadedRuntimeError, format_assertion_failure, sleep,
 };
+
+/// Upper bound on concurrent soak workers.
+pub const MAX_WORKERS: usize = 4_096;
+/// Upper bound on requests each worker issues.
+pub const MAX_REQUESTS_PER_WORKER: usize = 1_000_000;
+/// Upper bound on total requests (`workers * requests_per_worker`).
+pub const MAX_TOTAL_REQUESTS: usize = 2_000_000;
+/// Upper bound on scope, sink, mailbox, and timer capacities.
+pub const MAX_CAPACITY: usize = 1_000_000;
+/// Upper bound on simulated delays and host call timeouts.
+pub const MAX_DURATION_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RunConfig {
@@ -62,6 +75,163 @@ impl Default for RunConfig {
             call_timeout_ms: 5_000,
         }
     }
+}
+
+/// Typed rejection of an unsafe public configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunConfigError {
+    Zero {
+        field: &'static str,
+    },
+    TooLarge {
+        field: &'static str,
+        value: usize,
+        max: usize,
+    },
+    DurationTooLarge {
+        field: &'static str,
+        value_ms: u64,
+        max_ms: u64,
+    },
+    TotalRequestOverflow {
+        workers: usize,
+        requests_per_worker: usize,
+    },
+    TotalRequestsTooLarge {
+        total: usize,
+        max: usize,
+    },
+}
+
+impl fmt::Display for RunConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zero { field } => write!(f, "{field} must be greater than zero"),
+            Self::TooLarge { field, value, max } => {
+                write!(f, "{field} {value} exceeds maximum {max}")
+            }
+            Self::DurationTooLarge {
+                field,
+                value_ms,
+                max_ms,
+            } => write!(f, "{field} {value_ms}ms exceeds maximum {max_ms}ms"),
+            Self::TotalRequestOverflow {
+                workers,
+                requests_per_worker,
+            } => write!(
+                f,
+                "workers ({workers}) * requests_per_worker ({requests_per_worker}) overflowed usize"
+            ),
+            Self::TotalRequestsTooLarge { total, max } => {
+                write!(f, "total requests {total} exceeds maximum {max}")
+            }
+        }
+    }
+}
+
+impl Error for RunConfigError {}
+
+impl RunConfig {
+    /// Validates public counts and derived totals before runtime, barrier,
+    /// thread, outcome map, or scope construction.
+    pub fn validate(self) -> Result<Self, RunConfigError> {
+        nonzero_bounded("workers", self.workers, MAX_WORKERS)?;
+        nonzero_bounded(
+            "requests_per_worker",
+            self.requests_per_worker,
+            MAX_REQUESTS_PER_WORKER,
+        )?;
+        let total = self
+            .workers
+            .checked_mul(self.requests_per_worker)
+            .ok_or(RunConfigError::TotalRequestOverflow {
+                workers: self.workers,
+                requests_per_worker: self.requests_per_worker,
+            })?;
+        if total > MAX_TOTAL_REQUESTS {
+            return Err(RunConfigError::TotalRequestsTooLarge {
+                total,
+                max: MAX_TOTAL_REQUESTS,
+            });
+        }
+        // Barrier participants = workers + 1.
+        self.workers
+            .checked_add(1)
+            .ok_or(RunConfigError::TotalRequestOverflow {
+                workers: self.workers,
+                requests_per_worker: self.requests_per_worker,
+            })?;
+
+        nonzero_bounded(
+            "http_in_flight_cap",
+            self.http_in_flight_cap,
+            MAX_CAPACITY,
+        )?;
+        nonzero_bounded("db_in_flight_cap", self.db_in_flight_cap, MAX_CAPACITY)?;
+        nonzero_bounded("event_sink_cap", self.event_sink_cap, MAX_CAPACITY)?;
+        // Zero mailbox / timer remain available for intentional pressure proofs.
+        if self.gateway_mailbox > MAX_CAPACITY {
+            return Err(RunConfigError::TooLarge {
+                field: "gateway_mailbox",
+                value: self.gateway_mailbox,
+                max: MAX_CAPACITY,
+            });
+        }
+        if self.timer_capacity > MAX_CAPACITY {
+            return Err(RunConfigError::TooLarge {
+                field: "timer_capacity",
+                value: self.timer_capacity,
+                max: MAX_CAPACITY,
+            });
+        }
+        // Delays and thresholds may be zero for already-timed-out probes.
+        if self.fake_http_ms > MAX_DURATION_MS {
+            return Err(RunConfigError::DurationTooLarge {
+                field: "fake_http_ms",
+                value_ms: self.fake_http_ms,
+                max_ms: MAX_DURATION_MS,
+            });
+        }
+        if self.fake_db_ms > MAX_DURATION_MS {
+            return Err(RunConfigError::DurationTooLarge {
+                field: "fake_db_ms",
+                value_ms: self.fake_db_ms,
+                max_ms: MAX_DURATION_MS,
+            });
+        }
+        if self.slow_threshold_ms > MAX_DURATION_MS {
+            return Err(RunConfigError::DurationTooLarge {
+                field: "slow_threshold_ms",
+                value_ms: self.slow_threshold_ms,
+                max_ms: MAX_DURATION_MS,
+            });
+        }
+        // call_timeout_ms may be zero for already-expired caller probes.
+        if self.call_timeout_ms > MAX_DURATION_MS {
+            return Err(RunConfigError::DurationTooLarge {
+                field: "call_timeout_ms",
+                value_ms: self.call_timeout_ms,
+                max_ms: MAX_DURATION_MS,
+            });
+        }
+        Ok(self)
+    }
+
+    /// Checked total request count after [`Self::validate`].
+    pub fn total_requests(self) -> Result<usize, RunConfigError> {
+        let config = self.validate()?;
+        Ok(config.workers * config.requests_per_worker)
+    }
+}
+
+fn nonzero_bounded(field: &'static str, value: usize, max: usize) -> Result<(), RunConfigError> {
+    if value == 0 {
+        return Err(RunConfigError::Zero { field });
+    }
+    if value > max {
+        return Err(RunConfigError::TooLarge { field, value, max });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,6 +478,11 @@ fn classify_outcomes(
 }
 
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
+    let config = config.validate()?;
+    let total = config
+        .workers
+        .checked_mul(config.requests_per_worker)
+        .expect("validated total requests");
     let local_config = LocalSystemConfig {
         timer_capacity: config.timer_capacity,
         ..LocalSystemConfig::default()
@@ -328,7 +503,6 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
             .map_err(|error| anyhow::anyhow!("register soak gateway: {error:?}"))?;
 
         let timeout = Duration::from_millis(config.call_timeout_ms);
-        let total = config.workers * config.requests_per_worker;
         let outcomes = Mutex::new(Vec::with_capacity(total));
         let barrier = Barrier::new(config.workers + 1);
         let worker_panicked = thread::scope(|scope| {

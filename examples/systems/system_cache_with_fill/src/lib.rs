@@ -20,7 +20,7 @@ const MAX_CACHE_MAILBOX: usize = 65_536;
 const MAX_DURATION_MS: u64 = 60_000;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunConfig {
     pub callers: usize,
     pub pending_capacity: usize,
@@ -464,7 +464,7 @@ impl Cache {
 }
 
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
-    validate_config(config)?;
+    let config = config.validate()?;
     Ok(RunReport {
         single_flight: run_single_flight(config)?,
         stale_invalidation: run_stale_invalidation(config)?,
@@ -474,20 +474,13 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
 }
 
 pub fn run_single_flight(config: RunConfig) -> anyhow::Result<SingleFlightReport> {
-    validate_config(config)?;
+    let config = config.validate()?;
     let runtime =
         LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
     runtime
         .run_to_shutdown_reported(SHUTDOWN_TIMEOUT, |runtime| -> anyhow::Result<_> {
             let cache = register_cache(runtime, config)?;
-            let participants =
-                config
-                    .callers
-                    .checked_add(1)
-                    .ok_or(ConfigError::TooManyCallers {
-                        requested: config.callers,
-                        max: MAX_CALLERS,
-                    })?;
+            let participants = config.callers + 1;
             let barrier = Barrier::new(participants);
             let timeout = Duration::from_millis(config.call_timeout_ms);
             let outcomes = thread::scope(|scope| {
@@ -566,7 +559,7 @@ pub fn run_single_flight(config: RunConfig) -> anyhow::Result<SingleFlightReport
 }
 
 pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalidationReport> {
-    validate_config(config)?;
+    let config = config.validate()?;
     let runtime =
         LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
     runtime
@@ -636,7 +629,7 @@ pub fn run_stale_invalidation(config: RunConfig) -> anyhow::Result<StaleInvalida
 }
 
 pub fn run_caller_gone(config: RunConfig) -> anyhow::Result<CallerGoneReport> {
-    validate_config(config)?;
+    let config = config.validate()?;
     let runtime =
         LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
     runtime
@@ -718,7 +711,7 @@ pub fn run_caller_gone(config: RunConfig) -> anyhow::Result<CallerGoneReport> {
 }
 
 pub fn run_entry_capacity(config: RunConfig) -> anyhow::Result<EntryCapacityReport> {
-    validate_config(config)?;
+    let config = config.validate()?;
     let config = RunConfig {
         entry_capacity: 1,
         ..config
@@ -790,6 +783,22 @@ fn register_cache(
             config.cache_mailbox,
         )
         .map_err(|e| anyhow::anyhow!("register cache: {e:?}"))
+}
+
+impl RunConfig {
+    /// Rejects zero and oversized public counts before runtime, barrier, or
+    /// `SharedWork` construction.
+    pub fn validate(self) -> Result<Self, ConfigError> {
+        validate_config(self)?;
+        // Barrier participants = callers + 1 must not overflow.
+        self.callers
+            .checked_add(1)
+            .ok_or(ConfigError::TooManyCallers {
+                requested: self.callers,
+                max: MAX_CALLERS,
+            })?;
+        Ok(self)
+    }
 }
 
 fn validate_config(config: RunConfig) -> Result<(), ConfigError> {
@@ -930,4 +939,53 @@ fn expect_reply(
 
 fn terminal(operation: &'static str, outcome: TerminalOutcome) -> ScenarioError {
     ScenarioError::Terminal { operation, outcome }
+}
+
+/// Drives a single Get against a zero-capacity mailbox so host `Full` remains
+/// distinct from application `Rejected(PendingFull|EntryFull)`.
+pub fn run_mailbox_full(config: RunConfig) -> anyhow::Result<TerminalOutcome> {
+    // Validate every public field, then force mailbox=0 for this pressure proof.
+    // Zero mailbox is rejected by the normal public runner; this probe is the
+    // intentional failure path that proves host Full is still exact.
+    let config = RunConfig {
+        cache_mailbox: config.cache_mailbox.max(1),
+        callers: 1,
+        ..config
+    }
+    .validate()?;
+    let runtime =
+        LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    runtime
+        .run_to_shutdown_reported(SHUTDOWN_TIMEOUT, |runtime| -> anyhow::Result<_> {
+            let cache = register_cache(
+                runtime,
+                RunConfig {
+                    cache_mailbox: 0,
+                    ..config
+                },
+            )?;
+            match runtime.call_blocking_request(
+                cache.requests,
+                CacheRequest::Get {
+                    key: "mailbox-full".into(),
+                },
+                Duration::from_millis(config.call_timeout_ms),
+            ) {
+                Ok(CallOutcome::Full) => Ok(TerminalOutcome::Full),
+                Ok(CallOutcome::Closed) => Ok(TerminalOutcome::Closed),
+                Ok(CallOutcome::Timeout) => Ok(TerminalOutcome::Timeout),
+                Ok(CallOutcome::Rejected(reason)) => Ok(TerminalOutcome::Rejected(reason)),
+                Ok(CallOutcome::Replied(reply)) => Err(ScenarioError::Reply {
+                    operation: "mailbox full get",
+                    reply: Box::new(reply),
+                }
+                .into()),
+                Err(source) => Err(ScenarioError::Runtime {
+                    operation: "mailbox full get",
+                    source,
+                }
+                .into()),
+            }
+        })
+        .map_err(Into::into)
 }

@@ -1,4 +1,4 @@
-use system_cache_with_fill::{ConfigError, RunConfig, run};
+use system_cache_with_fill::{ConfigError, RunConfig, TerminalOutcome, run, run_mailbox_full};
 
 #[test]
 fn cache_fill_is_single_flight_and_stale_results_do_not_cache() {
@@ -153,4 +153,10 @@ fn invalid_configuration_is_typed_and_rejected_before_startup() {
         let error = run(config).expect_err("invalid configuration must fail");
         assert_eq!(error.downcast_ref::<ConfigError>(), Some(&expected));
     }
+}
+
+#[test]
+fn host_mailbox_full_is_distinct_from_application_rejection() {
+    let outcome = run_mailbox_full(RunConfig::default()).expect("mailbox full probe");
+    assert_eq!(outcome, TerminalOutcome::Full);
 }

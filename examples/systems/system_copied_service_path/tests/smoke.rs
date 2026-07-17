@@ -1,5 +1,5 @@
 use std::time::{Duration, Instant};
-use system_copied_service_path::{RunConfig, run};
+use system_copied_service_path::{MAX_CALLERS, MAX_CAPACITY, MAX_DURATION_MS, RunConfig, RunConfigError, run};
 
 #[test]
 fn copied_service_path_smoke() {
@@ -167,5 +167,88 @@ fn reporting_failure_still_reaches_clean_shutdown() {
     assert!(
         error.to_string().contains("stats mailbox was full"),
         "unexpected reporting error: {error:#}"
+    );
+}
+
+#[test]
+fn public_config_bounds_reject_before_runtime_startup() {
+    let cases = [
+        (
+            RunConfig {
+                capacity: 0,
+                ..RunConfig::default()
+            },
+            RunConfigError::Zero { field: "capacity" },
+        ),
+        (
+            RunConfig {
+                callers: 0,
+                ..RunConfig::default()
+            },
+            RunConfigError::Zero { field: "callers" },
+        ),
+        (
+            RunConfig {
+                call_timeout_ms: 0,
+                ..RunConfig::default()
+            },
+            RunConfigError::Zero {
+                field: "call_timeout_ms",
+            },
+        ),
+        (
+            RunConfig {
+                capacity: MAX_CAPACITY + 1,
+                ..RunConfig::default()
+            },
+            RunConfigError::TooLarge {
+                field: "capacity",
+                value: MAX_CAPACITY + 1,
+                max: MAX_CAPACITY,
+            },
+        ),
+        (
+            RunConfig {
+                callers: MAX_CALLERS + 1,
+                ..RunConfig::default()
+            },
+            RunConfigError::TooLarge {
+                field: "callers",
+                value: MAX_CALLERS + 1,
+                max: MAX_CALLERS,
+            },
+        ),
+        (
+            RunConfig {
+                work_ms: MAX_DURATION_MS + 1,
+                ..RunConfig::default()
+            },
+            RunConfigError::DurationTooLarge {
+                field: "work_ms",
+                value_ms: MAX_DURATION_MS + 1,
+                max_ms: MAX_DURATION_MS,
+            },
+        ),
+        (
+            RunConfig {
+                call_timeout_ms: MAX_DURATION_MS + 1,
+                ..RunConfig::default()
+            },
+            RunConfigError::DurationTooLarge {
+                field: "call_timeout_ms",
+                value_ms: MAX_DURATION_MS + 1,
+                max_ms: MAX_DURATION_MS,
+            },
+        ),
+    ];
+
+    for (config, expected) in cases {
+        let error = run(config).expect_err("invalid config must fail before startup");
+        assert_eq!(error.downcast_ref::<RunConfigError>(), Some(&expected));
+    }
+
+    assert_eq!(
+        RunConfig::default().validate().expect("defaults validate"),
+        RunConfig::default()
     );
 }

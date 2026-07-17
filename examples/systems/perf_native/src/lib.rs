@@ -94,6 +94,134 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 const KEEPALIVE_REQUESTS_PER_CONN: usize = 4;
 const FIXED_BODY_BYTES: usize = 4096;
 
+/// Public upper bounds for configurable workload knobs used by comparison rows.
+pub const MAX_OPS: u64 = 1_000_000;
+pub const MAX_WORKERS: usize = 4_096;
+pub const MAX_SAMPLES: usize = 1_024;
+pub const MAX_CAPACITY: usize = 2_000_000;
+pub const MAX_CALL_TIMEOUT_MS: u64 = 60_000;
+
+/// Public workload knobs for native comparison rows.
+///
+/// Defaults preserve the accepted historical counts. Validation rejects zero
+/// and oversized values, plus derived capacity overflow, before any runtime,
+/// mailbox, or load-runner construction that depends on those knobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkloadConfig {
+    pub ops: u64,
+    pub workers: usize,
+    pub samples: usize,
+    pub capacity: usize,
+    pub call_timeout_ms: u64,
+}
+
+impl Default for WorkloadConfig {
+    fn default() -> Self {
+        Self {
+            ops: OPS,
+            workers: WORKERS,
+            samples: SAMPLES,
+            capacity: CAPACITY,
+            call_timeout_ms: CALL_TIMEOUT.as_millis() as u64,
+        }
+    }
+}
+
+/// Typed rejection of an unsafe public workload configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkloadConfigError {
+    Zero {
+        field: &'static str,
+    },
+    TooLarge {
+        field: &'static str,
+        value: u128,
+        max: u128,
+    },
+    CapacityTooSmall {
+        capacity: usize,
+        ops: u64,
+    },
+    DerivedOverflow {
+        field: &'static str,
+    },
+}
+
+impl std::fmt::Display for WorkloadConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Zero { field } => write!(f, "{field} must be greater than zero"),
+            Self::TooLarge { field, value, max } => {
+                write!(f, "{field} {value} exceeds maximum {max}")
+            }
+            Self::CapacityTooSmall { capacity, ops } => {
+                write!(f, "capacity {capacity} is below ops {ops}")
+            }
+            Self::DerivedOverflow { field } => write!(f, "{field} overflowed"),
+        }
+    }
+}
+
+impl std::error::Error for WorkloadConfigError {}
+
+impl WorkloadConfig {
+    /// Validates public counts and derived values before allocation.
+    pub fn validate(self) -> Result<Self, WorkloadConfigError> {
+        nonzero_u64("ops", self.ops, MAX_OPS)?;
+        nonzero_usize("workers", self.workers, MAX_WORKERS)?;
+        nonzero_usize("samples", self.samples, MAX_SAMPLES)?;
+        nonzero_usize("capacity", self.capacity, MAX_CAPACITY)?;
+        nonzero_u64("call_timeout_ms", self.call_timeout_ms, MAX_CALL_TIMEOUT_MS)?;
+        let ops_usize = usize::try_from(self.ops).map_err(|_| WorkloadConfigError::DerivedOverflow {
+            field: "ops",
+        })?;
+        if self.capacity < ops_usize {
+            return Err(WorkloadConfigError::CapacityTooSmall {
+                capacity: self.capacity,
+                ops: self.ops,
+            });
+        }
+        self.workers
+            .checked_add(1)
+            .ok_or(WorkloadConfigError::DerivedOverflow {
+                field: "workers_plus_one",
+            })?;
+        Ok(self)
+    }
+}
+
+fn nonzero_usize(
+    field: &'static str,
+    value: usize,
+    max: usize,
+) -> Result<(), WorkloadConfigError> {
+    if value == 0 {
+        return Err(WorkloadConfigError::Zero { field });
+    }
+    if value > max {
+        return Err(WorkloadConfigError::TooLarge {
+            field,
+            value: value as u128,
+            max: max as u128,
+        });
+    }
+    Ok(())
+}
+
+fn nonzero_u64(field: &'static str, value: u64, max: u64) -> Result<(), WorkloadConfigError> {
+    if value == 0 {
+        return Err(WorkloadConfigError::Zero { field });
+    }
+    if value > max {
+        return Err(WorkloadConfigError::TooLarge {
+            field,
+            value: value as u128,
+            max: max as u128,
+        });
+    }
+    Ok(())
+}
+
 pub fn run_all() -> anyhow::Result<Vec<PerfComparisonReport>> {
     Ok(vec![
         host_enqueue_compare()?,
@@ -397,9 +525,17 @@ enum ChainEvent {
 /// Split-service envelope for [`ChainService`].
 type ChainMsg = tina::ServiceMessage<ChainEvent, ChainRequest>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ChainReply {
     Done,
+    /// Downstream ping mailbox was full; not collapsed into success.
+    DownstreamFull,
+    /// Downstream ping service was closed.
+    DownstreamClosed,
+    /// Downstream ping call timed out.
+    DownstreamTimeout,
+    /// Downstream ping call was rejected with an exact reason.
+    DownstreamRejected(tina::CallRejectedReason),
 }
 
 #[derive(Debug)]
@@ -415,10 +551,9 @@ impl ChainService {
         _ctx: &mut Context<'_, SingleShard, Self::Reply>,
     ) -> Effect<Self> {
         match event {
-            ChainEvent::PingReturned(request, CallOutcome::Replied(PingReply::Pong)) => {
-                reply_to(request, ChainReply::Done)
+            ChainEvent::PingReturned(request, outcome) => {
+                reply_to(request, chain_reply_from_ping(outcome))
             }
-            ChainEvent::PingReturned(request, _) => reply_to(request, ChainReply::Done),
         }
     }
 
@@ -432,6 +567,16 @@ impl ChainService {
                 .defer(call(self.ping, PingMsg::Ping, CALL_TIMEOUT))
                 .reply(|req, outcome| ChainMsg::Event(ChainEvent::PingReturned(req, outcome))),
         }
+    }
+}
+
+fn chain_reply_from_ping(outcome: CallOutcome<PingReply>) -> ChainReply {
+    match outcome {
+        CallOutcome::Replied(PingReply::Pong) => ChainReply::Done,
+        CallOutcome::Full => ChainReply::DownstreamFull,
+        CallOutcome::Closed => ChainReply::DownstreamClosed,
+        CallOutcome::Timeout => ChainReply::DownstreamTimeout,
+        CallOutcome::Rejected(reason) => ChainReply::DownstreamRejected(reason),
     }
 }
 
@@ -553,6 +698,12 @@ fn tina_observed_admission_row() -> anyhow::Result<PerfReport> {
             ) => OpOutcome::Err { kind: "full" },
             Err(ThreadedSendObservedError::MailboxClosed) => OpOutcome::Err { kind: "closed" },
             Err(ThreadedSendObservedError::WorkerStopped) => OpOutcome::Err { kind: "stopped" },
+            Err(ThreadedSendObservedError::ForeignSystem { .. }) => OpOutcome::Err {
+                kind: "foreign_system",
+            },
+            Err(ThreadedSendObservedError::UnknownShard(_)) => OpOutcome::Err {
+                kind: "unknown_shard",
+            },
         },
         Some({
             let count = Arc::clone(&count);
@@ -649,8 +800,10 @@ fn tina_host_call_row() -> anyhow::Result<PerfReport> {
         move |_| match rt.call_blocking(addr, PingMsg::Ping, CALL_TIMEOUT) {
             Ok(CallOutcome::Replied(PingReply::Pong)) => OpOutcome::Ok,
             Ok(CallOutcome::Full) => OpOutcome::Err { kind: "full" },
+            Ok(CallOutcome::Closed) => OpOutcome::Err { kind: "closed" },
             Ok(CallOutcome::Timeout) => OpOutcome::Timeout,
-            _ => OpOutcome::Err { kind: "call_error" },
+            Ok(CallOutcome::Rejected(_)) => OpOutcome::Err { kind: "rejected" },
+            Err(_) => OpOutcome::Err { kind: "host_error" },
         },
         None::<fn() -> LoadObservation>,
     );
@@ -723,9 +876,21 @@ fn tina_service_call_chain_row() -> anyhow::Result<PerfReport> {
         },
         move |_| match rt.call_blocking(chain, ChainMsg::Request(ChainRequest::Run), CALL_TIMEOUT) {
             Ok(CallOutcome::Replied(ChainReply::Done)) => OpOutcome::Ok,
+            Ok(CallOutcome::Replied(ChainReply::DownstreamFull)) => OpOutcome::Err {
+                kind: "downstream_full",
+            },
+            Ok(CallOutcome::Replied(ChainReply::DownstreamClosed)) => OpOutcome::Err {
+                kind: "downstream_closed",
+            },
+            Ok(CallOutcome::Replied(ChainReply::DownstreamTimeout)) => OpOutcome::Timeout,
+            Ok(CallOutcome::Replied(ChainReply::DownstreamRejected(_))) => OpOutcome::Err {
+                kind: "downstream_rejected",
+            },
             Ok(CallOutcome::Full) => OpOutcome::Err { kind: "full" },
+            Ok(CallOutcome::Closed) => OpOutcome::Err { kind: "closed" },
             Ok(CallOutcome::Timeout) => OpOutcome::Timeout,
-            _ => OpOutcome::Err { kind: "call_error" },
+            Ok(CallOutcome::Rejected(_)) => OpOutcome::Err { kind: "rejected" },
+            Err(_) => OpOutcome::Err { kind: "host_error" },
         },
         None::<fn() -> LoadObservation>,
     );
@@ -3325,5 +3490,82 @@ mod tests {
             io_error.kind(),
         );
         let _ = done_tx.send(());
+    }
+
+    #[test]
+    fn application_chain_terminals_remain_exact() {
+        assert_eq!(
+            chain_reply_from_ping(CallOutcome::Replied(PingReply::Pong)),
+            ChainReply::Done
+        );
+        assert_eq!(
+            chain_reply_from_ping(CallOutcome::Full),
+            ChainReply::DownstreamFull
+        );
+        assert_eq!(
+            chain_reply_from_ping(CallOutcome::Closed),
+            ChainReply::DownstreamClosed
+        );
+        assert_eq!(
+            chain_reply_from_ping(CallOutcome::Timeout),
+            ChainReply::DownstreamTimeout
+        );
+        let reason = tina::CallRejectedReason::UnsupportedMessage;
+        assert_eq!(
+            chain_reply_from_ping(CallOutcome::Rejected(reason)),
+            ChainReply::DownstreamRejected(reason)
+        );
+    }
+
+    #[test]
+    fn public_workload_config_rejects_zero_max_and_overflow() {
+        assert_eq!(
+            WorkloadConfig::default().validate().expect("defaults"),
+            WorkloadConfig::default()
+        );
+        assert_eq!(WorkloadConfig::default().ops, 120);
+        assert_eq!(WorkloadConfig::default().workers, 4);
+        assert_eq!(WorkloadConfig::default().samples, 5);
+        assert_eq!(WorkloadConfig::default().capacity, 184);
+
+        assert!(matches!(
+            WorkloadConfig {
+                ops: 0,
+                ..WorkloadConfig::default()
+            }
+            .validate(),
+            Err(WorkloadConfigError::Zero { field: "ops" })
+        ));
+        assert!(matches!(
+            WorkloadConfig {
+                workers: MAX_WORKERS + 1,
+                ..WorkloadConfig::default()
+            }
+            .validate(),
+            Err(WorkloadConfigError::TooLarge {
+                field: "workers",
+                ..
+            })
+        ));
+        assert!(matches!(
+            WorkloadConfig {
+                capacity: 1,
+                ops: 2,
+                ..WorkloadConfig::default()
+            }
+            .validate(),
+            Err(WorkloadConfigError::CapacityTooSmall {
+                capacity: 1,
+                ops: 2
+            })
+        ));
+        assert!(matches!(
+            WorkloadConfig {
+                ops: MAX_OPS + 1,
+                ..WorkloadConfig::default()
+            }
+            .validate(),
+            Err(WorkloadConfigError::TooLarge { field: "ops", .. })
+        ));
     }
 }
