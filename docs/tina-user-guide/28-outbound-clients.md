@@ -69,9 +69,12 @@ config.max_reconnects = 3;     // bounded — no hidden reconnect loop
 config.retained_reports = 4;   // bounded retained closed/stale reports
 config.validate().unwrap();
 
-let handles = build_websocket_client_manager(&runtime, ws, config, 32, 16)?;
+let handles = build_websocket_client_manager(&app.host_control(), ws, config, 32, 16)?;
 // call(handles.manager, WebSocketManagerMsg::Connect, timeout) → WebSocketConnectOutcome
 ```
+
+The builder registers on the lower `ThreadedRuntime`; on a `LocalSystem`
+app you reach it through `app.host_control()`.
 
 The manager returns typed connect outcomes: `Connected`, `ConnectFailed`,
 `NoHealthyEndpoint`, `TimedOut`, `Full`, and `Closed` when shutdown wins a

@@ -79,9 +79,9 @@ use tina_http::{GrpcClient, GrpcLimits, GrpcUnaryOutcome,
 
 // 1. Register a connection isolate to the target authority and Begin it.
 let target = Http2Target::H2c { authority: "svc".into(), addr };
-let conn = runtime.register_with_capacity::<Http2ClientConnection<S>, _>(
+let conn = app.register_root::<Http2ClientConnection<S>, _>(
     Http2ClientConnection::new(target, Default::default())?, 32)?;
-runtime.try_send(conn, Http2ClientMsg::Begin)?;
+app.try_send(conn, Http2ClientMsg::Begin)?;
 
 // 2. A GrpcClient is a thin wrapper over that connection.
 let client = GrpcClient::new(conn, GrpcLimits::default());
@@ -89,7 +89,7 @@ let client = GrpcClient::new(conn, GrpcLimits::default());
 // 3. Build the submit, call the connection, decode the outcome.
 let submit = client.unary_request("/pkg.Service/Method", &request_msg)?;
 let CallOutcome::Replied(reply) =
-    runtime.call_blocking(client.connection(), submit, timeout)?
+    app.call_blocking(client.connection(), submit, timeout)?
 else { /* host call timed out / target gone */ return; };
 match client.unary_outcome_from_reply::<ReplyMsg>(reply) {
     GrpcUnaryOutcome::Ok(msg) => { /* OK status + decoded message */ }

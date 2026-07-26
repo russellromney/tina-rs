@@ -36,8 +36,10 @@ native session, not a reconnecting client manager and not a bridge. Native
 HTTPS/1.1 lives in `tina-http`'s
 `HttpsListener` and `HttpClient` — explicit DER cert config, typed
 startup, matchable TLS errors. For repeated outbound
-requests against the same origin, `tina_http::build_keepalive_pool`
-hands you a `KeepalivePoolHandles { pool, connections }`: one TCP
+requests against the same origin,
+`tina_http::InstallKeepalivePool::install_keepalive_pool` installs the
+pool on a `LocalSystem` and hands you an owned `InstalledKeepalivePool`
+handle (`pool.pool()` / `pool.connections()`): one TCP
 (or TLS) connection per pool slot serves many requests, with
 `acquire` / `release` / `retire` / `close` and a pressure report.
 Each connection isolate is bound to one origin at construction —
@@ -46,14 +48,15 @@ roots themselves — so cross-origin reuse cannot happen at the
 connection-isolate level. The recommended consumer pattern is
 always release `Reuse`; the connection self-heals on
 `must_retire = true` (drops the bad transport, reconnects on the
-next request). On shutdown, call `shutdown_keepalive_pool(...)`
-or close the pool and call `KeepaliveConnectionMsg::Stop` on each
-address in `handles.connections`, checking for
-`KeepaliveOutcome::Stopped`; closing the pool alone only closes
-lease admission. With `CloseMode::Drain`, the helper waits for
-leased connections to return before stopping connection isolates;
-if that deadline fires, the report names the remaining leased count
-and leaves connections running. Reach for a bridge when you need the
+next request). On shutdown, the consuming
+`pool.close_and_drain(timeout)` closes lease admission, waits for
+leased connections to return, then stops each connection isolate;
+on deadline it returns `KeepaliveCloseAndDrain::TimedOut { pool,
+pending }` and keeps the handle so you can retry later. There is no
+public force-close on this facade. (The raw-runtime free functions
+`build_keepalive_pool` / `shutdown_keepalive_pool` still exist for
+`ThreadedRuntime` consumers; they are not the facade form.)
+Reach for a bridge when you need the
 broader ecosystem behavior Tina has not chosen to own natively:
 system trust roots, redirects/cookies, proxies, existing Axum/Tower
 apps, or a third-party SDK that only ships a Tokio client.
@@ -67,7 +70,7 @@ apps, or a third-party SDK that only ships a Tokio client.
 | `tina-rpc-tokio` | Tokio caller → `tina-rpc` framed client | A Tokio task wants an `await`able shape over a registered `tina_rpc::Client` (correlator demux, bounded admission, opt-in retry). Wraps the existing client; does not own the wire. |
 | `tina-reqwest-bridge` | Tina caller → outbound HTTP via `reqwest` | A Tina service needs redirects, cookies, system trust roots, proxy/middleware behavior, or other mature web-client behaviour. Native `tina-http` covers HTTP/1.1, HTTPS/1.1, HTTP/2 h2c/h2-TLS client basics, keepalive pools, and protocol facts; reqwest covers the broad web-client ecosystem. |
 | `tina-sqlite-bridge` | Tina caller → SQLite via `rusqlite` | A Tina service needs an in-process SQL database. SQLite is sync C; the bridge owns one connection on a blocking std thread. Autocommit only; no pool, no transactions in first form. |
-| `tina-sqlx-bridge` | Tina caller → Postgres via `sqlx::PgPool` | A Tina service needs to reach a real Postgres without blocking shard threads. Two-runtime cost: the bridge spawns SQLx work on Tokio. Postgres-first. Ships `Execute`, `FetchOne`, bounded `FetchMany`, atomic-script `Transaction`, and opt-in DB-side cancel. Generic `sqlx::Database`, ORM, migrations, and user-struct row mapping stay non-goals. |
+| `tina-sqlx-bridge` | Tina caller → Postgres via `sqlx::PgPool` | A Tina service needs to reach a real Postgres without blocking shard threads. Two-runtime cost: the bridge spawns SQLx work on Tokio. Postgres-first. Ships `Execute`, `FetchOne`, bounded `FetchMany`, and atomic-script `Transaction`. Generic `sqlx::Database`, ORM, migrations, and user-struct row mapping stay non-goals. |
 | `tina-aws-bridge` | Tina caller → AWS SDK S3/SQS/DynamoDB/SNS/Secrets Manager | A Tina service needs AWS SDK behavior without letting AWS/Hyper/Tokio pressure become invisible. Ships S3 (`PutObject`, bounded `GetObject`, `HeadObject`, `DeleteObject`), SQS (`SendMessage`, `ReceiveMessage`, `DeleteMessage`), DynamoDB (`GetItem`, `PutItem`, `UpdateItem`, `DeleteItem`, `Query` with typed capacity facts), SNS (`Publish`), and Secrets Manager (`GetSecretValue`). The SDK still owns SigV4, credentials, HTTP, TLS, endpoints, and service protocols. |
 
 Each crate is small, opt-in, and bounded. Native Tina crates
@@ -209,10 +212,10 @@ impl Isolate for App {
 }
 ```
 
-Setup uses the `install` helper:
+Setup uses the `install_local` helper:
 
 ```rust
-let bridge = ReqwestWorker::<SingleShard>::install(&runtime, ReqwestConfig::default())?;
+let bridge = ReqwestWorker::<SingleShard>::install_local(&app, ReqwestConfig::default())?;
 let app = App { http: bridge.address };
 ```
 
@@ -225,10 +228,10 @@ a missing column.
 |---|---|---|---|---|---|---|
 | `tina-tokio-bridge` | `BridgeHost::register_bridge` returns a `BridgeHandle` | n/a (host owns the Tina runtime; callers own Tokio) | `BridgeHandle::close()` flags closed; subsequent `call`/`call_with_*` returns `BridgeError::Closed`. Health surface is `BridgeHandle::health()` (`Accepting` / `Closed`). | `BridgeHost::drain_and_shutdown(d)` waits up to `d` for all handle clones to drop | `BridgeMetricsSnapshot::dropped_responses` — handler tried to respond after the Tokio caller went away (caller-terminal) | `tina_tokio.bridge.call`, `tina_tokio.bridge` |
 | `tina-tower-bridge` | `TinaTowerService::new(handle)` wraps a `BridgeHandle` | inherits whatever the underlying handle has | `TinaTowerService::close()` forwards to the handle | inherits the handle's host-level drain | inherits the handle's `dropped_responses` | `tina_tower.bridge.call`, `tina_tower.bridge` (plus the inner tokio targets) |
-| `tina-rpc-tokio` | `BridgeClient::new(runtime, client_addr, max_in_flight)` registers a reply-shim isolate beside an existing `tina_rpc::Client` | n/a (the wrapped `Client` is always caller-owned) | no `close()` — drop the `BridgeClient` (and the underlying client) when done | n/a in first form | no per-bridge late-result counter; late wire replies are dropped at the shim by correlator | `tina_rpc.bridge.call` span (parent of inner events) |
-| `tina-reqwest-bridge` | `ReqwestWorker::install(&runtime, cfg)` | `ReqwestWorker::with_supplied_client(cfg, client, handle)` then `runtime.register_with_capacity` | `ReqwestCloser::close()` flags closed; new sends reply `ReqwestError::Closed`. In-flight tasks run to natural completion or per-attempt timeout (`tokio::time::timeout`, then `AbortHandle::abort`). | no bounded drain helper — drop the runtime to force-cancel | no `late_results` counter: the per-attempt timeout aborts the spawned Tokio task. A reply that arrives after the Tina caller's `IsolateCall` deadline shows as `CallReplyRejected` in the runtime trace. | `tina_reqwest.bridge.call`, `tina_reqwest.bridge` |
-| `tina-sqlite-bridge` | `SqliteWorker::install(&runtime, cfg)` | n/a (one in-process connection; no pool/handle to supply) | `SqliteCloser::close()` flags closed; the worker thread always finishes its current SQLite call. Drop the bridge isolate to retire the thread at its next `recv`. | n/a — the worker thread is uncancellable C code | `SqliteMetrics::late_results` — worker-terminal landed after the bridge surfaced `SqliteError::Timeout` (also visible in the trace as `CallReplyRejected`) | `tina_sqlite.bridge.call`, `tina_sqlite.bridge` |
-| `tina-sqlx-bridge` | `PgWorker::install(&runtime, cfg)` builds a `PgPool` and a small Tokio runtime | `PgWorker::install_with_pool(&runtime, cfg, pool, handle)` (SQLx settings on the supplied pool stay caller-owned; the supplied Tokio runtime is never shut down by the bridge) | `PgCloser::close()` flags closed; does **not** close the SQLx pool. Owned pool drops with the bridge; supplied pool stays caller-owned. | no bounded drain helper; SQLx queries keep running until natural completion (or until DB-side cancel fires under `with_cancel_on_timeout`) | `PgMetrics::late_results` — spawned SQLx task completed after the bridge surfaced `PgError::Timeout`. Does **not** count Postgres-side execution that continues past the future drop, nor the caller-observed `CallOutcome::Timeout` path (that lives in the trace as `CallReplyRejected`). | `tina_sqlx.bridge.call`, `tina_sqlx.bridge` |
+| `tina-rpc-tokio` | `BridgeClient::new(runtime, client_addr, max_in_flight, client_max_in_flight)` registers a reply-shim isolate beside an existing `tina_rpc::Client` | n/a (the wrapped `Client` is always caller-owned) | no `close()` — drop the `BridgeClient` (and the underlying client) when done | n/a in first form | no per-bridge late-result counter; late wire replies are dropped at the shim by correlator | `tina_rpc.bridge.call` span (parent of inner events) |
+| `tina-reqwest-bridge` | `ReqwestWorker::install_local(&system, cfg)`; `ReqwestWorker::install(&runtime, cfg)` is the lower-level runtime form | `ReqwestWorker::with_supplied_client(cfg, client, handle)` then explicit registration | `ReqwestCloser::close()` flags closed; new sends reply `ReqwestError::Closed`. In-flight tasks run to natural completion or per-attempt timeout (`tokio::time::timeout`, then `AbortHandle::abort`). | no bounded drain helper — drop the runtime to force-cancel | no `late_results` counter: the per-attempt timeout aborts the spawned Tokio task. A reply that arrives after the Tina caller's `IsolateCall` deadline shows as `CallReplyRejected` in the runtime trace. | `tina_reqwest.bridge.call`, `tina_reqwest.bridge` |
+| `tina-sqlite-bridge` | `SqliteWorker::install_local(&system, cfg)`; `SqliteWorker::install(&runtime, cfg)` is the lower-level runtime form | n/a (one in-process connection; no pool/handle to supply) | `SqliteCloser::close()` flags closed; the worker thread always finishes its current SQLite call. Drop the bridge isolate to retire the thread at its next `recv`. | n/a — the worker thread is uncancellable C code | `SqliteMetrics::late_results` — worker-terminal landed after the bridge surfaced `SqliteError::Timeout` (also visible in the trace as `CallReplyRejected`) | `tina_sqlite.bridge.call`, `tina_sqlite.bridge` |
+| `tina-sqlx-bridge` | `PgWorker::install_local(&system, cfg)` builds a `PgPool` and a small Tokio runtime; `PgWorker::install(&runtime, cfg)` is the lower-level runtime form | `PgWorker::install_local_with_pool(&system, cfg, pool, handle)` or `PgWorker::install_with_pool(&runtime, cfg, pool, handle)` (SQLx settings on the supplied pool stay caller-owned; the supplied Tokio runtime is never shut down by the bridge) | `PgCloser::close()` flags closed; does **not** close the SQLx pool. Owned pool drops with the bridge; supplied pool stays caller-owned. | no bounded drain helper; SQLx queries keep running until natural completion | `PgMetrics::late_results` — spawned SQLx task completed after the bridge surfaced `PgError::Timeout`. Does **not** count Postgres-side execution that continues past the future drop, nor the caller-observed `CallOutcome::Timeout` path (that lives in the trace as `CallReplyRejected`). | `tina_sqlx.bridge.call`, `tina_sqlx.bridge` |
 | `tina-aws-bridge` (S3) | `install_s3_local(&system, cfg)` builds an SDK client and a small Tokio runtime behind `LocalSystem`; `install_s3(&runtime, cfg)` is the lower-level runtime form | `S3Worker::with_supplied_client(cfg, client, handle)` then explicit registration (caller-owned client owns SigV4/credentials/HTTP/TLS/SDK retry; `sdk_max_attempts` reports `0`/unknown). Caller's Tokio runtime is never shut down by the bridge. | `S3Closer::close()` flags closed; new admissions reply `S3Error::Closed` | `S3Closer::close_and_drain(timeout)` waits up to `timeout` for already-admitted SDK work to leave the in-flight set; reports `in_flight_remaining` + per-operation `in_flight_kinds` on deadline. Spawned SDK futures are **not aborted**: a bridge timeout means Tina stopped waiting, not that AWS/Hyper cancelled bytes. | `S3Metrics::late_results` — SDK future terminal after the bridge already surfaced `S3Error::Timeout`. Until the SDK future finishes, it keeps occupying `max_in_flight` capacity. | `tina_aws.bridge.call`, `tina_aws.bridge` |
 | `tina-aws-bridge` (SQS) | `install_sqs_local(&system, cfg)`; `install_sqs(&runtime, cfg)` is the lower-level runtime form | `SqsWorker::with_supplied_client(cfg, client, handle)` (same ownership split as S3) | `SqsCloser::close()` flags closed | `SqsCloser::close_and_drain(timeout)` mirrors the S3 shape | `SqsMetrics::late_results` mirrors S3 — SDK terminal after bridge timeout. SQS state (sent, visibility extended, deleted) is **not** rolled back when the bridge stops waiting. | `tina_aws.bridge.call`, `tina_aws.bridge` |
 | `tina-aws-bridge` (DynamoDB) | `install_dynamodb_local(&system, cfg)`; `install_dynamodb(&runtime, cfg)` is the lower-level runtime form | `DynamoWorker::with_supplied_client(cfg, client, handle)` (same ownership split as S3) | `DynamoCloser::close()` flags closed | `DynamoCloser::close_and_drain(timeout)` mirrors the S3 shape | `DynamoMetrics::late_results` mirrors S3 — SDK terminal after bridge timeout. DynamoDB mutations (`PutItem`, `UpdateItem`, `DeleteItem`) are **not** rolled back when the bridge stops waiting. | `tina_aws.bridge.call`, `tina_aws.bridge` |
@@ -289,7 +292,7 @@ cargo run --manifest-path examples/systems/mini_saas_api/Cargo.toml -- pressure
 ```
 
 It uses `SqliteWorker` as the honest one-lane pool shape and
-`build_keepalive_pool` for outbound notifications. The route code keeps
+`install_keepalive_pool` for outbound notifications. The route code keeps
 bridge-layer `Full` / `Closed` / `Timeout` distinct from worker or upstream
 failures, and `/debug/capacity` reports DB full/closed/timeout counts beside
 outbound keepalive waiters, leases, full, closed, and cancellation counts.
@@ -318,7 +321,7 @@ let cfg = PgConfig::new()
     .with_pool(PgPoolConfig::new(env::var("DATABASE_URL")?))
     .with_max_in_flight(8)
     .with_default_timeout(Duration::from_secs(2));
-let bridge = PgWorker::<SingleShard>::install(&runtime, cfg)?;
+let bridge = PgWorker::<SingleShard>::install_local(&system, cfg)?;
 
 // In a handler:
 execute_call(self.db, "INSERT INTO t (k, v) VALUES ($1, $2)",
@@ -373,26 +376,27 @@ acquire are different bottlenecks.
   real outcome lands in the worker-terminal counter.
 - `PgError::PoolAcquireTimeout` — SQLx's pool deadline.
 
-**Cancellation.** Default off: Postgres keeps running the query
+**Cancellation.** Postgres keeps running the query
 past `PgError::Timeout`. The connection stays held until SQLx
 returns. Treat `PgError::Timeout` as "Tina stopped waiting," not
 "the database stopped."
 
-Opt-in via `PgConfig::with_cancel_on_timeout(pool_size)`. The
-bridge builds a sidecar pool from the same URL and fires
-`pg_cancel_backend(pid)` on timeout. Cost: one extra round trip
-per request to capture the backend PID. `db_cancels_sent` counts
-attempts. Best-effort — Postgres may not honor it, and a small
-race exists between cancel firing and the target connection
-returning to the pool. Only the `install` path honors this;
-`install_with_pool` silently ignores it.
+`PgConfig::with_cancel_on_timeout(pool_size)` is a compatibility
+no-op. The old sidecar pool fired `pg_cancel_backend(pid)` on
+timeout, but that path could race connection reuse and cancel a
+later query, so the bridge does not fire it. `db_cancels_sent`
+stays at zero; Tina-side timeout settles the caller while the SQLx
+slot remains occupied until physical terminal. Supplied-pool
+installs ignore the setting entirely.
 
 **Two install paths.**
 
-- `install(&runtime, cfg)` — bridge builds the pool and a small
-  Tokio runtime from `cfg`.
-- `install_with_pool(&runtime, cfg, pool, handle)` — caller
-  supplies both. SQLx settings on the supplied pool are caller-
+- `install_local(&system, cfg)` — the `LocalSystem` facade form;
+  `install(&runtime, cfg)` is the lower-level runtime form. Bridge
+  builds the pool and a small Tokio runtime from `cfg`.
+- `install_local_with_pool(&system, cfg, pool, handle)` —
+  facade form of `install_with_pool(&runtime, cfg, pool, handle)`;
+  caller supplies both. SQLx settings on the supplied pool are caller-
   owned. The pool must be built inside an active Tokio context
   (SQLx 0.8 spawns maintenance tasks at construction).
 

@@ -61,7 +61,8 @@ Shape:
 
 ```rust
 use tina::prelude::*;
-use tina_supervisor::{RestartBudget, RestartPolicy, SupervisorConfig};
+use tina::{RestartBudget, RestartPolicy};
+use tina_supervisor::SupervisorConfig;
 
 #[tina::isolate(
     message = ParentMsg,

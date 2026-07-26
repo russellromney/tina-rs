@@ -115,7 +115,7 @@ It assembles these local-service layers:
 | routing | direct method/path match in the controller isolate |
 | domain state | controller isolate fields, not `Arc<Mutex<AppState>>` |
 | DB | `tina-sqlite-bridge::SqliteWorker` as the documented one-lane pool shape |
-| outbound HTTP | native `tina_http::build_keepalive_pool` |
+| outbound HTTP | native `tina_http::InstallKeepalivePool::install_keepalive_pool` |
 | readiness | `GET /ready` probes DB and outbound pool state |
 | capacity | `GET /debug/capacity` reports body, controller, DB, and outbound surfaces |
 | shutdown | mark ingress closed, let admitted work finish or fail visibly, prove readiness reasons, close DB, drain keepalive pool, stop listeners, shutdown runtime |
@@ -291,9 +291,9 @@ Use when state has a natural key.
 - `ShardServiceTable<M, R>` — typed `ShardId -> Address<M, R>` table built
   over the same shard list. No hidden registry, no `Arc<Mutex<...>>`.
   Build with `ShardServiceTable::from_placement(placement, |shard|
-  runtime.register_with_capacity_on(...))` (explicit-step) or
-  `try_from_placement(placement, |shard| runtime.register_with_capacity_on(...))`
-  for runtimes whose registration returns a `Result`. Build errors retain the
+  app.register_root_on(...))` (explicit-step) or
+  `try_from_placement(placement, |shard| app.register_root_on(...))`
+  for hosts whose registration returns a `Result`. Build errors retain the
   successfully registered prefix because registration effects cannot be
   rolled back by the table.
 - `ShardRequestServiceTable<Request, Reply>` — the capability-preserving form
@@ -520,15 +520,15 @@ a handler signature can say "I carry the promise across turns" instead of
 ## Host Call From Tests And Setup
 
 Tests, specimens, and setup code often need to drive one service call
-from the host thread and read the result. Both threaded runtimes expose
+from the host thread and read the result. The live system owners expose
 `call_blocking` for exactly this:
 
 ```rust
 // single-shard
-let outcome = runtime.call_blocking(addr, MyMsg::Probe, Duration::from_secs(2));
+let outcome = app.call_blocking(addr, MyMsg::Probe, Duration::from_secs(2));
 
 // multi-shard, routed by the address's owning shard
-let outcome = multi_runtime.call_blocking(shard_addr, MyMsg::Probe, Duration::from_secs(2));
+let outcome = multi_app.call_blocking(shard_addr, MyMsg::Probe, Duration::from_secs(2));
 ```
 
 Both forms:
@@ -540,10 +540,10 @@ Both forms:
   `Closed`, `Timeout`, `Rejected`;
 - do **not** cancel accepted work when the host wait ends.
 
-The multi-shard form panics on an unknown shard, matching `try_send`
-and `observe_result`. There is no `call_blocking_on` in this phase;
-the routing-by-address-shard shape removes one place callers can get
-the shard id wrong.
+An unknown shard is a typed `UnknownShard` error, not a panic — same as
+`try_send` and `observe_result`. There is no `call_blocking_on`; the
+routing-by-address-shard shape removes one place callers can get the
+shard id wrong.
 
 **Do not call `call_blocking` from inside an isolate handler.**
 Handlers must stay synchronous and non-blocking. Use
@@ -552,14 +552,17 @@ Handlers must stay synchronous and non-blocking. Use
 Copied sharded smoke shape:
 
 ```rust
-let runtime = ThreadedMultiShardRuntime::new(shards, DefaultThreadedMailboxFactory);
-let addr = runtime.register_with_capacity_on::<MyService, _>(shard_id, svc, cap)?;
-runtime.try_send(addr, MyMsg::Bootstrap)?;
-let outcome = runtime.call_blocking(addr, MyMsg::Ping, Duration::from_secs(2))?;
+let app = LocalSystem::multi_shard(DefaultThreadedMailboxFactory)
+    .shard(shard_a)
+    .shard(shard_b)
+    .try_build()?;
+let addr = app.register_root_on::<MyService, _>(shard_id, svc, cap)?;
+app.try_send(addr, MyMsg::Bootstrap)?;
+let outcome = app.call_blocking(addr, MyMsg::Ping, Duration::from_secs(2))?;
 ```
 
 See `examples/systems/system_session_auth` for a real sharded
-specimen using `ThreadedMultiShardRuntime::call_blocking`.
+specimen using `LocalMultiShardSystem::call_blocking_request`.
 
 ## Admission Policy
 
@@ -776,7 +779,7 @@ caller receives the final reply.
 
 ### Close / drain on stop
 
-`SharedWork::drain_all_with(factory)`, `CancelableWork::drain(factory)`,
+`SharedWork::drain_all_with(factory)`, `CancelableWork::drain()`,
 and `PendingReplies::drain(...)` reply every open caller with a
 terminal value before the service stops. No silent drop. See
 [14-lifecycle-and-shutdown.md](14-lifecycle-and-shutdown.md) for the

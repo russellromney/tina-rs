@@ -36,9 +36,9 @@ observes worker-terminal truth; it cannot always stop the outside work. The
 
 This crate captures completions through a result channel so the smoke test stays
 deterministic. A bridge feeding a live Tina service delivers each completion as a
-domain event instead: register with `ThreadedRuntime::register_event_service`,
+domain event instead: register with `LocalSystem::register_event_service`,
 retain its typed `EventServiceHandle<BridgeEvent>`, and call
-`runtime.try_send_event(events, BridgeEvent::Completed { .. })`, then
+`app.try_send_event(events, BridgeEvent::Completed { .. })`, then
 `reply_to(..)` to the original caller. That path is entirely public; the bounded
 admission, worker-terminal accounting, and caller warning shown here are exactly
 what such a bridge surfaces.

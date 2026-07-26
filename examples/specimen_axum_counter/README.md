@@ -70,8 +70,9 @@ cargo run --manifest-path examples/specimen_axum_counter/Cargo.toml -- tina
   the example uses `DefaultThreadedMailboxFactory`.
 - ~~The runtime + bridge wiring is verbose: build `ThreadedRuntime` →
   `register_with_capacity::<Counter, Infallible>` → `BridgeHandle::new` →
-  pass `Arc` clones around.~~ **Mostly resolved:** `BridgeHost`
-  owns the runtime and registers the bridge handle in one place. There is
+  pass `Arc` clones around.~~ **Mostly resolved:** `LocalSystem::single_shard(...)`
+  builds the app, `BridgeHost::from_app(app)` takes ownership of the runtime,
+  and `register_bridge` hands back the bridge handle in one place. There is
   still setup, but it now reads like one bridge-hosted service shape.
 - ~~Shutdown of the Tina runtime requires unwrapping the `Arc` and calling
   `shutdown()` only when no clones remain.~~ **Resolved:**

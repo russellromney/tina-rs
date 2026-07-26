@@ -53,7 +53,7 @@ truth, not leave hidden in-flight calls around.
 |---|---|---|---|---|---|
 | isolate address | stopped isolate rejects sends/calls as `Closed` | isolate-owned IDs are closed by that isolate or runtime shutdown | `cancel_call(handle)` closes the caller wait | app protocol, not `wait_idle()` | `IsolateStopped`, typed result waiter, or later `CallOutcome::Closed` |
 | `WorkerPool` | `WorkerPoolMsg::Close(Drain/Force)` | not owned by the pool unless the handle type says so | acquire waiter cancel reclaims waiter slot | `Drain` lets leases return; `Force` marks them stale | `WorkerPoolReply::Closed` and `PoolPressureReport { closed: true, ... }` |
-| keepalive pool | `WorkerPoolMsg::Close` closes lease admission | `KeepaliveConnectionMsg::Stop` drops the connection transport and stops the isolate | request caller can stop waiting; accepted transport work may still finish late | `shutdown_keepalive_pool(..., Drain, ...)` waits for pool leases to return before stopping connections | `KeepalivePoolShutdownReport` with pool close, drain outcome, requested/stopped/timed-out/rejected/already-closed, and failed slot indexes |
+| keepalive pool | consuming `InstalledKeepalivePool::close_and_drain(timeout)` closes lease admission first | each connection isolate is stopped once outstanding leases return | request caller can stop waiting; accepted transport work may still finish late | `close_and_drain(timeout)` waits for pool leases to return before stopping connections; `TimedOut { pool, pending }` keeps the handle for a later retry | `KeepaliveCloseAndDrain::Drained(KeepalivePoolSettledReport)` with pool close, drain outcome, and per-connection stop settlement; no public force-close |
 | TCP/TLS stream | owner stops issuing new I/O for that ID | `tcp_close_stream` / `tls_close` effect or runtime shutdown cleanup | pending runtime call is cancelled/tombstoned; started backend work may complete late | owner protocol plus bounded shutdown | close reply, late-reply trace, or terminal remaining-resource report |
 | HTTP body stream | connection stops pulling chunks | source releases buffers/files/calls on EOF/error/cancel | `ResponseChunkMsg::Cancel` tells source to release state | body metrics return to zero current bytes | `BodyPressureReport::drained()` plus IO/full/timeout counters |
 | external bridge work | bridge closer stops Tina-side admission | remote resource is not Tina-owned unless bridge documents it | caller wait can close; remote work may continue unless explicit cancel exists | bridge-specific bounded drain | bridge metrics and runtime late-result trace |
@@ -153,8 +153,8 @@ shutdown order:
    response.
 6. Close the SQLite bridge admission with its closer.
 7. Probe `/ready` and surface `db_closed`.
-8. Call `shutdown_keepalive_pool(..., CloseMode::Drain, ...)` for the outbound
-   pool.
+8. Call `close_and_drain(timeout)` on the owned outbound keepalive pool
+   handle.
 9. Stop the private notification listener.
 10. Stop the public listener, then shutdown the runtime and inspect
     trace/capacity facts.
@@ -217,9 +217,9 @@ no "kill this worker."
 | isolate call after delivery | yes | no, unless callee cooperates | yes |
 | deferred reply slot | yes | callee owns cleanup | yes |
 | HTTP response body source | yes | yes — `ResponseChunkMsg::Cancel` tells source to release state | body metric + trace |
-| SQLx bridge | yes | best-effort via `pg_cancel_backend` if enabled | metrics/trace |
+| SQLx bridge | yes | no — Tina stops waiting; Postgres may keep running | metrics/trace |
 | SQLite bridge | yes | no, blocking call runs to completion | metrics/trace |
-| reqwest bridge | yes | maybe future abort handle; today be honest | trace/metrics |
+| reqwest bridge | yes | not by the caller; the per-attempt timeout aborts the spawned task (`AbortHandle::abort`) | trace/metrics |
 | pool acquire waiter | yes | yes, reclaim waiter slot | no late work |
 
 ### Examples
@@ -237,12 +237,14 @@ body source. The source can release files, downstream calls, and
 pending slots. `body_io_error_count` still increments so the
 truncation is visible.
 
-**SQLx best-effort DB cancel.** Opt-in via
-`PgConfig::with_cancel_on_timeout`. When the bridge per-attempt
-timeout fires, a sidecar pool fires `pg_cancel_backend(pid)`. Postgres
-may or may not honor it, and a small race exists between cancel firing
-and the connection returning to the pool. `db_cancels_sent` counts
-attempts, not guaranteed query deaths.
+**SQLx no DB-side cancel.** `PgConfig::with_cancel_on_timeout` is a
+compatibility no-op: the old sidecar `pg_cancel_backend(pid)` path
+could race connection reuse and cancel a later query, so the bridge
+does not fire it. When the bridge per-attempt timeout fires, the
+caller settles with `PgError::Timeout` while the spawned query runs
+to physical terminal and keeps its in-flight slot until then.
+`db_cancels_sent` stays zero — "Tina stopped waiting," never
+"the database stopped working."
 
 **SQLite no-cancel late result.** `rusqlite` work runs on a blocking
 std thread. If the caller times out, the worker thread runs to
@@ -422,9 +424,10 @@ happen in different parts of the program.
 
 ## Host Shutdown Handle
 
-`ThreadedRuntime` and `ThreadedMultiShardRuntime` expose a cloneable
-shutdown handle so host threads and tests can drive runtime teardown
-without `Arc::try_unwrap(runtime)`:
+`LocalSystem` and `LocalMultiShardSystem` (and the lower-level
+`ThreadedRuntime` / `ThreadedMultiShardRuntime` behind them) expose a
+cloneable shutdown handle so host threads and tests can drive runtime
+teardown without `Arc::try_unwrap(runtime)`:
 
 ```rust
 let handle = runtime.shutdown_handle();

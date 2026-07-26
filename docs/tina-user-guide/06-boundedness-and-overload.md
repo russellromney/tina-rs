@@ -90,7 +90,7 @@ deadline stays plain config rather than a faked count.
 
 ### Join the manifest with what actually happened
 
-Pass the live [`ServicePressureReport`](#pressure-report-convention) to
+Pass the live [`ServicePressureReport`](17-pressure-report-convention.md) to
 `manifest.report(...)` to get one object answering "what did I
 configure, what was used, what was full?". The configured caps come from
 the manifest; the observed `cur` / `high` / `full` numbers come from the
@@ -165,8 +165,9 @@ If capacity is `1`, the second queued message should hit pressure.
 
 ## Pressure Diagnostics
 
-`Runtime::pressure_summary()` and `ThreadedRuntime::pressure_summary()`
-walk the trace and return a counted summary:
+`LocalSystem::pressure_summary()` and the lower-level
+`ThreadedRuntime::pressure_summary()` walk the trace and return a counted
+summary:
 
 ```rust
 let summary = runtime.pressure_summary()?;
@@ -315,7 +316,7 @@ RoomMsg::Publish { body } => {
         self.subscribers.iter().map(|(id, addr)| (*id, *addr)),
     ) {
         Ok(targets) => targets,
-        Err(_) => return reply_full(),
+        Err(_) => return self.reply_full(),
     };
     self.broadcast = Some(targets.tracker());
     broadcast_observed(
