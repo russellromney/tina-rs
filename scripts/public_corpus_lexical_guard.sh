@@ -4,7 +4,9 @@
 # Rejects, in the public corpus:
 #   - shared-state: Arc<Mutex> / Mutex<Option> / Condvar / atomics in
 #     examples/**/src code lines (result-sidecar signatures);
-#   - poll-loop: `loop { ... sleep(...) }` result polling in examples/**/src;
+#   - poll-loop: `loop { ... sleep(...) }` / `while ... { ... sleep(...) }`
+#     result polling in examples/**/src (one brace-nesting level; deeper
+#     nesting is a documented limit with no corpus instance);
 #   - obsolete-vocabulary: raw-runtime API names in corpus markdown;
 #   - intent-phrase: exact intent-artifact phrases anywhere in scanned text.
 #
@@ -52,9 +54,11 @@ scan_rs() { # $1 = perl program body evaluated per file, prints "file:line: deta
 shared_state_hits() {
     scan_rs '
         '"$strip_perl"'
-        while (/\b(?:Arc\s*<\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*Mutex|Mutex\s*<|Condvar|Atomic(?:Bool|I8|I16|I32|I64|Isize|U8|U16|U32|U64|Usize|Ptr))/g) {
+        while (/\b(?:Arc\s*<\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*Mutex|Mutex\s*(?:<|::\s*new)|RwLock|Condvar|Atomic(?:Bool|I8|I16|I32|I64|Isize|U8|U16|U32|U64|Usize|Ptr))/g) {
             my $line = 1 + (substr($_, 0, $-[0]) =~ tr/\n//);
-            print "$line: shared-state $&\n";
+            my $hit = $&;
+            $hit =~ s/\s+/ /g;
+            print "$line: shared-state $hit\n";
         }
     '
 }
@@ -205,7 +209,10 @@ TOML2
 
     export PUBLIC_CORPUS_ALLOWLIST="$fx/allow.toml"
     ALLOWLIST="$fx/allow.toml"
-    SCAN_ROOT="$fx"
+    # Scan from inside the fixture root so hit paths are repo-relative and
+    # exact-path exemption assertions are real, not vacuous.
+    SCAN_ROOT="."
+    pushd "$fx" >/dev/null
 
     # Path validation is bypassed in self-test (fixture paths live outside
     # the repo); run the scanners directly.
@@ -243,6 +250,7 @@ TOML2
     obslive="$(printf '%s\n' "$obs" | without_allowlisted obsolete-vocabulary)"
     printf '%s\n' "$obslive" | grep -q 'README.md' || {
         echo "self-test: unlisted README hit wrongly exempted" >&2; exit 1; }
+    popd >/dev/null
     echo "public-corpus lexical guard self-test: ok"
     exit 0
 fi

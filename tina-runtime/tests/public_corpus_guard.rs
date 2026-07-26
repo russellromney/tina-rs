@@ -259,13 +259,28 @@ fn build_alias_map(file: &syn::File) -> AliasMap {
 
         fn visit_item_type(&mut self, item: &syn::ItemType) {
             let text = item.ty.to_token_stream().to_string();
+            let mut resolved = None;
             for tracked in TRACKED_TYPES {
                 if text.contains(tracked) {
-                    self.map
-                        .aliases
-                        .insert(item.ident.to_string(), tracked.to_string());
+                    resolved = Some(tracked.to_string());
                     break;
                 }
+            }
+            if resolved.is_none() {
+                // Alias-of-alias: `type B = A;` where `A` is recorded.
+                // Token-level matching, not substring.
+                for (alias, canonical) in &self.map.aliases {
+                    let hit = text
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .any(|token| token == alias);
+                    if hit {
+                        resolved = Some(canonical.clone());
+                        break;
+                    }
+                }
+            }
+            if let Some(canonical) = resolved {
+                self.map.aliases.insert(item.ident.to_string(), canonical);
             }
             syn::visit::visit_item_type(self, item);
         }
@@ -273,10 +288,30 @@ fn build_alias_map(file: &syn::File) -> AliasMap {
     // Walk the whole file, not just top-level items: aliases declared in fn
     // bodies or inner modules are over-approximated to file scope (fail
     // closed) rather than missed.
+    // Collect and resolve to a true fixpoint: out-of-order declarations
+    // (`type C = B; type B = A; type A = ...`) and alias-of-alias chains
+    // converge only after repeated passes.
     let mut collector = Collector {
         map: AliasMap::default(),
     };
-    collector.visit_file(file);
+    loop {
+        let before = collector.map.aliases.clone();
+        collector.visit_file(file);
+        let snapshot = collector.map.aliases.clone();
+        for (alias, target) in snapshot.iter() {
+            if target.contains("::") || TRACKED_TYPES.contains(&target.as_str()) {
+                continue;
+            }
+            if let Some(resolved) = collector.map.aliases.get(target).cloned() {
+                if resolved != *target {
+                    collector.map.aliases.insert(alias.clone(), resolved);
+                }
+            }
+        }
+        if collector.map.aliases == before {
+            break;
+        }
+    }
     collector.map
 }
 
@@ -305,14 +340,34 @@ fn collect_use_aliases(tree: &syn::UseTree, prefix: &mut Vec<String>, map: &mut 
             }
         }
         syn::UseTree::Rename(rename) => {
-            let from = rename.ident.to_string();
+            // `use tina::ServiceMessage::{self as SM}` renames the last
+            // prefix segment.
+            let from = if rename.ident == "self" {
+                prefix.last().cloned().unwrap_or_default()
+            } else {
+                rename.ident.to_string()
+            };
             if TRACKED_TYPES.contains(&from.as_str()) || from == "CallOutcome" {
                 map.aliases.insert(rename.rename.to_string(), from);
+            } else if (from == "Event" || from == "Request")
+                && prefix.last().is_some_and(|last| last == "ServiceMessage")
+            {
+                // `use tina::ServiceMessage::Event as E;` then bare `E(..)`.
+                map.aliases
+                    .insert(rename.rename.to_string(), format!("ServiceMessage::{from}"));
             }
         }
         syn::UseTree::Glob(_) => {
             if prefix.last().is_some_and(|last| last == "CallOutcome") {
                 map.call_outcome_glob = true;
+            }
+            if prefix.last().is_some_and(|last| last == "ServiceMessage") {
+                // `use tina::ServiceMessage::*;` then bare `Event(..)` /
+                // `Request { .. }`.
+                for variant in ["Event", "Request"] {
+                    map.aliases
+                        .insert(variant.to_string(), format!("ServiceMessage::{variant}"));
+                }
             }
         }
     }
@@ -322,14 +377,10 @@ struct GuardVisitor<'a> {
     aliases: &'a AliasMap,
     path: String,
     violations: Vec<Violation>,
-    cfg_test_depth: usize,
 }
 
 impl GuardVisitor<'_> {
     fn push(&mut self, span: proc_macro2::Span, rule: &str, detail: String) {
-        if self.cfg_test_depth > 0 {
-            return;
-        }
         self.violations.push(Violation {
             path: self.path.clone(),
             line: span.start().line,
@@ -427,7 +478,9 @@ impl GuardVisitor<'_> {
             }
             // `use tina_runtime::CallOutcome as CO;` then `CO::Replied(_)`.
             if self.aliases.aliases.iter().any(|(alias, canonical)| {
-                canonical == "CallOutcome" && text.contains(alias.as_str())
+                canonical == "CallOutcome"
+                    && (text.contains(&format!("{alias} ::"))
+                        || text.contains(&format!("{alias}::")))
             }) {
                 return true;
             }
@@ -649,7 +702,6 @@ fn scan_file(path: &Path, rel: &Path) -> Result<Vec<Violation>, String> {
         aliases: &aliases,
         path: rel.to_string_lossy().replace('\\', "/"),
         violations: Vec::new(),
-        cfg_test_depth: 0,
     };
     visitor.visit_file(&parsed);
     Ok(visitor.violations)
@@ -948,11 +1000,51 @@ pub fn nested_scope() {
 }
 "#,
     );
+    write_fixture(
+        &root,
+        "examples/specimen_demo/src/more.rs",
+        r#"
+use tina::ServiceMessage::Event as E;
+use tina_runtime::ThreadedRuntime as TR;
+use tina::prelude::*;
+
+type Hop = TR<SingleShard, DefaultThreadedMailboxFactory>;
+
+pub fn renamed_variant() {
+    let _ = E(2u32);
+}
+
+pub fn multi_hop() {
+    let _ = Hop::try_new(SingleShard, DefaultThreadedMailboxFactory).unwrap();
+}
+"#,
+    );
+    write_fixture(
+        &root,
+        "examples/specimen_demo/src/ordered.rs",
+        r#"
+use tina::ServiceMessage::{self as SM, *};
+use tina::prelude::*;
+
+type C = B;
+type B = A;
+type A = tina_runtime::ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>;
+
+pub fn out_of_order_hops() {
+    let _ = C::try_new(SingleShard, DefaultThreadedMailboxFactory).unwrap();
+}
+
+pub fn self_and_glob_variants() {
+    let _ = SM::Event(3u32);
+    let _ = Event(4u32);
+}
+"#,
+    );
     let violations = scan_fixture(&root);
     let count = |rule: &str| violations.iter().filter(|v| v.rule == rule).count();
-    assert_eq!(count("envelope-construction"), 1, "{violations:?}");
+    assert_eq!(count("envelope-construction"), 4, "{violations:?}");
     assert_eq!(count("terminal-wildcard"), 1, "{violations:?}");
-    assert_eq!(count("raw-runtime-host"), 1, "{violations:?}");
+    assert_eq!(count("raw-runtime-host"), 3, "{violations:?}");
 }
 
 #[test]

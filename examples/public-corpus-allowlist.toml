@@ -431,3 +431,27 @@ reason = "struck-through resolved complaints deliberately name the superseded wi
 focused_test = "cargo test --manifest-path examples/specimen_axum_counter/Cargo.toml --test public_smoke public_smoke -- --exact"
 reviewer = "c1-independent-adversarial-review"
 reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "examples/systems/system_lock_manager/src/lib.rs"
+rule = "shared-state"
+reason = "scoped-thread assertion buffers joined inside the admission/fairness scenario tests; not application result channels"
+focused_test = "cargo test --manifest-path examples/systems/system_lock_manager/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "examples/systems/system_soak_http_db/src/lib.rs"
+rule = "shared-state"
+reason = "scoped worker threads collect outcome counts into a joined Vec for assertions; results flow through the typed report, not the mutex"
+focused_test = "cargo test --manifest-path examples/systems/system_soak_http_db/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "examples/specimen_mux_client/src/lib.rs"
+rule = "shared-state"
+reason = "tokio responder's shared write-half across responder tasks; transport plumbing in the fixture server, not a result sidecar"
+focused_test = "cargo test --manifest-path examples/specimen_mux_client/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "81cde839"
