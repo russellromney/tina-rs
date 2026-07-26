@@ -54,9 +54,10 @@ when the host needs the isolate's typed final value (counters, parsed
 output, accumulated state). Single-claim per `(isolate, generation)`;
 no replay cache.
 
-The same surface is on `ThreadedMultiShardRuntime`: registration is
-routed to the address's owning shard. Passing an address from a
-foreign runtime panics, matching `try_send`'s convention.
+The same surface is on `LocalMultiShardSystem` (and the lower-level
+`ThreadedMultiShardRuntime`): registration is routed to the address's
+owning shard. Passing an address from a foreign runtime returns a typed
+`ForeignSystem` error, matching `try_send`'s convention.
 
 Do not pass an `Arc<Outcome>`, `Arc<Mutex<Vec<_>>>`, or atomics into
 the isolate just so the host can read the final value after stop.
@@ -317,8 +318,9 @@ from isolate/generation fields.
 
 ### Operation completion
 
-Use `runtime.observe_operation_done(addr, CallKind::...).wait(timeout)`
-when host code needs to know a runtime call completed.
+Use `app.host_control().observe_operation_done(addr, CallKind::...).wait(timeout)`
+when host code needs to know a runtime call completed. This waiter lives on
+the lower `ThreadedRuntime` surface, reached through `host_control()`.
 
 Do not poll the trace for "did my sleep/read/write finish yet?"
 
@@ -605,21 +607,21 @@ Do not fall back to a hand-written `impl Isolate` with
 
 ### Registering isolates
 
-Use `runtime.register_with_capacity::<_, Infallible>(isolate, cap)`
+Use `app.register_root::<_, Infallible>(isolate, cap)`
 and let the compiler infer the concrete isolate type.
 
 Do not spell out
-`register_with_capacity::<SingleService<Dispatch<MyState, Json,
+`register_root::<SingleService<Dispatch<MyState, Json,
 SingleShard>, SingleShard>, Infallible>(...)`. Only the `Outbound`
 parameter (here `Infallible`) needs an explicit hint.
 
 ### Runtime config
 
-Use `ThreadedRuntime::new(shard, factory)` for examples and small
-programs. The defaults work.
+Use `LocalSystem::single_shard(shard, factory).try_build()?` for
+examples and small programs. The defaults work.
 
-Do not hand-tune `command_capacity`, `idle_wait`, or other
-`ThreadedRuntimeConfig` fields unless you have a measured reason.
+Do not hand-tune `ingress_capacity`, `idle_wait`, or other
+`LocalSystemConfig` fields unless you have a measured reason.
 
 ### Supervision
 

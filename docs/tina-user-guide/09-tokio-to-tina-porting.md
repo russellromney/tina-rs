@@ -88,8 +88,16 @@ loop {
 In Tina, name that policy as state:
 
 ```rust
-let decision = self.interval.next_delay(ctx.now());
-sleep(decision.delay()).then(move |reply| Msg::Tick(decision.tick_number(), reply))
+match self.interval.next(ctx.now()) {
+    RecurringTickDecision::Sleep { delay, token, report } => {
+        let tick = report.tick_number;
+        sleep(delay).then(move |reply| Msg::Tick(tick, token, reply))
+    }
+    RecurringTickDecision::Skip(report) => {
+        self.missed_ticks += report.missed_ticks;
+        noop()
+    }
+}
 ```
 
 For retries:

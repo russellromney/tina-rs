@@ -25,8 +25,9 @@ These crates define the Tina vocabulary. App authors and isolate authors live
 here.
 
 - `tina` — the trait crate. `Isolate`, `Effect`, `Address`, `Outbound`,
-  `Context`, `CallContext`, `RequestContext`, `IsolateTypes`, supervision
-  policy types, the `#[tina::isolate(...)]` macro, and `tina::prelude`.
+  `Context`, `CallContext`, `RequestContext`, the `isolate_types!`
+  associated-type macro, supervision policy types, the `#[tina::isolate(...)]`
+  macro, and `tina::prelude`.
 - `tina-mailbox-spsc` — the bounded SPSC mailbox implementation. Proven
   FIFO, `Full`, `Closed`, no hidden overflow.
 - `tina-macros` and `tina-rpc-macros` — proc-macros that expand into core
@@ -123,23 +124,19 @@ If a future battery violates one of these rules, name it in the **Known
 hook gaps** table on [Battery Authoring](24-battery-authoring.md) and do
 not call the battery production-ready.
 
-## Prelude tiers
+## Prelude
 
-Tina ships three import tiers. They are intentionally not the same prelude.
+Tina ships one prelude.
 
 - `tina::prelude` — for app and isolate authors. Imports `Effect`,
-  `Address`, `Outbound`, `Context`, `CallContext`, `RequestContext`,
-  `Isolate`, `IsolateTypes`, supervision types, and the effect helpers
-  (`reply`, `send`, `call`, `batch`, etc.). This is what `#[tina::isolate]`
-  expects to be in scope.
-- `tina_runtime::prelude` — for runtime owners, host test code, and system
-  setup. Adds runtime/launcher types, rail handles, host-blocking helpers,
-  bridge install/closer traits, capacity/topology report types, runtime
-  events, and replay-fact registration.
-- Battery preludes (e.g. `tina_http::prelude` where it exists) — battery-
-  specific helpers only. A battery prelude must not re-export the entire
-  Tina core; users who learn the battery should still see Tina nouns from
-  `tina::prelude`.
+  `Address`, `Outbound`, `Context`, `RequestContext`,
+  `Isolate`, the `isolate_types!` macro, spawn/supervision types, and the
+  effect helpers (`noop`, `reply`, `reply_to`, `send`, `spawn`, `stop`,
+  `stop_with`, `batch`, etc.). This is what `#[tina::isolate]` expects to
+  be in scope. Runtime calls (`call`, `sleep`, `tcp_*`) and runtime owner
+  types are imported from `tina_runtime` directly — there is no
+  `tina_runtime::prelude`, and battery crates do not ship their own
+  preludes.
 
 If you are an app author and find yourself reaching for `tina_runtime::*`
 inside an isolate handler, that is a smell. Handlers consume `Context` /

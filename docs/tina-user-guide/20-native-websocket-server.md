@@ -35,11 +35,11 @@ use tina_http::{
     WebSocketTarget,
 };
 
-let client = runtime.register_with_capacity::<WebSocketClientConnection<S>, _>(
+let client = app.register_root::<WebSocketClientConnection<S>, _>(
     WebSocketClientConnection::new(Default::default()),
     16,
 )?;
-let connected = runtime.call_blocking(
+let connected = app.call_blocking(
     client,
     WebSocketClientMsg::Connect {
         target: WebSocketTarget::ws(addr, "localhost", "/room"),
@@ -47,12 +47,12 @@ let connected = runtime.call_blocking(
     },
     timeout,
 )?;
-let sent = runtime.call_blocking(
+let sent = app.call_blocking(
     client,
     WebSocketClientMsg::Send(WebSocketMessage::Text("hello".to_owned())),
     timeout,
 )?;
-let next = runtime.call_blocking(client, WebSocketClientMsg::Receive, timeout)?;
+let next = app.call_blocking(client, WebSocketClientMsg::Receive, timeout)?;
 ```
 
 The client owns ping/pong and close-handshake facts without hiding pressure:

@@ -147,16 +147,24 @@ It uses `SingleShard`, the built-in shard, instead of a hand-written one. It
 also adds a `handle_call` method: fire-and-forget sends land in `handle`, and a
 blocking call from outside the runtime lands in `handle_call`, which replies.
 
-`ThreadedRuntime` starts a worker thread that owns the shard. You register the
-isolate, send it messages, ask it a question with `call_blocking`, then shut it
-down.
+`LocalSystem` is the canonical live host:
+`LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory)
+.try_build()?` builds it with fallible startup, and
+`run_to_shutdown_reported(timeout, workload)` runs the workload and then
+performs the bounded consuming shutdown with the terminal report checked for
+you. You register the isolate, send it messages, ask it a question with
+`call_blocking`, and the runner shuts the system down. The raw
+`ThreadedRuntime` underneath stays available as the low-level form —
+benchmarks and stepping demos use it directly — but the facade is the normal
+shape; every specimen under `examples/` uses it, apart from the labeled
+raw-runtime anti-pattern demonstration.
 
 ```rust
 //! Smallest runnable Tina program.
 //!
-//! One `Counter` isolate on a threaded single-shard runtime. Add a few numbers
-//! with fire-and-forget sends, read the total back with a blocking call, then
-//! shut the runtime down.
+//! One `Counter` isolate on a single-shard local system. Add a few numbers
+//! with fire-and-forget sends, read the total back with a blocking call,
+//! then shut the system down through the bounded terminal runner.
 //!
 //! Run with:
 //! ```bash
@@ -167,7 +175,7 @@ use std::convert::Infallible;
 use std::time::Duration;
 
 use tina::prelude::*;
-use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime};
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, LocalSystem};
 
 #[derive(Debug, Default)]
 struct Counter {
@@ -209,31 +217,34 @@ impl Counter {
     }
 }
 
-fn main() {
-    // Start the worker thread that owns the shard.
-    let runtime = ThreadedRuntime::new(SingleShard, DefaultThreadedMailboxFactory);
+fn main() -> anyhow::Result<()> {
+    // Build the canonical live host: a single-shard local system with
+    // fallible startup.
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
 
-    // Register the isolate and get its typed address.
-    let counter = runtime
-        .register_with_capacity::<Counter, Infallible>(Counter::default(), 16)
-        .expect("register counter");
+    app.run_to_shutdown_reported(Duration::from_secs(5), |app| -> anyhow::Result<()> {
+        // Register the isolate and get its typed address.
+        let counter = app
+            .register_root::<Counter, Infallible>(Counter::default(), 16)
+            .map_err(|e| anyhow::anyhow!("register counter: {e:?}"))?;
 
-    // Fire-and-forget sends. The worker delivers them in order.
-    runtime
-        .try_send(counter, CounterMsg::Add(2))
-        .expect("send add");
-    runtime
-        .try_send(counter, CounterMsg::Add(3))
-        .expect("send add");
+        // Fire-and-forget sends. The worker delivers them in order.
+        app.try_send(counter, CounterMsg::Add(2))
+            .map_err(|e| anyhow::anyhow!("send add: {e:?}"))?;
+        app.try_send(counter, CounterMsg::Add(3))
+            .map_err(|e| anyhow::anyhow!("send add: {e:?}"))?;
 
-    // Blocking call: ask for the total and wait for the reply.
-    match runtime.call_blocking(counter, CounterMsg::Read, Duration::from_secs(1)) {
-        Ok(CallOutcome::Replied(total)) => println!("counter total = {total}"),
-        other => println!("unexpected outcome: {other:?}"),
-    }
+        // Blocking call: ask for the total and wait for the reply.
+        match app.call_blocking(counter, CounterMsg::Read, Duration::from_secs(1)) {
+            Ok(CallOutcome::Replied(total)) => println!("counter total = {total}"),
+            other => println!("unexpected outcome: {other:?}"),
+        }
+        Ok(())
+    })?;
 
-    // Request shutdown and join the worker.
-    runtime.shutdown().expect("clean shutdown");
+    // The runner above performed the bounded consuming shutdown and
+    // checked the terminal report before returning.
+    Ok(())
 }
 ```
 

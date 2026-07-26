@@ -156,17 +156,25 @@ Interval shape:
 
 ```rust
 use tina::prelude::*;
+use tina::time::{RecurringTick, RecurringTickDecision};
 use tina_runtime::sleep;
 
-match self.interval.next_delay_until(ctx.now(), self.deadline) {
-    TimerDecision::Sleep(delay) => {
-        let tick = delay.tick_number();
-        sleep(delay.delay()).then(move |reply| Msg::Tick(tick, reply))
+match self.interval.next(ctx.now()) {
+    RecurringTickDecision::Sleep { delay, token, report } => {
+        let tick = report.tick_number;
+        sleep(delay).then(move |reply| Msg::Tick(tick, token, reply))
     }
-    TimerDecision::DeadlineElapsed => stop(),
-    TimerDecision::Exhausted => unreachable!("interval has no attempt budget"),
+    RecurringTickDecision::Skip(report) => {
+        self.missed_ticks += report.missed_ticks;
+        noop()
+    }
 }
 ```
+
+`self.interval` is a `RecurringTick` state. Carry the token in the
+continuation message and call `self.interval.validate(token)` when it arrives;
+a stale token means the schedule was re-armed or cleared underneath the
+in-flight tick.
 
 Backoff shape:
 

@@ -4,10 +4,14 @@ Companion to [mailbox-capacity.md](mailbox-capacity.md).
 
 The Tokio bridge (`tina-tokio-bridge`) is for small, gradual adoption inside
 existing Tokio apps. Tokio owns the edge; Tina owns isolate state. The
-shape is inherently two runtimes — one Tokio, one
-`ThreadedRuntime`. This page names the seams that bite first-time
-readers, plus the one-call shutdown path that replaces the
-`Arc::try_unwrap` dance.
+shape is inherently two runtimes — one Tokio, one Tina runtime. You reach
+the Tina side through the canonical facade: build a `LocalSystem` and hand
+it to `BridgeHost::from_app(app)`, which unwraps it into the
+`ThreadedRuntime` the host owns. Constructing a raw `ThreadedRuntime`
+yourself remains the supported low-level form — benchmarks and stepping
+demos use it — but it is not the bridge path. This page names the seams
+that bite first-time readers, plus the one-call shutdown path that replaces
+the `Arc::try_unwrap` dance.
 
 ## The two-runtime shape
 
@@ -30,6 +34,13 @@ Tokio runtime that hosts the HTTP/RPC stack and calls into the bridge:
 `BridgeHandle` clones flow from Tokio code into axum extractors. Each
 clone holds an `Arc<ThreadedRuntime>` — that's how requests reach the
 worker thread.
+
+The one-call sibling bridges follow the same facade-first split:
+`tina-reqwest-bridge` and `tina-sqlx-bridge` ship
+`install_local(&LocalSystem, config)` as the canonical form, with
+`install(&ThreadedRuntime, config)` kept as the raw low-level twin.
+Registration, returned handles, and typed install errors are identical;
+only the registration path differs.
 
 ## Footgun #1: sync `recv()` inside Tokio `block_on`
 

@@ -82,7 +82,7 @@ they happen. Sync, in-line, on the recording thread.
 
 ```rust
 use std::sync::Arc;
-use tina_runtime::{ThreadedRuntime, ThreadedRuntimeConfig};
+use tina_runtime::LocalSystem;
 use tina_tracing::TracingObserver;
 use tracing_subscriber::FmtSubscriber;
 
@@ -91,21 +91,14 @@ let subscriber = FmtSubscriber::builder()
     .finish();
 tracing::subscriber::set_global_default(subscriber).unwrap();
 
-let runtime = ThreadedRuntime::with_config_and_trace_observer(
-    shard,
-    factory,
-    ThreadedRuntimeConfig::default(),
-    Arc::new(TracingObserver::new()),
-);
-```
-
-`LocalSystem` builders take the same observer:
-
-```rust
 let app = LocalSystem::single_shard(shard, factory)
     .trace_observer(Arc::new(TracingObserver::new()))
-    .build();
+    .try_build()?;
 ```
+
+The raw `ThreadedRuntime::with_config_and_trace_observer(shard, factory,
+config, observer)` is the same wiring on the low-level runtime for code that
+owns one directly.
 
 Explicit-step `Runtime` has a setter for tests and tools:
 
@@ -141,10 +134,9 @@ The in-memory trace is bounded, like everything else. Three modes:
 Set `Full` yourself when you need the complete trace:
 
 ```rust
-ThreadedRuntimeConfig {
-    trace_retention: TraceRetention::Full,
-    ..Default::default()
-}
+let app = LocalSystem::single_shard(shard, factory)
+    .trace_retention(TraceRetention::Full)
+    .try_build()?;
 ```
 
 ## Fairness Reports
@@ -248,7 +240,7 @@ same shape:
 tina-sqlite-bridge = { version = "...", features = ["tracing"] }
 ```
 
-All five bridges emit today. Targets, kinds, and shared field
+All seven bridges emit today. Targets, kinds, and shared field
 vocabulary:
 
 | Bridge | Target | Kinds |
@@ -257,6 +249,8 @@ vocabulary:
 | `tina-tower-bridge` | `tina_tower.bridge.call` / `.bridge` | `tower_call`, `tower_response`, `tower_error`, `close` |
 | `tina-reqwest-bridge` | `tina_reqwest.bridge.call` / `.bridge` | `admission_rejected`, `admitted`, `replied`, `timeout`, `retry`, `close` |
 | `tina-sqlite-bridge` | `tina_sqlite.bridge.call` / `.bridge` | `admission_rejected`, `admitted`, `replied`, `timeout`, `close` |
+| `tina-sqlx-bridge` | `tina_sqlx.bridge.call` / `.bridge` | `admission_rejected`, `admitted`, `replied`, `timeout`, `close` |
+| `tina-aws-bridge` | `tina_aws.bridge.call` / `.bridge` | `admission_rejected`, `admitted`, `replied`, `timeout`, `close` |
 | `tina-rpc-tokio` | `tina_rpc.bridge.call` (span) | bridge span with `service`, `method`, `correlator`, `result_kind` |
 
 Shared `reason` vocabulary (across all bridges where the concept
@@ -264,6 +258,10 @@ applies): `Full`, `Closed`, `Timeout`. Each bridge adds its own:
 
 - `tina-sqlite-bridge`: `Busy`, `Constraint`, `Io`, `Sqlite`,
   `ResponseTooLarge`, `InvalidRequest`, `Internal`.
+- `tina-sqlx-bridge`: `PoolAcquireTimeout`, `PoolClosed`,
+  `InvalidRequest`, `TooManyRows`, `Decode`, `Sqlx`, `Internal`.
+- `tina-aws-bridge`: `RequestTooLarge`, `InvalidRequest`, plus the
+  SDK error kinds.
 - `tina-reqwest-bridge`: `Reqwest`, `RequestTooLarge`,
   `ResponseTooLarge`, `InvalidRequest`.
 - `tina-tokio-bridge`: only the three shared reasons; `dropped_response`

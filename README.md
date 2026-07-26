@@ -396,9 +396,12 @@ is never the default or an invisible queue.
 
 ## Live Runtime And I/O
 
-`ThreadedRuntime` runs a live single-shard service. `LocalSystem` and
-`ThreadedMultiShardRuntime` own multi-shard execution with bounded shard-pair
-queues. Runtime-owned TCP, TLS, Unix-domain sockets, local file I/O, and
+`LocalSystem` is the canonical live host: `LocalSystem::single_shard(...)` runs
+a single-shard service and `LocalSystem::multi_shard(...)` owns multi-shard
+execution with bounded shard-pair queues. The raw `ThreadedRuntime` and
+`ThreadedMultiShardRuntime` remain supported low-level runtimes underneath —
+benchmarks, stepping/replay demos, and bridge internals use them directly.
+Runtime-owned TCP, TLS, Unix-domain sockets, local file I/O, and
 persistence use the vendored Betelgeuse completion substrate. UDP and signal
 flags are polled without blocking on the shard thread. Blocking DNS and process
 work, plus storage metadata operations the substrate does not expose, use named

@@ -31,7 +31,7 @@ let placement = ShardPlacement::new("specimen-sharded-keyspace", shard_ids)?;
 // placement via the registration closure. No manual entries vec, no
 // .clone() dance.
 let table = ShardServiceTable::try_from_placement(placement.clone(), |shard| {
-    runtime.register_with_capacity_on::<Store, _>(shard, Store::new(), 32)
+    app.register_root_on::<Store, Infallible>(shard, Store::new(), 32)
 })?;
 
 // Driver routes keyed requests through the table:
@@ -63,8 +63,8 @@ parallel `send_observed` + bridge form (with `ScatterGatherConfig` /
 ## Run
 
 ```bash
-cargo run -p specimen-sharded-keyspace
-cargo test -p specimen-sharded-keyspace
+cargo run --manifest-path examples/specimen_sharded_keyspace/Cargo.toml
+cargo test --manifest-path examples/specimen_sharded_keyspace/Cargo.toml
 ```
 
 ## What this is not

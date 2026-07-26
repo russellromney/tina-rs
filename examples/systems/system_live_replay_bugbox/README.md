@@ -4,9 +4,9 @@ Live capture → sim replay → shrink, in one specimen.
 
 ## What this pulls on
 
-- `tina_runtime::ThreadedRuntime::try_with_config_and_trace_observer` to
-  fallibly start the worker and wire a live trace observer before the first
-  event.
+- `tina_runtime::LocalSystem::single_shard(...).trace_observer(...)
+  .try_build()` to fallibly start the worker and wire a live trace observer
+  before the first event.
 - `tina_proof_harness::LiveTrace` to capture the live trace shape
   (event count + `stable_trace_hash`).
 - `tina_sim::dst::capture_overload_run`, `save_overload_bug`,
@@ -113,7 +113,8 @@ want to compare only protocol behaviour rather than full trace shape.
 ## Findings
 
 What felt good:
-- `LiveTrace::new()` → `observer()` → `try_with_config_and_trace_observer`
+- `LiveTrace::new()` → `observer()` →
+  `LocalSystem::single_shard(...).trace_observer(...).try_build()`
   is a one-line "wire the live trace".
 - Live and sim sinks privately accumulate receives and settle with
   `stop_with(Output)` after a post-history `Finish`. The host claims
@@ -136,8 +137,8 @@ What felt rough:
   keep one alphabet on purpose.
 
 Tina capability pulled:
-- `tina_runtime::TraceObserver`, `try_with_config_and_trace_observer`,
-  `stable_trace_hash`.
+- `tina_runtime::TraceObserver`, the `LocalSystem` trace-observer
+  builder, `stable_trace_hash`.
 - `tina_sim::dst::ReplayCase`, `assert_replay_case`,
   `discover_constants`, `capture_overload_run`, `replay_overload_bug`,
   `save_overload_bug`, `read_saved_replay_case`,
@@ -149,10 +150,10 @@ Suggested follow-up:
   specimen wants to ignore RuntimeEventKind variants it does not
   care about (e.g., when a service-shaped specimen wants to compare
   only handler-started/handler-finished pairs across live/sim).
-- The live path still uses `ThreadedRuntime` directly even though
-  `LocalSystemBuilder::trace_observer(...).try_build()` already provides the
-  fallible facade form. This example is pending that `LocalSystem` migration;
-  it is not evidence of a missing framework helper.
+- The live path runs on `LocalSystem::single_shard(...).trace_observer(...)
+  .try_build()?` — the fallible facade form with the live observer wired at
+  build time (see `src/lib.rs`, "Live capture. LocalSystem + LiveTrace
+  observer.").
 
 Verdict:
 - keep. The user-proof gate "live capture → save → replay → shrink"

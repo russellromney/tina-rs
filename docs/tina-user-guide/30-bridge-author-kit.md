@@ -46,8 +46,12 @@ config.validate().map_err(InstallError::Config)?;
 
 ## Step 2 — Install starts the worker
 
-`install_xxx(runtime, config)` returns `Result<InstalledXxxBridge,
-InstallError>`. Failure is typed; the caller never has to "check if
+`install_xxx(system, config)` returns `Result<InstalledXxxBridge,
+InstallError>`. Ship two forms with one contract:
+`install_xxx_local(&LocalSystem, config)` as the application-facade
+form and `install_xxx(&ThreadedRuntime, config)` as the lower-level
+runtime form (the reqwest, sqlx, sqlite, and AWS bridges all follow
+this). Failure is typed; the caller never has to "check if
 the handle is real." The install handle implements
 `tina_runtime::bridge::BridgeInstall`:
 
