@@ -196,12 +196,20 @@ fn every_manifest_row_is_present_and_proved() {
         }
         let text =
             fs::read_to_string(&smoke).unwrap_or_else(|e| panic!("read {}: {e}", smoke.display()));
-        if !text.contains("fn public_smoke") {
-            failures.push(format!("{row}: public_smoke target lacks fn public_smoke"));
-        }
-        if !text.contains("fn public_characterization") {
+        if !text.contains(
+            "#[test]
+fn public_smoke(",
+        ) {
             failures.push(format!(
-                "{row}: public_smoke target lacks fn public_characterization"
+                "{row}: public_smoke target lacks an exact #[test] fn public_smoke"
+            ));
+        }
+        if !text.contains(
+            "#[test]
+fn public_characterization(",
+        ) {
+            failures.push(format!(
+                "{row}: public_smoke target lacks an exact #[test] fn public_characterization"
             ));
         }
     }
@@ -209,6 +217,34 @@ fn every_manifest_row_is_present_and_proved() {
     for row in DOC_ROWS {
         if !root.join(row).is_file() {
             failures.push(format!("public document missing: {row}"));
+        }
+    }
+
+    // Markdown discovery must match the manifest exactly: an unlisted
+    // public doc fails closed the same way an unlisted crate does.
+    let mut discovered_docs: Vec<String> = Vec::new();
+    for base in ["docs", "docs/tina-user-guide"] {
+        let dir = root.join(base);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "md") {
+                discovered_docs.push(
+                    path.strip_prefix(&root)
+                        .expect("under root")
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+            }
+        }
+    }
+    for extra in &discovered_docs {
+        if !DOC_ROWS.contains(&extra.as_str()) {
+            failures.push(format!(
+                "filesystem discovery found unlisted public document: {extra}"
+            ));
         }
     }
 

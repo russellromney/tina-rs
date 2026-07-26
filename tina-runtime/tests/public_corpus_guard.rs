@@ -27,6 +27,18 @@
 //! missing roots, parse failures, stale paths, and traversal failures fail
 //! closed. Pass/fail/evasion fixtures (including a directory whose path
 //! contains spaces) are generated in a temp dir and driven directly below.
+//!
+//! Accepted limits, deliberately documented rather than hidden:
+//! - macro *tokens* are opaque to `syn`; direct `ServiceMessage::Event(` /
+//!   `ServiceMessage::Request(` forms inside macros are backstopped
+//!   textually by `scripts/examples_service_envelope_guard.sh`.
+//! - UFCS forms (`<Type>::method`) and function-pointer indirection are
+//!   not resolved.
+//! - `use`/`type` aliases are over-approximated to file scope (fail
+//!   closed) rather than tracked per lexical scope.
+//! - framework-crate `tina*/examples/` files are outside the public
+//!   corpus manifest; `hello_world.rs` is instead pinned byte-for-byte
+//!   to its guide quote by `tests/readme_hello_world.rs`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -94,6 +106,7 @@ struct AllowlistEntry {
     reviewed_sha: String,
 }
 
+#[derive(Debug)]
 struct ValidatedAllowlist {
     /// (path, rule) -> reason, for exemption lookup.
     exemptions: BTreeMap<(String, String), String>,
@@ -220,6 +233,7 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
 #[derive(Default)]
 struct AliasMap {
     aliases: BTreeMap<String, String>,
+    call_outcome_glob: bool,
 }
 
 const TRACKED_TYPES: &[&str] = &[
@@ -234,49 +248,73 @@ const TRACKED_TYPES: &[&str] = &[
 ];
 
 fn build_alias_map(file: &syn::File) -> AliasMap {
-    let mut map = AliasMap::default();
-    for item in &file.items {
-        match item {
-            syn::Item::Use(item_use) => {
-                collect_use_aliases(&item_use.tree, &mut map);
-            }
-            syn::Item::Type(item_type) => {
-                let text = item_type.ty.to_token_stream().to_string();
-                for tracked in TRACKED_TYPES {
-                    if text.contains(tracked) {
-                        map.aliases
-                            .insert(item_type.ident.to_string(), tracked.to_string());
-                        break;
-                    }
+    struct Collector {
+        map: AliasMap,
+    }
+    impl Visit<'_> for Collector {
+        fn visit_item_use(&mut self, item: &syn::ItemUse) {
+            collect_use_aliases(&item.tree, &mut Vec::new(), &mut self.map);
+            syn::visit::visit_item_use(self, item);
+        }
+
+        fn visit_item_type(&mut self, item: &syn::ItemType) {
+            let text = item.ty.to_token_stream().to_string();
+            for tracked in TRACKED_TYPES {
+                if text.contains(tracked) {
+                    self.map
+                        .aliases
+                        .insert(item.ident.to_string(), tracked.to_string());
+                    break;
                 }
             }
-            _ => {}
+            syn::visit::visit_item_type(self, item);
         }
     }
-    map
+    // Walk the whole file, not just top-level items: aliases declared in fn
+    // bodies or inner modules are over-approximated to file scope (fail
+    // closed) rather than missed.
+    let mut collector = Collector {
+        map: AliasMap::default(),
+    };
+    collector.visit_file(file);
+    collector.map
 }
 
-fn collect_use_aliases(tree: &syn::UseTree, map: &mut AliasMap) {
+fn collect_use_aliases(tree: &syn::UseTree, prefix: &mut Vec<String>, map: &mut AliasMap) {
     match tree {
+        syn::UseTree::Path(path) => {
+            prefix.push(path.ident.to_string());
+            collect_use_aliases(&path.tree, prefix, map);
+            prefix.pop();
+        }
+        syn::UseTree::Group(group) => {
+            for tree in &group.items {
+                collect_use_aliases(tree, &mut prefix.clone(), map);
+            }
+        }
         syn::UseTree::Name(name) => {
             let ident = name.ident.to_string();
-            if TRACKED_TYPES.contains(&ident.as_str()) {
+            if TRACKED_TYPES.contains(&ident.as_str()) || ident == "CallOutcome" {
                 map.aliases.insert(ident.clone(), ident);
+            } else if (ident == "Event" || ident == "Request")
+                && prefix.last().is_some_and(|last| last == "ServiceMessage")
+            {
+                // `use tina::ServiceMessage::Event;` then bare `Event(..)`.
+                map.aliases
+                    .insert(ident.clone(), format!("ServiceMessage::{ident}"));
             }
         }
         syn::UseTree::Rename(rename) => {
             let from = rename.ident.to_string();
-            if TRACKED_TYPES.contains(&from.as_str()) {
+            if TRACKED_TYPES.contains(&from.as_str()) || from == "CallOutcome" {
                 map.aliases.insert(rename.rename.to_string(), from);
             }
         }
-        syn::UseTree::Path(path) => collect_use_aliases(&path.tree, map),
-        syn::UseTree::Group(group) => {
-            for tree in &group.items {
-                collect_use_aliases(tree, map);
+        syn::UseTree::Glob(_) => {
+            if prefix.last().is_some_and(|last| last == "CallOutcome") {
+                map.call_outcome_glob = true;
             }
         }
-        syn::UseTree::Glob(_) => {}
     }
 }
 
@@ -308,7 +346,11 @@ impl GuardVisitor<'_> {
             return None;
         }
         if let Some(canonical) = self.aliases.aliases.get(&segments[0]) {
-            segments[0] = canonical.clone();
+            if canonical.contains("::") && segments.len() == 1 {
+                segments = canonical.split("::").map(str::to_string).collect();
+            } else {
+                segments[0] = canonical.clone();
+            }
         }
         let terminal = segments.last()?.clone();
         let joined = segments.join("::");
@@ -377,11 +419,26 @@ impl GuardVisitor<'_> {
     }
 
     fn check_match(&mut self, expr_match: &syn::ExprMatch) {
+        let arm_text = |arm: &syn::Arm| arm.pat.to_token_stream().to_string();
         let mentions_call_outcome = expr_match.arms.iter().any(|arm| {
-            arm.pat
-                .to_token_stream()
-                .to_string()
-                .contains("CallOutcome")
+            let text = arm_text(arm);
+            if text.contains("CallOutcome") {
+                return true;
+            }
+            // `use tina_runtime::CallOutcome as CO;` then `CO::Replied(_)`.
+            if self.aliases.aliases.iter().any(|(alias, canonical)| {
+                canonical == "CallOutcome" && text.contains(alias.as_str())
+            }) {
+                return true;
+            }
+            // `use tina_runtime::CallOutcome::*;` then `Replied(_)`, `_ => ..`.
+            self.aliases.call_outcome_glob
+                && text.split([':', '(']).next().is_some_and(|head| {
+                    matches!(
+                        head.trim(),
+                        "Replied" | "Full" | "Closed" | "Timeout" | "Rejected"
+                    )
+                })
         });
         if !mentions_call_outcome {
             return;
@@ -433,6 +490,25 @@ impl GuardVisitor<'_> {
 }
 
 impl Visit<'_> for GuardVisitor<'_> {
+    fn visit_variant(&mut self, variant: &syn::Variant) {
+        self.check_ident(variant.ident.span(), &variant.ident);
+        syn::visit::visit_variant(self, variant);
+    }
+
+    fn visit_field(&mut self, field: &syn::Field) {
+        if let Some(ident) = &field.ident {
+            self.check_ident(ident.span(), ident);
+        }
+        syn::visit::visit_field(self, field);
+    }
+
+    fn visit_local(&mut self, local: &syn::Local) {
+        if let syn::Pat::Ident(pat) = &local.pat {
+            self.check_ident(pat.ident.span(), &pat.ident);
+        }
+        syn::visit::visit_local(self, local);
+    }
+
     fn visit_item_mod(&mut self, item: &syn::ItemMod) {
         if Self::is_cfg_test(&item.attrs) {
             return;
@@ -822,13 +898,61 @@ fn main() {
 pub fn public_example_certification_runner() {}
 
 pub struct ExecutionReviewFixture;
+
+pub enum Reviewed {
+    ExecutionReviewOne,
+}
+
+pub struct Counts {
+    pub public_example_certification_count: u32,
+}
+
+pub fn bind() {
+    let execution_review = 1u32;
+}
 "#,
     );
     let violations = scan_fixture(&root);
     let count = |rule: &str| violations.iter().filter(|v| v.rule == rule).count();
     assert_eq!(count("raw-runtime-host"), 3, "{violations:?}");
     assert_eq!(count("manual-drain"), 2, "{violations:?}");
-    assert_eq!(count("intent-identifier"), 2, "{violations:?}");
+    assert_eq!(count("intent-identifier"), 5, "{violations:?}");
+}
+
+#[test]
+fn fixture_import_and_scope_evasions_fail() {
+    let root = fixture_root("import evasions");
+    write_fixture(
+        &root,
+        "examples/specimen_demo/src/tina_impl.rs",
+        r#"
+use tina::ServiceMessage::Event;
+use tina_runtime::CallOutcome::*;
+use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime};
+use tina::prelude::*;
+
+pub fn variant_import() {
+    let _ = Event(1u32);
+}
+
+pub fn glob_collapse(outcome: tina_runtime::CallOutcome<u64>) -> &'static str {
+    match outcome {
+        Replied(_) => "ok",
+        _ => "collapsed",
+    }
+}
+
+pub fn nested_scope() {
+    type Rt = tina_runtime::ThreadedRuntime<SingleShard, DefaultThreadedMailboxFactory>;
+    let _ = Rt::try_new(SingleShard, DefaultThreadedMailboxFactory).unwrap();
+}
+"#,
+    );
+    let violations = scan_fixture(&root);
+    let count = |rule: &str| violations.iter().filter(|v| v.rule == rule).count();
+    assert_eq!(count("envelope-construction"), 1, "{violations:?}");
+    assert_eq!(count("terminal-wildcard"), 1, "{violations:?}");
+    assert_eq!(count("raw-runtime-host"), 1, "{violations:?}");
 }
 
 #[test]
@@ -884,17 +1008,42 @@ reviewer = "fixture"
 reviewed_sha = "00000000"
 "#,
     );
-    let text = fs::read_to_string(root.join("examples/public-corpus-allowlist-bad-rule.toml"))
-        .expect("read");
-    let parsed: Result<Allowlist, _> = toml::from_str(&text);
-    assert!(parsed.is_ok());
-    let parsed = parsed.expect("parsed");
-    assert!(
-        parsed
-            .entries
-            .iter()
-            .any(|e| !RULES.contains(&e.rule.as_str()))
+    write_fixture(
+        &root,
+        "examples/public-corpus-allowlist.toml",
+        r#"
+schema = 1
+
+[[entry]]
+path = "examples/specimen_demo/src/main.rs"
+rule = "not-a-rule"
+reason = "fixture"
+focused_test = "fixture-test"
+reviewer = "fixture"
+reviewed_sha = "00000000"
+"#,
     );
+    let err = load_allowlist(&root).expect_err("unknown rule must fail");
+    assert!(err.contains("unknown rule"), "{err}");
+
+    // Stale entry path fails closed through the real loader.
+    write_fixture(
+        &root,
+        "examples/public-corpus-allowlist.toml",
+        r#"
+schema = 1
+
+[[entry]]
+path = "examples/specimen_demo/src/deleted.rs"
+rule = "raw-runtime-host"
+reason = "fixture"
+focused_test = "fixture-test"
+reviewer = "fixture"
+reviewed_sha = "00000000"
+"#,
+    );
+    let err = load_allowlist(&root).expect_err("stale path must fail");
+    assert!(err.contains("stale path"), "{err}");
 
     // Unknown field fails closed at parse time.
     let bad = r#"

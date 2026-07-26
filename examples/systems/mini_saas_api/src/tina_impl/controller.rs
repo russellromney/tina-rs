@@ -653,9 +653,9 @@ fn db_reason(outcome: &CallOutcome<SqliteResult>) -> ReadinessReason {
         CallOutcome::Replied(Err(SqliteError::Timeout)) | CallOutcome::Timeout => {
             ReadinessReason::DependencyTimeout("db")
         }
-        // Readiness policy: a successful-but-unexpected reply or a
-        // rejected call is a dependency error, distinct from
-        // closed/full/timeout.
+        // Readiness policy: any reply not named above (ok shape or an
+        // unlisted SqliteError) or a rejected call is a dependency error,
+        // distinct from closed/full/timeout.
         CallOutcome::Replied(_) | CallOutcome::Rejected(_) => {
             ReadinessReason::DependencyError("db")
         }

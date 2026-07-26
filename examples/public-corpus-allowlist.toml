@@ -391,3 +391,43 @@ reason = "deadline-bounded test waiters over typed lock stats queries in the D1 
 focused_test = "cargo test --manifest-path examples/systems/system_lock_manager/Cargo.toml --test public_smoke public_smoke -- --exact"
 reviewer = "c1-independent-adversarial-review"
 reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "examples/specimen_websocket_room/src/lib.rs"
+rule = "shared-state"
+reason = "static serialization lock for the test module's socket-sharing scenarios"
+focused_test = "cargo test --manifest-path examples/specimen_websocket_room/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "62f0e5cd"
+
+[[entry]]
+path = "examples/extensions/tina-extension-fake-bridge/src/lib.rs"
+rule = "poll-loop"
+reason = "deadline-bounded join wait inside the fake bridge's own close_and_drain; the drain report, not the loop, publishes the outcome"
+focused_test = "cargo test --manifest-path examples/extensions/tina-extension-fake-bridge/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "5399cf06"
+
+[[entry]]
+path = "examples/specimen_cancellation_chain/src/tina_impl.rs"
+rule = "poll-loop"
+reason = "deadline-bounded trace-drain wait after cancel; the report flows through observe_result, not the loop"
+focused_test = "cargo test --manifest-path examples/specimen_cancellation_chain/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "examples/systems/system_copied_service_path/src/lib.rs"
+rule = "poll-loop"
+reason = "deadline-asserted test synchronization waiter over scope snapshots and topology pending counts"
+focused_test = "cargo test --manifest-path examples/systems/system_copied_service_path/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "examples/specimen_axum_counter/README.md"
+rule = "obsolete-vocabulary"
+reason = "struck-through resolved complaints deliberately name the superseded wiring next to the LocalSystem resolution"
+focused_test = "cargo test --manifest-path examples/specimen_axum_counter/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"

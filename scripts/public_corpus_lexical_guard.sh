@@ -52,7 +52,7 @@ scan_rs() { # $1 = perl program body evaluated per file, prints "file:line: deta
 shared_state_hits() {
     scan_rs '
         '"$strip_perl"'
-        while (/\b(?:Arc\s*<\s*(?:std::sync::)?Mutex|Mutex\s*<\s*Option|Condvar|Atomic(?:Bool|I8|I16|I32|I64|Isize|U8|U16|U32|U64|Usize|Ptr))/g) {
+        while (/\b(?:Arc\s*<\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*Mutex|Mutex\s*<|Condvar|Atomic(?:Bool|I8|I16|I32|I64|Isize|U8|U16|U32|U64|Usize|Ptr))/g) {
             my $line = 1 + (substr($_, 0, $-[0]) =~ tr/\n//);
             print "$line: shared-state $&\n";
         }
@@ -62,7 +62,7 @@ shared_state_hits() {
 poll_loop_hits() {
     scan_rs '
         '"$strip_perl"'
-        while (/\bloop\s*\{(?:[^{}]|\{[^{}]*\})*?sleep\s*\(/gs) {
+        while (/\b(?:loop|while)[^{]*\{(?:[^{}]|\{[^{}]*\})*?sleep\s*\(/gs) {
             my $line = 1 + (substr($_, 0, $-[0]) =~ tr/\n//);
             print "$line: poll-loop\n";
         }
@@ -102,47 +102,35 @@ allowlisted_paths() { # $1 = rule
     ' "$ALLOWLIST" | sort -u
 }
 
-# Lines "path: rest" minus allowlisted paths for $2 = rule.
-without_allowlisted() { # stdin hits, $1 = rule
-    local allowed
-    allowed="$(allowlisted_paths "$1")"
-    if [[ -z "$allowed" ]]; then
-        cat
-        return
-    fi
-    grep -Fv -f <(printf '%s\n' "$allowed") || true
+# Normalize a hit line "path:line: detail" to its exact repo-relative path.
+hit_paths() {
+    sed -e 's|^\./||' -e 's|:.*$||'
 }
 
-# Allowlisted paths for $1 = rule that no longer appear in the live hits.
-stale_entries() { # stdin hits, $1 = rule
-    local allowed
+# Lines "path: rest" minus entries whose EXACT path is allowlisted for $1.
+without_allowlisted() { # stdin hits, $1 = rule
+    local allowed hit hp
     allowed="$(allowlisted_paths "$1")"
-    [[ -n "$allowed" ]] || return 0
-    while IFS= read -r path; do
-        grep -qF -- "$path" <<< "${2:-}" && continue
-        if ! grep -qF "$path" /dev/stdin <<< "$1"; then :; fi
-    done <<< "$allowed"
+    while IFS= read -r hit; do
+        [[ -n "$hit" ]] || continue
+        hp="$(printf '%s' "$hit" | hit_paths)"
+        if [[ -z "$allowed" ]] || ! grep -Fxq -- "$hp" <<< "$allowed"; then
+            printf '%s\n' "$hit"
+        fi
+    done
 }
 
 status=0
-report() { # $1 = rule name, $2 = live hits (may be empty), $3 = all hits incl. allowlisted
-    local rule="$1" live="$2"
-    if [[ -n "$live" ]]; then
-        status=1
-        echo "public-corpus lexical guard: unexplained $rule hit(s):" >&2
-        printf '%s\n' "$live" >&2
-    fi
-}
 
 check_rule() { # $1 = rule, $2 = all-hits-command
     local rule="$1"
     local all_hits live stale
     all_hits="$($2 || true)"
     live="$(printf '%s\n' "$all_hits" | without_allowlisted "$rule")"
-    # Stale: an allowlisted path for this rule with no live or exempted hit.
+    # Stale: an allowlisted path for this rule with no exact hit path.
     stale="$(allowlisted_paths "$rule" | while IFS= read -r path; do
         [[ -n "$path" ]] || continue
-        if ! printf '%s\n' "$all_hits" | grep -qF "$path"; then
+        if ! printf '%s\n' "$all_hits" | hit_paths | grep -Fxq -- "$path"; then
             printf '%s\n' "$path"
         fi
     done)"
@@ -165,13 +153,18 @@ if [[ "${1:-}" == "--self-test" ]]; then
     mkdir -p "$fx/examples/specimen_demo/src" "$fx/docs" "$fx/tina-fake/src" "$fx/scripts"
     printf 'fn leaked() { let _x: std::sync::Arc<std::sync::Mutex<u64>> = start(); }\n' \
         > "$fx/examples/specimen_demo/src/sidecar.rs"
+    printf 'fn tokio_leak() { let _y: Arc<tokio::sync::Mutex<u64>> = start(); }\n' \
+        > "$fx/examples/specimen_demo/src/tokio_sidecar.rs"
     printf '// Arc<Mutex> in a comment is fine\nfn ok() {}\n' \
         > "$fx/examples/specimen_demo/src/comment_only.rs"
     printf 'fn poll() { loop { std::thread::sleep(std::time::Duration::from_millis(1)); break; } }\n' \
         > "$fx/examples/specimen_demo/src/poller.rs"
+    printf 'fn whine() { while !done() { std::thread::sleep(std::time::Duration::from_millis(1)); } }\n' \
+        > "$fx/examples/specimen_demo/src/whiler.rs"
     printf 'fn pace() { for _ in 0..3 { std::thread::sleep(std::time::Duration::from_millis(1)); } }\n' \
         > "$fx/examples/specimen_demo/src/pacer.rs"
     printf 'use tina_runtime::ThreadedRuntime;\n' > "$fx/docs/guide.md"
+    printf 'still teaches `register_with_capacity` on raw hosts\n' > "$fx/README.md"
     printf 'phase 163 alone is fine; the number is not forbidden\n' > "$fx/docs/notes.md"
     printf 'See the Public Example Certification package\n' > "$fx/examples/specimen_demo/src/leak.md"
     printf 'fn main() {}\n' > "$fx/tina-fake/src/lib.rs"
@@ -199,6 +192,16 @@ reviewed_sha = "00000000"
 TOML
     # Stale-entry fixture file must exist so path validation passes.
     printf 'fn stale() {}\n' > "$fx/examples/specimen_demo/src/stale.rs"
+    cat >> "$fx/allow.toml" <<'TOML2'
+
+[[entry]]
+path = "examples/specimen_demo/src/sidecar.rs"
+rule = "poll-loop"
+reason = "fixture (unused entry must not exempt anything)"
+focused_test = "fixture"
+reviewer = "fixture"
+reviewed_sha = "00000000"
+TOML2
 
     export PUBLIC_CORPUS_ALLOWLIST="$fx/allow.toml"
     ALLOWLIST="$fx/allow.toml"
@@ -213,21 +216,33 @@ TOML
 
     printf '%s\n' "$shared" | grep -q 'sidecar.rs:1: shared-state' \
         || { echo "self-test: shared-state miss" >&2; exit 1; }
+    printf '%s\n' "$shared" | grep -q 'tokio_sidecar.rs:1: shared-state' \
+        || { echo "self-test: tokio Mutex evasion missed" >&2; exit 1; }
     printf '%s\n' "$shared$poll$obs$phrase" | grep -q 'comment_only' && {
         echo "self-test: comment-only false positive" >&2; exit 1; }
     printf '%s\n' "$poll" | grep -q 'poller.rs:1: poll-loop' \
         || { echo "self-test: poll-loop miss" >&2; exit 1; }
+    printf '%s\n' "$poll" | grep -q 'whiler.rs:1: poll-loop' \
+        || { echo "self-test: while-poll evasion missed" >&2; exit 1; }
     printf '%s\n' "$poll" | grep -q 'pacer' && {
         echo "self-test: for-loop pacing false positive" >&2; exit 1; }
     printf '%s\n' "$obs" | grep -q 'guide.md:1: obsolete-vocabulary' \
         || { echo "self-test: obsolete-vocabulary miss" >&2; exit 1; }
+    printf '%s\n' "$obs" | grep -q 'README.md:1: obsolete-vocabulary' \
+        || { echo "self-test: root README hit missed" >&2; exit 1; }
     printf '%s\n' "$phrase" | grep -q 'leak.md:1: intent-phrase' \
         || { echo "self-test: intent-phrase miss" >&2; exit 1; }
     printf '%s\n' "$phrase" | grep -q 'notes.md' && {
         echo "self-test: bare 163 false positive" >&2; exit 1; }
 
     live="$(printf '%s\n' "$shared" | without_allowlisted shared-state)"
-    [[ -z "$live" ]] || { echo "self-test: allowlist did not exempt" >&2; exit 1; }
+    printf '%s\n' "$live" | grep -q 'tokio_sidecar' || {
+        echo "self-test: unrelated entry wrongly exempted another file" >&2; exit 1; }
+    ! printf '%s\n' "$live" | hit_paths | grep -Fxq "examples/specimen_demo/src/sidecar.rs" || {
+        echo "self-test: allowlist did not exempt the exact path" >&2; exit 1; }
+    obslive="$(printf '%s\n' "$obs" | without_allowlisted obsolete-vocabulary)"
+    printf '%s\n' "$obslive" | grep -q 'README.md' || {
+        echo "self-test: unlisted README hit wrongly exempted" >&2; exit 1; }
     echo "public-corpus lexical guard self-test: ok"
     exit 0
 fi

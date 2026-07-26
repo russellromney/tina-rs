@@ -1413,6 +1413,83 @@ fn caller_cancel_returns_local_cancel_and_keeps_connection_alive() {
 }
 
 #[test]
+fn cancel_racing_in_flight_response_headers_keeps_connection_alive() {
+    // The wire-level race behind a rare specimen flake: the caller cancels
+    // stream 1 and the client removes it locally (sending
+    // RST_STREAM(CANCEL)), but the peer's response HEADERS for that stream
+    // was already on the wire. RFC 9113 §5.1 ("closed"): any frame other
+    // than PRIORITY received *after we sent a RST_STREAM* is a
+    // stream-level STREAM_CLOSED error, never a connection error. The
+    // client must consume the late HEADERS (HPACK state stays in sync),
+    // refuse only the stream, and keep the connection: a follow-up call
+    // must still complete.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind peer");
+    let addr = listener.local_addr().expect("peer addr");
+    let peer = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        complete_handshake_with(&mut sock, &[]);
+        let first = next_headers(&mut sock); // stream 1: the call to cancel
+        // Wait for the client's RST_STREAM(CANCEL), then send the response
+        // that was already in flight when the cancel was processed.
+        loop {
+            let frame = read_frame(&mut sock).expect("frame after request headers");
+            if frame.ty == FRAME_RST_STREAM && frame.stream_id == first {
+                break;
+            }
+        }
+        send_response(&mut sock, first, "200", b"late-body");
+        // Answer the follow-up call normally.
+        let second = next_headers(&mut sock);
+        send_response(&mut sock, second, "200", b"after-cancel");
+        std::thread::sleep(Duration::from_millis(50));
+    });
+    let (runtime, client) = run_client(addr);
+
+    std::thread::scope(|scope| {
+        let runtime = &runtime;
+        let cancel = scope.spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            let _ = runtime.try_send(client, Http2ClientMsg::Cancel { stream_id: 1 });
+        });
+        let outcome = runtime
+            .call_blocking(
+                client,
+                Http2ClientMsg::Submit(Http2ClientRequest::get("/held")),
+                Duration::from_secs(5),
+            )
+            .expect("cancelled call returns");
+        cancel.join().unwrap();
+        match outcome {
+            CallOutcome::Replied(Http2ClientReply::Outcome {
+                stream_id: 1,
+                outcome: Http2ClientOutcome::LocalCancel,
+            }) => {}
+            other => panic!("expected LocalCancel on stream 1, got {other:?}"),
+        }
+    });
+
+    // Connection survives the late response: a fresh GET completes.
+    let follow_up = runtime
+        .call_blocking(
+            client,
+            Http2ClientMsg::Submit(Http2ClientRequest::get("/again")),
+            Duration::from_secs(5),
+        )
+        .expect("follow-up call returns");
+    match follow_up {
+        CallOutcome::Replied(Http2ClientReply::Outcome {
+            outcome: Http2ClientOutcome::Replied(response),
+            ..
+        }) => assert_eq!(response.body, b"after-cancel"),
+        other => panic!("expected Replied after late response, got {other:?}"),
+    }
+
+    let _ = runtime.try_send(client, Http2ClientMsg::Stop);
+    let _ = runtime.shutdown();
+    peer.join().expect("peer thread joins");
+}
+
+#[test]
 fn client_emits_outbound_open_and_close_lifecycle_facts() {
     // The plan requires the client to emit stream-lifecycle protocol
     // facts (not just private counters). A happy-path GET against the
