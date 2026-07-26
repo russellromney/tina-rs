@@ -359,3 +359,21 @@ its post-merge adversarial audit is tracked below. C1 remains incomplete.
 ### Next
 - C1 part 4: FINDINGS.md closure ledger + FINDINGS_HISTORY.md archival reconciliation + orphan lockfile removal
 - C1 final: full matrices, fresh whole-corpus review, certification record
+
+## C1 part 4 #393 OPEN — closure ledger + findings history + orphan lockfile (stacked on #392)
+
+- Work code: C1 (part 4: closure ledger)
+- Branch: agent/phase-163-c1-findings (stacked on agent/phase-163-c1-certification)
+- Reviewed head: 4fa813de
+- Independent adversarial review round 1 (6-file diff): CHANGES REQUIRED — archive banner elevated four falsified "Still open" claims to current status → dated closure markers on all four; re-review found a fifth unmarked entry + one alias-wording inaccuracy → all fixed; final verification: genuinely-open set = {cancel_isolate, join/stop child convenience}, all other still-open entries carry dated markers or closed
+- Mechanical verification (reviewer): all 71 owner merge commits touch their row path; 27 merge-SHA prefixes resolve; 12/12 sampled focused commands green; proof codes match manifest 1:1; archive append byte-identical to old FINDINGS.md body
+- Contents: FINDINGS.md closure ledger (71 crate rows + 44 document rows, owners, dispositions, focused commands, direct proof, merge SHAs, blockers); FINDINGS_HISTORY.md dated markers + full archive; orphan examples/systems/system_mini_saas_api/Cargo.lock removed (reference-free); perf_native tokio-control teardown race fixed (10/10 under load); stale FINDINGS.md obsolete-vocabulary allowlist entry removed
+- PR CI: run 30197239642 SUCCESS
+- Merge: after #392 (user web-UI merge for workflow scope)
+
+### Also since last checkpoint
+- First corpus-wide public_smoke sweep: 70/71 green with exact commands; only perf_native flaked (teardown race, fixed in #393)
+- pre-existing floor.rs wall-clock bound is load-sensitive — recorded in FINDINGS.md hygiene, not a corpus finding
+
+### Next
+- After #392 + #393 merge: C1 final full-matrix verification, fresh whole-corpus adversarial review, certification record
