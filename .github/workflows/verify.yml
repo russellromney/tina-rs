@@ -252,6 +252,16 @@ jobs:
         with:
           cache-on-failure: "true"
 
+      - name: Install ripgrep
+        # scripts/public_corpus_lexical_guard.sh (in `make verify-guards`)
+        # scans the corpus with `rg`; the runner images do not ship it.
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y ripgrep
+          else
+            brew install ripgrep
+          fi
+
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.10
 

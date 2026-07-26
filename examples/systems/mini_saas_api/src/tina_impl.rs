@@ -2,13 +2,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use rusqlite::Connection;
-use tina_http::{
-    HttpResponse, HttpResponseBody, HttpServerConfig,
-};
-use tina_runtime::lifecycle::{
-    Lifecycle, ServiceTopology, TopologyComponent,
-};
-
+use tina_http::{HttpResponse, HttpResponseBody, HttpServerConfig};
+use tina_runtime::lifecycle::{Lifecycle, ServiceTopology, TopologyComponent};
 
 mod controller;
 mod harness;

@@ -2154,6 +2154,27 @@ impl<S: Shard + 'static> Http2ClientConnection<S> {
             return Err(Http2ProtocolError::HpackUnsupported);
         }
         let Some(idx) = self.find_stream(stream_id) else {
+            // RFC 9113 §5.1 ("closed"): a frame that arrives for a stream we
+            // already closed — e.g. this response HEADERS raced with the
+            // RST_STREAM(CANCEL) we sent, or with the END_STREAM we already
+            // accepted — is a stream-level STREAM_CLOSED error, never a
+            // connection error. Decode the block and discard it (the HPACK
+            // dynamic table is connection state and must stay in sync),
+            // refuse just the stream, and keep the connection — mirroring
+            // the late-DATA path in `handle_data`. An id we never assigned
+            // stays a connection-level error: the peer invented a client
+            // stream.
+            if stream_id < self.next_stream_id {
+                let payload = headers_payload_view(flags, frame_payload)?;
+                decode_headers_block_compact_with(
+                    &mut self.hpack_decoder,
+                    payload,
+                    self.limits.max_header_bytes,
+                    None,
+                )?;
+                self.enqueue_frame(rst_stream_frame(stream_id, ERR_STREAM_CLOSED));
+                return Ok(());
+            }
             return Err(Http2ProtocolError::BadStreamId);
         };
         let payload = headers_payload_view(flags, frame_payload)?;

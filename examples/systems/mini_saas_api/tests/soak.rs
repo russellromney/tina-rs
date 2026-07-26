@@ -114,8 +114,7 @@ fn small_steady_load_drains_cleanly_with_only_typed_pressure() {
     // "some error happened".
     let notify_attempted = cap_u64(&cap, "notify.attempted");
     let outbound_acquired = cap_u64(&cap, "outbound.acquired");
-    let outbound_terminal =
-        cap_u64(&cap, "outbound.released") + cap_u64(&cap, "outbound.retired");
+    let outbound_terminal = cap_u64(&cap, "outbound.released") + cap_u64(&cap, "outbound.retired");
     assert!(
         notify_attempted > 0,
         "soak must admit at least one notify op: {}",

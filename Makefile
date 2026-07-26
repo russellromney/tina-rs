@@ -12,7 +12,8 @@ EXAMPLES_TARGET_DIR ?= $(CURDIR)/target/verify-examples
 .PHONY: fmt fmt-check check test loom miri doc clippy portable-runtime-cost perf \
 	perf-compare verify verify-static verify-guards verify-examples verify-packaging proof-fast proof-soak \
 	proof-long-soak proof-bad-peer proof-replay-regression race-surface-guard rail-inventory-guard \
-	examples-startup-api-guard examples-shutdown-truth-guard examples-service-envelope-guard
+	examples-startup-api-guard examples-shutdown-truth-guard examples-service-envelope-guard \
+	public-corpus-lexical-guard
 
 fmt:
 	cargo fmt --all
@@ -67,6 +68,10 @@ examples-shutdown-truth-guard:
 examples-service-envelope-guard:
 	./scripts/examples_service_envelope_guard.sh --self-test
 	./scripts/examples_service_envelope_guard.sh
+
+public-corpus-lexical-guard:
+	./scripts/public_corpus_lexical_guard.sh --self-test
+	./scripts/public_corpus_lexical_guard.sh
 
 miri:
 	cargo +nightly miri test --locked -p tina-mailbox-spsc --test miri_spsc
@@ -183,7 +188,7 @@ proof-replay-regression:
 # ubuntu-only.
 verify-static: fmt-check doc
 
-verify-guards: loom race-surface-guard rail-inventory-guard examples-startup-api-guard examples-shutdown-truth-guard examples-service-envelope-guard
+verify-guards: loom race-surface-guard rail-inventory-guard examples-startup-api-guard examples-shutdown-truth-guard examples-service-envelope-guard public-corpus-lexical-guard
 	cargo run --locked -p tina-runtime --example portable_runtime_cost | tee /tmp/tina-verify-cost.txt
 	grep -E "cost rows / local_machine comparison_baseline=none" /tmp/tina-verify-cost.txt
 	grep -E "mailbox local push/pop|local send|live ingress|cross-shard send|isolate call|timer|TCP loopback|TLS loopback|file read/write|journal append|bridge call" /tmp/tina-verify-cost.txt

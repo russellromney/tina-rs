@@ -5,9 +5,7 @@ use tina_http::{
     InstalledKeepalivePool, KeepaliveCloseAndDrain, KeepalivePendingCounts,
     KeepalivePoolDrainOutcome, KeepalivePoolSettledReport,
 };
-use tina_runtime::lifecycle::{
-    CloseAdmission, CloseOutcome, ResourceCloseReport, ResourceKind,
-};
+use tina_runtime::lifecycle::{CloseAdmission, CloseOutcome, ResourceCloseReport, ResourceKind};
 use tina_runtime::{LocalSystemState, LocalSystemTerminalReport, MailboxFactory};
 
 const POST_OWNER_SETTLE_TIMEOUT: Duration = Duration::from_millis(100);
@@ -290,9 +288,7 @@ pub(crate) fn pool_settled_to_close_report(
     elapsed: Duration,
 ) -> ResourceCloseReport {
     let outcome = match pool.drain {
-        KeepalivePoolDrainOutcome::Drained if pool.requested == pool.stopped => {
-            CloseOutcome::Clean
-        }
+        KeepalivePoolDrainOutcome::Drained if pool.requested == pool.stopped => CloseOutcome::Clean,
         KeepalivePoolDrainOutcome::TimedOut { .. } => CloseOutcome::TimedOut { waited: elapsed },
         KeepalivePoolDrainOutcome::PoolAlreadyClosed => CloseOutcome::AlreadyClosed,
         _ => CloseOutcome::Failed {
@@ -382,12 +378,9 @@ mod conversion_tests {
         LocalSystem<tina::SingleShard, DefaultThreadedMailboxFactory>,
         InstalledKeepalivePool<tina::SingleShard>,
     ) {
-        let app = LocalSystem::single_shard(
-            tina::SingleShard,
-            DefaultThreadedMailboxFactory,
-        )
-        .try_build()
-        .expect("system");
+        let app = LocalSystem::single_shard(tina::SingleShard, DefaultThreadedMailboxFactory)
+            .try_build()
+            .expect("system");
         let pool = app
             .install_keepalive_pool(KeepalivePoolInstallConfig::new(
                 HttpTarget::http(format!("127.0.0.1:{port}").parse().unwrap()),

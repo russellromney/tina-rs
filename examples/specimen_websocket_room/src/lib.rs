@@ -294,10 +294,11 @@ impl Gateway {
                 if let Some(generation) = idle_generation_from_path(&request.path) {
                     return self.handle_idle_deadline(generation);
                 }
-                let is_delete = request.method == Method::DELETE && request.path == "/rooms/default";
+                let is_delete =
+                    request.method == Method::DELETE && request.path == "/rooms/default";
                 let is_create = request.method == Method::POST && request.path == "/rooms/default";
-                let is_host_shutdown = request.method == Method::POST
-                    && request.path == GATEWAY_MARK_SHUTDOWN;
+                let is_host_shutdown =
+                    request.method == Method::POST && request.path == GATEWAY_MARK_SHUTDOWN;
                 let (response, side) = self.response_for(request);
                 let mut effects = vec![reply(response)];
                 effects.extend(side);
@@ -313,7 +314,13 @@ impl Gateway {
             GatewayMsg::RoomSnapshot { req, outcome } => {
                 let body = match outcome {
                     CallOutcome::Replied(WebSocketSessionOutcome::Text(json)) => json.into_bytes(),
-                    _ => b"{}".to_vec(),
+                    // Snapshot policy: any non-text reply or terminal
+                    // outcome serves an empty object, not an error status.
+                    CallOutcome::Replied(_)
+                    | CallOutcome::Full
+                    | CallOutcome::Closed
+                    | CallOutcome::Timeout
+                    | CallOutcome::Rejected(_) => b"{}".to_vec(),
                 };
                 let mut response = HttpResponse::with_body(http::StatusCode::OK, body);
                 response.headers.insert(
@@ -349,10 +356,11 @@ impl Gateway {
                         ))
                         .reply(|req, outcome| GatewayMsg::RoomSnapshot { req, outcome });
                 }
-                let is_delete = request.method == Method::DELETE && request.path == "/rooms/default";
+                let is_delete =
+                    request.method == Method::DELETE && request.path == "/rooms/default";
                 let is_create = request.method == Method::POST && request.path == "/rooms/default";
-                let is_host_shutdown = request.method == Method::POST
-                    && request.path == GATEWAY_MARK_SHUTDOWN;
+                let is_host_shutdown =
+                    request.method == Method::POST && request.path == GATEWAY_MARK_SHUTDOWN;
                 let (response, side) = self.response_for(request);
                 let mut effects = vec![call.reply(response), self.arm_idle_deadline()];
                 effects.extend(side);
@@ -368,7 +376,13 @@ impl Gateway {
             GatewayMsg::RoomSnapshot { req, outcome } => {
                 let body = match outcome {
                     CallOutcome::Replied(WebSocketSessionOutcome::Text(json)) => json.into_bytes(),
-                    _ => b"{}".to_vec(),
+                    // Snapshot policy: any non-text reply or terminal
+                    // outcome serves an empty object, not an error status.
+                    CallOutcome::Replied(_)
+                    | CallOutcome::Full
+                    | CallOutcome::Closed
+                    | CallOutcome::Timeout
+                    | CallOutcome::Rejected(_) => b"{}".to_vec(),
                 };
                 let mut response = HttpResponse::with_body(http::StatusCode::OK, body);
                 response.headers.insert(
@@ -409,19 +423,13 @@ impl Gateway {
             }
             if !self.admission.origin_allowed(&request) {
                 return (
-                    HttpResponse::with_body(
-                        http::StatusCode::FORBIDDEN,
-                        b"bad origin".to_vec(),
-                    ),
+                    HttpResponse::with_body(http::StatusCode::FORBIDDEN, b"bad origin".to_vec()),
                     vec![self.note_reject(REPORT_REJECT_ORIGIN)],
                 );
             }
             if !self.admission.auth_allowed(&request) {
                 return (
-                    HttpResponse::with_body(
-                        http::StatusCode::UNAUTHORIZED,
-                        b"bad auth".to_vec(),
-                    ),
+                    HttpResponse::with_body(http::StatusCode::UNAUTHORIZED, b"bad auth".to_vec()),
                     vec![self.note_reject(REPORT_REJECT_AUTH)],
                 );
             }
@@ -477,8 +485,7 @@ impl Gateway {
         } else if request.method == Method::GET && request.path == "/room-report" {
             // Handled via nested room snapshot in handle_call; message-form
             // path returns empty JSON if it lands here.
-            let mut response =
-                HttpResponse::with_body(http::StatusCode::OK, b"{}".to_vec());
+            let mut response = HttpResponse::with_body(http::StatusCode::OK, b"{}".to_vec());
             response.headers.insert(
                 http::header::CONTENT_TYPE,
                 http::HeaderValue::from_static("application/json"),
@@ -551,9 +558,8 @@ impl Gateway {
         }
         self.idle_generation = self.idle_generation.saturating_add(1);
         let generation = self.idle_generation;
-        sleep(self.idle_room_expiry).then(move |_| {
-            GatewayMsg::Http(idle_deadline_request(generation))
-        })
+        sleep(self.idle_room_expiry)
+            .then(move |_| GatewayMsg::Http(idle_deadline_request(generation)))
     }
 
     fn handle_idle_deadline(&mut self, generation: u64) -> Effect<Self> {
@@ -582,10 +588,16 @@ impl Gateway {
             return noop();
         }
         let live_members = match outcome {
-            CallOutcome::Replied(WebSocketSessionOutcome::Text(json)) => {
-                parse_report_json(&json).map(|r| r.live_members).unwrap_or(1)
-            }
-            _ => 1,
+            CallOutcome::Replied(WebSocketSessionOutcome::Text(json)) => parse_report_json(&json)
+                .map(|r| r.live_members)
+                .unwrap_or(1),
+            // Idle policy: an unreadable or unavailable room report is
+            // treated as one live member (no forced expiry this tick).
+            CallOutcome::Replied(_)
+            | CallOutcome::Full
+            | CallOutcome::Closed
+            | CallOutcome::Timeout
+            | CallOutcome::Rejected(_) => 1,
         };
         if live_members == 0 {
             self.delete_room();
@@ -664,12 +676,10 @@ impl Room {
                 let effect = self.handle_session_close(session_id);
                 call.reply_and(WebSocketSessionOutcome::Close(code, reason), vec![effect])
             }
-            WebSocketSessionMsg::Shutdown { code, reason } => {
-                call.reply_and(
-                    WebSocketSessionOutcome::None,
-                    vec![self.handle_shutdown(code, reason)],
-                )
-            }
+            WebSocketSessionMsg::Shutdown { code, reason } => call.reply_and(
+                WebSocketSessionOutcome::None,
+                vec![self.handle_shutdown(code, reason)],
+            ),
             other => {
                 // Request-lane fallback for control texts that arrive as calls.
                 call.reply_and(
@@ -730,8 +740,7 @@ impl Room {
             self.members.insert(session_id, session);
             self.report.joined += 1;
             self.report.live_members = self.members.len();
-            self.report.session_high_water =
-                self.report.session_high_water.max(self.members.len());
+            self.report.session_high_water = self.report.session_high_water.max(self.members.len());
             (
                 WebSocketSessionOutcome::Text(format!("join:{}", session_id.raw())),
                 effects,
@@ -795,7 +804,11 @@ impl Room {
         effects
     }
 
-    fn handle_session_text(&mut self, session_id: WebSocketSessionId, text: String) -> Effect<Self> {
+    fn handle_session_text(
+        &mut self,
+        session_id: WebSocketSessionId,
+        text: String,
+    ) -> Effect<Self> {
         let effects = self.session_text_effects(session_id, text);
         if effects.is_empty() {
             reply(WebSocketSessionOutcome::None)
@@ -1052,9 +1065,7 @@ impl Room {
                     WebSocketError::ProtocolError
                     | WebSocketError::InvalidClosePayload
                     | WebSocketError::ClientFrameUnmasked
-                    | WebSocketError::InvalidOpcode(_) => {
-                        self.report.protocol_close_seen = true
-                    }
+                    | WebSocketError::InvalidOpcode(_) => self.report.protocol_close_seen = true,
                     _ => {}
                 }
                 if self.deleting && self.members.is_empty() {
@@ -1069,9 +1080,7 @@ impl Room {
                     WebSocketError::ProtocolError
                     | WebSocketError::InvalidClosePayload
                     | WebSocketError::ClientFrameUnmasked
-                    | WebSocketError::InvalidOpcode(_) => {
-                        self.report.protocol_close_seen = true
-                    }
+                    | WebSocketError::InvalidOpcode(_) => self.report.protocol_close_seen = true,
                     _ => {}
                 }
                 reply(WebSocketSessionOutcome::None)
@@ -1299,7 +1308,15 @@ impl RoomServer {
             Ok(CallOutcome::Replied(WebSocketSessionOutcome::Text(json))) => {
                 parse_report_json(&json).unwrap_or_default()
             }
-            _ => RoomReport::default(),
+            // Fixture report policy: a failed or non-text snapshot reads
+            // as the default report; the scenario assertions name the
+            // values they depend on.
+            Ok(CallOutcome::Replied(_))
+            | Ok(CallOutcome::Full)
+            | Ok(CallOutcome::Closed)
+            | Ok(CallOutcome::Timeout)
+            | Ok(CallOutcome::Rejected(_))
+            | Err(_) => RoomReport::default(),
         }
     }
 
@@ -1480,7 +1497,15 @@ impl TlsRoomServer {
             Ok(CallOutcome::Replied(WebSocketSessionOutcome::Text(json))) => {
                 parse_report_json(&json).unwrap_or_default()
             }
-            _ => RoomReport::default(),
+            // Fixture report policy: a failed or non-text snapshot reads
+            // as the default report; the scenario assertions name the
+            // values they depend on.
+            Ok(CallOutcome::Replied(_))
+            | Ok(CallOutcome::Full)
+            | Ok(CallOutcome::Closed)
+            | Ok(CallOutcome::Timeout)
+            | Ok(CallOutcome::Rejected(_))
+            | Err(_) => RoomReport::default(),
         }
     }
 
