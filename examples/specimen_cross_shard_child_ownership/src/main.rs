@@ -1,7 +1,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use tina::{ChildDefinition, ChildRef, RestartBudget, RestartPolicy, SpawnObservedRemote, prelude::*};
+use tina::{
+    ChildDefinition, ChildRef, RestartBudget, RestartPolicy, SpawnObservedRemote, prelude::*,
+};
 use tina_runtime::{DefaultMailboxFactory, MultiShardRuntime};
 use tina_supervisor::SupervisorConfig;
 
@@ -97,7 +99,11 @@ fn main() {
     }
 
     let live = runtime.child_lifecycle_report(supervisor).unwrap();
-    let shards: Vec<_> = live.children.iter().map(|child| child.shard.get()).collect();
+    let shards: Vec<_> = live
+        .children
+        .iter()
+        .map(|child| child.shard.get())
+        .collect();
     println!(
         "child_lifecycle specimen=cross_shard_child_ownership parent={} children={} shards={:?} state=live",
         live.parent.get(),

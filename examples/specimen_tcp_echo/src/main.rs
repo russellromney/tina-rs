@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use specimen_tcp_echo::{EchoListener, EchoListenerMsg, LISTENER_CAPACITY, run_load_shed};
 use tina::prelude::SingleShard;
-use tina_runtime::{DefaultThreadedMailboxFactory, ThreadedRuntime};
+use tina_runtime::{DefaultThreadedMailboxFactory, LocalSystem};
 
 const LOAD_SHED_CAPACITY: usize = 4;
 const LOAD_SHED_BURST: u32 = 32;
@@ -45,24 +45,30 @@ fn main() -> anyhow::Result<()> {
 ///
 /// The listener accepts forever (`target_accepts = None`), so this is a
 /// real server, not a bounded test. The bound address is learned through
-/// the runtime's `observe_next_bound` handle — no shared-slot polling.
+/// the system's `observe_next_bound` handle — no shared-slot polling.
 fn serve() -> anyhow::Result<()> {
-    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)
-        .map_err(|e| anyhow::anyhow!("runtime startup: {e:?}"))?;
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    app.run_to_shutdown_reported(Duration::from_secs(5), serve_until_enter)
+        .map_err(|e| anyhow::anyhow!("echo server: {e:?}"))?;
+    Ok(())
+}
+
+fn serve_until_enter(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+) -> anyhow::Result<()> {
     let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
 
-    let listener = runtime
-        .register_with_capacity::<EchoListener, EchoListenerMsg>(
+    let listener = app
+        .register_root::<EchoListener, EchoListenerMsg>(
             EchoListener::new(bind_addr, None),
             LISTENER_CAPACITY,
         )
         .map_err(|e| anyhow::anyhow!("register listener: {e:?}"))?;
 
-    let bound = runtime
+    let bound = app
         .observe_next_bound()
         .map_err(|e| anyhow::anyhow!("register bind observer: {e}"))?;
-    runtime
-        .try_send(listener, EchoListenerMsg::Start)
+    app.try_send(listener, EchoListenerMsg::Start)
         .map_err(|e| anyhow::anyhow!("start listener: {e:?}"))?;
 
     let addr = bound
@@ -74,15 +80,10 @@ fn serve() -> anyhow::Result<()> {
     println!("press Enter to stop");
 
     // Serve until the operator stops us. Blocking on stdin keeps this a
-    // dependency-free standing server; the runtime's own threads keep
+    // dependency-free standing server; the system's own threads keep
     // accepting and echoing while we wait here.
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line)?;
-
-    runtime
-        .shutdown_report()
-        .ensure_clean()
-        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
     Ok(())
 }
 

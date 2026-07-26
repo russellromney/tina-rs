@@ -36,17 +36,17 @@ protocol, and cleanup outcomes remain distinct typed errors.
 ## Run
 
 ```sh
-cargo run -p specimen-local-io-codec-ipc -- file-ingest
-cargo run -p specimen-local-io-codec-ipc -- admin-socket
-cargo run -p specimen-local-io-codec-ipc -- framed-keyspace
-cargo run -p specimen-local-io-codec-ipc -- live-unix
-cargo run -p specimen-local-io-codec-ipc -- all
+cargo run --manifest-path examples/specimen_local_io_codec_ipc/Cargo.toml -- file-ingest
+cargo run --manifest-path examples/specimen_local_io_codec_ipc/Cargo.toml -- admin-socket
+cargo run --manifest-path examples/specimen_local_io_codec_ipc/Cargo.toml -- framed-keyspace
+cargo run --manifest-path examples/specimen_local_io_codec_ipc/Cargo.toml -- live-unix
+cargo run --manifest-path examples/specimen_local_io_codec_ipc/Cargo.toml -- all
 ```
 
 ## Acceptance tests
 
 ```sh
-cargo test -p specimen-local-io-codec-ipc --all-targets
+cargo test --manifest-path examples/specimen_local_io_codec_ipc/Cargo.toml --all-targets
 ```
 
 The suite covers EOF, honest cap exhaustion, zero caps, empty payloads,
