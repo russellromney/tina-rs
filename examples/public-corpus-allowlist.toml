@@ -209,14 +209,6 @@ reviewed_sha = "20c7806e"
 # ---------------------------------------------------------------------------
 
 [[entry]]
-path = "examples/FINDINGS.md"
-rule = "obsolete-vocabulary"
-reason = "public closure ledger records superseded forms while narrating their replacement"
-focused_test = "scripts/public_corpus_lexical_guard.sh"
-reviewer = "c1-independent-adversarial-review"
-reviewed_sha = "d71b9acc"
-
-[[entry]]
 path = "examples/FINDINGS_HISTORY.md"
 rule = "obsolete-vocabulary"
 reason = "historical ledger preserves superseded forms as clearly historical claims"
