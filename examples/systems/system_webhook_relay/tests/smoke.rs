@@ -311,12 +311,10 @@ fn real_sqs_inputs_are_bounded_before_runtime_startup() {
             "http://127.0.0.1/queue".into(),
             Duration::from_secs(60) + Duration::from_nanos(1),
         ),
-        Err(RunError::InvalidConfig(
-            RunConfigError::DurationTooLarge {
-                field: "bridge timeout",
-                requested_ms: 60_001,
-                max_ms: 60_000,
-            }
-        ))
+        Err(RunError::InvalidConfig(RunConfigError::DurationTooLarge {
+            field: "bridge timeout",
+            requested_ms: 60_001,
+            max_ms: 60_000,
+        }))
     ));
 }

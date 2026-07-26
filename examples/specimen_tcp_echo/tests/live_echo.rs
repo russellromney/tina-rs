@@ -1,4 +1,4 @@
-//! Live loopback tests: real `ThreadedRuntime`, real sockets.
+//! Live loopback tests: real `LocalSystem`, real sockets.
 //!
 //! The bound address arrives through `observe_next_bound`, and the
 //! listener stop through `observe_isolate_complete` (both inside

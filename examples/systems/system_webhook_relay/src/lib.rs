@@ -26,8 +26,8 @@ use std::time::Duration;
 use tina::CallRejectedReason;
 use tina::prelude::*;
 use tina_aws_bridge::{
-    BridgeFatal, BridgeOutcomeClass, BridgeRetryable, BridgeUnavailable, SqsAddress, SqsError,
-    SqsConfig, SqsDrainReport, SqsInstallError, SqsRequest, SqsResponse, SqsSendMessage, send_sqs,
+    BridgeFatal, BridgeOutcomeClass, BridgeRetryable, BridgeUnavailable, SqsAddress, SqsConfig,
+    SqsDrainReport, SqsError, SqsInstallError, SqsRequest, SqsResponse, SqsSendMessage, send_sqs,
 };
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, ReportedWorkloadError,
@@ -876,10 +876,7 @@ fn drive_relay(
         Err(error) => return Err(RelayWorkloadError::StatsHost(error)),
     };
 
-    Ok(RunReport {
-        replies,
-        stats,
-    })
+    Ok(RunReport { replies, stats })
 }
 
 fn classify_driver_outcome(

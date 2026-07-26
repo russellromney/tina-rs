@@ -116,7 +116,11 @@ pub fn run() -> anyhow::Result<Report> {
 }
 
 /// Durably mark one webhook sent: stage the completion, append it, confirm.
-fn mark_sent(journal: &Path, outbox: &mut DurableOutbox<Vec<u8>>, id: WorkId) -> anyhow::Result<()> {
+fn mark_sent(
+    journal: &Path,
+    outbox: &mut DurableOutbox<Vec<u8>>,
+    id: WorkId,
+) -> anyhow::Result<()> {
     match outbox.begin_complete(id) {
         CompletionStart::Record(completion) => {
             io(persistence::append_journal_record(

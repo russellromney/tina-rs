@@ -64,9 +64,7 @@ fn map_error(error: BridgeError) -> StatusCode {
         BridgeError::ForeignSystem { .. }
         | BridgeError::Full
         | BridgeError::Closed
-        | BridgeError::UnknownShard(_) => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
+        | BridgeError::UnknownShard(_) => StatusCode::SERVICE_UNAVAILABLE,
         BridgeError::Timeout => StatusCode::GATEWAY_TIMEOUT,
     }
 }

@@ -197,9 +197,7 @@ fn classify(e: &BoxError) -> Outcome {
             BridgeError::ForeignSystem { .. }
             | BridgeError::Full
             | BridgeError::Closed
-            | BridgeError::UnknownShard(_) => {
-                Outcome::ServiceUnavailable
-            }
+            | BridgeError::UnknownShard(_) => Outcome::ServiceUnavailable,
         };
     }
     Outcome::ServiceUnavailable
