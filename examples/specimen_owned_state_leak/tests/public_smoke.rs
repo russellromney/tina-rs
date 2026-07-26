@@ -5,18 +5,15 @@
 //! it — the anti-pattern is the demo. Characterization pins that it is
 //! *exercised* (exactly `INTENTIONAL_ESCAPE_WRITES` writes landed through
 //! the escape, proving the type system did not block it) and stays
-//! *labeled* (the crate still documents exactly
-//! `DOCUMENTED_COMPILE_FAILS` compile-fail probes).
+//! *labeled* (the crate still documents exactly 4 compile-fail probes).
 
-use specimen_owned_state_leak::{
-    DOCUMENTED_COMPILE_FAILS, INTENTIONAL_ESCAPE_WRITES, Report, tina_impl,
-};
+use specimen_owned_state_leak::{INTENTIONAL_ESCAPE_WRITES, Report, tina_impl};
 
 fn assert_report(report: Report) {
     assert_eq!(
         report,
         Report {
-            documented_compile_fails: DOCUMENTED_COMPILE_FAILS,
+            documented_compile_fails: 4,
             intentional_escape_writes: INTENTIONAL_ESCAPE_WRITES,
             exit_clean: true,
         }
