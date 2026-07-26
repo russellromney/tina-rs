@@ -34,11 +34,68 @@ command -v perl >/dev/null 2>&1 || {
     exit 1
 }
 
+# Single-pass Rust-ish lexer: masks line/block comments (nested), strings,
+# chars, byte strings/chars, and raw strings with arbitrary hash counts.
+# Regex substitution order is exploitable (`/* " */` and `/* // */`
+# confusion); a state machine is not.
 strip_perl='
-    s{r(\#*)".*?"\1}{ my $literal = $&; $literal =~ s/[^\n]/ /g; $literal }gse;
-    s{"(?:\\.|[^"\\])*"}{ my $literal = $&; $literal =~ s/[^\n]/ /g; $literal }gse;
-    s{//[^\n]*}{ }g;
-    s{/\*.*?\*/}{ my $comment = $&; $comment =~ s/[^\n]/ /g; $comment }gse;
+sub mask_code {
+    my ($s) = @_;
+    my $out = q{};
+    my ($i, $n) = (0, length $s);
+    my ($state, $depth, $raw_hashes) = ("code", 0, 0);
+    my $mask = sub { my ($t) = @_; $t =~ s/[^\n]/ /g; $t };
+    while ($i < $n) {
+        my $c = substr($s, $i, 1);
+        my $two = substr($s, $i, 2);
+        if ($state eq "code") {
+            if ($two eq "//") { $state = "line"; $out .= "  "; $i += 2; }
+            elsif ($two eq "/*") { $state = "block"; $depth = 1; $out .= "  "; $i += 2; }
+            elsif ($c eq chr(34)) { $state = "string"; $out .= " "; $i += 1; }
+            elsif ($two eq q{b"}) { $state = "string"; $out .= "  "; $i += 2; }
+            elsif (substr($s, $i) =~ /\Abr(#*)"/) {
+                $state = "raw"; $raw_hashes = length $1;
+                my $tok = "br" . ("#" x $raw_hashes) . chr(34);
+                $out .= $mask->($tok); $i += length $tok;
+            }
+            elsif (substr($s, $i) =~ /\Ar(#*)"/) {
+                $state = "raw"; $raw_hashes = length $1;
+                my $tok = "r" . ("#" x $raw_hashes) . chr(34);
+                $out .= $mask->($tok); $i += length $tok;
+            }
+            elsif (substr($s, $i, 4) =~ /\Ab\x27(?:\\.|[^\\\x27])\x27/) {
+                $state = "char"; $out .= " "; $i += 1;
+            }
+            elsif (substr($s, $i, 3) =~ /\A\x27(?:\\.|[^\\\x27])\x27/) {
+                $state = "char"; $out .= " "; $i += 1;
+            }
+            else { $out .= $c; $i += 1; }
+        } elsif ($state eq "line") {
+            if ($c eq "\n") { $state = "code"; $out .= "\n"; }
+            else { $out .= " "; }
+            $i += 1;
+        } elsif ($state eq "block") {
+            if ($two eq "/*") { $depth++; $out .= "  "; $i += 2; }
+            elsif ($two eq "*/") { $depth--; $out .= "  "; $i += 2; $state = "code" if $depth == 0; }
+            else { $out .= $c eq "\n" ? "\n" : " "; $i += 1; }
+        } elsif ($state eq "string") {
+            if ($c eq "\\") { $out .= $mask->(substr($s, $i, 2)); $i += 2; }
+            elsif ($c eq chr(34)) { $state = "code"; $out .= " "; $i += 1; }
+            else { $out .= $c eq "\n" ? "\n" : " "; $i += 1; }
+        } elsif ($state eq "char") {
+            if ($c eq "\\") { $out .= "  "; $i += 2; }
+            elsif ($c eq chr(39)) { $state = "code"; $out .= " "; $i += 1; }
+            else { $out .= " "; $i += 1; }
+        } elsif ($state eq "raw") {
+            my $close = chr(34) . ("#" x $raw_hashes);
+            if (substr($s, $i, length $close) eq $close) {
+                $out .= $mask->($close); $i += length $close; $state = "code";
+            } else { $out .= $c eq "\n" ? "\n" : " "; $i += 1; }
+        }
+    }
+    return $out;
+}
+$_ = mask_code($_);
 '
 
 # Code-line hits in examples/**/src (tokio_impl.rs is the Tokio control).
@@ -107,8 +164,10 @@ allowlisted_paths() { # $1 = rule
 }
 
 # Normalize a hit line "path:line: detail" to its exact repo-relative path.
+# Splits at the first :<digits>: (the line number); corpus paths must not
+# contain a :<digits>: segment (none exist today).
 hit_paths() {
-    sed -e 's|^\./||' -e 's|:.*$||'
+    sed -E -e 's|^\./||' -e 's|:[0-9]+:.*$||'
 }
 
 # Lines "path: rest" minus entries whose EXACT path is allowlisted for $1.
@@ -167,6 +226,10 @@ if [[ "${1:-}" == "--self-test" ]]; then
         > "$fx/examples/specimen_demo/src/whiler.rs"
     printf 'fn pace() { for _ in 0..3 { std::thread::sleep(std::time::Duration::from_millis(1)); } }\n' \
         > "$fx/examples/specimen_demo/src/pacer.rs"
+    printf 'fn sneaky() { /* " */ let _z: Arc<Mutex<u64>> = g(); /* " */ }\n' \
+        > "$fx/examples/specimen_demo/src/lexer_confusion.rs"
+    printf 'fn sneaky2() { /* // */ loop { std::thread::sleep(std::time::Duration::from_millis(1)); break; } }\n' \
+        > "$fx/examples/specimen_demo/src/lexer_confusion_poll.rs"
     printf 'use tina_runtime::ThreadedRuntime;\n' > "$fx/docs/guide.md"
     printf 'still teaches `register_with_capacity` on raw hosts\n' > "$fx/README.md"
     printf 'phase 163 alone is fine; the number is not forbidden\n' > "$fx/docs/notes.md"
@@ -233,6 +296,10 @@ TOML2
         || { echo "self-test: while-poll evasion missed" >&2; exit 1; }
     printf '%s\n' "$poll" | grep -q 'pacer' && {
         echo "self-test: for-loop pacing false positive" >&2; exit 1; }
+    printf '%s\n' "$shared" | grep -q 'lexer_confusion.rs:1: shared-state' \
+        || { echo "self-test: block-comment quote confusion evaded the strip" >&2; exit 1; }
+    printf '%s\n' "$poll" | grep -q 'lexer_confusion_poll.rs:1: poll-loop' \
+        || { echo "self-test: block-comment slash confusion evaded the strip" >&2; exit 1; }
     printf '%s\n' "$obs" | grep -q 'guide.md:1: obsolete-vocabulary' \
         || { echo "self-test: obsolete-vocabulary miss" >&2; exit 1; }
     printf '%s\n' "$obs" | grep -q 'README.md:1: obsolete-vocabulary' \
@@ -242,11 +309,12 @@ TOML2
     printf '%s\n' "$phrase" | grep -q 'notes.md' && {
         echo "self-test: bare 163 false positive" >&2; exit 1; }
 
+    positively="$(printf '%s\n' "$shared" | grep '/sidecar.rs:' | without_allowlisted shared-state)"
+    [[ -z "$positively" ]] || {
+        echo "self-test: exact-path exemption failed: $positively" >&2; exit 1; }
     live="$(printf '%s\n' "$shared" | without_allowlisted shared-state)"
     printf '%s\n' "$live" | grep -q 'tokio_sidecar' || {
         echo "self-test: unrelated entry wrongly exempted another file" >&2; exit 1; }
-    ! printf '%s\n' "$live" | hit_paths | grep -Fxq "examples/specimen_demo/src/sidecar.rs" || {
-        echo "self-test: allowlist did not exempt the exact path" >&2; exit 1; }
     obslive="$(printf '%s\n' "$obs" | without_allowlisted obsolete-vocabulary)"
     printf '%s\n' "$obslive" | grep -q 'README.md' || {
         echo "self-test: unlisted README hit wrongly exempted" >&2; exit 1; }
