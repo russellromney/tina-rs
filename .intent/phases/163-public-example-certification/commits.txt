@@ -341,3 +341,21 @@ its post-merge adversarial audit is tracked below. C1 remains incomplete.
 - C1 part 3: public corpus guards + forced corrections (in review; grpc cancel-race flake disposition pending)
 - C1 part 4: FINDINGS.md/FINDINGS_HISTORY.md reconciliation + orphan lockfile removal
 - C1 final: full matrices, fresh whole-corpus adversarial review, certification record
+
+## C1 part 3 #392 OPEN — public corpus guards (awaiting merge)
+
+- Work code: C1 (part 3: guards + corrections)
+- Branch: agent/phase-163-c1-certification
+- Head: e2b4f3b6 (reviews covered 6b29f4e4..816470b4 + rg-install fix)
+- Adversarial review: 4 rounds, all findings fixed and re-verified
+  - R1: substring-exemption fail-open; hello_world unguarded; rename/variant/nested evasions; while/Mutex evasions; grpc flake → fixed (flake root-caused to RFC 9113 §5.1 late-HEADERS connection teardown; deterministic regression test; 300/300 post-fix)
+  - R2: rename-imported variants; multi-hop aliases; constructor-form mutexes (4 live sites allowlisted); vacuous self-test assertion; nesting limit; CallOutcome alias false-positives → fixed
+  - R3: fixpoint non-convergence (out-of-order declarations); canonical-target rewrite regression; self-as + glob variants; wording → fixed
+  - R4: lexer-confusion fail-open (/* " */ and /* // */) → single-pass lexer + fixtures
+- Contents: syn structural guard, rg+perl lexical guard (single-pass lexer), finite-corpus inventory guard, reviewed allowlist TOML, grpc_counter + tcp_echo facade migrations, 11 exhaustive-terminal corrections, hello_world facade + guide byte-pin, rustfmt normalization, tina-http late-HEADERS fix
+- PR CI: run 30192558998 SUCCESS after adding the ripgrep install step (runner images ship no rg; guard failed closed as designed)
+- Merge: pending — user merges via web UI (gh token lacks workflow scope for the verify.yml step)
+
+### Next
+- C1 part 4: FINDINGS.md closure ledger + FINDINGS_HISTORY.md archival reconciliation + orphan lockfile removal
+- C1 final: full matrices, fresh whole-corpus review, certification record
