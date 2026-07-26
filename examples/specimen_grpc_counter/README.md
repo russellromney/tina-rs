@@ -13,14 +13,14 @@ should copy: register one `Http2ClientConnection` isolate, wrap it in a
 `GrpcClient`, then build a submit / call the connection / fold the reply:
 
 ```rust,ignore
-let conn = runtime.register_with_capacity::<Http2ClientConnection<S>, _>(
+let conn = app.register_root::<Http2ClientConnection<S>, _>(
     Http2ClientConnection::new(target, Default::default())?, 32)?;
-runtime.try_send(conn, Http2ClientMsg::Begin)?;
+app.try_send(conn, Http2ClientMsg::Begin)?;
 let client = GrpcClient::new(conn, GrpcLimits::default());
 
 let submit = client.unary_request("/specimen.Counter/Increment", &req)?;
 let CallOutcome::Replied(reply) =
-    runtime.call_blocking(client.connection(), submit, timeout)? else { return; };
+    app.call_blocking(client.connection(), submit, timeout)? else { return; };
 match client.unary_outcome_from_reply::<CounterReply>(reply) {
     GrpcUnaryOutcome::Ok(msg)       => { /* OK + decoded message */ }
     GrpcUnaryOutcome::Status(s)     => { /* non-OK status, e.g. PermissionDenied */ }
@@ -40,14 +40,22 @@ cargo test --manifest-path examples/specimen_grpc_counter/Cargo.toml
 ```
 
 The service uses hand-written `prost::Message` types and typed `GrpcRouter`
-routes. Stateful unary and bidirectional methods point directly at split-service
-request addresses:
+routes. Stateful unary and bidirectional methods point directly at typed
+service request addresses — a request-only service handle for unary, a split
+service's `requests` lane for streaming:
 
 ```rust,ignore
+let counter = runtime.register_request_service::<CounterService, _, Infallible>(
+    CounterService::default(), 16)?;
+let streaming = runtime
+    .register_split_service::<StreamingFactory, _, _, ResponseChunkMsg>(
+        StreamingFactory { limits }, 16)?
+    .requests;
+
 let router = GrpcRouter::<S>::new(limits)
     .with_actor_route_capacity(16)?
-    .try_unary_actor("/specimen.Counter/Increment", counter.requests, timeout)?
-    .try_streaming_actor("/specimen.Counter/Chat", streams.requests, timeout)?;
+    .try_unary_actor("/specimen.Counter/Increment", counter, timeout)?
+    .try_streaming_actor("/specimen.Counter/Chat", streaming, timeout)?;
 ```
 
 The complete route set uses `try_unary_actor` for `Increment` and `Forbidden`,

@@ -153,7 +153,9 @@ impl QuoteGateway {
                             cents: q.cents,
                         })
                     }
-                    _ => None,
+                    // Race policy: only a classified success wins; every
+                    // other reply and any cancellation yields no winner.
+                    SelectedCallOutcome::Reply(_) | SelectedCallOutcome::Cancel(_) => None,
                 };
                 if let SelectedCallOutcome::Cancel(outcome) = step.selected.outcome {
                     self.cancel_outcomes.borrow_mut().push(outcome);

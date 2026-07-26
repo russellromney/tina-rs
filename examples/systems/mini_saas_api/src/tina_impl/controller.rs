@@ -3,29 +3,24 @@ use std::time::Duration;
 
 use http::StatusCode;
 use tina::pool::{
-    AcquireOutcome, PoolLease, PoolPressureReport, ReleaseDisposition,
-    ReleaseOutcome,
+    AcquireOutcome, PoolLease, PoolPressureReport, ReleaseDisposition, ReleaseOutcome,
 };
 use tina::prelude::*;
 use tina::{CallContext, RequestContext, reply_to};
 use tina_http::{
-    BodyMetrics, BodyPressureReport, HttpRequest,
-    HttpRequestBody, HttpResponse,
-    KeepaliveConnAddr, KeepaliveConnectionMsg, KeepaliveOutcome,
+    BodyMetrics, BodyPressureReport, HttpRequest, HttpRequestBody, HttpResponse, KeepaliveConnAddr,
+    KeepaliveConnectionMsg, KeepaliveOutcome,
 };
-use tina_runtime::lifecycle::{
-    Lifecycle, Readiness, ReadinessReason,
-};
+use tina_runtime::lifecycle::{Lifecycle, Readiness, ReadinessReason};
 use tina_runtime::pool::{WorkerPoolMsg, WorkerPoolReply};
 use tina_runtime::{
-    CallOutcome, DrainStage, DrainState, RequestScope,
-    RequestScopeId, RequestScopeSet, call, call_cancelable, sleep,
+    CallOutcome, DrainStage, DrainState, RequestScope, RequestScopeId, RequestScopeSet, call,
+    call_cancelable, sleep,
 };
 use tina_sqlite_bridge::{
-    SqliteAddress, SqliteError, SqliteMetricsHandle, SqlitePressureReport,
-    SqliteRequest, SqliteResponse, SqliteResult, SqliteValue, send_request,
+    SqliteAddress, SqliteError, SqliteMetricsHandle, SqlitePressureReport, SqliteRequest,
+    SqliteResponse, SqliteResult, SqliteValue, send_request,
 };
-
 
 use super::{REQUEST_TIMEOUT, ScopeSetMetrics};
 
@@ -405,7 +400,15 @@ impl Controller {
                     CallOutcome::Replied(WorkerPoolReply::Pressure(_)) => {
                         Some(ReadinessReason::DependencyFull("outbound"))
                     }
-                    _ => Some(ReadinessReason::DependencyClosed("outbound")),
+                    // Readiness policy: any non-pressure outcome cannot
+                    // prove availability and reads as not-ready/closed.
+                    CallOutcome::Replied(_)
+                    | CallOutcome::Full
+                    | CallOutcome::Closed
+                    | CallOutcome::Timeout
+                    | CallOutcome::Rejected(_) => {
+                        Some(ReadinessReason::DependencyClosed("outbound"))
+                    }
                 };
                 reply_to(
                     req,
@@ -422,15 +425,19 @@ impl Controller {
                 }
                 other => reply_to(req, db_error_response(other)),
             },
-            ControllerMsg::Loaded(req, id, outcome) => {
-                reply_to(req, item_response(id, outcome))
-            }
+            ControllerMsg::Loaded(req, id, outcome) => reply_to(req, item_response(id, outcome)),
             ControllerMsg::CapacityPool(req, outcome) => {
                 let body = self.body_metrics.snapshot();
                 let db = self.db_metrics.pressure_report();
                 let outbound = match outcome {
                     CallOutcome::Replied(WorkerPoolReply::Pressure(report)) => report,
-                    _ => PoolPressureReport::default(),
+                    // Capacity policy: a non-pressure outcome reports the
+                    // default pressure rather than a synthesized success.
+                    CallOutcome::Replied(_)
+                    | CallOutcome::Full
+                    | CallOutcome::Closed
+                    | CallOutcome::Timeout
+                    | CallOutcome::Rejected(_) => PoolPressureReport::default(),
                 };
                 reply_to(
                     req,
@@ -646,7 +653,12 @@ fn db_reason(outcome: &CallOutcome<SqliteResult>) -> ReadinessReason {
         CallOutcome::Replied(Err(SqliteError::Timeout)) | CallOutcome::Timeout => {
             ReadinessReason::DependencyTimeout("db")
         }
-        _ => ReadinessReason::DependencyError("db"),
+        // Readiness policy: a successful-but-unexpected reply or a
+        // rejected call is a dependency error, distinct from
+        // closed/full/timeout.
+        CallOutcome::Replied(_) | CallOutcome::Rejected(_) => {
+            ReadinessReason::DependencyError("db")
+        }
     }
 }
 
@@ -659,7 +671,11 @@ fn pool_acquire_error_response(
         CallOutcome::Replied(WorkerPoolReply::Acquire(AcquireOutcome::Closed))
         | CallOutcome::Closed => text(StatusCode::SERVICE_UNAVAILABLE, "outbound_closed\n"),
         CallOutcome::Timeout => text(StatusCode::GATEWAY_TIMEOUT, "outbound_timeout\n"),
-        _ => text(StatusCode::SERVICE_UNAVAILABLE, "outbound_unavailable\n"),
+        // Acquire policy: an unexpected reply or a rejected call maps to
+        // the same 503 body, named separately from full/closed/timeout.
+        CallOutcome::Replied(_) | CallOutcome::Rejected(_) => {
+            text(StatusCode::SERVICE_UNAVAILABLE, "outbound_unavailable\n")
+        }
     }
 }
 

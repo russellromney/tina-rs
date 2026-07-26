@@ -13,9 +13,9 @@ use http::Method;
 use tina::prelude::*;
 use tina_http::{
     AdmitOutcome, HttpLimits, HttpListener, HttpListenerMsg, HttpRequest, HttpResponse,
-    HttpServerConfig, SendOutcomeAction, WebSocketCloseCode, WebSocketError,
-    WebSocketLimits, WebSocketMemberTable, WebSocketSessionControl, WebSocketSessionHandle,
-    WebSocketSessionId, WebSocketSessionMsg, WebSocketSessionOutcome, websocket_upgrade,
+    HttpServerConfig, SendOutcomeAction, WebSocketCloseCode, WebSocketError, WebSocketLimits,
+    WebSocketMemberTable, WebSocketSessionControl, WebSocketSessionHandle, WebSocketSessionId,
+    WebSocketSessionMsg, WebSocketSessionOutcome, websocket_upgrade,
 };
 use tina_runtime::{
     CallOutcome, DefaultThreadedMailboxFactory, LocalSystem, LocalSystemConfig, SplitServiceHandle,
@@ -141,7 +141,6 @@ impl std::fmt::Display for RoomShutdownTimeout {
 
 impl std::error::Error for RoomShutdownTimeout {}
 
-
 /// Reserved tick generation used as a host snapshot request (never scheduled).
 const SNAPSHOT_TICK: u64 = u64::MAX;
 const SESSION_SEND_TIMEOUT: Duration = Duration::from_secs(1);
@@ -217,22 +216,19 @@ impl Room {
             WebSocketSessionMsg::AppControl(WebSocketSessionControl::Start) => {
                 call.reply_and(WebSocketSessionOutcome::None, vec![self.on_bootstrap()])
             }
-            WebSocketSessionMsg::AppControl(WebSocketSessionControl::Tick(generation)) => {
-                call.reply_and(
+            WebSocketSessionMsg::AppControl(WebSocketSessionControl::Tick(generation)) => call
+                .reply_and(
                     WebSocketSessionOutcome::None,
                     vec![self.on_tick(generation, now)],
-                )
-            }
+                ),
             WebSocketSessionMsg::AppControl(WebSocketSessionControl::Drain) => call.reply_and(
                 WebSocketSessionOutcome::None,
-                vec![self.on_shutdown(
-                    Some(WebSocketCloseCode(1001)),
-                    b"server drain".to_vec(),
-                )],
+                vec![self.on_shutdown(Some(WebSocketCloseCode(1001)), b"server drain".to_vec())],
             ),
-            WebSocketSessionMsg::Shutdown { code, reason } => {
-                call.reply_and(WebSocketSessionOutcome::None, vec![self.on_shutdown(code, reason)])
-            }
+            WebSocketSessionMsg::Shutdown { code, reason } => call.reply_and(
+                WebSocketSessionOutcome::None,
+                vec![self.on_shutdown(code, reason)],
+            ),
             _ => call.reply(WebSocketSessionOutcome::None),
         }
     }
@@ -339,11 +335,10 @@ impl Room {
         }
 
         let payload = format!("tick:{}:{}", generation, self.members.len());
-        effects.extend(self.members.broadcast_text::<Self>(
-            None,
-            payload,
-            SESSION_SEND_TIMEOUT,
-        ));
+        effects.extend(
+            self.members
+                .broadcast_text::<Self>(None, payload, SESSION_SEND_TIMEOUT),
+        );
         effects.push(self.schedule_tick());
         batch(effects)
     }
@@ -433,8 +428,8 @@ impl Room {
         } else {
             match action {
                 SendOutcomeAction::Ok => {
-                self.stats.presence_broadcasts_ok += 1;
-                self.stats.messages_out_ok += 1;
+                    self.stats.presence_broadcasts_ok += 1;
+                    self.stats.messages_out_ok += 1;
                 }
                 SendOutcomeAction::Stale => self.stats.presence_broadcasts_stale += 1,
                 SendOutcomeAction::RemovedSlow => {
@@ -605,10 +600,7 @@ impl Gateway {
                 HttpResponse::with_body(http::StatusCode::OK, b"healthy".to_vec())
             }
             (Method::GET, "/report") => {
-                let mut response = HttpResponse::with_body(
-                    http::StatusCode::OK,
-                    b"{}".to_vec(),
-                );
+                let mut response = HttpResponse::with_body(http::StatusCode::OK, b"{}".to_vec());
                 response.headers.insert(
                     http::header::CONTENT_TYPE,
                     http::HeaderValue::from_static("application/json"),
@@ -820,11 +812,23 @@ impl RoomServer {
             Ok(CallOutcome::Replied(WebSocketSessionOutcome::Text(json))) => {
                 parse_stats_json(&json).unwrap_or_default()
             }
-            _ => RoomStats::default(),
+            // Fixture stats policy: a failed or non-text snapshot reads
+            // as the default stats; the scenario assertions name the
+            // values they depend on.
+            Ok(CallOutcome::Replied(_))
+            | Ok(CallOutcome::Full)
+            | Ok(CallOutcome::Closed)
+            | Ok(CallOutcome::Timeout)
+            | Ok(CallOutcome::Rejected(_))
+            | Err(_) => RoomStats::default(),
         }
     }
 
-    pub fn wait_until(&self, timeout: Duration, mut f: impl FnMut(&RoomStats) -> bool) -> RoomStats {
+    pub fn wait_until(
+        &self,
+        timeout: Duration,
+        mut f: impl FnMut(&RoomStats) -> bool,
+    ) -> RoomStats {
         let deadline = Instant::now() + timeout;
         loop {
             let stats = self.snapshot();

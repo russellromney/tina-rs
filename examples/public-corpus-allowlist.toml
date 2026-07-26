@@ -1,0 +1,393 @@
+# Reviewed allowlist for intentional raw-runtime, shared-state, manual-drain,
+# and low-level-vocabulary forms in the public corpus.
+#
+# Every entry names a path, ONE narrow guard rule it exempts, a behavior
+# reason, the focused test that proves the exempted behavior, the reviewer,
+# and the commit at which the exempted form was reviewed. Unknown fields,
+# unknown rules, stale paths, and entries that no longer match a live guard
+# hit fail the guards closed. Nothing may be added here without a recorded
+# human decision and reviewer agreement.
+schema = 1
+
+# ---------------------------------------------------------------------------
+# raw-runtime-host: raw ThreadedRuntime / ThreadedMultiShardRuntime /
+# MultiShardRuntime / BridgeHost / tina_runtime::Runtime construction in
+# examples/**/src.
+# ---------------------------------------------------------------------------
+
+[[entry]]
+path = "examples/systems/perf_native/src/lib.rs"
+rule = "raw-runtime-host"
+reason = "explicit runtime benchmark control rows own their raw runtimes"
+focused_test = "cargo test --manifest-path examples/systems/perf_native/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "7eedbeb4"
+
+[[entry]]
+path = "examples/specimen_owned_state_leak/src/tina_impl.rs"
+rule = "raw-runtime-host"
+reason = "deliberately adversarial owned-state-escape anti-pattern demonstration, labeled in README"
+focused_test = "cargo test --manifest-path examples/specimen_owned_state_leak/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "7c6505fc"
+
+[[entry]]
+path = "examples/specimen_cross_shard_child_ownership/src/main.rs"
+rule = "raw-runtime-host"
+reason = "low-level cross-shard ownership stepping demonstration on the deterministic runtime"
+focused_test = "cargo test --manifest-path examples/specimen_cross_shard_child_ownership/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "d71b9acc"
+
+[[entry]]
+path = "examples/specimen_tracing_demo/src/main.rs"
+rule = "raw-runtime-host"
+reason = "explicit low-level stepping/trace demonstration on the deterministic runtime"
+focused_test = "cargo test --manifest-path examples/specimen_tracing_demo/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "f3fa75fd"
+
+[[entry]]
+path = "examples/systems/perf_native/src/lib.rs"
+rule = "envelope-construction"
+reason = "benchmark control rows drive raw split-service envelopes directly through the private ChainMsg alias; no facade delivery exists at this layer"
+focused_test = "cargo test --manifest-path examples/systems/perf_native/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "7eedbeb4"
+
+# ---------------------------------------------------------------------------
+# manual-drain: shutdown_handle / request_and_wait_report / shutdown_report /
+# build_keepalive_pool / shutdown_keepalive_pool in examples/**/src outside
+# cfg(test) items, where a guaranteed terminal runner exists.
+# ---------------------------------------------------------------------------
+
+[[entry]]
+path = "examples/systems/perf_native/src/lib.rs"
+rule = "manual-drain"
+reason = "benchmark control rows own their raw runtime lifecycle including the terminal report"
+focused_test = "cargo test --manifest-path examples/systems/perf_native/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "7eedbeb4"
+
+[[entry]]
+path = "examples/specimen_owned_state_leak/src/tina_impl.rs"
+rule = "manual-drain"
+reason = "anti-pattern demo drives its raw runtime to a checked terminal report"
+focused_test = "cargo test --manifest-path examples/specimen_owned_state_leak/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "7c6505fc"
+
+[[entry]]
+path = "examples/specimen_websocket_room/src/lib.rs"
+rule = "manual-drain"
+reason = "server fixtures stop best-effort before drop; scenario terminal truth is asserted through the typed room report"
+focused_test = "cargo test --manifest-path examples/specimen_websocket_room/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "62f0e5cd"
+
+[[entry]]
+path = "examples/systems/system_realtime_rooms/src/lib.rs"
+rule = "manual-drain"
+reason = "room server fixture stops best-effort before drop; scenario terminal truth is asserted through the typed room stats"
+focused_test = "cargo test --manifest-path examples/systems/system_realtime_rooms/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "62f0e5cd"
+
+[[entry]]
+path = "examples/systems/mini_saas_api/src/tina_impl/harness.rs"
+rule = "manual-drain"
+reason = "test harness observes owner join through the raw handle after the facade workload returns"
+focused_test = "cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test smoke"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "20c7806e"
+
+[[entry]]
+path = "examples/systems/mini_saas_api/src/tina_impl/serve.rs"
+rule = "manual-drain"
+reason = "serve loop consumes its app into the raw runtime for the final observed report after close_and_drain"
+focused_test = "cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test smoke"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "20c7806e"
+
+# ---------------------------------------------------------------------------
+# shared-state: Arc<Mutex> / Mutex<Option> / Condvar / atomics in
+# examples/**/src (lexical rule, code lines only).
+# ---------------------------------------------------------------------------
+
+[[entry]]
+path = "examples/specimen_webhook_publisher/src/lib.rs"
+rule = "shared-state"
+reason = "webhook capture server buffer shared by both impls; bodies publish through the typed Report, not the mutex"
+focused_test = "cargo test --manifest-path examples/specimen_webhook_publisher/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "1bee3319"
+
+[[entry]]
+path = "examples/specimen_retrying_outbound_http/src/tina_impl.rs"
+rule = "shared-state"
+reason = "flaky-upstream fixture counter inside the tokio-side test server, not a result channel"
+focused_test = "cargo test --manifest-path examples/specimen_retrying_outbound_http/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "81cde839"
+
+[[entry]]
+path = "examples/specimen_cpu_run/src/main.rs"
+rule = "shared-state"
+reason = "benchmark spinner stop flag inside the benchmark control"
+focused_test = "cargo test --manifest-path examples/specimen_cpu_run/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "1bee3319"
+
+[[entry]]
+path = "examples/systems/perf_native/src/lib.rs"
+rule = "shared-state"
+reason = "benchmark counters inside benchmark control rows"
+focused_test = "cargo test --manifest-path examples/systems/perf_native/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "7eedbeb4"
+
+[[entry]]
+path = "examples/specimen_owned_state_leak/src/tina_impl.rs"
+rule = "shared-state"
+reason = "the escaped Arc<Mutex<u64>> IS the labeled anti-pattern being demonstrated"
+focused_test = "cargo test --manifest-path examples/specimen_owned_state_leak/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "7c6505fc"
+
+[[entry]]
+path = "examples/extensions/tina-extension-custom-codec/src/lib.rs"
+rule = "shared-state"
+reason = "codec fixture services capture frames/rejections for host assertions across the sim boundary"
+focused_test = "cargo test --manifest-path examples/extensions/tina-extension-custom-codec/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "5399cf06"
+
+[[entry]]
+path = "examples/extensions/tina-extension-fake-bridge/src/lib.rs"
+rule = "shared-state"
+reason = "the fake bridge is a test double; its atomics and Condvars gate bridge machinery, not application results"
+focused_test = "cargo test --manifest-path examples/extensions/tina-extension-fake-bridge/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "5399cf06"
+
+[[entry]]
+path = "examples/specimen_local_io_codec_ipc/src/live_unix_smoke.rs"
+rule = "shared-state"
+reason = "socket-path nonce producing unique live-test sockets"
+focused_test = "cargo test --manifest-path examples/specimen_local_io_codec_ipc/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "85a735e2"
+
+[[entry]]
+path = "examples/specimen_supervised_worker/src/tina_impl.rs"
+rule = "shared-state"
+reason = "factory-panic injection counter for the typed restart-outcome proof"
+focused_test = "cargo test --manifest-path examples/specimen_supervised_worker/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "81d76b71"
+
+[[entry]]
+path = "examples/systems/mini_saas_api/src/tina_impl.rs"
+rule = "shared-state"
+reason = "capacity-scope metric counters shared for host observation, not a result sidecar"
+focused_test = "cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test smoke"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "3cc1f485"
+
+[[entry]]
+path = "examples/systems/mini_saas_api/src/tina_impl/serve.rs"
+rule = "shared-state"
+reason = "OS-signal trip switch into the blocking serve thread; the shutdown result flows through the typed terminal report"
+focused_test = "cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test smoke"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "20c7806e"
+
+# ---------------------------------------------------------------------------
+# obsolete-vocabulary: raw-runtime API names in markdown (lexical rule).
+# Entries remain only where the mention is deliberately historical or
+# documents the low-level twin as low-level.
+# ---------------------------------------------------------------------------
+
+[[entry]]
+path = "examples/FINDINGS.md"
+rule = "obsolete-vocabulary"
+reason = "public closure ledger records superseded forms while narrating their replacement"
+focused_test = "scripts/public_corpus_lexical_guard.sh"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "d71b9acc"
+
+[[entry]]
+path = "examples/FINDINGS_HISTORY.md"
+rule = "obsolete-vocabulary"
+reason = "historical ledger preserves superseded forms as clearly historical claims"
+focused_test = "scripts/public_corpus_lexical_guard.sh"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "d71b9acc"
+
+[[entry]]
+path = "docs/bridge-composition.md"
+rule = "obsolete-vocabulary"
+reason = "documents the raw ThreadedRuntime bridge twin deliberately as the low-level form behind the facade"
+focused_test = "scripts/public_corpus_lexical_guard.sh"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "d71b9acc"
+
+[[entry]]
+path = "docs/resource-owner-matrix.md"
+rule = "obsolete-vocabulary"
+reason = "the matrix's raw-runtime column documents the low-level free functions next to the facade forms"
+focused_test = "scripts/public_corpus_lexical_guard.sh"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "d71b9acc"
+
+[[entry]]
+path = "examples/specimen_owned_state_leak/README.md"
+rule = "obsolete-vocabulary"
+reason = "anti-pattern labels name the raw runtime constraint the demonstration probes"
+focused_test = "cargo test --manifest-path examples/specimen_owned_state_leak/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "7c6505fc"
+
+[[entry]]
+path = "README.md"
+rule = "obsolete-vocabulary"
+reason = "pinned bounded_mailbox block is an intentional explicit-step low-level demonstration; the runtime paragraph names the raw runtimes as the low-level form underneath the facade"
+focused_test = "cargo test -p tina-runtime --test readme_bounded_mailbox"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "docs/tina-user-guide/02-first-isolate.md"
+rule = "obsolete-vocabulary"
+reason = "framing names the raw runtime only as the low-level form after teaching the facade program"
+focused_test = "scripts/public_corpus_lexical_guard.sh"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "docs/tina-user-guide/06-boundedness-and-overload.md"
+rule = "obsolete-vocabulary"
+reason = "names the lower-level pressure_summary twin deliberately next to the facade form"
+focused_test = "scripts/public_corpus_lexical_guard.sh"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "docs/tina-user-guide/10-service-patterns.md"
+rule = "obsolete-vocabulary"
+reason = "the registration table documents explicit-step, live, and multi-shard low-level forms next to the facade rows"
+focused_test = "scripts/public_corpus_lexical_guard.sh"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "docs/tina-user-guide/11-ergonomics-checklist.md"
+rule = "obsolete-vocabulary"
+reason = "names the lower-level multi-shard runtime and the raw bootstrap form in the comparison rows next to the facade rows"
+focused_test = "scripts/public_corpus_lexical_guard.sh"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "docs/tina-user-guide/14-lifecycle-and-shutdown.md"
+rule = "obsolete-vocabulary"
+reason = "the Host Shutdown Handle section documents the low-level shutdown handle API that the facade also exposes"
+focused_test = "scripts/public_corpus_lexical_guard.sh"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "docs/tina-user-guide/18-bridge-crates.md"
+rule = "obsolete-vocabulary"
+reason = "parenthetical documents the raw keepalive free functions as the non-facade form for raw-runtime consumers"
+focused_test = "scripts/public_corpus_lexical_guard.sh"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "docs/tina-user-guide/19-tracing.md"
+rule = "obsolete-vocabulary"
+reason = "names the raw observer/TraceSnapshot forms as the low-level twin after teaching the facade builder form"
+focused_test = "scripts/public_corpus_lexical_guard.sh"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "docs/tina-user-guide/21-compile-time-safety-rails.md"
+rule = "obsolete-vocabulary"
+reason = "names call_blocking_typed, which exists only on the raw runtime, and keeps register_with_capacity inside the labeled anti-pattern snippet"
+focused_test = "scripts/public_corpus_lexical_guard.sh"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "docs/tina-user-guide/28-outbound-clients.md"
+rule = "obsolete-vocabulary"
+reason = "documents that the WebSocket client manager builder still takes the lower host-control handle"
+focused_test = "scripts/public_corpus_lexical_guard.sh"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "docs/tina-user-guide/30-bridge-author-kit.md"
+rule = "obsolete-vocabulary"
+reason = "documents the two-form install convention including the raw runtime twin"
+focused_test = "scripts/public_corpus_lexical_guard.sh"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "examples/systems/perf_native/README.md"
+rule = "obsolete-vocabulary"
+reason = "benchmark-control README discusses its own raw runtime rows"
+focused_test = "cargo test --manifest-path examples/systems/perf_native/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "7eedbeb4"
+
+[[entry]]
+path = "examples/systems/system_bounded_object_lane/src/lib.rs"
+rule = "shared-state"
+reason = "cfg(test)-gated lifecycle audit slot used by the admission settlement tests"
+focused_test = "cargo test --manifest-path examples/systems/system_bounded_object_lane/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "examples/systems/system_session_auth/src/lib.rs"
+rule = "shared-state"
+reason = "workload fixture identity counter shared across host driver threads, not a result channel"
+focused_test = "cargo test --manifest-path examples/systems/system_session_auth/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "0b341c15"
+
+[[entry]]
+path = "examples/specimen_websocket_room/src/lib.rs"
+rule = "poll-loop"
+reason = "deadline-bounded fixture condition waiters over typed room reports; results publish through the report, not the loop"
+focused_test = "cargo test --manifest-path examples/specimen_websocket_room/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "62f0e5cd"
+
+[[entry]]
+path = "examples/specimen_bounded_batcher/src/tina_impl.rs"
+rule = "poll-loop"
+reason = "deadline-asserted test condition waiter over typed stats queries; not a result channel"
+focused_test = "cargo test --manifest-path examples/specimen_bounded_batcher/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "examples/systems/system_realtime_rooms/src/lib.rs"
+rule = "poll-loop"
+reason = "deadline-bounded fixture condition waiter over typed room stats; results publish through the stats snapshot"
+focused_test = "cargo test --manifest-path examples/systems/system_realtime_rooms/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "62f0e5cd"
+
+[[entry]]
+path = "examples/systems/system_lock_manager/src/lib.rs"
+rule = "poll-loop"
+reason = "deadline-bounded test waiters over typed lock stats queries in the D1 failure-path tests"
+focused_test = "cargo test --manifest-path examples/systems/system_lock_manager/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"

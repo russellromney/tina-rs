@@ -9,7 +9,10 @@ use ergonomics_playground::{
 #[test]
 fn public_characterization() {
     let quote = run_quote_race_probe().expect("quote race");
-    assert!(!quote.replies.is_empty(), "quote race must reply: {quote:?}");
+    assert!(
+        !quote.replies.is_empty(),
+        "quote race must reply: {quote:?}"
+    );
     assert!(
         quote.late_cancelled_rejections >= 1 || !quote.cancel_outcomes.is_empty(),
         "quote race must settle the loser path: {quote:?}"

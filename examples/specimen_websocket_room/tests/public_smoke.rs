@@ -8,7 +8,10 @@ fn public_smoke() {
     let report = run().expect("room run");
     assert!(report.joined >= 2, "{report:?}");
     assert!(report.broadcast_ok >= 1, "{report:?}");
-    assert!(report.client_a_received || report.client_b_received, "{report:?}");
+    assert!(
+        report.client_a_received || report.client_b_received,
+        "{report:?}"
+    );
 }
 
 /// Pins accepted cross-client broadcast facts and startup validation.

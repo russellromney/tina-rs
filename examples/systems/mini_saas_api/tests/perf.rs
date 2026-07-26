@@ -24,8 +24,7 @@ fn perf_report_reports_whole_service_load() {
         soak.summary_line(),
     );
 
-    let perf =
-        PerfReport::from_load("mini_saas_api", "whole_service_http_db_pool", soak.load);
+    let perf = PerfReport::from_load("mini_saas_api", "whole_service_http_db_pool", soak.load);
     println!("{}", perf.summary_line());
     println!("{}", perf.json_line());
 
@@ -36,7 +35,10 @@ fn perf_report_reports_whole_service_load() {
     assert!(summary.contains("leak_clean=true"), "{summary}");
 
     let json = perf.json_line();
-    assert!(json.contains("\"schema\":\"tina.perf_report.v2\""), "{json}");
+    assert!(
+        json.contains("\"schema\":\"tina.perf_report.v2\""),
+        "{json}"
+    );
     assert!(json.contains("\"label\":\"mini_saas_api\""), "{json}");
     assert!(json.contains("\"comparison_baseline\":\"none\""), "{json}");
 }

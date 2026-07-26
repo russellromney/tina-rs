@@ -38,9 +38,9 @@ fn parse_serve_addr(mut args: impl Iterator<Item = String>) -> anyhow::Result<So
         Some("--addr") => args
             .next()
             .ok_or_else(|| anyhow::anyhow!("--addr requires a HOST:PORT value"))?,
-        Some(other) => anyhow::bail!(
-            "unexpected serve argument {other:?}; usage: serve [--addr HOST:PORT]"
-        ),
+        Some(other) => {
+            anyhow::bail!("unexpected serve argument {other:?}; usage: serve [--addr HOST:PORT]")
+        }
     };
     addr.parse::<SocketAddr>()
         .map_err(|e| anyhow::anyhow!("invalid --addr {addr:?}: {e}"))

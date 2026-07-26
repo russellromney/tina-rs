@@ -22,9 +22,7 @@ use tina_sqlite_bridge::{InstalledSqliteBridge, SqliteConfig, SqliteWorker};
 
 use super::controller::{Controller, ControllerMsg, NotifyEvent, NotifyRequest, NotifySink};
 use super::harness::wait_for_capacity;
-use super::shutdown::{
-    keepalive_close_report, prove_owner_terminal, settle_after_owner_shutdown,
-};
+use super::shutdown::{keepalive_close_report, prove_owner_terminal, settle_after_owner_shutdown};
 use super::{
     REQUEST_TIMEOUT, ScopeSetMetrics, StartupSummary, build_startup_summary, listener_config,
     response_body_text, seed_db,
@@ -183,7 +181,8 @@ impl ServiceInstance {
         let db_path = dir.path().join("mini-saas.sqlite");
         seed_db(&db_path)?;
 
-        let runtime = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+        let runtime =
+            LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
         let sqlite = SqliteWorker::<SingleShard>::install_local(
             &runtime,
             SqliteConfig::path(&db_path)
@@ -195,7 +194,10 @@ impl ServiceInstance {
         .map_err(|e| anyhow::anyhow!("install sqlite bridge: {e}"))?;
 
         let notify_service = runtime
-            .register_split_service::<NotifySink, NotifyEvent, NotifyRequest, Infallible>(NotifySink::default(), caps.notify_mailbox)
+            .register_split_service::<NotifySink, NotifyEvent, NotifyRequest, Infallible>(
+                NotifySink::default(),
+                caps.notify_mailbox,
+            )
             .map_err(|e| anyhow::anyhow!("register notify sink: {e:?}"))?;
         let notify_listener_config = listener_config(caps.notify_body);
         let notify_listener = runtime
@@ -393,8 +395,10 @@ impl ServiceInstance {
         let db_pressure = self.sqlite.metrics.pressure_report();
 
         let t_pool = Instant::now();
-        let (outbound_shutdown, pool_close_report, retained_outbound) =
-            keepalive_close_report(self.outbound.close_and_drain(Duration::from_secs(2)), t_pool.elapsed());
+        let (outbound_shutdown, pool_close_report, retained_outbound) = keepalive_close_report(
+            self.outbound.close_and_drain(Duration::from_secs(2)),
+            t_pool.elapsed(),
+        );
         choreo.record_close(&pool_close_report, "close_outbound_pool");
 
         let t_notify_listener = Instant::now();

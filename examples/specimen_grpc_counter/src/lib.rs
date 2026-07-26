@@ -12,9 +12,7 @@ use tina_http::{
     Http2ClientMsg, Http2Listener, Http2ListenerMsg, Http2ServerConfig, Http2Target,
     ResponseChunkMsg, ResponseChunkReply, grpc_stream_finish, grpc_stream_message,
 };
-use tina_runtime::{
-    CallOutcome, DefaultThreadedMailboxFactory, ThreadedRuntime, ThreadedRuntimeConfig,
-};
+use tina_runtime::{CallOutcome, DefaultThreadedMailboxFactory, LocalSystem};
 
 const ACTOR_ROUTE_CAPACITY: usize = 16;
 
@@ -41,7 +39,7 @@ impl Shard for SpecimenShard {
 
 pub struct SpecimenServer {
     pub addr: SocketAddr,
-    runtime: Option<ThreadedRuntime<SpecimenShard, DefaultThreadedMailboxFactory>>,
+    app: Option<LocalSystem<SpecimenShard, DefaultThreadedMailboxFactory>>,
     listener: Address<Http2ListenerMsg>,
 }
 
@@ -51,16 +49,21 @@ impl SpecimenServer {
     }
 
     fn shutdown_inner(&mut self) -> Result<(), String> {
-        let Some(runtime) = self.runtime.take() else {
+        let Some(app) = self.app.take() else {
             return Ok(());
         };
-        let listener_stop = runtime
+        let listener_stop = app
             .try_send(self.listener, Http2ListenerMsg::Stop)
             .map_err(|error| format!("stop listener: {error:?}"));
-        let runtime_shutdown = runtime
-            .shutdown_report()
-            .ensure_clean()
-            .map_err(|error| format!("shutdown: {error}"));
+        let runtime_shutdown = app
+            .shutdown()
+            .join()
+            .map_err(|error| format!("shutdown: {error}"))
+            .and_then(|report| {
+                report
+                    .ensure_clean()
+                    .map_err(|error| format!("shutdown: {error}"))
+            });
         listener_stop?;
         runtime_shutdown
     }
@@ -70,8 +73,8 @@ impl SpecimenServer {
     /// cancellation, all over a single `Http2ClientConnection` isolate.
     /// This is the copied path users should follow.
     pub fn native_grpc_smoke(&self) -> Result<NativeGrpcSmoke, String> {
-        let runtime = self
-            .runtime
+        let app = self
+            .app
             .as_ref()
             .ok_or_else(|| "server already shut down".to_owned())?;
 
@@ -80,15 +83,14 @@ impl SpecimenServer {
             authority: "specimen".into(),
             addr: self.addr,
         };
-        let conn = runtime
-            .register_with_capacity::<Http2ClientConnection<SpecimenShard>, _>(
+        let conn = app
+            .register_root::<Http2ClientConnection<SpecimenShard>, _>(
                 Http2ClientConnection::<SpecimenShard>::new(target, Http2ClientLimits::default())
                     .map_err(|error| format!("HTTP/2 client config: {error}"))?,
                 32,
             )
             .map_err(|error| format!("register connection: {error:?}"))?;
-        runtime
-            .try_send(conn, Http2ClientMsg::Begin)
+        app.try_send(conn, Http2ClientMsg::Begin)
             .map_err(|error| format!("begin connection: {error:?}"))?;
         let client = GrpcClient::new(
             conn,
@@ -101,7 +103,7 @@ impl SpecimenServer {
         // 1. Unary OK — the response message is decoded only because the
         //    status was OK.
         let increment_value = match unary_call::<CounterReply>(
-            runtime,
+            app,
             &client,
             "/specimen.Counter/Increment",
             &CounterRequest { delta: 7 },
@@ -112,7 +114,7 @@ impl SpecimenServer {
 
         // 2. Non-OK gRPC status is the caller outcome, not a success.
         let forbidden_status = match unary_call::<CounterReply>(
-            runtime,
+            app,
             &client,
             "/specimen.Counter/Forbidden",
             &CounterRequest { delta: 0 },
@@ -130,12 +132,12 @@ impl SpecimenServer {
             let canceller = scope.spawn(move || {
                 std::thread::sleep(Duration::from_millis(5));
                 // Streams 1 and 3 were used above; this call is stream 5.
-                let _ = runtime.try_send(conn, Http2ClientMsg::Cancel { stream_id: 5 });
+                let _ = app.try_send(conn, Http2ClientMsg::Cancel { stream_id: 5 });
             });
             let submit = client
                 .unary_request("/specimen.Counter/Forbidden", &CounterRequest { delta: 0 })
                 .map_err(|error| format!("encode cancel request: {error:?}"))?;
-            let reply = runtime
+            let reply = app
                 .call_blocking(client.connection(), submit, Duration::from_secs(2))
                 .map_err(|error| format!("cancel call: {error:?}"))?;
             canceller
@@ -146,7 +148,7 @@ impl SpecimenServer {
 
         // Connection survives cancellation: a final call still completes.
         match unary_call::<CounterReply>(
-            runtime,
+            app,
             &client,
             "/specimen.Counter/Forbidden",
             &CounterRequest { delta: 0 },
@@ -155,8 +157,7 @@ impl SpecimenServer {
             other => return Err(format!("post-cancel call: expected Status, got {other:?}")),
         }
 
-        runtime
-            .try_send(conn, Http2ClientMsg::Stop)
+        app.try_send(conn, Http2ClientMsg::Stop)
             .map_err(|error| format!("stop native gRPC connection: {error:?}"))?;
         Ok(NativeGrpcSmoke {
             increment_value,
@@ -388,27 +389,22 @@ impl StreamingFactory {
 }
 
 pub fn start_server() -> anyhow::Result<SpecimenServer> {
-    let runtime = ThreadedRuntime::try_with_config(
-        SpecimenShard,
-        DefaultThreadedMailboxFactory,
-        ThreadedRuntimeConfig {
-            command_capacity: 64,
-            idle_wait: Duration::from_millis(1),
-            ..Default::default()
-        },
-    )?;
+    let app = LocalSystem::single_shard(SpecimenShard, DefaultThreadedMailboxFactory)
+        .ingress_capacity(64)
+        .idle_wait(Duration::from_millis(1))
+        .try_build()?;
 
     let limits = GrpcLimits {
         max_message_bytes: 1024,
         ..Default::default()
     };
-    let counter = runtime
+    let counter = app
         .register_request_service::<CounterService, GrpcRequest<CounterRequest>, Infallible>(
             CounterService::default(),
             16,
         )
         .map_err(|error| anyhow::anyhow!("register counter service: {error:?}"))?;
-    let streaming = runtime
+    let streaming = app
         .register_split_service::<
             StreamingFactory,
             StreamingFactoryEvent,
@@ -455,12 +451,12 @@ pub fn start_server() -> anyhow::Result<SpecimenServer> {
         )
         .try_streaming_actor("/specimen.Counter/Chat", streaming, Duration::from_secs(2))?;
 
-    let service = runtime
-        .register_with_capacity::<GrpcRouter<SpecimenShard>, _>(router, 16)
+    let service = app
+        .register_root::<GrpcRouter<SpecimenShard>, _>(router, 16)
         .map_err(|error| anyhow::anyhow!("register router: {error:?}"))?;
     let config = Http2ServerConfig::default();
-    let listener = runtime
-        .register_with_capacity::<Http2Listener<SpecimenShard, GrpcRouterMsg>, _>(
+    let listener = app
+        .register_root::<Http2Listener<SpecimenShard, GrpcRouterMsg>, _>(
             Http2Listener::<SpecimenShard, GrpcRouterMsg>::new(
                 "127.0.0.1:0".parse::<SocketAddr>().expect("loopback"),
                 service,
@@ -471,9 +467,8 @@ pub fn start_server() -> anyhow::Result<SpecimenServer> {
         )
         .map_err(|error| anyhow::anyhow!("register listener: {error:?}"))?;
 
-    let bound = runtime.observe_next_bound()?;
-    runtime
-        .try_send(listener, Http2ListenerMsg::Start)
+    let bound = app.observe_next_bound()?;
+    app.try_send(listener, Http2ListenerMsg::Start)
         .map_err(|error| anyhow::anyhow!("start listener: {error:?}"))?;
     let addr = bound
         .wait(Duration::from_secs(2))
@@ -481,7 +476,7 @@ pub fn start_server() -> anyhow::Result<SpecimenServer> {
 
     Ok(SpecimenServer {
         addr,
-        runtime: Some(runtime),
+        app: Some(app),
         listener,
     })
 }
@@ -502,7 +497,7 @@ pub struct NativeGrpcSmoke {
 /// typed outcome. The copied path: build the submit, call the
 /// connection, fold the reply.
 fn unary_call<Resp: prost::Message + Default>(
-    runtime: &ThreadedRuntime<SpecimenShard, DefaultThreadedMailboxFactory>,
+    app: &LocalSystem<SpecimenShard, DefaultThreadedMailboxFactory>,
     client: &GrpcClient,
     path: &str,
     request: &CounterRequest,
@@ -510,7 +505,7 @@ fn unary_call<Resp: prost::Message + Default>(
     let submit = client
         .unary_request(path, request)
         .map_err(|error| format!("encode {path}: {error:?}"))?;
-    let CallOutcome::Replied(reply) = runtime
+    let CallOutcome::Replied(reply) = app
         .call_blocking(client.connection(), submit, Duration::from_secs(2))
         .map_err(|error| format!("call {path}: {error:?}"))?
     else {

@@ -59,3 +59,10 @@ rcgen = "0.13"
 # `compile_fail` doctests pin compilation failure but not the message, so a
 # regression that weakened the diagnostic to trait-soup would slip through.
 trybuild = "1"
+# Public-corpus structural guard (tests/public_corpus_guard.rs): parses
+# example/crate sources with `syn` and the reviewed allowlist with `toml`.
+syn = { version = "2", default-features = false, features = ["full", "visit", "parsing", "printing"] }
+quote = "1"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

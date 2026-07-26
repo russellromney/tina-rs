@@ -29,8 +29,8 @@ use tina::prelude::*;
 use tina_runtime::{
     CallError, DefaultThreadedMailboxFactory, HostBurstOutcomes, ListenerId, LocalSystem,
     SendOutcome, SingleCallGate, SleepReply, StreamId, TcpReadReply, TcpStreamCloseReply,
-    TcpWriteReply, ThreadedRuntime, send_observed, sleep, tcp_accept, tcp_bind, tcp_close_listener,
-    tcp_close_stream, tcp_read, tcp_write,
+    TcpWriteReply, send_observed, sleep, tcp_accept, tcp_bind, tcp_close_listener, tcp_close_stream,
+    tcp_read, tcp_write,
 };
 
 /// Largest chunk a connection reads from the wire in one call.
@@ -499,10 +499,19 @@ impl LoadShedReport {
 /// The worker drains one record per gated sleep, so a burst larger than
 /// its capacity outruns it and the surplus comes back as typed `Full`.
 pub fn run_load_shed(burst: u32, capacity: usize) -> anyhow::Result<LoadShedReport> {
-    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)
-        .map_err(|e| anyhow::anyhow!("runtime startup: {e:?}"))?;
-    let worker = runtime
-        .register_with_capacity::<Meter, Infallible>(
+    let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+    Ok(app.run_to_shutdown_reported(Duration::from_secs(5), move |app| {
+        run_load_shed_on(app, burst, capacity)
+    })?)
+}
+
+fn run_load_shed_on(
+    app: &LocalSystem<SingleShard, DefaultThreadedMailboxFactory>,
+    burst: u32,
+    capacity: usize,
+) -> anyhow::Result<LoadShedReport> {
+    let worker = app
+        .register_root::<Meter, Infallible>(
             Meter {
                 work: Duration::from_millis(5),
                 gate: SingleCallGate::new(),
@@ -513,17 +522,12 @@ pub fn run_load_shed(burst: u32, capacity: usize) -> anyhow::Result<LoadShedRepo
 
     let outcomes = HostBurstOutcomes::new();
     for n in 0..burst {
-        let _ = runtime.try_send_outcome(worker, MeterMsg::Record(n), &outcomes);
+        let _ = app.try_send_outcome(worker, MeterMsg::Record(n), &outcomes);
     }
     outcomes
         .wait_complete(Duration::from_secs(2))
         .map_err(|e| anyhow::anyhow!("burst observers: {e}"))?;
     let snap = outcomes.snapshot();
-
-    runtime
-        .shutdown_report()
-        .ensure_clean()
-        .map_err(|e| anyhow::anyhow!("runtime shutdown: {e:?}"))?;
 
     Ok(LoadShedReport {
         admitted: snap.admitted,
