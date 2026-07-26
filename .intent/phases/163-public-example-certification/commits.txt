@@ -306,3 +306,38 @@ its post-merge adversarial audit is tracked below. C1 remains incomplete.
   macOS nextest failed once in the unrelated pre-existing
   `request_and_wait_passes_only_remaining_budget_to_wait_phase` timing test;
   failed-job rerun attempt 2 SUCCESS on 3de11fc4c55621ef8b5fdf04f9dd431bda6102a7.
+
+## C1 part 1 #390 MERGED — public runner proof across the corpus
+
+- Work code: C1 (part 1: public runner proof)
+- Reviewed head: 8c7a0bce (d71b9acc + fix commit)
+- Independent adversarial review round 1 (50-file diff): CHANGES REQUIRED
+  - FIX REQUIRED: tautological compile-fail public_smoke (const-vs-const) → pinned against literal 4, doc comment corrected
+  - RESIDUAL RISK: fixed /tmp paths raced under concurrent test binaries → per-process socket paths (custom-codec), test-local flow lock (codec_ipc)
+  - NOTE: codec_ipc README `-p` commands unrunnable from root → manifest-path form; ledger count 30 (not 31); 5 intent-to-add lockfiles excluded; hot_key_fairness libc edge legitimate
+- Round 2 (committed head d71b9acc): APPROVE; fmt-normalization mechanically proven rustfmt-only; one cosmetic NOTE applied as 8c7a0bce (owned-state-leak count pinned against literal)
+- Merge commit: 35b90d37
+- PR CI: run 30184564562 full matrix SUCCESS (incl. postgres-example)
+- Post-merge main workflow: 30184958960 SUCCESS
+- Owns: 30 crates gain tests/public_smoke.rs (exact public_smoke + public_characterization; corpus now 71/71 rows); specimen_tcp_echo + specimen_multi_turn_request_context READMEs and documented public runners; tcp_echo serve() LocalSystem migration; 5-crate rustfmt normalization; 6 tracked lockfile refreshes (tina-codec edge)
+- Note: specimen_supervised_worker already had the target; grpc_counter public_smoke flaked once in review (cancel race) — tracked for C1 part 3 disposition
+
+## C1 part 2 #391 MERGED — docs reconciliation
+
+- Work code: C1 (part 2: public docs)
+- Reviewed head: 6c9a7ef1
+- Independent adversarial review (23-file diff): CHANGES REQUIRED
+  - FIX REQUIRED: CallContext falsely listed in tina::prelude (23) → removed
+  - FIX REQUIRED: absolute "every specimen uses the facade" (02) → qualified with labeled anti-pattern carve-out
+  - RESIDUAL RISK: two stale try_with_config_and_trace_observer attributions in live_replay_bugbox README → LocalSystem trace-observer builder
+  - NOTE: 02 quote anticipates hello_world facade migration landing in C1 part 3 (byte-identical to worktree file)
+- All other claims verified with line references (facade/keepalive/bridge/install forms, 22 commands, both byte-pinned README regions)
+- Merge commit: 5b353b50
+- PR CI: run 30186540022 SUCCESS
+- Post-merge main workflow: 30188176502 SUCCESS
+- Owns: 31 user-guide pages reconciled (15 changed), 3 public docs, root README, 7 crate/systems/extensions READMEs
+
+### Next
+- C1 part 3: public corpus guards + forced corrections (in review; grpc cancel-race flake disposition pending)
+- C1 part 4: FINDINGS.md/FINDINGS_HISTORY.md reconciliation + orphan lockfile removal
+- C1 final: full matrices, fresh whole-corpus adversarial review, certification record
