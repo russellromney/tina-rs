@@ -50,7 +50,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 WORKDIR /app
 # Print every probe row (untraced + traced tail rows included), then run the
 # Linux validation tests single-threaded, and exit. Fly captures stdout to the
-# machine log; the orchestration script scrapes it.
+# machine log; the manual machine sequence in README.md reads it back (it can
+# also drive each binary over `fly ssh console`).
 CMD set -eux; \
     for b in /app/hotpath-* /app/perf-*; do \
       echo "##### RUN $(basename "$b") #####"; \

@@ -1,6 +1,3 @@
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use tina::{
     ChildDefinition, ChildRef, RestartBudget, RestartPolicy, SpawnObservedRemote, prelude::*,
 };
@@ -43,9 +40,7 @@ enum SupervisorMsg {
     StopChildren,
 }
 
-struct Supervisor {
-    learned: Rc<RefCell<Vec<ChildRef<WorkerMsg>>>>,
-}
+struct Supervisor;
 
 #[tina_runtime::isolate(
     message = SupervisorMsg,
@@ -68,10 +63,7 @@ impl Supervisor {
                     .on_shard(ShardId::new(2))
                     .then(SupervisorMsg::WorkerStarted),
             ]),
-            SupervisorMsg::WorkerStarted(Ok(child)) => {
-                self.learned.borrow_mut().push(child);
-                send(child.address, WorkerMsg::Ping)
-            }
+            SupervisorMsg::WorkerStarted(Ok(child)) => send(child.address, WorkerMsg::Ping),
             SupervisorMsg::WorkerStarted(Err(_)) => stop(),
             SupervisorMsg::StopChildren => stop_children(),
         }
@@ -79,15 +71,9 @@ impl Supervisor {
 }
 
 fn main() {
-    let learned = Rc::new(RefCell::new(Vec::new()));
     let mut runtime = MultiShardRuntime::new([DemoShard(1), DemoShard(2)], DefaultMailboxFactory);
-    let supervisor = runtime.register_with_capacity_on::<Supervisor, WorkerMsg>(
-        ShardId::new(1),
-        Supervisor {
-            learned: Rc::clone(&learned),
-        },
-        8,
-    );
+    let supervisor =
+        runtime.register_with_capacity_on::<Supervisor, WorkerMsg>(ShardId::new(1), Supervisor, 8);
     runtime.supervise(
         supervisor,
         SupervisorConfig::new(RestartPolicy::OneForOne, RestartBudget::new(4)),

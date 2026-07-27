@@ -11,33 +11,35 @@ pub struct RunReport {
     pub replies: Vec<String>,
 }
 
-async fn probe_ok() -> Result<(), &'static str> {
-    time::sleep(Duration::from_millis(10)).await;
-    Ok(())
+/// Per-step readiness deadline, matching the Tina side's call timeout.
+const DEADLINE_MS: u64 = 50;
+
+async fn probe(delay_ms: u64) -> Result<(), &'static str> {
+    time::sleep(Duration::from_millis(delay_ms)).await;
+    if delay_ms <= DEADLINE_MS {
+        Ok(())
+    } else {
+        Err("probe slow")
+    }
 }
 
-async fn db_ping() -> Result<(), &'static str> {
-    time::sleep(Duration::from_millis(10)).await;
-    Ok(())
-}
-
-fn final_reply() -> String {
-    String::from("ready")
+async fn db_ping(delay_ms: u64) -> Result<(), &'static str> {
+    time::sleep(Duration::from_millis(delay_ms)).await;
+    if delay_ms <= DEADLINE_MS {
+        Ok(())
+    } else {
+        Err("db slow")
+    }
 }
 
 pub async fn run(config: RunConfig) -> anyhow::Result<RunReport> {
-    let mut replies = Vec::new();
-
-    probe_ok()
-        .await
-        .map_err(|e| anyhow::anyhow!("probe failed: {}", e))?;
-    db_ping()
-        .await
-        .map_err(|e| anyhow::anyhow!("db ping failed: {}", e))?;
-    replies.push(final_reply());
-
-    time::sleep(Duration::from_millis(config.probe_delay_ms)).await;
-    time::sleep(Duration::from_millis(config.db_delay_ms)).await;
-
-    Ok(RunReport { replies })
+    // Same readiness shape as the Tina side: probe, then db, each with a
+    // deadline; a slow dependency means not_ready.
+    let ready = match probe(config.probe_delay_ms).await {
+        Ok(()) => db_ping(config.db_delay_ms).await.is_ok(),
+        Err(_) => false,
+    };
+    Ok(RunReport {
+        replies: vec![String::from(if ready { "ready" } else { "not_ready" })],
+    })
 }

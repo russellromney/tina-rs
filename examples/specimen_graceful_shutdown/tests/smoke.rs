@@ -27,12 +27,26 @@ fn assert_drained(report: specimen_graceful_shutdown::Report) {
     assert!(report.exit_clean);
 }
 
+/// The Tokio and Tina sides both raise a real process-wide SIGINT in
+/// the same test binary; serialize the signal-raising runs so one test's
+/// handler lifecycle cannot land in the other's window.
+static SIGINT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn run_serialized(
+    run: fn() -> anyhow::Result<specimen_graceful_shutdown::Report>,
+) -> specimen_graceful_shutdown::Report {
+    let _guard = SIGINT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    run().expect("side ran")
+}
+
 #[test]
 fn tokio_smoke() {
-    assert_drained(tokio_impl::run().expect("tokio side ran"));
+    assert_drained(run_serialized(tokio_impl::run));
 }
 
 #[test]
 fn tina_smoke() {
-    assert_drained(tina_impl::run().expect("tina side ran"));
+    assert_drained(run_serialized(tina_impl::run));
 }

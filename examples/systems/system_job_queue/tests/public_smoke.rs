@@ -77,7 +77,10 @@ fn public_characterization() {
     assert_eq!(overflow.busy, 3);
 
     let cancel = run_cancel_in_flight(default_config()).expect("cancel");
-    assert!(matches!(cancel.submit_outcome, JobOutcome::Cancelled { .. }));
+    assert!(matches!(
+        cancel.submit_outcome,
+        JobOutcome::Cancelled { .. }
+    ));
 
     let gone = run_caller_gone(default_config()).expect("caller-gone");
     assert!(matches!(

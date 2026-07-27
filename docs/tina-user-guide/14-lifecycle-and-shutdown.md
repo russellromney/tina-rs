@@ -296,8 +296,8 @@ What the scope can honestly do:
 - Provide a synchronous [`ScopeCancelReport`] listing every registered
   rail and its state at cancel time.
 
-First cause wins. The first `cancel_into_effect(...)` sets the cause; a
-second cancel keeps the original cause and returns an empty effect, so a
+First cause wins. The first `cancel_into_effects(...)` sets the cause; a
+second cancel keeps the original cause and returns an empty effect list, so a
 client disconnect that races a per-request timeout reports one cause, not
 two. Wrap the cancel report, the post-removal
 `RequestScopeSetCapacityReport`, and the late-result / ignored-timer

@@ -345,14 +345,6 @@ reviewer = "c1-independent-adversarial-review"
 reviewed_sha = "35b90d37"
 
 [[entry]]
-path = "examples/systems/system_session_auth/src/lib.rs"
-rule = "shared-state"
-reason = "workload fixture identity counter shared across host driver threads, not a result channel"
-focused_test = "cargo test --manifest-path examples/systems/system_session_auth/Cargo.toml --test public_smoke public_smoke -- --exact"
-reviewer = "c1-independent-adversarial-review"
-reviewed_sha = "0b341c15"
-
-[[entry]]
 path = "examples/specimen_websocket_room/src/lib.rs"
 rule = "poll-loop"
 reason = "deadline-bounded fixture condition waiters over typed room reports; results publish through the report, not the loop"
@@ -447,3 +439,131 @@ reason = "tokio responder's shared write-half across responder tasks; transport 
 focused_test = "cargo test --manifest-path examples/specimen_mux_client/Cargo.toml --test public_smoke public_smoke -- --exact"
 reviewer = "c1-independent-adversarial-review"
 reviewed_sha = "81cde839"
+
+[[entry]]
+path = "examples/systems/ergonomics_playground/src/lib.rs"
+rule = "shared-state"
+reason = "single-threaded simulator host reads in-flight state of non-terminating probe isolates after the run; typed observation resolves only on termination, live hosts use observe_result instead"
+focused_test = "cargo test --manifest-path examples/systems/ergonomics_playground/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "30500ff9"
+
+[[entry]]
+path = "examples/specimen_replay_dst/src/tina_impl.rs"
+rule = "shared-state"
+reason = "single-threaded simulator host reads the sink's in-flight receive log after replay; the sink never terminates, so typed observation cannot resolve it; live rows use observe_result"
+focused_test = "cargo test --manifest-path examples/specimen_replay_dst/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "examples/specimen_mux_client/src/lib.rs"
+rule = "poll-loop"
+reason = "tokio responder's per-request delays ARE the multiplexing workload being demonstrated, not result polling"
+focused_test = "cargo test --manifest-path examples/specimen_mux_client/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "81cde839"
+
+[[entry]]
+path = "examples/specimen_sqlite_counter/src/tina_demo.rs"
+rule = "poll-loop"
+reason = "demo retry-backoff pacing in the retry walkthrough, not a result channel"
+focused_test = "cargo test --manifest-path examples/specimen_sqlite_counter/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "bf2e915a"
+
+[[entry]]
+path = "examples/specimen_worker_pool/src/tina_impl.rs"
+rule = "poll-loop"
+reason = "deadline-bounded trace/trace-arming waits and settle pauses in timeout tests; facts assert from the typed trace and report, never the sleep"
+focused_test = "cargo test --manifest-path examples/specimen_worker_pool/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "35b90d37"
+
+[[entry]]
+path = "examples/systems/system_cache_with_fill/src/lib.rs"
+rule = "poll-loop"
+reason = "deadline-bailed typed-stats condition waiter for race ordering; results publish through the typed report, not the loop"
+focused_test = "cargo test --manifest-path examples/systems/system_cache_with_fill/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "83700b3f"
+
+[[entry]]
+path = "examples/systems/mini_saas_api/src/tina_impl/serve.rs"
+rule = "poll-loop"
+reason = "deadline-bounded drain condition wait over typed scope/db snapshots that fails with a typed 503 on timeout; settlement publishes through the typed report"
+focused_test = "cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test smoke"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "20c7806e"
+
+[[entry]]
+path = "examples/systems/mini_saas_api/src/tina_impl/harness.rs"
+rule = "poll-loop"
+reason = "deadline-bounded capacity waiter over the typed /debug/capacity query used to order test races; not a result channel"
+focused_test = "cargo test --manifest-path examples/systems/mini_saas_api/Cargo.toml --test smoke"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "20c7806e"
+
+[[entry]]
+path = "examples/systems/system_bounded_object_lane/src/lib.rs"
+rule = "poll-loop"
+reason = "deadline-bailed typed admission waiter before stop; results publish through the typed report"
+focused_test = "cargo test --manifest-path examples/systems/system_bounded_object_lane/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "83700b3f"
+
+[[entry]]
+path = "examples/systems/system_metrics_shipper/src/lib.rs"
+rule = "poll-loop"
+reason = "deadline-asserted await-parking waiter inside the crate's test module; not production runner code"
+focused_test = "cargo test --manifest-path examples/systems/system_metrics_shipper/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "30500ff9"
+
+[[entry]]
+path = "examples/systems/perf_native/src/lib.rs"
+rule = "poll-loop"
+reason = "deadline-bounded condition spins inside benchmark-control rows that fail loudly and publish through LoadReport"
+focused_test = "cargo test --manifest-path examples/systems/perf_native/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "7eedbeb4"
+
+[[entry]]
+path = "examples/systems/ergonomics_playground/src/lib.rs"
+rule = "poll-loop"
+reason = "deadline-asserted condition waiter for timer arming inside the deterministic playground harness; not a result channel"
+focused_test = "cargo test --manifest-path examples/systems/ergonomics_playground/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "30500ff9"
+
+[[entry]]
+path = "examples/systems/system_job_queue/src/lib.rs"
+rule = "poll-loop"
+reason = "deadline-bounded typed admission waiter used to order the cancel-after-admission scenario; results publish through the typed report"
+focused_test = "cargo test --manifest-path examples/systems/system_job_queue/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "9f05cb62"
+
+[[entry]]
+path = "examples/specimen_http_body_streaming/src/lib.rs"
+rule = "poll-loop"
+reason = "slow-reader inter-read pause IS the backpressure workload being demonstrated, not result polling"
+focused_test = "cargo test --manifest-path examples/specimen_http_body_streaming/Cargo.toml --test public_smoke public_smoke -- --exact"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "81cde839"
+
+[[entry]]
+path = "CHANGELOG.md"
+rule = "obsolete-vocabulary"
+reason = "release history records superseded APIs as historical claims"
+focused_test = "scripts/public_corpus_lexical_guard.sh"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "5b353b50"
+
+[[entry]]
+path = "ROADMAP.md"
+rule = "obsolete-vocabulary"
+reason = "architecture and roadmap references name the live runtime component, not application hosting guidance"
+focused_test = "scripts/public_corpus_lexical_guard.sh"
+reviewer = "c1-independent-adversarial-review"
+reviewed_sha = "5b353b50"

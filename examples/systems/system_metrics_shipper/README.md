@@ -155,11 +155,12 @@ Host result paths:
   `ShipperRequest::AwaitRouted { target }` rather than sleep-polling
   stats. Metrics still come from `Stats` replies and the terminal
   `Stopped` report.
-- `Arc::try_unwrap(runtime)` is gone. The host takes a cloneable
-  `ThreadedShutdownHandle` from `runtime.shutdown_handle()`, calls
-  `request_shutdown()`, and waits via `wait_report(timeout)`. The
-  handle controls **runtime** shutdown; the shipper's own
-  `Stop`/`DrainState` protocol still owns service-level drain.
+- `Arc::try_unwrap(runtime)` is gone. The host drives runtime shutdown
+  through the owned facade: `self.app.shutdown().join_report()` joins
+  the worker and always returns the terminal lifecycle report, and
+  `report.error().is_none()` is the clean signal. The facade controls
+  **runtime** shutdown; the shipper's own `Stop`/`DrainState` protocol
+  still owns service-level drain.
 
 Related shapes:
 - `ergonomics_playground::debounced_batch` parks each submitter in

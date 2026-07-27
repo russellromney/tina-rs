@@ -1299,33 +1299,48 @@ impl RoomServer {
         self.addr
     }
 
-    pub fn report(&self) -> RoomReport {
+    /// Snapshot of the room's typed report, or `None` when the snapshot
+    /// lane failed, timed out, or returned an unparseable payload.
+    fn snapshot(&self) -> Option<RoomReport> {
         match self.app.call_blocking_request(
             self.room.requests,
             WebSocketSessionMsg::AppControl(WebSocketSessionControl::Tick(SNAPSHOT_TICK)),
             Duration::from_secs(2),
         ) {
             Ok(CallOutcome::Replied(WebSocketSessionOutcome::Text(json))) => {
-                parse_report_json(&json).unwrap_or_default()
+                parse_report_json(&json)
             }
-            // Fixture report policy: a failed or non-text snapshot reads
-            // as the default report; the scenario assertions name the
-            // values they depend on.
             Ok(CallOutcome::Replied(_))
             | Ok(CallOutcome::Full)
             | Ok(CallOutcome::Closed)
             | Ok(CallOutcome::Timeout)
             | Ok(CallOutcome::Rejected(_))
-            | Err(_) => RoomReport::default(),
+            | Err(_) => None,
         }
     }
 
+    pub fn report(&self) -> RoomReport {
+        // Fixture report policy: a failed or non-text snapshot reads
+        // as the default report; the scenario assertions name the
+        // values they depend on.
+        self.snapshot().unwrap_or_default()
+    }
+
     pub fn wait_until(&self, timeout: Duration, f: impl Fn(&RoomReport) -> bool) -> RoomReport {
+        // A failed/unavailable snapshot must never satisfy `f`: only a
+        // real snapshot is offered to the condition, so a dead snapshot
+        // lane polls until the deadline and the caller's assert fires
+        // honestly instead of reading the fabricated default as settled.
         let deadline = Instant::now() + timeout;
+        let mut last = RoomReport::default();
         loop {
-            let report = self.report();
-            if f(&report) || Instant::now() >= deadline {
-                return report;
+            match self.snapshot() {
+                Some(report) if f(&report) => return report,
+                Some(report) => last = report,
+                None => {}
+            }
+            if Instant::now() >= deadline {
+                return last;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -1488,33 +1503,48 @@ impl TlsRoomServer {
         self.addr
     }
 
-    pub fn report(&self) -> RoomReport {
+    /// Snapshot of the room's typed report, or `None` when the snapshot
+    /// lane failed, timed out, or returned an unparseable payload.
+    fn snapshot(&self) -> Option<RoomReport> {
         match self.app.call_blocking_request(
             self.room.requests,
             WebSocketSessionMsg::AppControl(WebSocketSessionControl::Tick(SNAPSHOT_TICK)),
             Duration::from_secs(2),
         ) {
             Ok(CallOutcome::Replied(WebSocketSessionOutcome::Text(json))) => {
-                parse_report_json(&json).unwrap_or_default()
+                parse_report_json(&json)
             }
-            // Fixture report policy: a failed or non-text snapshot reads
-            // as the default report; the scenario assertions name the
-            // values they depend on.
             Ok(CallOutcome::Replied(_))
             | Ok(CallOutcome::Full)
             | Ok(CallOutcome::Closed)
             | Ok(CallOutcome::Timeout)
             | Ok(CallOutcome::Rejected(_))
-            | Err(_) => RoomReport::default(),
+            | Err(_) => None,
         }
     }
 
+    pub fn report(&self) -> RoomReport {
+        // Fixture report policy: a failed or non-text snapshot reads
+        // as the default report; the scenario assertions name the
+        // values they depend on.
+        self.snapshot().unwrap_or_default()
+    }
+
     pub fn wait_until(&self, timeout: Duration, f: impl Fn(&RoomReport) -> bool) -> RoomReport {
+        // A failed/unavailable snapshot must never satisfy `f`: only a
+        // real snapshot is offered to the condition, so a dead snapshot
+        // lane polls until the deadline and the caller's assert fires
+        // honestly instead of reading the fabricated default as settled.
         let deadline = Instant::now() + timeout;
+        let mut last = RoomReport::default();
         loop {
-            let report = self.report();
-            if f(&report) || Instant::now() >= deadline {
-                return report;
+            match self.snapshot() {
+                Some(report) if f(&report) => return report,
+                Some(report) => last = report,
+                None => {}
+            }
+            if Instant::now() >= deadline {
+                return last;
             }
             std::thread::sleep(Duration::from_millis(5));
         }

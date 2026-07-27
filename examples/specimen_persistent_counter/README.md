@@ -87,7 +87,7 @@ What feels better:
   memory, then await fsync" is the correct ordering by convention
   only.
 - **Recovery is a sequence of effects.** `Recover →
-  SnapshotLoaded → JournalLoaded → publish` reads as a state
+  SnapshotLoaded → JournalLoaded → reply` reads as a state
   machine, with each step's failure handled per-arm.
 
 What feels worse:
@@ -95,14 +95,17 @@ What feels worse:
 - **The continuation enum still names every IO step.** Typed
   request/reply retires the host side channel, but the isolate still
   expands each op into explicit load/append/commit continuations.
-- **The continuation enum has 7 variants for 3 user-facing
+- **The continuation enum has 4 variants for 3 user-facing
   operations.** Each runtime call needs a reply variant; the
-  Recover op alone touches three. A combinator that chained "do
-  `journal_replay`, then publish" would compress the state machine.
-- **Result-shaped variants stack up `Err(_)` arms that all do the
-  same thing.** The bottom of the match has four `Err(_)` arms
-  that collapse into one `publish(op); noop()`. `FINDINGS.md` tracks
-  the broader continuation/pipeline sugar work.
+  Recover op alone touches two. A combinator that chained "do
+  `journal_replay`, then reply" would compress the state machine.
+- **Result-shaped variants stack up `Err(error)` arms that differ
+  only in the failure tag.** The bottom of the match has four
+  `Err(error)` arms with the same body — `finish_operation(permit)`
+  then `reply_to(req, CounterReply::Failed(...))` — one each for
+  `CounterFailure::SnapshotLoad`, `JournalReplay`, `JournalAppend`,
+  and `SnapshotCommit`. `FINDINGS.md` tracks the broader
+  continuation/pipeline work.
 
 What this suggests:
 

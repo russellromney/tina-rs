@@ -75,6 +75,17 @@ async fn handle_socket(socket: WebSocket, svc: RoomService) {
         return;
     }
 
+    // The Subscribe reply means the sender is registered in the Room
+    // isolate; acknowledge to the client with a Ping control frame so
+    // the driver can observe the landed subscription before publishing.
+    if write
+        .send(AxumMessage::Ping(Vec::new().into()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
     let writer = tokio::spawn(async move {
         while let Some(text) = rx.recv().await {
             if write.send(AxumMessage::Text(text.into())).await.is_err() {

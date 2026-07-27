@@ -33,12 +33,18 @@ impl Report {
 /// Two clients (alpha, bravo) connect, each publishes one text
 /// message, each reads until two text messages have arrived or the
 /// deadline elapses.
+///
+/// Publishing starts only after BOTH subscriptions are observable: each
+/// server acknowledges a landed subscription with a Ping control frame
+/// (see `tina_impl`/`tokio_impl`), and the driver waits for both acks
+/// under a deadline instead of sleeping a fixed delay.
 pub async fn run_room_clients(addr: SocketAddr) -> Report {
     let url = format!("ws://{addr}/ws");
     let (alpha_socket, _) = connect_async(&url).await.expect("alpha connect");
     let (bravo_socket, _) = connect_async(&url).await.expect("bravo connect");
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let alpha_socket = await_subscribed(alpha_socket, "alpha").await;
+    let bravo_socket = await_subscribed(bravo_socket, "bravo").await;
 
     let alpha = tokio::spawn(client_session(alpha_socket, "from-alpha".to_string()));
     let bravo = tokio::spawn(client_session(bravo_socket, "from-bravo".to_string()));
@@ -47,6 +53,33 @@ pub async fn run_room_clients(addr: SocketAddr) -> Report {
         alpha_inbox: alpha.await.expect("alpha task"),
         bravo_inbox: bravo.await.expect("bravo task"),
     }
+}
+
+/// Reads until the server's post-subscription Ping arrives or the
+/// deadline elapses. The Ping is a control frame: it is never published
+/// to the room and never enters the pinned text transcript.
+async fn await_subscribed<S>(mut socket: S, peer: &str) -> S
+where
+    S: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error>
+        + StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+{
+    let subscribed = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(message) = socket.next().await {
+            match message {
+                Ok(Message::Ping(_)) => return true,
+                Ok(_) => continue,
+                Err(_) => return false,
+            }
+        }
+        false
+    })
+    .await;
+    assert!(
+        matches!(subscribed, Ok(true)),
+        "{peer} subscription was not acknowledged before the deadline"
+    );
+    socket
 }
 
 async fn client_session<S>(mut socket: S, outgoing: String) -> Vec<String>

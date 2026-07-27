@@ -12,11 +12,11 @@
 //! - Checked shard conversion and bounded `RunConfig::validate` before any
 //!   worker, mailbox, or placement is built.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::error::Error;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -294,11 +294,7 @@ impl fmt::Display for SessionInputError {
 
 impl Error for SessionInputError {}
 
-fn validate_input(
-    field: &'static str,
-    value: &str,
-    max: usize,
-) -> Result<(), SessionInputError> {
+fn validate_input(field: &'static str, value: &str, max: usize) -> Result<(), SessionInputError> {
     if value.is_empty() {
         Err(SessionInputError::Empty { field })
     } else if value.len() > max {
@@ -689,7 +685,7 @@ struct AuthWorld<'a> {
     placement: ShardPlacement,
     shard_ids: Vec<ShardId>,
     addrs_by_shard: BTreeMap<ShardId, AuthRequestAddr>,
-    next_id: AtomicU64,
+    next_id: Cell<u64>,
     timeout: Duration,
 }
 
@@ -841,13 +837,14 @@ impl<'a> AuthWorld<'a> {
             placement,
             shard_ids,
             addrs_by_shard,
-            next_id: AtomicU64::new(1),
+            next_id: Cell::new(1),
             timeout: Duration::from_millis(config.call_timeout_ms),
         })
     }
 
     fn mint_token(&self) -> SessionToken {
-        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let n = self.next_id.get();
+        self.next_id.set(n + 1);
         SessionToken::try_new(format!("s-{n}")).expect("minted token is bounded")
     }
 

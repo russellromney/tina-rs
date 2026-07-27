@@ -59,7 +59,7 @@ disclaimers — is bloat.
   exact invariant pinning.
 - **Library invariants live in library tests.** If you want to pin
   "the in-flight cap returns `Error(Full)` after N requests," that
-  test belongs in `tina-rpc/tests/connection.rs`, not in the example.
+  test belongs in `tina-rpc/tests/rpc_end_to_end.rs`, not in the example.
 - **README is discussion.** Compare feel and observed behavior in
   prose. No "What This Does Not Prove" sections — that reads like a
   court filing.

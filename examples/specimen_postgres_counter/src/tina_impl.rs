@@ -39,18 +39,13 @@ fn run_application(
         .map_err(|e| anyhow::anyhow!("install pg bridge: {e}"))?;
 
     let table = unique_table("tina_counter");
-    let mut report = Report::default();
     let run_result = run_counter_script(&host, bridge.address, &table);
-    match run_result {
-        Ok(final_value) => {
-            report.final_value = final_value;
-            report.exit_clean = true;
-        }
-        Err(error) => {
-            eprintln!("specimen_postgres_counter (tina): {error:#}");
-        }
+    // Cleanup and metrics stay unconditional: the table is dropped and the
+    // bridge metrics are printed even when the script failed, then the
+    // script error propagates so the runner and binary fail honestly.
+    if let Err(error) = execute(&host, bridge.address, drop_sql(&table)) {
+        eprintln!("specimen_postgres_counter (tina): drop table failed: {error:#}");
     }
-    let _ = execute(&host, bridge.address, drop_sql(&table));
     bridge.closer.close();
 
     let snap = bridge.metrics.snapshot();
@@ -69,7 +64,11 @@ fn run_application(
         snap.in_flight_high_water,
     );
 
-    Ok(report)
+    let final_value = run_result?;
+    Ok(Report {
+        final_value,
+        exit_clean: true,
+    })
 }
 
 fn run_counter_script(

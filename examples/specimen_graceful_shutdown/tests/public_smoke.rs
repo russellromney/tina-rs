@@ -11,9 +11,7 @@ use std::time::Duration;
 
 use specimen_graceful_shutdown::{TOTAL_PLANNED_ITEMS, tina_impl};
 use tina::prelude::*;
-use tina_runtime::{
-    DefaultThreadedMailboxFactory, ResultWaitError, ThreadedRuntime, sleep,
-};
+use tina_runtime::{DefaultThreadedMailboxFactory, ResultWaitError, ThreadedRuntime, sleep};
 
 fn assert_drained(report: specimen_graceful_shutdown::Report) {
     assert!(report.signal_received, "signal must be observed");
@@ -32,16 +30,29 @@ fn assert_drained(report: specimen_graceful_shutdown::Report) {
     assert!(report.exit_clean);
 }
 
+/// `tina_impl::run()` raises a real process-wide SIGINT to prove
+/// signal-driven drain, and the two public tests below run in parallel
+/// threads: serialize the SIGINT-raising runs so one test's signal
+/// cannot land in the other's handler window.
+static SIGINT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn run_serialized() -> specimen_graceful_shutdown::Report {
+    let _guard = SIGINT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    tina_impl::run().expect("tina side ran")
+}
+
 /// Pins public drain facts before/after host-result migration.
 #[test]
 fn public_characterization() {
-    assert_drained(tina_impl::run().expect("tina side ran"));
+    assert_drained(run_serialized());
 }
 
 /// Documented public runner path: `tina_impl::run()`.
 #[test]
 fn public_smoke() {
-    assert_drained(tina_impl::run().expect("tina side ran"));
+    assert_drained(run_serialized());
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,8 +108,8 @@ impl Never {
 
 #[test]
 fn observation_registered_too_late() {
-    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)
-        .expect("runtime");
+    let runtime =
+        ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory).expect("runtime");
     let addr = runtime
         .register_with_capacity::<_, Infallible>(Tiny, 4)
         .expect("register");
@@ -122,8 +133,8 @@ fn observation_registered_too_late() {
 
 #[test]
 fn observation_type_mismatch() {
-    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)
-        .expect("runtime");
+    let runtime =
+        ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory).expect("runtime");
     let addr = runtime
         .register_with_capacity::<_, Infallible>(Tiny, 4)
         .expect("register");
@@ -132,7 +143,9 @@ fn observation_type_mismatch() {
         .observe_result::<u64, _, _>(addr)
         .expect("claim wrong type");
     runtime.try_send(addr, TinyMsg::Go).expect("kick");
-    let err = waiter.wait(Duration::from_secs(2)).expect_err("type mismatch");
+    let err = waiter
+        .wait(Duration::from_secs(2))
+        .expect_err("type mismatch");
     assert!(
         matches!(err, ResultWaitError::TypeMismatch),
         "expected TypeMismatch, got {err:?}"
@@ -142,8 +155,8 @@ fn observation_type_mismatch() {
 
 #[test]
 fn observation_timeout() {
-    let runtime = ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory)
-        .expect("runtime");
+    let runtime =
+        ThreadedRuntime::try_new(SingleShard, DefaultThreadedMailboxFactory).expect("runtime");
     let addr = runtime
         .register_with_capacity::<_, Infallible>(Never, 4)
         .expect("register");
@@ -160,7 +173,9 @@ fn observation_timeout() {
     );
     // Host shuts down while the isolate still holds a timer; report need not
     // be clean of cancelled work, but shutdown must complete.
-    let _ = Arc::new(runtime).shutdown_handle().request_and_wait_report(Duration::from_secs(2));
+    let _ = Arc::new(runtime)
+        .shutdown_handle()
+        .request_and_wait_report(Duration::from_secs(2));
 }
 
 #[test]
@@ -190,7 +205,9 @@ fn observation_host_shutdown() {
     assert!(
         matches!(
             err,
-            ResultWaitError::RuntimeStopped | ResultWaitError::Timeout | ResultWaitError::StoppedWithoutResult
+            ResultWaitError::RuntimeStopped
+                | ResultWaitError::Timeout
+                | ResultWaitError::StoppedWithoutResult
         ),
         "expected runtime-stop shaped error, got {err:?}"
     );

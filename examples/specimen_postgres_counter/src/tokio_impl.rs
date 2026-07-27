@@ -38,14 +38,23 @@ pub fn run(url: &str) -> anyhow::Result<Report> {
         let row: (i64,) = sqlx::query_as(&format!("SELECT value FROM {table} WHERE id = 0"))
             .fetch_one(&pool)
             .await?;
-        let _ = sqlx::query(&format!("DROP TABLE {table}"))
+        // A negative final value must fail the run, never fabricate 0.
+        let final_value = u64::try_from(row.0)
+            .map_err(|_| anyhow::anyhow!("final counter value {} does not fit in u64", row.0))?;
+        // The table drop is best-effort cleanup: log its outcome (the
+        // README promises both sides drop their table) without failing
+        // the run on it.
+        if let Err(error) = sqlx::query(&format!("DROP TABLE {table}"))
             .execute(&pool)
-            .await;
+            .await
+        {
+            eprintln!("specimen_postgres_counter (tokio): drop table failed: {error:#}");
+        }
 
         pool.close().await;
 
         Ok(Report {
-            final_value: u64::try_from(row.0).unwrap_or(0),
+            final_value,
             exit_clean: true,
         })
     })
