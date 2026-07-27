@@ -15,7 +15,9 @@ fn one_shot_http_500() -> (String, std::thread::JoinHandle<()>) {
         .expect("make fake S3 accept bounded");
     let address = listener.local_addr().expect("fake S3 address");
     let thread = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // Generous accept/read bounds: the typed-failure proof must not
+        // race the bridge's own deadlines under CI load.
+        let deadline = Instant::now() + Duration::from_secs(10);
         let (mut stream, _) = loop {
             match listener.accept() {
                 Ok(connection) => break connection,
@@ -28,8 +30,14 @@ fn one_shot_http_500() -> (String, std::thread::JoinHandle<()>) {
                 Err(error) => panic!("accept fake S3 request: {error}"),
             }
         };
+        // Accepted sockets inherit O_NONBLOCK from the listener on
+        // macOS/BSD (Linux clears it), which turns the first read into an
+        // instant WouldBlock. Restore blocking mode on both platforms.
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_nonblocking(false)
+            .expect("fake S3 stream blocking");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("set fake S3 timeout");
         let mut request = [0_u8; 8 * 1024];
         let _ = stream.read(&mut request).expect("read fake S3 request");
@@ -103,8 +111,14 @@ fn host_mailbox_full_is_an_exact_put_terminal() {
     .expect("put terminals must remain observable");
 
     assert_eq!(report.callers, 4);
-    assert_eq!(report.full, 4, "zero mailbox must Full every Put: {report:?}");
-    assert_eq!(report.busy, 0, "mailbox Full must not become Busy: {report:?}");
+    assert_eq!(
+        report.full, 4,
+        "zero mailbox must Full every Put: {report:?}"
+    );
+    assert_eq!(
+        report.busy, 0,
+        "mailbox Full must not become Busy: {report:?}"
+    );
     assert_eq!(report.stored, 0, "report={report:?}");
     assert_eq!(report.closed, 0, "report={report:?}");
     assert_eq!(report.timeout, 0, "report={report:?}");
@@ -161,10 +175,10 @@ fn real_s3_path_installs_on_the_same_facade_and_drains_before_shutdown() {
                 .with_endpoint_url(endpoint)
                 .with_force_path_style(true)
                 .with_credentials(S3Credentials::new("test", "test"))
-                .with_default_timeout(Duration::from_secs(1)),
+                .with_default_timeout(Duration::from_secs(5)),
             "bucket".into(),
             "prefix/".into(),
-            Duration::from_secs(1),
+            Duration::from_secs(5),
         )
         .expect("typed S3 failure is an application reply, not a runner failure");
         server.join().expect("fake S3 server");
@@ -200,9 +214,7 @@ fn real_s3_path_preserves_typed_install_failure_through_clean_shutdown() {
     match terminal.as_ref() {
         RunToShutdownError::Workload(report) => assert!(matches!(
             report.get_ref(),
-            S3WorkloadError::Install(InstallError::Config(
-                S3ConfigError::ZeroMailboxCapacity
-            ))
+            S3WorkloadError::Install(InstallError::Config(S3ConfigError::ZeroMailboxCapacity))
         )),
         other => panic!("expected clean shutdown after install failure, got {other:?}"),
     }

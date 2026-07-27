@@ -33,8 +33,14 @@ fn one_shot_http_500() -> (String, std::thread::JoinHandle<()>) {
                 Err(error) => panic!("accept fake SQS request: {error}"),
             }
         };
+        // Accepted sockets inherit O_NONBLOCK from the listener on
+        // macOS/BSD (Linux clears it), which turns the first read into an
+        // instant WouldBlock. Restore blocking mode on both platforms.
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_nonblocking(false)
+            .expect("fake SQS stream blocking");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("set fake SQS timeout");
         let mut request = [0_u8; 8 * 1024];
         let _ = stream.read(&mut request).expect("read fake SQS request");

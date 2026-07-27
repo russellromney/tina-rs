@@ -192,9 +192,10 @@ impl Error for S3WorkloadError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Install(error) => Some(error),
-            Self::Application(error) | Self::ApplicationAndDrain { application: error, .. } => {
-                Some(error.as_ref())
-            }
+            Self::Application(error)
+            | Self::ApplicationAndDrain {
+                application: error, ..
+            } => Some(error.as_ref()),
             Self::Drain(_) => None,
         }
     }
@@ -536,10 +537,9 @@ fn finish_s3_workload(
         (Ok(workload), true) => Ok(S3RunReport { workload, drain }),
         (Err(error), true) => Err(S3WorkloadError::Application(error)),
         (Ok(_), false) => Err(S3WorkloadError::Drain(drain)),
-        (Err(application), false) => Err(S3WorkloadError::ApplicationAndDrain {
-            application,
-            drain,
-        }),
+        (Err(application), false) => {
+            Err(S3WorkloadError::ApplicationAndDrain { application, drain })
+        }
     }
 }
 
