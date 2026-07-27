@@ -377,3 +377,11 @@ its post-merge adversarial audit is tracked below. C1 remains incomplete.
 
 ### Next
 - After #392 + #393 merge: C1 final full-matrix verification, fresh whole-corpus adversarial review, certification record
+
+## Correction ledger — specimen_ws_room subscription acknowledgement
+
+| Correction | Old behavior | New promise | Compatibility and direct proof |
+| --- | --- | --- | --- |
+| ws_room subscribe race | `run_room_clients` slept 50ms after connecting alpha+bravo and hoped the second `Subscribe` had landed in the Room isolate before the first `Publish`; under scheduler pressure the pin could miss `from-alpha` | After the `Subscribe` bridge call returns Ok (sender registered), the server sends one ordered Ping control frame per connection; the driver awaits BOTH peers' ack with a 2s deadline before publishing — no smoke sleeps for race ordering | Wire data plane unchanged (text frames, close semantics, report contents identical); one RFC-obligatory-tolerated Ping control frame per connection added to the specimen's own demo protocol (clients already skipped non-Text frames); both impls (tina + tokio control) made symmetric; direct proof: pinned sorted transcripts `["from-alpha", "from-bravo"]` per inbox asserted 3× on both impls, `cargo test --manifest-path examples/specimen_ws_room/Cargo.toml --all-targets` green |
+
+Recorded per the correction policy: the certification mechanics forbid smoke tests sleeping for race ordering, so the fix was mandated; the smallest honest observable signal is the ack.
