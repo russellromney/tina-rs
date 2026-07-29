@@ -385,3 +385,23 @@ its post-merge adversarial audit is tracked below. C1 remains incomplete.
 | ws_room subscribe race | `run_room_clients` slept 50ms after connecting alpha+bravo and hoped the second `Subscribe` had landed in the Room isolate before the first `Publish`; under scheduler pressure the pin could miss `from-alpha` | After the `Subscribe` bridge call returns Ok (sender registered), the server sends one ordered Ping control frame per connection; the driver awaits BOTH peers' ack with a 2s deadline before publishing — no smoke sleeps for race ordering | Wire data plane unchanged (text frames, close semantics, report contents identical); one RFC-obligatory-tolerated Ping control frame per connection added to the specimen's own demo protocol (clients already skipped non-Text frames); both impls (tina + tokio control) made symmetric; direct proof: pinned sorted transcripts `["from-alpha", "from-bravo"]` per inbox asserted 3× on both impls, `cargo test --manifest-path examples/specimen_ws_room/Cargo.toml --all-targets` green |
 
 Recorded per the correction policy: the certification mechanics forbid smoke tests sleeping for race ordering, so the fix was mandated; the smallest honest observable signal is the ack.
+
+## C1 final audit round — whole-corpus review and certification fixes (#393)
+
+- Fresh independent whole-corpus audit of the stacked final state (agent-36-style reviewer, ~1.6h, 71 crates + 44 docs read by hand): verdict NOT READY — 3 launch blockers (metrics_shipper missing input validation; metrics_shipper stale shutdown README; ws_room load-bearing 50ms race sleep), 19 fix-before-certification, 5 residuals, guard blind spots itemized
+- All findings fixed on agent/phase-163-c1-findings and reviewed in rounds:
+  - validations: metrics_shipper RunConfig::validate (typed Zero/TooLarge, all 4 run paths, rejection tests), service-policy max_keys, fake-bridge capacity
+  - races: ws_room observable subscribe (correction-ledger Ping ack row recorded above), job_queue cancel-after-observable-admission, graceful_shutdown SIGINT serialization (both binaries), websocket_room snapshot honesty
+  - terminals/defaults: dynamic_worker_pool all 6 SpawnObservedError variants, multi_turn stop_with+observe_result + honest tokio control + bounded mailboxes, native_https/outbound_http strict parse, postgres error propagation + drop logging, ergonomics exact pins
+  - atomics/sidecars: session_auth Cell<u64> (entry removed), cross_shard vestigial Rc deleted, multi_turn converted (no entry needed), ergonomics/replay_dst sim-idiom allowlisted with reasons
+  - guards: poll-loop brace-depth tracker (correct + negative fixtures), Rc<RefCell> rule, vocab tokens (request_shutdown/wait_report/shutdown_handle), SpawnObservedError terminal rule, markdown scope (CHANGELOG/ROADMAP/fuzz README in inventory)
+  - 16 poll-loop + 2 sim-idiom + 2 root-md allowlist entries, all per-site verified
+  - docs: 12 corrections across READMEs/guides verified against code
+- Reviewed head: fc60ad70 — adversarial re-review APPROVE (3 defect fixes verified by mutation probes; nothing beyond)
+- Matrices on stacked state, all green: make verify-examples (2 runs), full workspace nextest+doctests, clippy --all-targets -D warnings, verify-guards, verify-static, verify-packaging, proof-fast, 71/71 public_smoke+public_characterization exact-command sweep
+- Residual dispositions recorded: postgres host-script shape accepted (tina-sqlx-bridge ships no LocalSystem blocking facade; host_control + capability-typed calls documented); cpu_run spinner count accepted as benchmark-control workload knob (same class as raw-runtime benchmark rows); graceful_shutdown tests/ raw-runtime edge proofs intentional (low-level API remains supported, tests prove it)
+- PR CI: run 30197239642 was on 4fa813de; CI on fc60ad70 in progress at this checkpoint
+
+### Next (final)
+- User merges #392 (guards) then #393 (ledger + fixes) via web UI (workflow scope)
+- After merge: final origin/main workflow must be fully green; record final SHA + workflow here and in FINDINGS.md; certification closes
