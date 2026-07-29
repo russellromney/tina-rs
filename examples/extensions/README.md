@@ -20,9 +20,10 @@ Each crate has a `README.md` with its run command and a smoke test. None imports
 a private runtime module.
 
 The extension hooks themselves are on the canonical public surface. The custom
-codec's sample transport loop still awaits event-only continuation helpers on
-`UnixWriteAll`; its README and `examples/FINDINGS.md` describe that prerequisite
-without hiding the remaining migration.
+codec's sample transport loop is already on it: one-shot Unix calls use
+`then_service_event`, and the `UnixWriteAll` write loop drives
+`next_service_event`/`advance_service_event`; application code never
+constructs a service envelope.
 
 ## Smallest hook shape
 

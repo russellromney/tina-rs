@@ -117,7 +117,21 @@ fn record_spawn_error(report: &mut Report, error: SpawnObservedError) {
     match error {
         SpawnObservedError::ZeroMailboxCapacity => report.spawn_zero_capacity += 1,
         SpawnObservedError::DestinationUnavailable => report.spawn_destination_unavailable += 1,
-        _ => report.spawn_other += 1,
+        SpawnObservedError::FactoryPanicked => report.spawn_factory_panicked += 1,
+        SpawnObservedError::ParentMailboxFull => report.spawn_parent_mailbox_full += 1,
+        SpawnObservedError::ParentMailboxClosed => report.spawn_parent_mailbox_closed += 1,
+        SpawnObservedError::ParentMailboxReservationsUnsupported => {
+            report.spawn_parent_mailbox_reservations_unsupported += 1;
+        }
+        // `SpawnObservedError` is `#[non_exhaustive]`; only variants added
+        // after this specimen land in `spawn_other`.
+        other => report.record_future_spawn(other),
+    }
+}
+
+impl Report {
+    fn record_future_spawn(&mut self, _error: SpawnObservedError) {
+        self.spawn_other += 1;
     }
 }
 
@@ -237,8 +251,19 @@ mod tests {
         let mut report = Report::default();
         record_spawn_error(&mut report, SpawnObservedError::ZeroMailboxCapacity);
         record_spawn_error(&mut report, SpawnObservedError::DestinationUnavailable);
+        record_spawn_error(&mut report, SpawnObservedError::FactoryPanicked);
+        record_spawn_error(&mut report, SpawnObservedError::ParentMailboxFull);
+        record_spawn_error(&mut report, SpawnObservedError::ParentMailboxClosed);
+        record_spawn_error(
+            &mut report,
+            SpawnObservedError::ParentMailboxReservationsUnsupported,
+        );
         assert_eq!(report.spawn_zero_capacity, 1);
         assert_eq!(report.spawn_destination_unavailable, 1);
+        assert_eq!(report.spawn_factory_panicked, 1);
+        assert_eq!(report.spawn_parent_mailbox_full, 1);
+        assert_eq!(report.spawn_parent_mailbox_closed, 1);
+        assert_eq!(report.spawn_parent_mailbox_reservations_unsupported, 1);
         assert_eq!(report.spawn_other, 0);
     }
 }

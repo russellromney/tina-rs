@@ -1,6 +1,4 @@
-use std::cell::RefCell;
 use std::convert::Infallible;
-use std::rc::Rc;
 use std::time::Duration;
 
 use tina::prelude::*;
@@ -216,7 +214,7 @@ enum ClientMsg {
 }
 
 struct Client {
-    replies: Rc<RefCell<Vec<String>>>,
+    replies: Vec<String>,
 }
 
 #[tina_runtime::isolate(message = ClientMsg)]
@@ -232,30 +230,28 @@ impl Client {
                     .then(ClientMsg::Returned)
             }
             ClientMsg::Returned(CallOutcome::Replied(ServiceReply::Ready)) => {
-                self.replies.borrow_mut().push(String::from("ready"));
-                noop()
+                self.replies.push(String::from("ready"));
+                stop_with(std::mem::take(&mut self.replies))
             }
             ClientMsg::Returned(CallOutcome::Replied(ServiceReply::NotReady)) => {
-                self.replies.borrow_mut().push(String::from("not_ready"));
-                noop()
+                self.replies.push(String::from("not_ready"));
+                stop_with(std::mem::take(&mut self.replies))
             }
             ClientMsg::Returned(CallOutcome::Timeout) => {
-                self.replies.borrow_mut().push(String::from("timeout"));
-                noop()
+                self.replies.push(String::from("timeout"));
+                stop_with(std::mem::take(&mut self.replies))
             }
             ClientMsg::Returned(CallOutcome::Full) => {
-                self.replies.borrow_mut().push(String::from("full"));
-                noop()
+                self.replies.push(String::from("full"));
+                stop_with(std::mem::take(&mut self.replies))
             }
             ClientMsg::Returned(CallOutcome::Closed) => {
-                self.replies.borrow_mut().push(String::from("closed"));
-                noop()
+                self.replies.push(String::from("closed"));
+                stop_with(std::mem::take(&mut self.replies))
             }
             ClientMsg::Returned(CallOutcome::Rejected(reason)) => {
-                self.replies
-                    .borrow_mut()
-                    .push(format!("rejected:{reason:?}"));
-                noop()
+                self.replies.push(format!("rejected:{reason:?}"));
+                stop_with(std::mem::take(&mut self.replies))
             }
         }
     }
@@ -268,7 +264,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
             Probe {
                 delay_ms: config.probe_delay_ms,
             },
-            usize::MAX,
+            16,
         )
         .requests;
     let db = sim
@@ -276,25 +272,30 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
             Db {
                 delay_ms: config.db_delay_ms,
             },
-            usize::MAX,
+            16,
         )
         .requests;
     let service = sim
         .register_split_service::<Service, ServiceEvent, ServiceRequest, Infallible>(
             Service { probe, db },
-            usize::MAX,
+            16,
         )
         .requests;
-    let replies = Rc::new(RefCell::new(Vec::new()));
     let client = sim.register(Client {
-        replies: Rc::clone(&replies),
+        replies: Vec::new(),
     });
 
+    // Typed terminal observation: the reply vector reaches the host through
+    // `stop_with` and the waiter, never through a shared cell.
+    let waiter = sim
+        .observe_result::<Vec<String>, _, _>(client)
+        .map_err(|e| anyhow::anyhow!("observe_result: {e:?}"))?;
     sim.try_send(client, ClientMsg::Start(service))
         .map_err(|e| anyhow::anyhow!("client send failed: {:?}", e))?;
     sim.run_until_quiescent();
+    let replies = waiter
+        .wait(Duration::from_secs(1))
+        .map_err(|e| anyhow::anyhow!("client result: {e:?}"))?;
 
-    Ok(RunReport {
-        replies: replies.borrow().clone(),
-    })
+    Ok(RunReport { replies })
 }

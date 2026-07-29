@@ -241,15 +241,15 @@ pub fn run() -> anyhow::Result<Report> {
     app.run_to_shutdown_reported(Duration::from_secs(5), |app| {
         let consumer = app
             .register_root::<_, Infallible>(
-            Consumer {
-                processed: 0,
-                expected: None,
-                signal_received: false,
-                exit_clean: true,
-            },
-            (TOTAL_PLANNED_ITEMS as usize) + 4,
-        )
-        .map_err(|e| anyhow::anyhow!("register consumer: {e:?}"))?;
+                Consumer {
+                    processed: 0,
+                    expected: None,
+                    signal_received: false,
+                    exit_clean: true,
+                },
+                (TOTAL_PLANNED_ITEMS as usize) + 4,
+            )
+            .map_err(|e| anyhow::anyhow!("register consumer: {e:?}"))?;
 
         // Claim the terminal drain report before any message can stop the consumer.
         let waiter = app
@@ -258,26 +258,24 @@ pub fn run() -> anyhow::Result<Report> {
 
         let producer = app
             .register_root::<_, _>(
-            Producer {
-                consumer,
-                target: TOTAL_PLANNED_ITEMS,
-                produced: 0,
-                stopped: false,
-                signal_stop: false,
-            },
-            16,
-        )
-        .map_err(|e| anyhow::anyhow!("register producer: {e:?}"))?;
+                Producer {
+                    consumer,
+                    target: TOTAL_PLANNED_ITEMS,
+                    produced: 0,
+                    stopped: false,
+                    signal_stop: false,
+                },
+                16,
+            )
+            .map_err(|e| anyhow::anyhow!("register producer: {e:?}"))?;
 
         let watcher = app
             .register_root::<_, _>(SignalWatcher { producer }, 8)
             .map_err(|e| anyhow::anyhow!("register watcher: {e:?}"))?;
 
-        app
-            .try_send(producer, ProducerMsg::Tick(0))
+        app.try_send(producer, ProducerMsg::Tick(0))
             .map_err(|e| anyhow::anyhow!("kick producer: {e:?}"))?;
-        app
-            .try_send(watcher, SignalMsg::Begin)
+        app.try_send(watcher, SignalMsg::Begin)
             .map_err(|e| anyhow::anyhow!("kick watcher: {e:?}"))?;
 
         // Operator: simulate Ctrl-C from outside the runtime.
@@ -328,11 +326,16 @@ mod tests {
         };
         assert!(consumer.finished_report().is_none());
         consumer.processed = 3;
-        let report = consumer.finished_report().expect("all admitted work drained");
+        let report = consumer
+            .finished_report()
+            .expect("all admitted work drained");
         assert_eq!(report.items_produced, 3);
         assert_eq!(report.items_processed, 3);
         assert_eq!(report.items_remaining_in_queue_at_exit, 0);
         assert!(!report.signal_received);
-        assert!(!report.exit_clean, "dependency failure must never look clean");
+        assert!(
+            !report.exit_clean,
+            "dependency failure must never look clean"
+        );
     }
 }

@@ -11,6 +11,8 @@
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::error::Error;
+use std::fmt;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
@@ -68,6 +70,139 @@ impl Default for RunConfig {
             sink_fail_every: 0,
             sink_flush_delay_ms: 0,
         }
+    }
+}
+
+// Public bounds checked by [`RunConfig::validate`] before any runtime,
+// barrier, thread, or batch allocation exists. `callers` is an OS-thread
+// count (`thread::scope`); the capacities are allocation bounds
+// (`Vec::with_capacity`, mailbox slots); `events` also bounds the derived
+// 4x overload burst in `run`; the durations are sanity caps in the same
+// shape as the sibling systems (`system_tenant_rate_limiter`,
+// `system_soak_http_db`).
+const MAX_EVENTS: usize = 1_000_000;
+const MAX_CALLERS: usize = 1_024;
+const MAX_BUFFER_CAPACITY: usize = 65_536;
+const MAX_BATCH_SIZE: usize = 65_536;
+const MAX_BATCH_WINDOW_MS: u64 = 3_600_000;
+const MAX_MAILBOX: usize = 65_536;
+const MAX_CALL_TIMEOUT_MS: u64 = 60_000;
+const MAX_FLUSH_TIMEOUT_MS: u64 = 60_000;
+const MAX_STOP_TIMEOUT_MS: u64 = 60_000;
+const MAX_SINK_FAIL_EVERY: usize = 1_000_000;
+const MAX_SINK_FLUSH_DELAY_MS: u64 = 60_000;
+
+/// Invalid configuration rejected before runtime, barrier, thread, or
+/// batch construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunConfigError {
+    /// A non-zero bounded field was zero.
+    Zero { field: &'static str },
+    /// A bounded field exceeded its public limit.
+    TooLarge {
+        field: &'static str,
+        requested: u128,
+        max: u128,
+    },
+}
+
+impl fmt::Display for RunConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zero { field } => write!(f, "{field} must be greater than zero"),
+            Self::TooLarge {
+                field,
+                requested,
+                max,
+            } => write!(f, "{field} {requested} exceeds maximum {max}"),
+        }
+    }
+}
+
+impl Error for RunConfigError {}
+
+impl RunConfig {
+    /// Validate all panic and allocation bounds before starting Tina.
+    ///
+    /// Zero is rejected for every field whose zero value would panic
+    /// (`batch_window_ms` feeds `RecurringTick::every`), underflow
+    /// (`batch_size - 1` in the shutdown script), or silently degrade the
+    /// run (a zero mailbox or buffer turns every submission into `Full`
+    /// or `Dropped`). `sink_fail_every` and `sink_flush_delay_ms` stay
+    /// max-only: zero is their documented "disabled" value.
+    pub fn validate(&self) -> Result<(), RunConfigError> {
+        validate_usize("events", self.events, MAX_EVENTS)?;
+        validate_usize("callers", self.callers, MAX_CALLERS)?;
+        validate_usize("buffer_capacity", self.buffer_capacity, MAX_BUFFER_CAPACITY)?;
+        validate_usize("batch_size", self.batch_size, MAX_BATCH_SIZE)?;
+        validate_u64("batch_window_ms", self.batch_window_ms, MAX_BATCH_WINDOW_MS)?;
+        validate_usize("shipper_mailbox", self.shipper_mailbox, MAX_MAILBOX)?;
+        validate_usize("sink_mailbox", self.sink_mailbox, MAX_MAILBOX)?;
+        validate_u64("call_timeout_ms", self.call_timeout_ms, MAX_CALL_TIMEOUT_MS)?;
+        validate_u64(
+            "flush_timeout_ms",
+            self.flush_timeout_ms,
+            MAX_FLUSH_TIMEOUT_MS,
+        )?;
+        validate_u64("stop_timeout_ms", self.stop_timeout_ms, MAX_STOP_TIMEOUT_MS)?;
+        // `World::submit_burst` builds `Barrier::new(callers + 1)`. The
+        // callers cap above already keeps `+ 1` un-overflowable; the
+        // checked form keeps a future cap change from ever wrapping.
+        if self.callers.checked_add(1).is_none() {
+            return Err(RunConfigError::TooLarge {
+                field: "callers",
+                requested: self.callers as u128,
+                max: MAX_CALLERS as u128,
+            });
+        }
+        // Zero means "disabled" for the sink fault knobs; only bound them.
+        validate_usize_max("sink_fail_every", self.sink_fail_every, MAX_SINK_FAIL_EVERY)?;
+        validate_u64_max(
+            "sink_flush_delay_ms",
+            self.sink_flush_delay_ms,
+            MAX_SINK_FLUSH_DELAY_MS,
+        )?;
+        Ok(())
+    }
+}
+
+fn validate_usize(field: &'static str, value: usize, max: usize) -> Result<(), RunConfigError> {
+    if value == 0 {
+        Err(RunConfigError::Zero { field })
+    } else {
+        validate_usize_max(field, value, max)
+    }
+}
+
+fn validate_usize_max(field: &'static str, value: usize, max: usize) -> Result<(), RunConfigError> {
+    if value > max {
+        Err(RunConfigError::TooLarge {
+            field,
+            requested: value as u128,
+            max: max as u128,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_u64(field: &'static str, value: u64, max: u64) -> Result<(), RunConfigError> {
+    if value == 0 {
+        Err(RunConfigError::Zero { field })
+    } else {
+        validate_u64_max(field, value, max)
+    }
+}
+
+fn validate_u64_max(field: &'static str, value: u64, max: u64) -> Result<(), RunConfigError> {
+    if value > max {
+        Err(RunConfigError::TooLarge {
+            field,
+            requested: u128::from(value),
+            max: u128::from(max),
+        })
+    } else {
+        Ok(())
     }
 }
 
@@ -184,11 +319,15 @@ pub enum ShipperEvent {
 /// Caller-authority requests the host can ask the shipper.
 #[derive(Debug)]
 pub enum ShipperRequest {
-    Submit { event: Event },
+    Submit {
+        event: Event,
+    },
     Stats,
     /// Hold the reply until `events_delivered + events_lost_on_flush >= target`.
     /// Replaces a host sleep-poll on stats for "has the burst settled?".
-    AwaitRouted { target: u64 },
+    AwaitRouted {
+        target: u64,
+    },
     Stop,
 }
 
@@ -199,9 +338,13 @@ pub enum ShipperReply {
     Stopping,
     Stats(ShipperStats),
     /// [`ShipperRequest::AwaitRouted`] resolved; `routed` is delivered + lost.
-    Routed { routed: u64 },
+    Routed {
+        routed: u64,
+    },
     AwaitBusy,
-    RouteWaitStopped { routed: u64 },
+    RouteWaitStopped {
+        routed: u64,
+    },
     Stopped {
         flushed_on_drain: usize,
         drained_batches: usize,
@@ -329,11 +472,7 @@ impl Shipper {
             .saturating_add(self.stats.events_lost_on_flush)
     }
 
-    fn on_await_routed(
-        &mut self,
-        target: u64,
-        call: RequestCall<'_, Self>,
-    ) -> RequestEffect<Self> {
+    fn on_await_routed(&mut self, target: u64, call: RequestCall<'_, Self>) -> RequestEffect<Self> {
         self.sweep_await();
         if self.routed_total() >= target {
             return call.reply(ShipperReply::Routed {
@@ -431,7 +570,10 @@ impl Shipper {
         // tick makes any in-flight Tick continuation visibly stale via
         // `flush_tick.validate()`.
         if self.buffer.len() >= self.batch_size && self.flush_gate.is_idle() {
-            return call.reply_and(ShipperReply::Accepted, vec![self.start_flush(FlushKind::Size)]);
+            return call.reply_and(
+                ShipperReply::Accepted,
+                vec![self.start_flush(FlushKind::Size)],
+            );
         }
 
         // Time-based flush: arm the recurring tick the first time the buffer
@@ -518,10 +660,8 @@ impl Shipper {
         } else {
             self.drain.record_cancelled_or_retired();
             self.stats.flush_failures += 1;
-            self.stats.events_lost_on_flush = self
-                .stats
-                .events_lost_on_flush
-                .saturating_add(count as u64);
+            self.stats.events_lost_on_flush =
+                self.stats.events_lost_on_flush.saturating_add(count as u64);
         }
 
         let drain_done =
@@ -573,13 +713,11 @@ impl Shipper {
             SinkRequest::Flush { batch },
             self.flush_timeout,
         )
-        .then_service_event(move |outcome| {
-            ShipperEvent::FlushDone {
-                kind,
-                count,
-                permit,
-                outcome,
-            }
+        .then_service_event(move |outcome| ShipperEvent::FlushDone {
+            kind,
+            count,
+            permit,
+            outcome,
         })
     }
 
@@ -645,9 +783,8 @@ impl Sink {
                 if self.flush_delay.is_zero() {
                     return self.reply_for_batch(call, batch);
                 }
-                call.defer(sleep(self.flush_delay)).reply_service_event(move |req, _| {
-                    SinkEvent::Complete { req, batch }
-                })
+                call.defer(sleep(self.flush_delay))
+                    .reply_service_event(move |req, _| SinkEvent::Complete { req, batch })
             }
             SinkRequest::Stats => call.reply(SinkReply::Stats(SinkStats {
                 mailbox_capacity: self.mailbox_capacity,
@@ -699,6 +836,7 @@ impl Sink {
 }
 
 pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
+    config.validate()?;
     let steady_config = RunConfig {
         sink_fail_every: 0,
         ..config.clone()
@@ -706,8 +844,10 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
     let overload_config = RunConfig {
         // Force buffer overflow: parallel callers + slow sink + small
         // buffer. Each in-flight flush blocks for sink_flush_delay_ms so
-        // the buffer fills and the next Submit gets a typed Dropped.
-        events: config.events.saturating_mul(4),
+        // the buffer fills and the next Submit gets a typed Dropped. The
+        // derived 4x burst is clamped to the public bound so a validated
+        // input config still validates inside `run_overload`.
+        events: config.events.saturating_mul(4).min(MAX_EVENTS),
         callers: 8,
         buffer_capacity: (config.buffer_capacity / 2).max(2),
         batch_size: (config.batch_size / 2).max(1),
@@ -730,6 +870,7 @@ pub fn run(config: RunConfig) -> anyhow::Result<RunReport> {
 }
 
 pub fn run_steady(config: &RunConfig) -> anyhow::Result<SteadyReport> {
+    config.validate()?;
     let world = World::start(config)?;
     // The steady probe isolates normal service behavior. Concurrency pressure
     // belongs to `run_overload`, where Full and Dropped are asserted directly.
@@ -765,6 +906,7 @@ pub fn run_steady(config: &RunConfig) -> anyhow::Result<SteadyReport> {
 }
 
 pub fn run_overload(config: &RunConfig) -> anyhow::Result<OverloadReport> {
+    config.validate()?;
     let world = World::start(config)?;
     let outcomes = world.submit_burst(config.events, config.callers, false)?;
     let mut accepted = 0;
@@ -799,14 +941,17 @@ pub fn run_overload(config: &RunConfig) -> anyhow::Result<OverloadReport> {
 }
 
 pub fn run_shutdown(config: &RunConfig) -> anyhow::Result<ShutdownReport> {
+    config.validate()?;
     let mut lifecycle_transitions: Vec<Lifecycle> = vec![Lifecycle::Starting];
     let world = World::start(config)?;
     lifecycle_transitions.push(Lifecycle::Ready);
     let topology = build_topology(config);
 
     // Submit a partial batch (smaller than batch_size) so Stop must flush
-    // on drain rather than ride a size-based flush.
-    let partial = (config.batch_size - 1).max(1);
+    // on drain rather than ride a size-based flush. Validated
+    // `batch_size >= 1` keeps the subtraction from underflowing; the
+    // saturating form keeps a future caller honest even without validate.
+    let partial = config.batch_size.saturating_sub(1).max(1);
     let outcomes = world.submit_burst(partial, 1, true)?;
     let accepted = outcomes
         .iter()
@@ -1079,7 +1224,8 @@ struct World {
 
 impl World {
     fn start(config: &RunConfig) -> anyhow::Result<Self> {
-        let app = LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
+        let app =
+            LocalSystem::single_shard(SingleShard, DefaultThreadedMailboxFactory).try_build()?;
         let sink = app
             .register_split_service::<Sink, SinkEvent, SinkRequest, Infallible>(
                 Sink::new(
@@ -1173,14 +1319,11 @@ impl World {
     }
 
     fn shipper_stats(&self) -> anyhow::Result<ShipperStats> {
-        match self
-            .app
-            .call_blocking_request(
-                self.shipper,
-                ShipperRequest::Stats,
-                self.call_timeout,
-            )?
-        {
+        match self.app.call_blocking_request(
+            self.shipper,
+            ShipperRequest::Stats,
+            self.call_timeout,
+        )? {
             CallOutcome::Replied(ShipperReply::Stats(stats)) => Ok(stats),
             other => anyhow::bail!("expected Stats reply, got {other:?}"),
         }
@@ -1209,9 +1352,9 @@ impl World {
             timeout,
         )? {
             CallOutcome::Replied(ShipperReply::Routed { .. }) => Ok(()),
-            other => anyhow::bail!(
-                "expected Routed reply for target={target_accepted}, got {other:?}"
-            ),
+            other => {
+                anyhow::bail!("expected Routed reply for target={target_accepted}, got {other:?}")
+            }
         }
     }
 
@@ -1239,6 +1382,231 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_accepts_default_boundary_and_disabled_sink_knobs() {
+        assert!(RunConfig::default().validate().is_ok());
+        let maxed = RunConfig {
+            events: MAX_EVENTS,
+            callers: MAX_CALLERS,
+            buffer_capacity: MAX_BUFFER_CAPACITY,
+            batch_size: MAX_BATCH_SIZE,
+            batch_window_ms: MAX_BATCH_WINDOW_MS,
+            shipper_mailbox: MAX_MAILBOX,
+            sink_mailbox: MAX_MAILBOX,
+            call_timeout_ms: MAX_CALL_TIMEOUT_MS,
+            flush_timeout_ms: MAX_FLUSH_TIMEOUT_MS,
+            stop_timeout_ms: MAX_STOP_TIMEOUT_MS,
+            sink_fail_every: MAX_SINK_FAIL_EVERY,
+            sink_flush_delay_ms: MAX_SINK_FLUSH_DELAY_MS,
+        };
+        assert!(maxed.validate().is_ok());
+        // Zero is the documented "disabled" value for the sink fault knobs.
+        let disabled = RunConfig {
+            sink_fail_every: 0,
+            sink_flush_delay_ms: 0,
+            ..RunConfig::default()
+        };
+        assert!(disabled.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_counts_capacities_and_durations() {
+        let cases = [
+            (
+                RunConfig {
+                    events: 0,
+                    ..RunConfig::default()
+                },
+                "events",
+            ),
+            (
+                RunConfig {
+                    callers: 0,
+                    ..RunConfig::default()
+                },
+                "callers",
+            ),
+            (
+                RunConfig {
+                    buffer_capacity: 0,
+                    ..RunConfig::default()
+                },
+                "buffer_capacity",
+            ),
+            (
+                RunConfig {
+                    batch_size: 0,
+                    ..RunConfig::default()
+                },
+                "batch_size",
+            ),
+            (
+                RunConfig {
+                    batch_window_ms: 0,
+                    ..RunConfig::default()
+                },
+                "batch_window_ms",
+            ),
+            (
+                RunConfig {
+                    shipper_mailbox: 0,
+                    ..RunConfig::default()
+                },
+                "shipper_mailbox",
+            ),
+            (
+                RunConfig {
+                    sink_mailbox: 0,
+                    ..RunConfig::default()
+                },
+                "sink_mailbox",
+            ),
+            (
+                RunConfig {
+                    call_timeout_ms: 0,
+                    ..RunConfig::default()
+                },
+                "call_timeout_ms",
+            ),
+            (
+                RunConfig {
+                    flush_timeout_ms: 0,
+                    ..RunConfig::default()
+                },
+                "flush_timeout_ms",
+            ),
+            (
+                RunConfig {
+                    stop_timeout_ms: 0,
+                    ..RunConfig::default()
+                },
+                "stop_timeout_ms",
+            ),
+        ];
+        for (config, field) in cases {
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(RunConfigError::Zero { field: actual }) if actual == field
+                ),
+                "expected Zero rejection for {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_max_plus_one_for_every_bounded_field() {
+        let cases = [
+            (
+                RunConfig {
+                    events: MAX_EVENTS + 1,
+                    ..RunConfig::default()
+                },
+                "events",
+            ),
+            (
+                RunConfig {
+                    callers: MAX_CALLERS + 1,
+                    ..RunConfig::default()
+                },
+                "callers",
+            ),
+            (
+                RunConfig {
+                    buffer_capacity: MAX_BUFFER_CAPACITY + 1,
+                    ..RunConfig::default()
+                },
+                "buffer_capacity",
+            ),
+            (
+                RunConfig {
+                    batch_size: MAX_BATCH_SIZE + 1,
+                    ..RunConfig::default()
+                },
+                "batch_size",
+            ),
+            (
+                RunConfig {
+                    batch_window_ms: MAX_BATCH_WINDOW_MS + 1,
+                    ..RunConfig::default()
+                },
+                "batch_window_ms",
+            ),
+            (
+                RunConfig {
+                    shipper_mailbox: MAX_MAILBOX + 1,
+                    ..RunConfig::default()
+                },
+                "shipper_mailbox",
+            ),
+            (
+                RunConfig {
+                    sink_mailbox: MAX_MAILBOX + 1,
+                    ..RunConfig::default()
+                },
+                "sink_mailbox",
+            ),
+            (
+                RunConfig {
+                    call_timeout_ms: MAX_CALL_TIMEOUT_MS + 1,
+                    ..RunConfig::default()
+                },
+                "call_timeout_ms",
+            ),
+            (
+                RunConfig {
+                    flush_timeout_ms: MAX_FLUSH_TIMEOUT_MS + 1,
+                    ..RunConfig::default()
+                },
+                "flush_timeout_ms",
+            ),
+            (
+                RunConfig {
+                    stop_timeout_ms: MAX_STOP_TIMEOUT_MS + 1,
+                    ..RunConfig::default()
+                },
+                "stop_timeout_ms",
+            ),
+            (
+                RunConfig {
+                    sink_fail_every: MAX_SINK_FAIL_EVERY + 1,
+                    ..RunConfig::default()
+                },
+                "sink_fail_every",
+            ),
+            (
+                RunConfig {
+                    sink_flush_delay_ms: MAX_SINK_FLUSH_DELAY_MS + 1,
+                    ..RunConfig::default()
+                },
+                "sink_flush_delay_ms",
+            ),
+        ];
+        for (config, field) in cases {
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(RunConfigError::TooLarge { field: actual, .. }) if actual == field
+                ),
+                "expected TooLarge rejection for {field}"
+            );
+        }
+        // The barrier-parties derivation cannot wrap for a capped callers
+        // count, and the typed rejection covers it if a future cap change
+        // ever makes it possible.
+        assert!(matches!(
+            RunConfig {
+                callers: usize::MAX,
+                ..RunConfig::default()
+            }
+            .validate(),
+            Err(RunConfigError::TooLarge {
+                field: "callers",
+                ..
+            })
+        ));
+    }
 
     fn wait_until_await_is_parked(world: &World) {
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
@@ -1311,11 +1679,7 @@ mod tests {
             wait_until_await_is_parked(&world);
             let stopped = world
                 .app
-                .call_blocking_request(
-                    world.shipper,
-                    ShipperRequest::Stop,
-                    Duration::from_secs(1),
-                )
+                .call_blocking_request(world.shipper, ShipperRequest::Stop, Duration::from_secs(1))
                 .expect("stop call");
             assert!(matches!(
                 stopped,

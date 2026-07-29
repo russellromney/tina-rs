@@ -191,7 +191,7 @@ families with stable single-byte tags:
 - `EffectKind::Fact` = 13
 - `RuntimeEventKind::FactObserved` event tag = 36
 - `RuntimeFact::Protocol` family tag = 1
-- `ProtocolFact` variant tags 1..8 in the order documented in the
+- `ProtocolFact` variant tags 1..=9 in the order documented in the
   source file.
 
 Existing tags are not renumbered. A stable-hash regression test pins

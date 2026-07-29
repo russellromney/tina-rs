@@ -54,13 +54,33 @@ pub enum PolicyConfigError {
     ZeroLimit,
     /// A zero window has no stable retry interval.
     ZeroWindow,
+    /// A zero key capacity would reject every tenant as `Full`.
+    ZeroKeys,
+    /// The requested key capacity exceeds the pre-allocated table bound.
+    TooManyKeys {
+        /// The requested key capacity.
+        requested: usize,
+        /// The public maximum key capacity.
+        max: usize,
+    },
 }
+
+/// Public bound on the key table. `try_new` pre-allocates the whole table
+/// (`Vec::with_capacity(max_keys)` plus one `Option<Slot>` per key, ~48
+/// bytes each), so an absurd `max_keys` is an allocation bug, not a policy
+/// choice: 65_536 slots caps the table at roughly 3 MiB and keeps
+/// `usize::MAX` from aborting the process before the first decision.
+pub const MAX_KEYS: usize = 65_536;
 
 impl std::fmt::Display for PolicyConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ZeroLimit => f.write_str("per-tenant limit must be greater than zero"),
             Self::ZeroWindow => f.write_str("policy window must be greater than zero"),
+            Self::ZeroKeys => f.write_str("key capacity must be greater than zero"),
+            Self::TooManyKeys { requested, max } => {
+                write!(f, "key capacity {requested} exceeds maximum {max}")
+            }
         }
     }
 }
@@ -76,6 +96,15 @@ impl PerTenantWindow {
         limit: u32,
         window: Duration,
     ) -> Result<Self, PolicyConfigError> {
+        if max_keys == 0 {
+            return Err(PolicyConfigError::ZeroKeys);
+        }
+        if max_keys > MAX_KEYS {
+            return Err(PolicyConfigError::TooManyKeys {
+                requested: max_keys,
+                max: MAX_KEYS,
+            });
+        }
         if limit == 0 {
             return Err(PolicyConfigError::ZeroLimit);
         }
@@ -287,6 +316,29 @@ mod tests {
         assert!(matches!(
             PerTenantWindow::try_new("ext.zero-window", 1, 1, Duration::ZERO),
             Err(PolicyConfigError::ZeroWindow)
+        ));
+    }
+
+    #[test]
+    fn key_capacity_is_validated_before_the_table_is_allocated() {
+        assert!(matches!(
+            PerTenantWindow::try_new("ext.zero-keys", 0, 1, Duration::from_secs(1)),
+            Err(PolicyConfigError::ZeroKeys)
+        ));
+        assert!(
+            PerTenantWindow::try_new("ext.one-key", 1, 1, Duration::from_secs(1)).is_ok(),
+            "a single-key table is the smallest valid policy"
+        );
+        assert!(
+            PerTenantWindow::try_new("ext.max-keys", MAX_KEYS, 1, Duration::from_secs(1)).is_ok(),
+            "the public bound itself stays valid"
+        );
+        assert!(matches!(
+            PerTenantWindow::try_new("ext.too-many-keys", MAX_KEYS + 1, 1, Duration::from_secs(1)),
+            Err(PolicyConfigError::TooManyKeys {
+                requested,
+                max: MAX_KEYS,
+            }) if requested == MAX_KEYS + 1
         ));
     }
 }

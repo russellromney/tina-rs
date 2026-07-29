@@ -172,7 +172,11 @@ fn run_application(
     if second.status == StatusCode::OK {
         report.successful_get += 1;
     }
-    report.final_counter_value = body_text(&second).trim().parse().unwrap_or(0);
+    // A garbage body must fail the runner, never fabricate a counter value.
+    let second_body = body_text(&second);
+    report.final_counter_value = second_body.trim().parse().map_err(|error| {
+        anyhow::anyhow!("second GET /counter body {second_body:?} is not a u32 counter: {error}")
+    })?;
 
     let missing = fetch(request(Method::GET, "/missing"))?;
     if missing.status == StatusCode::NOT_FOUND {

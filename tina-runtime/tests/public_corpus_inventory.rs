@@ -138,6 +138,9 @@ const DOC_ROWS: &[&str] = &[
     "examples/systems/README.md",
     "examples/extensions/README.md",
     "examples/systems/perf_native/fly/README.md",
+    "CHANGELOG.md",
+    "ROADMAP.md",
+    "fuzz/README.md",
 ];
 
 fn discovered_crates(root: &Path) -> Vec<String> {

@@ -1084,7 +1084,12 @@ mod tests {
         queue.quiescent_waiter = Some(request_context(true, 4));
         queue.discard_closed_ready_waiter();
         queue.discard_closed_quiescent_waiter();
-        assert!(queue.ready_waiter.as_ref().is_some_and(|waiter| waiter.is_open()));
+        assert!(
+            queue
+                .ready_waiter
+                .as_ref()
+                .is_some_and(|waiter| waiter.is_open())
+        );
         assert!(
             queue
                 .quiescent_waiter
@@ -1439,7 +1444,21 @@ pub fn run_cancel_in_flight(config: RunConfig) -> anyhow::Result<CancelInFlightR
                     )
                 });
 
-                thread::sleep(Duration::from_millis(config.job_sleep_ms / 4 + 5));
+                // Cancel must be issued exactly after admission is
+                // observable: poll the typed stats snapshot until the
+                // job is in flight (same deadline-bounded wait shape as
+                // run_quiescent_waiter_replacement), never a guessed sleep.
+                let admission_deadline = std::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    if stats(app, queue.requests)?.in_flight == 1 {
+                        break;
+                    }
+                    if std::time::Instant::now() >= admission_deadline {
+                        anyhow::bail!("submitted job was not admitted before cancel deadline");
+                    }
+                    thread::yield_now();
+                }
+
                 let cancel_reply = match app.call_blocking_request(
                     queue.requests,
                     QueueRequest::Cancel(JobId(1)),

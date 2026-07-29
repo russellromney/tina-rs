@@ -157,7 +157,8 @@ you. You register the isolate, send it messages, ask it a question with
 `ThreadedRuntime` underneath stays available as the low-level form —
 benchmarks and stepping demos use it directly — but the facade is the normal
 shape; every specimen under `examples/` uses it, apart from the labeled
-raw-runtime anti-pattern demonstration.
+raw-runtime anti-pattern demonstration, the low-level stepping and
+ownership demonstrations, and the benchmark controls.
 
 ```rust
 //! Smallest runnable Tina program.

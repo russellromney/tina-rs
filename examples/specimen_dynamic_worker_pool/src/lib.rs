@@ -39,7 +39,20 @@ pub struct Report {
     pub spawn_zero_capacity: u32,
     /// Cross-shard child construction could not reach its destination.
     pub spawn_destination_unavailable: u32,
-    /// A future non-exhaustive spawn rejection reason.
+    /// A child's isolate or bootstrap factory panicked; no child was
+    /// published.
+    pub spawn_factory_panicked: u32,
+    /// The parent mailbox could not reserve a terminal-delivery slot; no
+    /// child was created.
+    pub spawn_parent_mailbox_full: u32,
+    /// The parent mailbox was closed, so no terminal-delivery reservation
+    /// could be taken; no child was created.
+    pub spawn_parent_mailbox_closed: u32,
+    /// The parent mailbox does not implement physical capacity
+    /// reservations; no child was created.
+    pub spawn_parent_mailbox_reservations_unsupported: u32,
+    /// A spawn rejection reason added after this specimen was written
+    /// (`SpawnObservedError` is `#[non_exhaustive]`).
     pub spawn_other: u32,
     /// A child request could not enter its bounded mailbox.
     pub call_full: u32,
@@ -74,6 +87,10 @@ pub fn assert_tina_report_accounted(report: &Report) {
     let settled = report.results_collected
         + report.spawn_zero_capacity
         + report.spawn_destination_unavailable
+        + report.spawn_factory_panicked
+        + report.spawn_parent_mailbox_full
+        + report.spawn_parent_mailbox_closed
+        + report.spawn_parent_mailbox_reservations_unsupported
         + report.spawn_other
         + report.call_full
         + report.call_closed

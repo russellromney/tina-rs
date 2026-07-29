@@ -94,11 +94,12 @@ timings drift because there is no virtual clock.
 
 ## Tina Shape
 
-`tina_sim::Simulator` with seeded fault injection: 1-in-3 timer wakes
-get pushed by an extra millisecond, deterministically chosen by the
-seed; 1-in-4 local sends get delayed by a round. The seed plus the
-explicit `History` plus the visible `ReplayConfig` plus the pinned
-event count and trace hash specify the run.
+`tina_sim::Simulator` with seeded fault injection: 1-in-4 local sends
+get delayed by one delivery round, deterministically chosen by the
+seed. `LocalSendFaultMode::DelayByRounds { one_in: 4, rounds: 1 }`
+is the only fault knob the case turns — the workload has no timers.
+The seed plus the explicit `History` plus the visible `ReplayConfig`
+plus the pinned event count and trace hash specify the run.
 
 The fingerprint comes from `tina_runtime::stable_trace_hash` — a
 deterministic hash over the typed trace events, not
@@ -114,8 +115,9 @@ deterministic hash over the typed trace events, not
   `format!("{event:?}")` hashing; the runtime owns the stable
   serialization.
 - **Faults are knobs, not happenstance.**
-  `FaultMode::DelayBy { one_in: 3, by: 1ms }` makes the seed do real
-  work — the test does not assert on a quiet system.
+  `LocalSendFaultMode::DelayByRounds { one_in: 4, rounds: 1 }` makes
+  the seed do real work — the pinned hash covers a trace with seeded
+  delivery delays, not a quiet system.
 - **Bugs travel as data.** The whole case is one `struct` literal.
   Paste it into a bug report; the next reader replays it.
 

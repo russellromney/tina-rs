@@ -133,8 +133,10 @@ fn run_application(app: &App) -> anyhow::Result<Report> {
     }
 
     let response = send_request(app, conn, HttpRequest::get("/counter").build())?;
-    record_get(&mut report, &response, None)?;
-    report.final_counter_value = body_text(&response).trim().parse().unwrap_or(0);
+    // The script posted three increments; a body other than "3" fails the
+    // runner instead of fabricating a final value.
+    record_get(&mut report, &response, Some("3"))?;
+    report.final_counter_value = body_text(&response).trim().parse()?;
 
     let response = send_request(app, conn, HttpRequest::get("/missing").build())?;
     if response.status == StatusCode::NOT_FOUND {

@@ -132,9 +132,12 @@ it has to absorb two distinct streams of messages:
 > total capacity = inbound messages + replies to outstanding runtime calls
 
 If an isolate has 4 inbound senders and runs 2 `tcp_read`s in flight
-at once, both peaks have to fit. A capacity of `4` will reject the
-read replies under load with `CallCompletionRejected { reason:
-MailboxFull }` in the trace.
+at once, both peaks have to fit. A capacity of `4` does not reject
+the read replies: runtime-call continuations are never dropped on a
+full mailbox. The continuation parks in the isolate's priority
+overflow lane and the trace shows `CallContinuationOverflowed`; the
+overflow drains ahead of ordinary mailbox traffic and the call still
+completes. Under-sizing costs ordering and latency, not the reply.
 
 Use [`MailboxBudget`](https://docs.rs/tina-runtime) at the spawn site
 to make the math obvious:
@@ -262,7 +265,7 @@ impl Producer {
                 }))
             }
             ProducerMsg::Sent(outcome) => {
-                if outcome.is_full() {
+                if matches!(outcome, SendOutcome::Full) {
                     self.rejected += 1;
                 }
                 noop()

@@ -1,6 +1,6 @@
 //! Public runner proof for the metrics shipper system.
 
-use system_metrics_shipper::{RunConfig, lifecycle_for_drain_stage, run};
+use system_metrics_shipper::{RunConfig, RunConfigError, lifecycle_for_drain_stage, run};
 use tina_runtime::DrainStage;
 use tina_runtime::lifecycle::Lifecycle;
 
@@ -70,10 +70,70 @@ fn default_config() -> RunConfig {
     }
 }
 
-/// Pins steady/overload/drain metrics semantics.
+/// Pins steady/overload/drain metrics semantics and the exact typed
+/// config rejections raised before any runtime, barrier, thread, or
+/// batch is constructed.
 #[test]
 fn public_characterization() {
     assert_shipper_report(run(default_config()).expect("run succeeds"));
+
+    assert!(matches!(
+        run(RunConfig {
+            batch_window_ms: 0,
+            ..default_config()
+        })
+        .expect_err("zero batch window must be rejected before RecurringTick::every")
+        .downcast_ref::<RunConfigError>(),
+        Some(RunConfigError::Zero {
+            field: "batch_window_ms"
+        })
+    ));
+    assert!(matches!(
+        run(RunConfig {
+            batch_size: 0,
+            ..default_config()
+        })
+        .expect_err("zero batch size must be rejected before the batch_size - 1 site")
+        .downcast_ref::<RunConfigError>(),
+        Some(RunConfigError::Zero {
+            field: "batch_size"
+        })
+    ));
+    assert!(matches!(
+        run(RunConfig {
+            callers: 0,
+            ..default_config()
+        })
+        .expect_err("zero callers must be rejected")
+        .downcast_ref::<RunConfigError>(),
+        Some(RunConfigError::Zero { field: "callers" })
+    ));
+    assert!(matches!(
+        run(RunConfig {
+            shipper_mailbox: 65_537,
+            ..default_config()
+        })
+        .expect_err("mailbox above the public bound must be rejected")
+        .downcast_ref::<RunConfigError>(),
+        Some(RunConfigError::TooLarge {
+            field: "shipper_mailbox",
+            requested: 65_537,
+            max: 65_536,
+        })
+    ));
+    assert!(matches!(
+        run(RunConfig {
+            events: 1_000_001,
+            ..default_config()
+        })
+        .expect_err("events above the public bound must be rejected")
+        .downcast_ref::<RunConfigError>(),
+        Some(RunConfigError::TooLarge {
+            field: "events",
+            requested: 1_000_001,
+            max: 1_000_000,
+        })
+    ));
 }
 
 /// Documented public runner path: `run(RunConfig)`.

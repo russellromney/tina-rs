@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use tina_extension_service_policy::{PerTenantWindow, PolicyConfigError, Report, run};
+use tina_extension_service_policy::{MAX_KEYS, PerTenantWindow, PolicyConfigError, Report, run};
 
 /// limit=2 per 1s window, table holds 2 tenants: admit, admit,
 /// rate_limited (window full), admit (new key), full (table full),
@@ -41,5 +41,16 @@ fn public_characterization() {
     assert!(matches!(
         PerTenantWindow::try_new("ext.public.zero_window", 1, 1, Duration::ZERO),
         Err(PolicyConfigError::ZeroWindow)
+    ));
+    assert!(matches!(
+        PerTenantWindow::try_new("ext.public.zero_keys", 0, 1, Duration::from_secs(1)),
+        Err(PolicyConfigError::ZeroKeys)
+    ));
+    assert!(matches!(
+        PerTenantWindow::try_new("ext.public.too_many_keys", MAX_KEYS + 1, 1, Duration::from_secs(1)),
+        Err(PolicyConfigError::TooManyKeys {
+            requested,
+            max: MAX_KEYS,
+        }) if requested == MAX_KEYS + 1
     ));
 }

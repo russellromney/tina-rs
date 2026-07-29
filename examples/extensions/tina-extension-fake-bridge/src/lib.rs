@@ -81,9 +81,28 @@ struct Job {
 pub struct FakeBridgeConfig {
     /// Stable, validated surface name (e.g. `"fake.worker"`).
     pub name: String,
-    /// Bounded admission capacity across queued plus active work.
+    /// Bounded admission capacity across queued plus active work. Must be
+    /// non-zero: a zero capacity would reject every submit as `BridgeFull`.
     pub capacity: usize,
 }
+
+/// Invalid fake bridge configuration, rejected before the channel or the
+/// worker thread exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FakeBridgeConfigError {
+    /// A zero admission capacity would degrade the bridge to always-`Full`.
+    ZeroCapacity,
+}
+
+impl std::fmt::Display for FakeBridgeConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroCapacity => f.write_str("bridge capacity must be greater than zero"),
+        }
+    }
+}
+
+impl std::error::Error for FakeBridgeConfigError {}
 
 /// Idempotent admission closer.
 #[derive(Clone)]
@@ -223,10 +242,19 @@ impl CallTicket {
 }
 
 /// Install a fake bridge that runs `work` on a bounded worker thread.
-pub fn install<F>(config: FakeBridgeConfig, work: F) -> FakeBridgeInstall
+///
+/// Rejects an invalid config (zero capacity) before the bounded channel
+/// or the worker thread exist.
+pub fn install<F>(
+    config: FakeBridgeConfig,
+    work: F,
+) -> Result<FakeBridgeInstall, FakeBridgeConfigError>
 where
     F: Fn(u64) -> u64 + Send + 'static,
 {
+    if config.capacity == 0 {
+        return Err(FakeBridgeConfigError::ZeroCapacity);
+    }
     let state = Arc::new(State::default());
     let closed = Arc::new(AtomicBool::new(false));
     let admission = Arc::new(Mutex::new(()));
@@ -234,7 +262,7 @@ where
     let worker_state = Arc::clone(&state);
     let worker = thread::spawn(move || worker_loop(rx, work, worker_state));
 
-    FakeBridgeInstall {
+    Ok(FakeBridgeInstall {
         closer: FakeBridgeCloser { closed, admission },
         metrics: FakeBridgeMetrics {
             name: config.name,
@@ -243,7 +271,7 @@ where
         },
         tx: Some(tx),
         worker: Some(worker),
-    }
+    })
 }
 
 fn worker_loop<F: Fn(u64) -> u64>(rx: Receiver<Job>, work: F, state: Arc<State>) {
@@ -433,7 +461,8 @@ fn run_happy_path() -> (u64, bool) {
             capacity: 4,
         },
         |x| x + 1,
-    );
+    )
+    .expect("scenario capacity is non-zero");
     let mut completed = 0;
     for i in 0..3 {
         if let SubmitOutcome::Admitted(ticket) = bridge.submit(i) {
@@ -471,7 +500,8 @@ fn run_timeout_and_late_result() -> (bool, u64, u64) {
             }
             x * 2
         },
-    );
+    )
+    .expect("scenario capacity is non-zero");
 
     let warning = match bridge.submit(7) {
         SubmitOutcome::Admitted(ticket) => match ticket.wait(Duration::from_millis(20)) {
@@ -526,7 +556,8 @@ fn run_full() -> bool {
             }
             x
         },
-    );
+    )
+    .expect("scenario capacity is non-zero");
 
     // A reserves the one installed in-flight slot. B is Full whether A is
     // active or still queued.
@@ -552,7 +583,8 @@ fn run_closed() -> bool {
             capacity: 2,
         },
         |x| x,
-    );
+    )
+    .expect("scenario capacity is non-zero");
     bridge.close();
     let saw_closed = matches!(
         bridge.submit(1),
@@ -593,6 +625,22 @@ mod tests {
     }
 
     #[test]
+    fn zero_capacity_is_rejected_before_channel_or_worker_exist() {
+        // The typed error is the whole proof: no `FakeBridgeInstall` (and
+        // therefore no bounded channel or worker thread) is ever built.
+        assert!(matches!(
+            install(
+                FakeBridgeConfig {
+                    name: "fake.zero".to_string(),
+                    capacity: 0,
+                },
+                |x| x,
+            ),
+            Err(FakeBridgeConfigError::ZeroCapacity)
+        ));
+    }
+
+    #[test]
     fn closer_is_idempotent_and_visible() {
         let bridge = install(
             FakeBridgeConfig {
@@ -600,7 +648,8 @@ mod tests {
                 capacity: 1,
             },
             |x| x,
-        );
+        )
+        .expect("scenario capacity is non-zero");
         assert!(!bridge.closer().is_closed());
         bridge.closer().close();
         bridge.closer().close(); // idempotent
@@ -617,7 +666,8 @@ mod tests {
                     capacity: 1,
                 },
                 |x| x,
-            );
+            )
+            .expect("scenario capacity is non-zero");
             let ticket = match bridge.submit(1) {
                 SubmitOutcome::Admitted(ticket) => ticket,
                 SubmitOutcome::Rejected(error) => panic!("first submit rejected: {error:?}"),

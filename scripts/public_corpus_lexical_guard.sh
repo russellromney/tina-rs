@@ -4,9 +4,8 @@
 # Rejects, in the public corpus:
 #   - shared-state: Arc<Mutex> / Mutex<Option> / Condvar / atomics in
 #     examples/**/src code lines (result-sidecar signatures);
-#   - poll-loop: `loop { ... sleep(...) }` / `while ... { ... sleep(...) }`
-#     result polling in examples/**/src (one brace-nesting level; deeper
-#     nesting is a documented limit with no corpus instance);
+#   - poll-loop: `loop`/`while` bodies that spin on `sleep(...)` or
+#     `yield_now()` at any brace depth in examples/**/src;
 #   - obsolete-vocabulary: raw-runtime API names in corpus markdown;
 #   - intent-phrase: exact intent-artifact phrases anywhere in scanned text.
 #
@@ -111,7 +110,7 @@ scan_rs() { # $1 = perl program body evaluated per file, prints "file:line: deta
 shared_state_hits() {
     scan_rs '
         '"$strip_perl"'
-        while (/\b(?:Arc\s*<\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*Mutex|Mutex\s*(?:<|::\s*new)|RwLock|Condvar|Atomic(?:Bool|I8|I16|I32|I64|Isize|U8|U16|U32|U64|Usize|Ptr))/g) {
+        while (/\b(?:Arc\s*<\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*Mutex|Mutex\s*(?:<|::\s*new)|RwLock|Condvar|Rc\s*<\s*RefCell|Atomic(?:Bool|I8|I16|I32|I64|Isize|U8|U16|U32|U64|Usize|Ptr))/g) {
             my $line = 1 + (substr($_, 0, $-[0]) =~ tr/\n//);
             my $hit = $&;
             $hit =~ s/\s+/ /g;
@@ -123,19 +122,39 @@ shared_state_hits() {
 poll_loop_hits() {
     scan_rs '
         '"$strip_perl"'
-        while (/\b(?:loop|while)[^{]*\{(?:[^{}]|\{[^{}]*\})*?sleep\s*\(/gs) {
-            my $line = 1 + (substr($_, 0, $-[0]) =~ tr/\n//);
-            print "$line: poll-loop\n";
+        # Brace-depth tracker: a sleep/yield_now at depth >= 1 inside a
+        # loop/while block is a poll loop, at any nesting, past any
+        # intervening closures or pattern blocks.
+        my $depth = 0;
+        my @loop_stack;
+        while (/((?<![A-Za-z0-9_])loop\s*\{|(?<![A-Za-z0-9_])while\b[^{]*\{|\{|\}|thread::sleep\s*\(|tokio::time::sleep\s*\(|yield_now\s*\()/g) {
+            my $tok = $1;
+            if ($tok =~ /^loop|^while/) {
+                $depth++;
+                push @loop_stack, $depth;
+            } elsif ($tok eq "{") {
+                $depth++;
+            } elsif ($tok eq "}") {
+                $depth--;
+                $depth = 0 if $depth < 0;
+                while (@loop_stack && $loop_stack[-1] > $depth) { pop @loop_stack; }
+            } else {
+                if (@loop_stack) {
+                    my $line = 1 + (substr($_, 0, $-[0]) =~ tr/\n//);
+                    print "$line: poll-loop\n";
+                }
+            }
         }
     '
 }
 
-OBSOLETE_PATTERN='\bThreadedRuntime\b|\bThreadedMultiShardRuntime\b|\bMultiShardRuntime\b|\bbuild_keepalive_pool\b|\bshutdown_keepalive_pool\b|\bregister_with_capacity[a-z_]*|\brequest_and_wait_report\b|\bshutdown_report\(\)'
+OBSOLETE_PATTERN='\bThreadedRuntime\b|\bThreadedMultiShardRuntime\b|\bMultiShardRuntime\b|\bbuild_keepalive_pool\b|\bshutdown_keepalive_pool\b|\bregister_with_capacity[a-z_]*|\brequest_and_wait_report\b|\bshutdown_report\(\)|\brequest_shutdown\b|\bwait_report\(|\bshutdown_handle\(\)'
 
 obsolete_vocabulary_hits() {
     rg --no-messages -n -e "$OBSOLETE_PATTERN" \
         --glob '*.md' \
-        "$SCAN_ROOT/examples" "$SCAN_ROOT/docs" "$SCAN_ROOT/README.md" 2>/dev/null \
+        "$SCAN_ROOT/examples" "$SCAN_ROOT/docs" "$SCAN_ROOT/README.md" \
+        "$SCAN_ROOT/CHANGELOG.md" "$SCAN_ROOT/ROADMAP.md" "$SCAN_ROOT/fuzz" 2>/dev/null \
         | sed 's/:/: obsolete-vocabulary:/2'
 }
 
@@ -226,17 +245,27 @@ if [[ "${1:-}" == "--self-test" ]]; then
         > "$fx/examples/specimen_demo/src/whiler.rs"
     printf 'fn pace() { for _ in 0..3 { std::thread::sleep(std::time::Duration::from_millis(1)); } }\n' \
         > "$fx/examples/specimen_demo/src/pacer.rs"
+    printf 'fn spin_loop() { loop { break; } }\nfn settle() { std::thread::sleep(std::time::Duration::from_millis(1)); }\n' \
+        > "$fx/examples/specimen_demo/src/post_loop_settle.rs"
     printf 'fn sneaky() { /* " */ let _z: Arc<Mutex<u64>> = g(); /* " */ }\n' \
         > "$fx/examples/specimen_demo/src/lexer_confusion.rs"
     printf 'fn sneaky2() { /* // */ loop { std::thread::sleep(std::time::Duration::from_millis(1)); break; } }\n' \
         > "$fx/examples/specimen_demo/src/lexer_confusion_poll.rs"
+    printf 'fn spin() { loop { if ready() { break; } std::thread::yield_now(); } }\n' \
+        > "$fx/examples/specimen_demo/src/spinner.rs"
+    printf 'fn deep() { loop { if a() { if b() { std::thread::sleep(std::time::Duration::from_millis(1)); } } break; } }\n' \
+        > "$fx/examples/specimen_demo/src/deep_poll.rs"
+    printf 'fn shared() { let _r: Rc<RefCell<Vec<u8>>> = start(); }\n' \
+        > "$fx/examples/specimen_demo/src/rc_sidecar.rs"
     printf 'use tina_runtime::ThreadedRuntime;\n' > "$fx/docs/guide.md"
     printf 'still teaches `register_with_capacity` on raw hosts\n' > "$fx/README.md"
     printf 'phase 163 alone is fine; the number is not forbidden\n' > "$fx/docs/notes.md"
     printf 'See the Public Example Certification package\n' > "$fx/examples/specimen_demo/src/leak.md"
     printf 'fn main() {}\n' > "$fx/tina-fake/src/lib.rs"
     printf '#!/usr/bin/env bash\ntrue\n' > "$fx/scripts/other.sh"
-    touch "$fx/Makefile" "$fx/README.md"
+    touch "$fx/Makefile" "$fx/README.md" "$fx/CHANGELOG.md" "$fx/ROADMAP.md"
+    mkdir -p "$fx/fuzz"
+    printf 'fuzz notes\n' > "$fx/fuzz/README.md"
 
     cat > "$fx/allow.toml" <<'TOML'
 schema = 1
@@ -296,10 +325,18 @@ TOML2
         || { echo "self-test: while-poll evasion missed" >&2; exit 1; }
     printf '%s\n' "$poll" | grep -q 'pacer' && {
         echo "self-test: for-loop pacing false positive" >&2; exit 1; }
+    printf '%s\n' "$poll" | grep -q 'post_loop_settle' && {
+        echo "self-test: post-loop settle sleep false positive" >&2; exit 1; }
     printf '%s\n' "$shared" | grep -q 'lexer_confusion.rs:1: shared-state' \
         || { echo "self-test: block-comment quote confusion evaded the strip" >&2; exit 1; }
     printf '%s\n' "$poll" | grep -q 'lexer_confusion_poll.rs:1: poll-loop' \
         || { echo "self-test: block-comment slash confusion evaded the strip" >&2; exit 1; }
+    printf '%s\n' "$poll" | grep -q 'spinner.rs:1: poll-loop' \
+        || { echo "self-test: yield_now spin evaded" >&2; exit 1; }
+    printf '%s\n' "$poll" | grep -q 'deep_poll.rs:1: poll-loop' \
+        || { echo "self-test: nested sleep poll evaded" >&2; exit 1; }
+    printf '%s\n' "$shared" | grep -q 'rc_sidecar.rs:1: shared-state' \
+        || { echo "self-test: Rc<RefCell> sidecar evaded" >&2; exit 1; }
     printf '%s\n' "$obs" | grep -q 'guide.md:1: obsolete-vocabulary' \
         || { echo "self-test: obsolete-vocabulary miss" >&2; exit 1; }
     printf '%s\n' "$obs" | grep -q 'README.md:1: obsolete-vocabulary' \

@@ -3,7 +3,8 @@
 #
 #   fly deploy . -c examples/systems/perf_native/fly/fly.toml --build-only --push
 #
-# then run a one-off machine from the pushed image (see run_perf_on_fly.sh).
+# then run a one-off machine from the pushed image (see the manual
+# `fly machine run` + `fly ssh console` sequence in README.md).
 app = "tina-perf-150"
 primary_region = "iad"
 

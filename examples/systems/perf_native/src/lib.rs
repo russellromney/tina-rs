@@ -184,9 +184,8 @@ impl WorkloadConfig {
         nonzero_usize("samples", self.samples, MAX_SAMPLES)?;
         nonzero_usize("capacity", self.capacity, MAX_CAPACITY)?;
         nonzero_u64("call_timeout_ms", self.call_timeout_ms, MAX_CALL_TIMEOUT_MS)?;
-        let ops_usize = usize::try_from(self.ops).map_err(|_| WorkloadConfigError::DerivedOverflow {
-            field: "ops",
-        })?;
+        let ops_usize = usize::try_from(self.ops)
+            .map_err(|_| WorkloadConfigError::DerivedOverflow { field: "ops" })?;
         if self.capacity < ops_usize {
             return Err(WorkloadConfigError::CapacityTooSmall {
                 capacity: self.capacity,
@@ -202,11 +201,7 @@ impl WorkloadConfig {
     }
 }
 
-fn nonzero_usize(
-    field: &'static str,
-    value: usize,
-    max: usize,
-) -> Result<(), WorkloadConfigError> {
+fn nonzero_usize(field: &'static str, value: usize, max: usize) -> Result<(), WorkloadConfigError> {
     if value == 0 {
         return Err(WorkloadConfigError::Zero { field });
     }
@@ -850,14 +845,13 @@ fn tokio_observed_admission_row(config: WorkloadConfig) -> anyhow::Result<PerfRe
         },
         None::<fn() -> LoadObservation>,
     );
-    finish_teardown([
-        stop_tx
-            .send(())
-            .map_err(|_| "tokio observed stop receiver dropped".to_owned()),
-        handle
-            .join()
-            .map_err(|_| "tokio observed worker panicked".to_owned()),
-    ])?;
+    // The stop send races the worker's own sender-close exit; a dropped
+    // receiver means the intended terminal already happened. The join
+    // check alone carries teardown truth (a panic still fails).
+    let _ = stop_tx.send(());
+    finish_teardown([handle
+        .join()
+        .map_err(|_| "tokio observed worker panicked".to_owned())])?;
     record_clean_lifecycle(&mut load);
     Ok(PerfReport::from_load_with_allocations(
         "tokio_observed_admission",
@@ -919,14 +913,13 @@ fn tokio_host_call_row(config: WorkloadConfig) -> anyhow::Result<PerfReport> {
         move |_| tokio_call_op(&tx),
         None::<fn() -> LoadObservation>,
     );
-    finish_teardown([
-        stop_tx
-            .send(())
-            .map_err(|_| "tokio call stop receiver dropped".to_owned()),
-        handle
-            .join()
-            .map_err(|_| "tokio call worker panicked".to_owned()),
-    ])?;
+    // The stop send races the worker's own sender-close exit; a dropped
+    // receiver means the intended terminal already happened. The join
+    // check alone carries teardown truth (a panic still fails).
+    let _ = stop_tx.send(());
+    finish_teardown([handle
+        .join()
+        .map_err(|_| "tokio call worker panicked".to_owned())])?;
     record_clean_lifecycle(&mut load);
     Ok(PerfReport::from_load_with_allocations(
         "tokio_host_call",
@@ -944,10 +937,7 @@ fn tina_service_call_chain_row(config: WorkloadConfig) -> anyhow::Result<PerfRep
         .map_err(|e| anyhow::anyhow!("register tina chain ping: {e:?}"))?;
     let chain = runtime
         .register_split_service::<ChainService, ChainEvent, ChainRequest, Infallible>(
-            ChainService {
-                ping,
-                call_timeout,
-            },
+            ChainService { ping, call_timeout },
             config.capacity,
         )
         .map_err(|e| anyhow::anyhow!("register tina chain service: {e:?}"))?
@@ -966,8 +956,7 @@ fn tina_service_call_chain_row(config: WorkloadConfig) -> anyhow::Result<PerfRep
             stop: LoadStop::ops(config.ops),
             label: "tina_service_call_chain",
         },
-        move |_| match rt.call_blocking(chain, ChainMsg::Request(ChainRequest::Run), call_timeout)
-        {
+        move |_| match rt.call_blocking(chain, ChainMsg::Request(ChainRequest::Run), call_timeout) {
             Ok(CallOutcome::Replied(ChainReply::Done)) => OpOutcome::Ok,
             Ok(CallOutcome::Replied(ChainReply::DownstreamFull)) => OpOutcome::Err {
                 kind: "downstream_full",
@@ -1016,13 +1005,12 @@ fn tokio_service_call_chain_row(config: WorkloadConfig) -> anyhow::Result<PerfRe
         move |_| tokio_call_op(&service_tx),
         None::<fn() -> LoadObservation>,
     );
+    // The stop send races the worker's own sender-close exit; a dropped
+    // receiver means the intended terminal already happened. The join
+    // check alone carries teardown truth (a panic still fails).
+    let _ = service_stop.send(());
+    let _ = ping_stop.send(());
     finish_teardown([
-        service_stop
-            .send(())
-            .map_err(|_| "tokio chain service stop receiver dropped".to_owned()),
-        ping_stop
-            .send(())
-            .map_err(|_| "tokio chain ping stop receiver dropped".to_owned()),
         service_handle
             .join()
             .map_err(|_| "tokio chain service panicked".to_owned()),
@@ -1297,10 +1285,11 @@ fn tokio_http_row(
     let (allocs_delta, allocated_bytes_delta, rss_delta) =
         ProcessSnapshot::now().delta_from(process_before);
     print_process_metrics(label, allocs_delta, allocated_bytes_delta, rss_delta);
+    // The stop send races the worker's own sender-close exit; a dropped
+    // receiver means the intended terminal already happened. The join
+    // check alone carries teardown truth (a panic still fails).
+    let _ = stop_tx.send(());
     finish_teardown([
-        stop_tx
-            .send(())
-            .map_err(|_| "tokio HTTP stop receiver dropped".to_owned()),
         done_rx
             .recv_timeout(Duration::from_secs(2))
             .map_err(|error| format!("tokio HTTP completion: {error}")),
@@ -1354,10 +1343,11 @@ fn tokio_http_steady_state_row(
     });
     let addr = addr_rx.recv_timeout(Duration::from_secs(2))?;
     let mut report = http_steady_state_load(workload, label, kind, addr, expected_len)?;
+    // The stop send races the worker's own sender-close exit; a dropped
+    // receiver means the intended terminal already happened. The join
+    // check alone carries teardown truth (a panic still fails).
+    let _ = stop_tx.send(());
     finish_teardown([
-        stop_tx
-            .send(())
-            .map_err(|_| "tokio steady HTTP stop receiver dropped".to_owned()),
         done_rx
             .recv_timeout(Duration::from_secs(2))
             .map_err(|error| format!("tokio steady HTTP completion: {error}")),
@@ -1421,14 +1411,12 @@ fn stop_tokio_counter(
     stop_tx: oneshot::Sender<()>,
     handle: thread::JoinHandle<()>,
 ) -> anyhow::Result<()> {
-    finish_teardown([
-        stop_tx
-            .send(())
-            .map_err(|_| "tokio counter stop receiver dropped".to_owned()),
-        handle
-            .join()
-            .map_err(|_| "tokio counter worker panicked".to_owned()),
-    ])
+    // A dropped stop receiver means the worker already exited on sender
+    // close — the intended terminal. The join check carries teardown truth.
+    let _ = stop_tx.send(());
+    finish_teardown([handle
+        .join()
+        .map_err(|_| "tokio counter worker panicked".to_owned())])
 }
 
 type TokioPingHandle = (
@@ -3563,13 +3551,10 @@ mod tests {
     #[test]
     fn teardown_attempts_join_after_stop_failure() {
         let join_attempted = Cell::new(false);
-        let error = finish_teardown([
-            Err("stop receiver dropped".to_owned()),
-            {
-                join_attempted.set(true);
-                Err("worker panicked".to_owned())
-            },
-        ])
+        let error = finish_teardown([Err("stop receiver dropped".to_owned()), {
+            join_attempted.set(true);
+            Err("worker panicked".to_owned())
+        }])
         .expect_err("stop failure remains visible");
 
         assert!(join_attempted.get(), "join step must still be attempted");
@@ -3653,10 +3638,7 @@ mod tests {
             .expect("register zero-capacity ping");
         let chain = runtime
             .register_split_service::<ChainService, ChainEvent, ChainRequest, Infallible>(
-                ChainService {
-                    ping,
-                    call_timeout,
-                },
+                ChainService { ping, call_timeout },
                 8,
             )
             .expect("register chain")
@@ -3687,10 +3669,7 @@ mod tests {
             .expect("register slow ping");
         let chain = runtime
             .register_split_service::<ChainService, ChainEvent, ChainRequest, Infallible>(
-                ChainService {
-                    ping,
-                    call_timeout,
-                },
+                ChainService { ping, call_timeout },
                 8,
             )
             .expect("register chain")

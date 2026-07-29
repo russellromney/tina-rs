@@ -219,8 +219,9 @@ snapshots rather than appending one event per message.
 
 | Where | Visible outcome |
 | --- | --- |
-| Runtime call to session owner is full | `WebSocketSendError::OutboundQueueFull` |
-| Runtime call to session owner is closed/rejected | `WebSocketSendError::Closed` |
+| Runtime call to session owner is full | `WebSocketSendError::Full` |
+| Runtime call to session owner is closed | `WebSocketSendError::Closed` |
+| Runtime call to session owner is rejected | `WebSocketSendError::ForeignSystem` when the handle names another runtime incarnation, `WebSocketSendError::Protocol` otherwise |
 | Runtime call times out | `WebSocketSendError::Timeout` |
 | Handle names a previous session generation | `WebSocketSendError::Stale`, or `Closed` if the old owner already stopped |
 | Session is closing | `WebSocketSendError::Closing` |

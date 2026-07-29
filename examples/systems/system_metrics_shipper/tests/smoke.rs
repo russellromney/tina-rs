@@ -1,4 +1,7 @@
-use system_metrics_shipper::{RunConfig, lifecycle_for_drain_stage, run};
+use system_metrics_shipper::{
+    RunConfig, RunConfigError, lifecycle_for_drain_stage, run, run_overload, run_shutdown,
+    run_steady,
+};
 use tina_runtime::DrainStage;
 use tina_runtime::lifecycle::{Lifecycle, ResourceKind, ShutdownStep};
 
@@ -132,6 +135,77 @@ fn metrics_shipper_steady_overload_and_drain_are_typed() {
         lifecycle_for_drain_stage(DrainStage::Stopped),
         Lifecycle::Stopped,
     );
+}
+
+#[test]
+fn invalid_configs_are_typed_and_do_not_start_a_runtime() {
+    // Every public run path validates before `World::start`, so a typed
+    // `RunConfigError` proves no runtime, barrier, thread, or batch was
+    // ever constructed. Each case names the site it protects.
+    let run_cases: [(RunConfig, &str); 2] = [
+        (
+            RunConfig {
+                batch_window_ms: 0,
+                ..RunConfig::default()
+            },
+            "batch_window_ms", // RecurringTick::every(0ms) panic site
+        ),
+        (
+            RunConfig {
+                events: 1_000_001,
+                ..RunConfig::default()
+            },
+            "events", // outcome-Vec allocation bound
+        ),
+    ];
+    for (config, field) in run_cases {
+        let error = run(config).expect_err("run must reject an invalid config");
+        assert!(
+            matches!(
+                error.downcast_ref::<RunConfigError>(),
+                Some(RunConfigError::Zero { field: actual } | RunConfigError::TooLarge { field: actual, .. })
+                    if *actual == field
+            ),
+            "run rejected with the wrong error: {error:#}"
+        );
+    }
+
+    let steady_error = run_steady(&RunConfig {
+        shipper_mailbox: 0,
+        ..RunConfig::default()
+    })
+    .expect_err("run_steady must reject a zero shipper mailbox");
+    assert!(matches!(
+        steady_error.downcast_ref::<RunConfigError>(),
+        Some(RunConfigError::Zero {
+            field: "shipper_mailbox"
+        })
+    ));
+
+    let overload_error = run_overload(&RunConfig {
+        callers: usize::MAX,
+        ..RunConfig::default()
+    })
+    .expect_err("run_overload must reject callers that overflow Barrier::new(callers + 1)");
+    assert!(matches!(
+        overload_error.downcast_ref::<RunConfigError>(),
+        Some(RunConfigError::TooLarge {
+            field: "callers",
+            ..
+        })
+    ));
+
+    let shutdown_error = run_shutdown(&RunConfig {
+        batch_size: 0,
+        ..RunConfig::default()
+    })
+    .expect_err("run_shutdown must reject the batch_size - 1 underflow input");
+    assert!(matches!(
+        shutdown_error.downcast_ref::<RunConfigError>(),
+        Some(RunConfigError::Zero {
+            field: "batch_size"
+        })
+    ));
 }
 
 #[test]

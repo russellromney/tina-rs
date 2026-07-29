@@ -47,8 +47,8 @@ The worker replies and stops in one explicit effect:
 call.reply_and(WorkerReply::Partial(partial), vec![stop()])
 ```
 
-`WorkerStarted(Err(_))` preserves both current spawn-rejection reasons (plus a
-future non-exhaustive bucket). `WorkerDone` exhaustively
+`WorkerStarted(Err(_))` preserves all six current spawn-rejection reasons in
+distinct counters (plus a future non-exhaustive bucket). `WorkerDone` exhaustively
 accounts for `Replied`, `Full`, `Closed`, `Timeout`, and all four
 `CallRejectedReason` variants. Every child therefore settles exactly one report
 bucket. There is no parent address in the

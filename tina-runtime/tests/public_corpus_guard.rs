@@ -471,9 +471,11 @@ impl GuardVisitor<'_> {
 
     fn check_match(&mut self, expr_match: &syn::ExprMatch) {
         let arm_text = |arm: &syn::Arm| arm.pat.to_token_stream().to_string();
-        let mentions_call_outcome = expr_match.arms.iter().any(|arm| {
+        // Terminal enums whose distinct variants must not collapse silently:
+        // the runtime call outcome and the observed-spawn error.
+        let mentions_terminal_enum = expr_match.arms.iter().any(|arm| {
             let text = arm_text(arm);
-            if text.contains("CallOutcome") {
+            if text.contains("CallOutcome") || text.contains("SpawnObservedError") {
                 return true;
             }
             // `use tina_runtime::CallOutcome as CO;` then `CO::Replied(_)`.
@@ -493,7 +495,7 @@ impl GuardVisitor<'_> {
                     )
                 })
         });
-        if !mentions_call_outcome {
+        if !mentions_terminal_enum {
             return;
         }
         for arm in &expr_match.arms {
@@ -502,7 +504,7 @@ impl GuardVisitor<'_> {
                     self.push(
                         wild.underscore_token.span,
                         "terminal-wildcard",
-                        "CallOutcome terminals collapsed into an unnamed `_` arm".to_string(),
+                        "distinct terminal outcomes collapsed into an unnamed `_` arm".to_string(),
                     );
                 }
                 syn::Pat::Ident(ident) => {

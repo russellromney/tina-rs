@@ -25,6 +25,13 @@ async fn handle_socket(socket: WebSocket, room: RoomState) {
     let (mut write, mut read) = socket.split();
     let mut subscription = room.sender.subscribe();
 
+    // The broadcast subscription is live; acknowledge it to the client
+    // with a Ping control frame so the driver can observe the landed
+    // subscription before publishing (same ack as the Tina side).
+    if write.send(Message::Ping(Vec::new().into())).await.is_err() {
+        return;
+    }
+
     let writer = tokio::spawn(async move {
         while let Ok(text) = subscription.recv().await {
             if write.send(Message::Text(text.into())).await.is_err() {

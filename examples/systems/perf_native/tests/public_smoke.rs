@@ -92,11 +92,17 @@ fn public_characterization() {
     .validate()
     .expect("small accepted workload");
     let report = host_call_compare_with(custom).expect("custom host call comparison");
-    assert_eq!(report.tina.load.ops_attempted, 8, "ops must come from config");
+    assert_eq!(
+        report.tina.load.ops_attempted, 8,
+        "ops must come from config"
+    );
     assert_eq!(
         report.baseline.load.ops_attempted, 8,
         "baseline must share config ops"
     );
     assert_eq!(report.samples, 1, "samples must come from config");
-    assert!(report.tina.load.ops_ok > 0, "custom row must do useful work");
+    assert!(
+        report.tina.load.ops_ok > 0,
+        "custom row must do useful work"
+    );
 }
